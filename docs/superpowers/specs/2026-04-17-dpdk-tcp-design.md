@@ -17,7 +17,7 @@ Non-goals: server-side TCP in production, IPv6, HTTP/1.1-parser-in-library (Stag
 - **Stability is a first-class feature**: safe languages, memory-correct parsers, small attack surface, WAN-tested under induced loss/reorder.
 - **Observability through primitives, not framework**: stack exports raw counters, timestamps on every event, and state-change events. Aggregation (histograms, tracing, export endpoints) happens in the application using existing infrastructure.
 - **RFC behavior is tested, not claimed**: conformance is proved by running opensource RFC-conformance suites against the stack; anything unclear is resolved by referring to the RFC.
-- **Flexible API**: epoll-like pull model for stage 1, callback-style can layer on top later.
+- **Flexible API**: epoll-like pull model for Stage 1; callback-style or async layers can be built on top in user code or a later stage.
 
 ## 2. Architecture
 
@@ -69,10 +69,12 @@ Stages 3–5 are flagged "if needed" because the application may prefer to run H
 - **One engine per lcore.** Caller pins itself to an lcore before calling `resd_net_engine_create(lcore_id, &cfg)`.
 - **User code lives on the same lcore as the stack.** Run-to-completion: the user's event loop repeatedly calls `resd_net_poll`, which runs rx_burst → stack → emits events → user handles events inline → user-initiated sends batch into the next tx_burst.
 - **No cross-lcore rings on the hot path.** Connections are pinned to lcores at `connect()` time; the application chooses the assignment.
-- **Typical deployment**: one lcore per market-data feed (high-pps inbound WebSocket), one lcore for order entry (few latency-critical REST/WS connections), plus strategy/business-logic cores communicating with the stack lcores via the application's own existing mechanisms.
-- **Callback safety contract**: user code invoked on the stack lcore MUST be `noexcept` (C++) and non-panicking (Rust). An escaped C++ exception or Rust panic across the FFI boundary is undefined behavior and will abort the process. Callbacks that can fail should set an error flag the poll loop inspects, not throw. A CI test asserts this by running fuzzed callbacks that throw/panic and confirming the abort vs. UB diagnosis is clean.
+- **Typical deployment**: one lcore for market-data ingress (one or a few high-pps inbound connections per venue), one lcore for order entry (few latency-critical outbound connections), plus strategy/business-logic cores communicating with the stack lcores via the application's own existing mechanisms.
+- **FFI safety contract**: the Rust implementation must not panic across the `extern "C"` boundary. Any Rust panic within the stack is a library bug; panics are converted to process abort via a global `panic = "abort"` policy in `Cargo.toml` (release profile). On the caller side, a C++ exception in user code stays in user code — the poll-style API has no upcall, so exceptions never cross back into Rust.
 
 ## 4. Public API (Stage 1)
+
+This section is **normative**. It defines the stable C ABI; `include/resd_net.h` is auto-generated from the Rust side via `cbindgen` and must match exactly. Error codes are negative `errno` values; success is `0` unless otherwise documented.
 
 ```c
 /* ===== Engine ===== */
@@ -82,17 +84,25 @@ typedef struct {
     uint16_t port_id;
     uint16_t rx_queue_id;
     uint16_t tx_queue_id;
-    uint32_t max_connections;      /* sized ≥ expected, e.g. 16 */
-    uint32_t recv_buffer_bytes;    /* per-conn; default 256KiB */
-    uint32_t send_buffer_bytes;    /* per-conn; default 256KiB */
-    uint32_t tcp_mss;              /* 0 = derive from PMTUD */
-    bool     tcp_timestamps;       /* RFC 7323, default true */
-    bool     tcp_sack;             /* RFC 2018, default true */
-    bool     tcp_ecn;              /* RFC 3168, default false */
-    uint8_t  cc_mode;              /* 0=off (default), 1=reno, 2=cubic (later) */
-    bool     tcp_per_packet_events; /* emit RESD_NET_EVT_TCP_RETRANS etc. per packet;
-                                       state-change and error events always emitted
-                                       regardless. default false */
+    uint32_t max_connections;       /* sized ≥ expected, e.g. 16 */
+    uint32_t recv_buffer_bytes;     /* per-conn; default 256KiB */
+    uint32_t send_buffer_bytes;     /* per-conn; default 256KiB */
+    uint32_t tcp_mss;               /* 0 = derive from PMTUD */
+    bool     tcp_timestamps;        /* RFC 7323; default true */
+    bool     tcp_sack;              /* RFC 2018; default true */
+    bool     tcp_ecn;               /* RFC 3168; default false */
+    bool     tcp_nagle;             /* Nagle coalescing; default false (trading latency) */
+    bool     tcp_delayed_ack;       /* default false (trading latency); true = ACK per ≥2 segments, ≤40ms */
+    uint8_t  cc_mode;               /* 0=off (default), 1=reno, 2=cubic (later) */
+    uint32_t tcp_min_rto_ms;        /* default 20; RFC 6298 recommends 1000 */
+    uint32_t tcp_initial_rto_ms;    /* default 50 for SYN; RFC recommends 1000 */
+    uint32_t tcp_msl_ms;            /* for 2×MSL TIME_WAIT; default 30000 */
+    bool     tcp_per_packet_events; /* per-packet RETRANS/LOSS events; default false */
+    uint8_t  preset;                /* 0=latency (all defaults above apply);
+                                       1=rfc_compliance (forces nagle=true,
+                                       delayed_ack=true, cc_mode=reno, min_rto=200,
+                                       initial_rto=1000 — overrides above fields).
+                                       Runtime-selectable per engine. */
 } resd_net_engine_config_t;
 
 resd_net_engine_t* resd_net_engine_create(uint16_t lcore_id,
@@ -112,23 +122,34 @@ typedef struct {
 int resd_net_connect(resd_net_engine_t*,
                      const resd_net_connect_opts_t*,
                      resd_net_conn_t* out);
-int resd_net_close(resd_net_engine_t*, resd_net_conn_t);
+
+/* Close flags. Bitmask. */
+#define RESD_NET_CLOSE_FORCE_TW_SKIP  (1u << 0)  /* honored only when RFC 6191 §4.2 conds met */
+
+int resd_net_close(resd_net_engine_t*, resd_net_conn_t, uint32_t flags);
 int resd_net_shutdown(resd_net_engine_t*, resd_net_conn_t, int how);
 
 /* ===== Byte-stream send ===== */
-/* Enqueues `len` bytes on the connection's send queue. Bytes are flushed to the
- * NIC at end of poll iter, or immediately on resd_net_flush().
+/* Enqueues bytes on the connection's send queue; copies into a tx mbuf chain
+ * and returns. `buf` may be reused immediately after return.
  *
- * Returns the number of bytes accepted (always 0..len). If the per-connection
- * send buffer is full, returns < len (or 0); caller waits for
- * RESD_NET_EVT_WRITABLE before retrying the remainder.
+ * Return value (int32_t):
+ *   >= 0  number of bytes accepted, in the range [0, len]. A value < len means
+ *         the per-connection send buffer reached its cap; caller waits for
+ *         RESD_NET_EVT_WRITABLE before retrying the remainder.
+ *   < 0   negative errno:
+ *           -ENOMEM  tx mempool exhausted; retry later; a RESD_NET_EVT_ERROR
+ *                    {err=ENOMEM} is also emitted for visibility
+ *           -ENOTCONN  connection not in a sending state
+ *           -EINVAL  bad handle / null buf with nonzero len
  *
- * `buf` must remain valid until the call returns; bytes are copied into the
- * stack's tx mbuf chain before returning. */
-int resd_net_send(resd_net_engine_t*,
-                  resd_net_conn_t,
-                  const uint8_t* buf,
-                  uint32_t len);
+ * Mempool exhaustion is surfaced as an error return (never as a silent short
+ * accept); a short accept (0..len with no error) means backpressure from the
+ * peer's receive window or our per-conn send buffer cap. */
+int32_t resd_net_send(resd_net_engine_t*,
+                      resd_net_conn_t,
+                      const uint8_t* buf,
+                      uint32_t len);
 
 /* ===== Poll ===== */
 typedef enum {
@@ -143,15 +164,27 @@ typedef enum {
     RESD_NET_EVT_TCP_STATE_CHANGE,
 } resd_net_event_kind_t;
 
+/* Per-kind event payload. The `kind` field selects which arm of the union is
+ * meaningful; other arms are undefined. */
 typedef struct {
     resd_net_event_kind_t kind;
     resd_net_conn_t       conn;
-    const uint8_t*        data;            /* borrowed; READABLE only; valid until next poll */
-    uint32_t              data_len;
     uint64_t              rx_hw_ts_ns;     /* NIC HW timestamp when available; else 0 */
     uint64_t              enqueued_ts_ns;  /* TSC when event entered user-visible form */
-    int32_t               err;
-    uint64_t              user_data;       /* passthrough for RESD_NET_EVT_TIMER */
+
+    union {
+        struct { const uint8_t* data; uint32_t data_len; } readable;
+        struct { int32_t err; } error;                     /* -errno */
+        struct { int32_t err; } closed;                    /* 0 on clean close */
+        struct { uint64_t timer_id; uint64_t user_data; } timer;
+
+        /* tcp stability-visibility; present only when enabled */
+        struct { uint32_t seq; uint32_t rtx_count; } tcp_retrans;
+        struct { uint32_t first_seq; uint8_t trigger; } tcp_loss;  /* 0=RACK, 1=RTO, 2=TLP */
+        struct { uint8_t from_state; uint8_t to_state; } tcp_state;
+
+        /* empty arms for CONNECTED / WRITABLE — no payload */
+    } u;
 } resd_net_event_t;
 
 int resd_net_poll(resd_net_engine_t*,
@@ -163,8 +196,20 @@ void resd_net_flush(resd_net_engine_t*);   /* force rte_eth_tx_burst now */
 
 /* ===== Timers & clock ===== */
 uint64_t resd_net_now_ns(resd_net_engine_t*);
-int      resd_net_timer_add(resd_net_engine_t*, uint64_t deadline_ns, uint64_t user_data);
-int      resd_net_timer_cancel(resd_net_engine_t*, uint64_t timer_id);
+
+/* Schedule a one-shot timer. On fire, emits RESD_NET_EVT_TIMER with the same
+ * timer_id echoed in events[i].u.timer.timer_id and user_data passed through.
+ * Returns 0 on success and fills *timer_id_out; negative errno on failure. */
+int resd_net_timer_add(resd_net_engine_t*,
+                       uint64_t deadline_ns,
+                       uint64_t user_data,
+                       uint64_t* timer_id_out);
+
+/* Cancel a previously-added timer. Fire is a no-op if the timer has already
+ * been cancelled or has already fired. Returns 0 if cancelled before fire,
+ * -ENOENT if not found, -EALREADY if the fire event has already been queued
+ * (caller should still handle the RESD_NET_EVT_TIMER). */
+int resd_net_timer_cancel(resd_net_engine_t*, uint64_t timer_id);
 
 /* ===== Observability primitives ===== */
 const resd_net_counters_t* resd_net_counters(resd_net_engine_t*);
@@ -187,14 +232,15 @@ while (running) {
             break;
         case RESD_NET_EVT_READABLE:
             /* application parses the bytes (HTTP, WS, custom wire format, ...) */
-            app_consume(conn, events[i].data, events[i].data_len);
+            app_consume(conn, events[i].u.readable.data,
+                               events[i].u.readable.data_len);
             break;
         case RESD_NET_EVT_WRITABLE:
             /* retry any bytes that were refused earlier */
             app_drain_pending(conn);
             break;
         case RESD_NET_EVT_CLOSED:
-            app_on_close(conn);
+            app_on_close(conn, events[i].u.closed.err);
             break;
         }
     }
@@ -203,12 +249,13 @@ while (running) {
 
 ### 4.2 API contracts
 
-- `resd_net_send` is synchronous: it copies bytes into the stack's tx mbuf chain and returns. No borrow-across-poll semantics for the send buffer; the caller may reuse `buf` immediately.
-- `RESD_NET_EVT_READABLE.data` is a **borrowed view** into mbuf memory, valid from the moment `resd_net_poll` returns until the next `resd_net_poll` call on the same engine. The stack refcount-pins every mbuf referenced by any event in `events_out[0..n]` for that window; internal stack processing (including later bursts within the same poll) must not free those mbufs. Caller must `memcpy` out if they need bytes to outlive the poll.
+- `resd_net_send` is synchronous: it copies bytes into the stack's tx mbuf chain and returns. No borrow-across-poll semantics for the send buffer; the caller may reuse `buf` immediately. Return contract: `>= 0` bytes accepted (possibly partial under backpressure); `< 0` is `-errno` (mempool exhaustion `-ENOMEM`, bad handle `-EINVAL`, not-connected `-ENOTCONN`). A short accept under backpressure is not an error; `-ENOMEM` is an error.
+- `RESD_NET_EVT_READABLE.u.readable.data` is a **borrowed view** into mbuf memory, valid from the moment `resd_net_poll` returns until the next `resd_net_poll` call on the same engine. The stack refcount-pins every mbuf referenced by any event in `events_out[0..n]` for that window; internal stack processing (including later bursts within the same poll) must not free those mbufs. Caller must `memcpy` out if they need bytes to outlive the poll.
 - Multiple `RESD_NET_EVT_READABLE` events may fire per poll iteration if received bytes span multiple mbufs; they deliver in-order, each with one contiguous mbuf-data region.
 - `RESD_NET_EVT_WRITABLE` fires when the per-connection send buffer has drained by at least half its capacity after a prior full/partial send refusal.
-- `resd_net_flush` drains the current TX batch via exactly one `rte_eth_tx_burst`; no-op when empty; safe to call from inside a user callback (same-lcore, single-threaded re-entry).
+- `resd_net_flush` drains the current TX batch via exactly one `rte_eth_tx_burst`; no-op when empty. Safe to call multiple times per poll iteration; idempotent — a follow-up call with nothing newly queued is a no-op.
 - `rx_hw_ts_ns` is 0 when the NIC/PMD does not fill hardware timestamps; callers fall back to `enqueued_ts_ns`.
+- **`resd_net_poll` event-overflow policy**: if more events are ready than `max_events`, the stack fills `events_out[0..max_events]` with events in FIFO enqueue order, stops further RX-burst processing for this iteration, and leaves the overflow + any unprocessed RX packets queued inside the engine. The next `resd_net_poll` call drains the queue before processing new RX. Per-connection event ordering is preserved across poll boundaries; no event kind is preempted or prioritized. Callers size `max_events` at least to `(NIC_BURST × 2)` so steady-state traffic fits; smaller sizes are valid but cause additional poll round-trips.
 
 ## 5. Data Flow
 
@@ -335,8 +382,8 @@ struct TcpConn {
 - **Segment-level mbuf tracking**: every TX segment holds an mbuf refcount until ACK or RST. **Retransmit allocates a fresh header mbuf** chained to the original data mbuf (see §5.3) — never edits an in-flight mbuf in place.
 - **ISS**: `ISS = (monotonic_time_4µs_ticks_low_32) + SipHash64(local_ip || local_port || remote_ip || remote_port || secret || boot_nonce)` per RFC 6528 §3. Clock value is added outside the hash so reconnects to the same 4-tuple within MSL yield monotonically-increasing ISS. `secret` is a 128-bit per-process random constant; `boot_nonce` survives reboots via `/proc/sys/kernel/random/boot_id` or equivalent.
 - **SYN retransmit**: schedule respects `connect_timeout_ms` from `resd_net_connect_opts_t`. Default: 3 attempts with initial backoff `max(initial_rto_ms, minRTO)` (config default: `initial_rto_ms=50`), exponential up to the total budget. Never exceed `connect_timeout_ms` in total; the connection fails fast for trading, not per RFC 6298's 1s recommendation.
-- **RTO timer re-arm**: lazy. On ACK, update `snd.una`; the existing wheel entry fires at its originally-scheduled deadline. When it fires the callback re-checks `snd.una` vs `snd.nxt` — if fully ACKed, the timer cancels itself; otherwise it retransmits and re-arms. Avoids remove+insert on every ACK.
-- **TIME_WAIT shortening**: `resd_net_close(..., FORCE_TW_SKIP)` is honored only when RFC 6191 / RFC 7323 §5 conditions are met — specifically, timestamps are enabled on both sides AND `SEG.TSval > TS.Recent` at reconnect. When conditions aren't met, the flag is ignored and the connection stays in TIME_WAIT; a `RESD_NET_EVT_ERROR` with `err=EPERM_TW_REQUIRED` is emitted so the caller knows.
+- **RTO timer re-arm**: lazy. On ACK, update `snd.una`; the existing wheel entry fires at its originally-scheduled deadline. When it fires, the handler re-checks `snd.una` vs `snd.nxt` — if fully ACKed, the timer cancels itself; otherwise it retransmits and re-arms. Avoids remove+insert on every ACK.
+- **TIME_WAIT shortening**: `resd_net_close(engine, conn, RESD_NET_CLOSE_FORCE_TW_SKIP)` is honored only when RFC 6191 / RFC 7323 §5 conditions are met — specifically, timestamps are enabled on both sides AND `SEG.TSval > TS.Recent` at reconnect. When conditions aren't met, the flag is ignored and the connection stays in TIME_WAIT; a `RESD_NET_EVT_ERROR` with `err=EPERM_TW_REQUIRED` is emitted so the caller knows.
 
 ## 7. Memory and Buffer Model
 
@@ -503,7 +550,7 @@ Black-box mode for bring-up; white-box mode (JSON protocol) when enough internal
 - `scapy` for adversarial hand-crafted packets: overlapping segments, malformed options, port-reuse races, timestamp wraparound.
 - `smoltcp`'s `FaultInjector` pattern ported in: stackable RX-path middleware that randomly drops/duplicates/reorders/corrupts with configurable rates, enabled via env var for local soak-testing without netem.
 
-### 10.7 Layer G — WAN A/B vs Linux (stage 4)
+### 10.7 Layer G — WAN A/B vs Linux (Stage 2 hardening)
 
 ```
 Producer(strategy) ─► [lcore: resd_net stack]  ─┐
@@ -517,18 +564,18 @@ Producer(strategy) ─► [kernel Linux socket   ]  ─┘
 - Measurement protocol: tap jitter baseline is subtracted from measured deltas; reported latency parity is `(resd_net_p999 − Linux_p999) − tap_jitter_p999`.
 - Pass gate: `resd_net` p999 latency ≤ Linux p999 latency (after jitter subtraction) on all tested venues; zero RFC-conformance deltas from replay through the packetdrill shim.
 
-### 10.8 Layer H — WAN-condition fault injection (stage 4)
+### 10.8 Layer H — WAN-condition fault injection (Stage 2 hardening)
 
 Via `tc netem` on an intermediate Linux box inline between stack NIC and exchange:
 - Delay: +20ms, +50ms, +200ms, jittered.
 - Loss: 0.1% / 1% / 5% random, 1% correlated bursts.
 - Duplication, reordering (3-segment depth), corruption.
-- PMTU blackholing (drop ICMP frag-needed; force stack to detect via RTO + MSS probe).
+- PMTU blackholing (drop ICMP frag-needed) — **Stage 2 scenario only**; requires PLPMTUD (RFC 8899)-style recovery, which is not in Stage 1 scope. Stage 1 relies on ICMP-driven PMTUD (RFC 1191) and degrades gracefully to the configured MSS when ICMP is dropped.
 - Asserts: no stuck connections, no unbounded retransmit, state transitions remain valid, counters show the expected signals.
 
-### 10.9 Layer I — Online shadow mode (stage 4)
+### 10.9 Layer I — Online shadow mode (Stage 2 hardening)
 
-Run `resd_net` alongside Linux-stack path in production. Same requests over both. Gate promotion on zero response-body divergence and p99/p999 parity for 7 days.
+Run `resd_net` alongside the Linux-stack path in production. The application mirrors the same byte-stream workload onto both stacks (application-side responsibility). Gate promotion on zero byte-stream divergence and p99/p999 latency parity for 7 days.
 
 ### 10.10 Stage gates
 
@@ -595,7 +642,7 @@ Each measures one unit of work in isolation; target is the function call cost, n
 Run against the loopback-test-server (same-host) and against a dedicated peer on a cross-cable link.
 
 - **Request-response RTT** (single connection, single outstanding): `send N bytes → recv N bytes` round-trip. Histogram reported as p50/p90/p99/p999/max.
-- **HW-timestamp attribution**: for each measurement, record `rx_hw_ts_ns` minus `tx_sched_ts_ns` (wire RTT); record `enqueued_ts_ns` minus `rx_hw_ts_ns` (stack RX cost); record `user_return_ns` minus `enqueued_ts_ns` (callback cost); record `tx_burst_ns` minus `user_send_ns` (stack TX cost). These attribution buckets sum to the wall-clock RTT — the sum identity is asserted per-measurement (any mismatch invalidates the run).
+- **HW-timestamp attribution**: for each measurement, record `rx_hw_ts_ns` minus `tx_sched_ts_ns` (wire RTT); record `enqueued_ts_ns` minus `rx_hw_ts_ns` (stack RX cost); record `user_return_ns` minus `enqueued_ts_ns` (event-handler cost in the user's poll loop); record `tx_burst_ns` minus `user_send_ns` (stack TX cost). These attribution buckets sum to the wall-clock RTT — the sum identity is asserted per-measurement (any mismatch invalidates the run).
 - **One-way latency**: send-only tests with synchronized clocks (PTP or shared NIC tap) to measure TX-direction latency distribution independent of the peer's response latency.
 - **Head-of-line latency under load**: while a background stream saturates the link at 80% of line rate, measure RTT on a separate connection. Target: no p99 degradation vs. idle-link RTT.
 
@@ -608,7 +655,7 @@ Conducted via `tc netem` on an intermediate Linux box, or via `smoltcp`'s `Fault
 | 0.1% random loss, 10ms RTT | request-response latency | p999 ≤ 3× idle p999; no stuck connection over 10 minutes |
 | 1% correlated burst loss | request-response latency | p999 ≤ 10× idle p999; RTO/TLP fires observable via `tcp.tx_rto` / `tcp.tx_tlp` counters |
 | Reordering depth 3 | same | RACK detects reorder, no spurious retransmit per `tcp.tx_retrans` delta |
-| PMTU blackhole (drop ICMP frag-needed) | time-to-detect | stack adjusts MSS within 2 RTOs; no connection stall |
+| PMTU blackhole (drop ICMP frag-needed) — **Stage 2 only** | time-to-detect via PLPMTUD | requires RFC 8899; out of Stage 1 scope (use ICMP-driven PMTUD, RFC 1191) |
 | Duplication (2x) | request-response latency | no observable degradation at p99 |
 | Receiver zero-window stall then recovery | time to resume | `RESD_NET_EVT_WRITABLE` fires within 1 RTT of window open |
 | Send-buffer-full under slow peer | backpressure signaling | `resd_net_send` returns partial; `WRITABLE` fires on drain |
