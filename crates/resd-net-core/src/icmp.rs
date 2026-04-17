@@ -29,12 +29,12 @@ impl PmtuTable {
     /// Floors at IPV4_MIN_MTU. Declines to grow (PMTU only shrinks).
     pub fn update(&mut self, ip: u32, mtu: u16) -> bool {
         let mtu = mtu.max(IPV4_MIN_MTU);
-        let entry = self.entries.entry(ip).or_insert(u16::MAX);
-        if mtu < *entry {
-            *entry = mtu;
-            true
-        } else {
-            false
+        match self.entries.get(&ip).copied() {
+            Some(existing) if mtu >= existing => false,
+            _ => {
+                self.entries.insert(ip, mtu);
+                true
+            }
         }
     }
 }
@@ -171,6 +171,27 @@ mod tests {
     fn zero_mtu_malformed() {
         let inner = build_inner_ip(0x0a000050);
         let pkt = build_icmp_frag(0, &inner);
+        let mut t = PmtuTable::new();
+        assert_eq!(icmp_input(&pkt, &mut t), IcmpResult::Malformed);
+    }
+
+    #[test]
+    fn pmtu_update_u16_max_first_entry_is_recorded_and_counted() {
+        // Regression: previously, u16::MAX was used as a sentinel meaning
+        // "no entry yet", causing a legit u16::MAX MTU on first update to
+        // be silently dropped.
+        let mut t = PmtuTable::new();
+        assert!(t.update(0x0a000002, u16::MAX));
+        assert_eq!(t.get(0x0a000002), Some(u16::MAX));
+        // Second identical update should return false.
+        assert!(!t.update(0x0a000002, u16::MAX));
+    }
+
+    #[test]
+    fn inner_bad_version_malformed() {
+        let mut inner = build_inner_ip(0x0a000050);
+        inner[0] = 0x55; // version 5, IHL 5 — bad version
+        let pkt = build_icmp_frag(1400, &inner);
         let mut t = PmtuTable::new();
         assert_eq!(icmp_input(&pkt, &mut t), IcmpResult::Malformed);
     }
