@@ -3,6 +3,7 @@ use std::cell::RefCell;
 use std::ffi::CString;
 use std::sync::Mutex;
 
+use crate::arp;
 use crate::counters::Counters;
 use crate::icmp::PmtuTable;
 use crate::mempool::Mempool;
@@ -256,16 +257,14 @@ impl Engine {
     }
 
     /// One iteration of the run-to-completion loop.
-    /// In Phase A1, this rx-bursts and drops everything, then tx-bursts nothing.
-    /// Subsequent phases add real processing.
+    /// Phase A2: decode L2/L3/ICMP/ARP. Counts every packet by its outcome.
+    /// TCP dispatches to a stub that only bumps ip.rx_tcp. Real TCP is A3.
     pub fn poll_once(&self) -> usize {
-        use crate::counters::inc;
+        use crate::counters::{add, inc};
         inc(&self.counters.poll.iters);
 
         const BURST: usize = 32;
         let mut mbufs: [*mut sys::rte_mbuf; BURST] = [std::ptr::null_mut(); BURST];
-        // `rte_eth_rx_burst` is static-inline in DPDK headers, so we call
-        // the `resd_` extern wrapper defined in shim.c.
         let n = unsafe {
             sys::resd_rte_eth_rx_burst(
                 self.cfg.port_id,
@@ -274,18 +273,142 @@ impl Engine {
                 BURST as u16,
             )
         } as usize;
-        if n > 0 {
-            inc(&self.counters.poll.iters_with_rx);
-            crate::counters::add(&self.counters.eth.rx_pkts, n as u64);
-            for m in &mbufs[..n] {
-                // Drop each mbuf via the shim wrapper (rte_pktmbuf_free is
-                // static-inline and not exposed by bindgen).
-                unsafe { sys::resd_rte_pktmbuf_free(*m) };
-            }
-        } else {
+
+        if n == 0 {
             inc(&self.counters.poll.iters_idle);
+            self.maybe_emit_gratuitous_arp();
+            return 0;
         }
+
+        inc(&self.counters.poll.iters_with_rx);
+        add(&self.counters.eth.rx_pkts, n as u64);
+
+        for &m in &mbufs[..n] {
+            // Safety: mbuf is valid for the duration of this iteration.
+            let bytes = unsafe { crate::mbuf_data_slice(m) };
+            add(&self.counters.eth.rx_bytes, bytes.len() as u64);
+
+            self.rx_frame(bytes);
+
+            // Phase A2: we free every packet at the end of the iteration.
+            // Phase A3 will transfer ownership to recv_queues for TCP pkts.
+            unsafe { sys::resd_rte_pktmbuf_free(m) };
+        }
+
+        self.maybe_emit_gratuitous_arp();
         n
+    }
+
+    fn rx_frame(&self, bytes: &[u8]) {
+        use crate::counters::inc;
+        match crate::l2::l2_decode(bytes, self.our_mac) {
+            Err(crate::l2::L2Drop::Short) => inc(&self.counters.eth.rx_drop_short),
+            Err(crate::l2::L2Drop::MissMac) => inc(&self.counters.eth.rx_drop_miss_mac),
+            Err(crate::l2::L2Drop::UnknownEthertype) => {
+                inc(&self.counters.eth.rx_drop_unknown_ethertype)
+            }
+            Ok(l2) => {
+                let payload = &bytes[l2.payload_offset..];
+                match l2.ethertype {
+                    crate::l2::ETHERTYPE_ARP => {
+                        inc(&self.counters.eth.rx_arp);
+                        self.handle_arp(payload);
+                    }
+                    crate::l2::ETHERTYPE_IPV4 => self.handle_ipv4(payload),
+                    _ => unreachable!("l2_decode filters unsupported ethertypes"),
+                }
+            }
+        }
+    }
+
+    fn handle_arp(&self, payload: &[u8]) {
+        let Ok(pkt) = arp::arp_decode(payload) else {
+            return;
+        };
+        if pkt.op == arp::ARP_OP_REQUEST
+            && pkt.target_ip == self.cfg.local_ip
+            && self.cfg.local_ip != 0
+        {
+            let mut buf = [0u8; arp::ARP_FRAME_LEN];
+            if arp::build_arp_reply(self.our_mac, self.cfg.local_ip, &pkt, &mut buf).is_some()
+                && self.tx_frame(&buf)
+            {
+                crate::counters::inc(&self.counters.eth.tx_arp);
+            }
+        }
+        // ARP replies that rewrite gateway MAC would be handled here; for
+        // static-gateway A2 we rely on the configured MAC and do not mutate.
+    }
+
+    fn handle_ipv4(&self, payload: &[u8]) {
+        use crate::counters::inc;
+        match crate::l3_ip::ip_decode(payload, self.cfg.local_ip, /*nic_csum_ok=*/ false) {
+            Err(crate::l3_ip::L3Drop::Short) => inc(&self.counters.ip.rx_drop_short),
+            Err(crate::l3_ip::L3Drop::BadVersion) => inc(&self.counters.ip.rx_drop_bad_version),
+            Err(crate::l3_ip::L3Drop::BadHeaderLen) => inc(&self.counters.ip.rx_drop_bad_hl),
+            Err(crate::l3_ip::L3Drop::BadTotalLen) => inc(&self.counters.ip.rx_drop_short),
+            Err(crate::l3_ip::L3Drop::CsumBad) => inc(&self.counters.ip.rx_csum_bad),
+            Err(crate::l3_ip::L3Drop::TtlZero) => inc(&self.counters.ip.rx_ttl_zero),
+            Err(crate::l3_ip::L3Drop::Fragment) => inc(&self.counters.ip.rx_frag),
+            Err(crate::l3_ip::L3Drop::NotOurs) => inc(&self.counters.ip.rx_drop_not_ours),
+            Err(crate::l3_ip::L3Drop::UnsupportedProto) => {
+                inc(&self.counters.ip.rx_drop_unsupported_proto)
+            }
+            Ok(ip) => {
+                let inner = &payload[ip.header_len..ip.total_len];
+                match ip.protocol {
+                    crate::l3_ip::IPPROTO_TCP => {
+                        inc(&self.counters.ip.rx_tcp);
+                        self.tcp_input_stub(&ip, inner);
+                    }
+                    crate::l3_ip::IPPROTO_ICMP => {
+                        inc(&self.counters.ip.rx_icmp);
+                        let res = {
+                            let mut pmtu = self.pmtu.borrow_mut();
+                            crate::icmp::icmp_input(inner, &mut pmtu)
+                        };
+                        use crate::icmp::IcmpResult::*;
+                        match res {
+                            FragNeededPmtuUpdated => {
+                                inc(&self.counters.ip.rx_icmp_frag_needed);
+                                inc(&self.counters.ip.pmtud_updates);
+                            }
+                            FragNeededNoShrink => {
+                                inc(&self.counters.ip.rx_icmp_frag_needed);
+                            }
+                            OtherDropped | Malformed => {}
+                        }
+                    }
+                    _ => unreachable!("ip_decode filters unsupported protocols"),
+                }
+            }
+        }
+    }
+
+    /// Phase A2 TCP input stub — real FSM lands in A3.
+    /// Kept separate so A3 can replace this with a real implementation
+    /// without touching the L3 dispatch code above.
+    fn tcp_input_stub(&self, _ip: &crate::l3_ip::L3Decoded, _tcp_payload: &[u8]) {
+        // No-op. Counter already bumped in the caller.
+    }
+
+    fn maybe_emit_gratuitous_arp(&self) {
+        if self.cfg.garp_interval_sec == 0 || self.cfg.local_ip == 0 {
+            return;
+        }
+        let interval_ns = (self.cfg.garp_interval_sec as u64) * 1_000_000_000;
+        let now = crate::clock::now_ns();
+        let mut last = self.last_garp_ns.borrow_mut();
+        if now.saturating_sub(*last) < interval_ns {
+            return;
+        }
+        let mut buf = [0u8; arp::ARP_FRAME_LEN];
+        if arp::build_gratuitous_arp(self.our_mac, self.cfg.local_ip, &mut buf).is_some()
+            && self.tx_frame(&buf)
+        {
+            crate::counters::inc(&self.counters.eth.tx_arp);
+        }
+        *last = now;
     }
 }
 
