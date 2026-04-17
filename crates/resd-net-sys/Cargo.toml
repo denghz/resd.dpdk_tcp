@@ -12,3 +12,7 @@ libc.workspace = true
 [build-dependencies]
 bindgen = "0.69"
 pkg-config = "0.3"
+cc = "1"
+# Pinned via [workspace.dependencies] to keep toolchain 1.75-compatible.
+# See the workspace-root Cargo.toml for the full rationale.
+home.workspace = true

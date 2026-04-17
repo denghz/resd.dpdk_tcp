@@ -17,4 +17,11 @@ mod tests {
         assert!(s.starts_with("DPDK "), "got {s:?}");
         assert!(s.contains("23.11") || s.contains("24."), "version mismatch: {s:?}");
     }
+
+    #[test]
+    fn resd_rte_errno_linkable() {
+        // Just prove the symbol links and can be called. Value before EAL init
+        // is typically 0 but could be any int; we only care that linking works.
+        let _ = unsafe { resd_rte_errno() };
+    }
 }

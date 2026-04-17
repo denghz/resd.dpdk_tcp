@@ -17,8 +17,9 @@
 #include <rte_icmp.h>
 #include <rte_mbuf_dyn.h>
 
-/* `rte_errno` is a macro expanding to a thread-local int; bindgen
- * cannot reliably expose it. Wrap it in a trivial C shim that bindgen
- * does expose. All Rust callers use `resd_rte_errno()`.
+/* `rte_errno` is a macro expanding to a thread-local int; bindgen cannot
+ * reliably expose it. We provide `resd_rte_errno()` as a real extern
+ * function (defined in shim.c, compiled via the `cc` crate in build.rs)
+ * so bindgen emits a plain FFI stub for it.
  */
-static inline int resd_rte_errno(void) { return rte_errno; }
+int resd_rte_errno(void);

@@ -3,7 +3,14 @@ use std::path::PathBuf;
 
 fn main() {
     println!("cargo:rerun-if-changed=wrapper.h");
+    println!("cargo:rerun-if-changed=shim.c");
     println!("cargo:rerun-if-changed=build.rs");
+
+    // Anchor `home` in the build-dep graph. We don't actually need the
+    // returned value — this reference forces the resolver to materialize
+    // the `=0.5.9` pin declared in the workspace-root Cargo.toml even
+    // though `home` is otherwise only a transitive dep of bindgen.
+    let _ = home::home_dir;
 
     let lib = pkg_config::Config::new()
         .atleast_version("23.11")
@@ -44,14 +51,18 @@ fn main() {
     // the user (or CI) sets BINDGEN_RESOURCE_DIR, honor that; otherwise
     // auto-detect by matching LIBCLANG_PATH and fall back to probing the
     // installed clang-* binaries.
-    if let Some(dir) = detect_clang_resource_dir() {
-        clang_args.push(format!("-resource-dir={dir}"));
+    match detect_clang_resource_dir() {
+        Some(dir) => clang_args.push(format!("-resource-dir={dir}")),
+        None => println!(
+            "cargo:warning=could not detect a clang resource dir; bindgen may fail on DPDK SIMD intrinsics. Set BINDGEN_RESOURCE_DIR=/usr/lib/llvm-22/lib/clang/22 (or equivalent) and retry."
+        ),
     }
 
     let bindings = bindgen::Builder::default()
         .header("wrapper.h")
-        .clang_args(clang_args)
+        .clang_args(clang_args.iter().cloned())
         .allowlist_function("rte_.*")
+        .allowlist_function("resd_.*")
         .allowlist_type("rte_.*")
         .allowlist_var("RTE_.*")
         // DPDK 23.11 pulls in ARP/L2TPv2/GTP-PSC headers transitively. Those
@@ -73,6 +84,24 @@ fn main() {
     bindings
         .write_to_file(out_dir.join("bindings.rs"))
         .expect("write bindings.rs");
+
+    // Compile the C shim that backs `resd_rte_errno()`. We reuse the
+    // DPDK include paths + pkg-config cflags so the shim sees the same
+    // `rte_config.h`, `-march`, etc. as bindgen did.
+    let mut build = cc::Build::new();
+    build.file("shim.c");
+    for p in &lib.include_paths {
+        build.include(p);
+    }
+    for arg in &clang_args {
+        // `clang_args` contains `-I...`, `-D...`, `-include rte_config.h`,
+        // `-march=...`, `-std=gnu11`, plus possibly the bindgen-only
+        // `-resource-dir=...`. `cc` understands `-I/-D/-include/-march/-std`;
+        // `-resource-dir` is clang-specific and gcc would reject it, so
+        // gate it behind `flag_if_supported`.
+        build.flag_if_supported(arg);
+    }
+    build.compile("resd_net_sys_shim");
 
     // Linker args come from pkg-config; cargo will emit -l and -L already.
 }
