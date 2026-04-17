@@ -65,6 +65,7 @@ Non-goals: server-side TCP in production, IPv6, HTTP/2, HTTP/3, WebSocket compre
 - **User code lives on the same lcore as the stack.** Run-to-completion: the user's event loop repeatedly calls `resd_net_poll`, which runs rx_burst → stack → emits events → user handles events inline → user-initiated sends batch into the next tx_burst.
 - **No cross-lcore rings on the hot path.** Connections are pinned to lcores at `connect()` time; the application chooses the assignment.
 - **Typical deployment**: one lcore per market-data feed (high-pps inbound WebSocket), one lcore for order entry (few latency-critical REST/WS connections), plus strategy/business-logic cores communicating with the stack lcores via the application's own existing mechanisms.
+- **Callback safety contract**: user code invoked on the stack lcore MUST be `noexcept` (C++) and non-panicking (Rust). An escaped C++ exception or Rust panic across the FFI boundary is undefined behavior and will abort the process. Callbacks that can fail should set an error flag the poll loop inspects, not throw. A CI test asserts this by running fuzzed callbacks that throw/panic and confirming the abort vs. UB diagnosis is clean.
 
 ## 4. Public API (Stage 1)
 
@@ -196,8 +197,11 @@ while (running) {
 ### 4.2 API contracts
 
 - `req_id` lets the caller pipeline multiple requests and match responses without ordering assumptions.
-- Headers and body pointers in events are **borrowed views** into mbuf memory, valid until the next `resd_net_poll`. Caller must copy for longer lifetime.
-- `resd_net_flush` is the latency knob: call it after a latency-critical send inside an event handler to invoke `rte_eth_tx_burst` immediately rather than waiting for end-of-poll batching.
+- Headers and body pointers in events are **borrowed views** into mbuf memory, valid from the moment `resd_net_poll` returns until the next `resd_net_poll` call on the same engine. The stack refcount-pins every mbuf referenced by any event in `events_out[0..n]` for that window; internal stack processing (including later bursts within the same poll) must not free those mbufs. Caller must `memcpy` out if they need to hold bytes longer.
+- `resd_net_flush` drains the current TX batch via exactly one `rte_eth_tx_burst`; no-op when empty; safe to call from inside a user callback (same-lcore, single-threaded re-entry). Call it after a latency-critical send to avoid end-of-poll batching delay.
+- `rx_hw_ts_ns` is 0 when the NIC/PMD does not fill hardware timestamps (no `PTYPE_HWTIMESTAMP` support, or dyn-field unavailable). Callers that rely on RX timing must either check for 0 and fall back to `enqueued_ts_ns`, or refuse to run on an unsupported NIC.
+- HTTP request body: if `body_len` exceeds a single tx mbuf's payload capacity, the stack splits the body across an mbuf chain internally. The caller passes a single contiguous buffer; the stack allocates the chain from `tx_data_mempool`. If mempool exhaustion prevents allocation, the call returns an error and emits no packets.
+- HTTP response body events: each `RESD_NET_EVT_HTTP_RESPONSE_BODY` corresponds to one contiguous mbuf-data region delivered to the parser. Chunked encoding is decoded; the caller sees the decoded (post-chunk-header) bytes. Multiple events may fire per chunk if the chunk crosses mbuf boundaries; `RESD_NET_EVT_HTTP_RESPONSE_DONE` fires once when the final chunk / `Content-Length` body is complete.
 
 ## 5. Data Flow
 
@@ -226,19 +230,24 @@ while (!stop) {
 
 ```
 resd_net_http_request
-  → http1_encode    (writes request into mbuf at reserved headroom offset)
-  → tls_write       (stage 2+; rustls writes record directly into mbuf)
-  → tcp_output      (segment to MSS, prepend TCP hdr in reserved headroom,
-                     track for retransmit via mbuf refcount)
+  → http1_encode    (serialize request line + headers + body into a tx mbuf chain:
+                     head mbuf holds line+headers at reserved headroom offset;
+                     body > MSS-headroom-bytes is split across chained mbufs
+                     allocated from tx_data_mempool)
+  → tls_write       (stage 2+; rustls writes record directly into mbuf chain)
+  → tcp_output      (segment to MSS-aligned chunks; prepend TCP hdr in reserved
+                     headroom of each segment's head mbuf; track for retransmit
+                     via mbuf refcount)
   → ip_output       (prepend IP + eth hdrs in reserved headroom)
   → push to TX batch (flushed at end of poll iter, or immediately on flush())
 ```
 
 ### 5.3 Buffer ownership
 
-- RX mbufs owned by stack; delivered to user as `&[u8]` view; user copies if they need longer lifetime.
-- TX mbufs allocated from per-lcore mempool, filled bottom-up with pre-reserved headroom for eth+IP+TCP+TLS-record headers, pushed to next tx_burst.
-- Retransmit queue holds mbuf pointers with bumped refcount; on ACK the ref drops and the mbuf returns to the mempool. Retransmit reuses the same mbuf (with small in-place edit of the timestamp option if RFC 7323 is enabled).
+- RX mbufs owned by stack; delivered to user as `&[u8]` view. Any mbuf referenced by a delivered event is refcount-pinned from `resd_net_poll` return to the next `resd_net_poll` entry; internal stack processing (including later bursts within the same poll iteration) does not free these mbufs until the caller hands the poll back.
+- TX mbufs allocated from per-lcore mempool, filled bottom-up with pre-reserved headroom for eth+IP+TCP+TLS-record headers, pushed to next tx_burst. Bodies larger than one mbuf's payload are sent as an mbuf chain (DPDK segmented mbuf).
+- Retransmit queue holds mbuf pointers with bumped refcount; on ACK the ref drops and the mbuf returns to the mempool.
+- **Retransmit mbuf policy**: a retransmit allocates a fresh mbuf from `tx_hdr_mempool` (header-only, chained back to the original data mbuf) rather than editing the original in place. This costs one allocation per retransmit (rare; negligible aggregate) and eliminates the race where an mbuf currently queued for or in-flight via `rte_eth_tx_burst` would have its TCP options edited under the NIC's DMA. The original data mbuf's refcount is held for the duration; only the TCP/IP/eth header mbuf is fresh. RFC 7323 timestamp-option refresh is done by writing the new `TSval` into the fresh header mbuf.
 
 ## 6. TCP Layer
 
@@ -288,7 +297,7 @@ struct TcpConn {
 |---|---|---|---|
 | 791 | IPv4 | full for client send/recv | TOS/DSCP passthrough, DF always set |
 | 792 | ICMP | frag-needed + dest-unreachable (in-only) | drives PMTUD; drop others silently |
-| 815 | Reassembly | deferred | stub returns ICMP frag-needed |
+| 1122 §3.3.2 | IPv4 reassembly | **not implemented** | RX fragments are dropped and counted (`ip.rx_frag`); we set DF on all TX, so we never fragment outbound |
 | 1122 | Host requirements (TCP §4.2) | client-side items only | deviations documented below |
 | 1191 | PMTUD | yes | driven by ICMP messages |
 | 9293 | TCP | client FSM complete | no LISTEN/accept |
@@ -300,7 +309,7 @@ struct TcpConn {
 | 6691 | MSS | yes | clamp to local MTU |
 | 3168 | ECN | off-by-default (flag) | |
 | 8985 | RACK-TLP | yes | primary loss detection; replaces 3-dup-ACK |
-| 6528 | ISS generation | yes | SipHash(4-tuple \|\| secret \|\| boot_nonce \|\| monotonic_time) |
+| 6528 | ISS generation | yes | `ISS = (ticks_since_boot_at_4µs) + SipHash(4-tuple \|\| secret \|\| boot_nonce)` — clock outside the hash for monotonicity across reconnects |
 | 5961 | Blind-data-attack mitigations | yes | challenge-ACK on out-of-window seqs |
 | 7413 | TCP Fast Open | **NO** | not useful for long-lived connections |
 
@@ -308,7 +317,7 @@ struct TcpConn {
 
 | Default | RFC stance | Our default | Rationale |
 |---|---|---|---|
-| Delayed ACK | RFC 1122 SHOULD | **off** | 200ms ACK delay is catastrophic for trading; per-burst natural coalescing gives efficiency without latency cost |
+| Delayed ACK | RFC 1122 SHOULD (§4.2.3.2 ≤500ms, ≥1/2 full-size segments) | **off** | 200ms ACK delay is catastrophic for trading. Within each `resd_net_poll` iteration the stack emits at most one ACK per connection covering the in-order RX delta (burst-scope coalescing, not time-based delay). This bounds ACK rate at `(conn_count × poll_rate)` Hz. On bulk inbound market-data bursts, ACK rate can approach line-rate/MSS — acceptable because the TX path to the exchange is low-volume and not bandwidth-starved. |
 | Nagle (`TCP_NODELAY` inverse) | RFC 896 | **off** | user sends complete requests; coalescing is their choice |
 | TCP keepalive | optional | **off** | exchanges close idle; application heartbeats are preferred |
 | minRTO | RFC 6298 RECOMMENDS 1s | **20ms** (tunable) | intra-region WAN RTT is 1–10ms |
@@ -317,11 +326,12 @@ struct TcpConn {
 
 ### 6.5 Implementation choices
 
-- **Flow table**: flat `Vec<Option<TcpConn>>` indexed by handle id + a hash map `(4-tuple) → handle` for RX lookup. Linear scan would be acceptable at ≤16 connections; hash is free.
-- **Segment-level mbuf tracking**: every TX segment holds an mbuf refcount until ACK or RST. Retransmit reuses the same mbuf (with in-place timestamp-option edit when RFC 7323 is on).
-- **ISS**: SipHash of `(4-tuple || secret || boot_nonce || monotonic_time)` — RFC 6528.
-- **SYN retransmit**: 3 attempts, exponential from 1s.
-- **TIME_WAIT shortening**: allow skipping TIME_WAIT for reconnect to the same peer when the user requests it via `resd_net_close(..., FORCE_TW_SKIP)`; default obeys RFC.
+- **Flow table**: flat `Vec<Option<TcpConn>>` indexed by handle id + a hash map `(4-tuple) → handle` for RX lookup. Expected cost: ~40ns hot, ~200ns cold due to bucket cacheline miss; acceptable at ≤100 connections. If per-connection latency budget tightens, switch to a small pre-warmed array (≤8 candidates per RSS-bucket) with linear scan — faster under cache pressure at this scale.
+- **Segment-level mbuf tracking**: every TX segment holds an mbuf refcount until ACK or RST. **Retransmit allocates a fresh header mbuf** chained to the original data mbuf (see §5.3) — never edits an in-flight mbuf in place.
+- **ISS**: `ISS = (monotonic_time_4µs_ticks_low_32) + SipHash64(local_ip || local_port || remote_ip || remote_port || secret || boot_nonce)` per RFC 6528 §3. Clock value is added outside the hash so reconnects to the same 4-tuple within MSL yield monotonically-increasing ISS. `secret` is a 128-bit per-process random constant; `boot_nonce` survives reboots via `/proc/sys/kernel/random/boot_id` or equivalent.
+- **SYN retransmit**: schedule respects `connect_timeout_ms` from `resd_net_connect_opts_t`. Default: 3 attempts with initial backoff `max(initial_rto_ms, minRTO)` (config default: `initial_rto_ms=50`), exponential up to the total budget. Never exceed `connect_timeout_ms` in total; the connection fails fast for trading, not per RFC 6298's 1s recommendation.
+- **RTO timer re-arm**: lazy. On ACK, update `snd.una`; the existing wheel entry fires at its originally-scheduled deadline. When it fires the callback re-checks `snd.una` vs `snd.nxt` — if fully ACKed, the timer cancels itself; otherwise it retransmits and re-arms. Avoids remove+insert on every ACK.
+- **TIME_WAIT shortening**: `resd_net_close(..., FORCE_TW_SKIP)` is honored only when RFC 6191 / RFC 7323 §5 conditions are met — specifically, timestamps are enabled on both sides AND `SEG.TSval > TS.Recent` at reconnect. When conditions aren't met, the flag is ignored and the connection stays in TIME_WAIT; a `RESD_NET_EVT_ERROR` with `err=EPERM_TW_REQUIRED` is emitted so the caller knows.
 
 ## 7. Memory and Buffer Model
 
@@ -329,12 +339,15 @@ struct TcpConn {
 
 ```
 rx_mempool       : 2× NIC rx ring size × max_lcores
-                   MBUF_SIZE = 2048 + RTE_PKTMBUF_HEADROOM(192)
-                   HEADROOM sized for eth(14) + ip(20..60) + tcp(20..60) + tls_rec(5..21)
-tx_hdr_mempool   : small mbufs for ACK-only / RST / control
-tx_data_mempool  : large mbufs for request bodies
+                   MBUF_SIZE = 2048 + RTE_PKTMBUF_HEADROOM(192) + TAILROOM(32)
+                   HEADROOM sized for eth(14) + ip(20..60) + tcp(20..60) + tls_hdr(5)
+                   TAILROOM reserves 16B TLS 1.3 AEAD tag + 1B inner-content-type + pad
+tx_hdr_mempool   : small mbufs for ACK-only / RST / control / retransmit-header
+tx_data_mempool  : large mbufs for request bodies (chained when body > mbuf capacity)
 timer_mempool    : fixed-object pool for timer nodes
 ```
+
+On mempool exhaustion: `rx_mempool` alloc failure drops the inbound packet and increments `eth.rx_drop_nomem`. `tx_*_mempool` failure causes `resd_net_http_request` (or internal retransmit scheduling) to return `-ENOMEM`, emits `RESD_NET_EVT_ERROR{err=ENOMEM}`, and does not corrupt the in-flight connection state. A CI test pins mempool size to a tiny value and verifies surfacing.
 
 ### 7.2 Per-connection buffers
 
@@ -364,12 +377,15 @@ Only unavoidable copy on the TX path: user body bytes into the TX mbuf at `resd_
 
 - Hashed timing wheel, 8 levels × 256 buckets, per-lcore arena.
 - Resolution: 10 µs. Horizon: ~68 s. Longer timers (2×MSL=60s) demoted to higher-level wheel.
-- Timers checked at the start and after rx_burst in each `resd_net_poll` iteration.
+- Wheel advancement is gated on `now_tick > last_ticked_tick`; when no tick elapsed since last poll (common at high poll rates), wheel walking is skipped entirely.
+- Per-connection timer-list: each `TcpConn` owns a linked list of its scheduled timer IDs. On connection close, the close path walks this list and marks each timer cancelled (O(k) for k per-conn timers, k typically ≤4). Cancellation is a tombstone (generation counter bump); fire handlers check the generation and no-op on a stale fire.
 
 ### 7.5 Clock
 
-- TSC-based, calibrated once at engine startup against `CLOCK_MONOTONIC_RAW`. `resd_net_now_ns` returns `(tsc - tsc0) * ns_per_tsc + t0`.
-- NIC hardware timestamp captured from mbuf's `timestamp` dyn-field when `PTYPE_HWTIMESTAMP` is set; surfaced to users as `rx_hw_ts_ns`.
+- TSC-based; invariant TSC required (`CPUID.80000007H.EDX.InvariantTSC[bit 8]` set). Check at engine creation; fail fast otherwise.
+- **Single calibration shared across all engines on the host**: the first `resd_net_engine_create` call performs `(tsc0, t0) = calibrate_against(CLOCK_MONOTONIC_RAW)`; subsequent engines reuse the same epoch via a process-global atomic-init. All engines therefore share one `ns_per_tsc` conversion; cross-lcore event correlation has bounded skew (only the per-core invariant-TSC startup offset, <100ns typical on bare metal; measured and reported in WAN A/B harness).
+- `resd_net_now_ns` uses `rdtsc` (not `rdtscp`) — serialization is unnecessary for ms/µs-scale latency attribution. An inline variant `resd_net_now_ns_inline()` is exposed as a `static inline` in `resd_net.h` (reads TSC via compiler intrinsic, applies `(tsc-tsc0)*ns_per_tsc + t0` with engine-calibrated constants) so users can avoid the FFI call on tight hot-paths.
+- NIC hardware timestamp: dyn-field offset and flag are resolved **once** at `engine_create` via `rte_mbuf_dynfield_lookup("rte_dynfield_timestamp")` and `rte_mbuf_dynflag_lookup("rte_dynflag_rx_timestamp")`. Hot-path reads are a direct `*(uint64_t*)((char*)mbuf + ts_offset)` behind an always-inline accessor. When the NIC/PMD doesn't register the dynfield, the accessor returns 0 and `rx_hw_ts_ns` in every event is 0; callers fall back to `enqueued_ts_ns`.
 
 ## 8. Hardware Assumptions
 
@@ -389,13 +405,15 @@ Stack emits primitives; application computes histograms, routes logs, runs expor
 
 ### 9.1 Counters
 
-Per-lcore struct of `u64` counts, cacheline-grouped, lock-free-readable via:
+Per-lcore struct of `AtomicU64` counts, cacheline-grouped, lock-free-readable via:
 
 ```c
 const resd_net_counters_t* resd_net_counters(resd_net_engine_t*);
 ```
 
-Counter groups: `eth`, `ip`, `tcp`, `tls` (stage 2+), `http`, `poll`. Examples in `eth`: `rx_pkts`, `rx_bytes`, `rx_drop_miss_mac`, `tx_pkts`, `tx_bytes`, `tx_drop_full_ring`. In `tcp`: `rx_syn_ack`, `rx_data`, `rx_out_of_order`, `tx_retrans`, `tx_rto`, `tx_tlp`, `state_trans[11][11]`, `conn_open`, `conn_close`, `conn_rst`. No atomics — plain increments. Application snapshots by `memcpy` into its own thread-local view.
+Counter groups: `eth`, `ip`, `tcp`, `tls` (stage 2+), `http`, `poll`. Examples in `eth`: `rx_pkts`, `rx_bytes`, `rx_drop_miss_mac`, `rx_drop_nomem`, `tx_pkts`, `tx_bytes`, `tx_drop_full_ring`, `tx_drop_nomem`. In `tcp`: `rx_syn_ack`, `rx_data`, `rx_out_of_order`, `tx_retrans`, `tx_rto`, `tx_tlp`, `state_trans[11][11]`, `conn_open`, `conn_close`, `conn_rst`.
+
+Hot-path writes are `store(val+1, Ordering::Relaxed)` on the owning lcore (zero cost on x86_64 vs. plain store). Cross-lcore snapshot readers use `load(Ordering::Relaxed)` — no torn reads. `Relaxed` is sufficient because counters are non-ordering observability data, not synchronization primitives. The alternative — "plain `u64` + `memcpy`" — is a data race by the Rust / C++ abstract machine and is rejected.
 
 ### 9.2 Timestamps on events
 
@@ -412,8 +430,9 @@ Delivered through the normal `resd_net_poll` interface:
 - `RESD_NET_EVT_TCP_LOSS_DETECTED` — RACK or RTO trigger.
 - `RESD_NET_EVT_TCP_STATE_CHANGE` — from/to state.
 - `RESD_NET_EVT_TLS_ALERT` (stage 2+) — alert level/description.
+- `RESD_NET_EVT_ERROR` with `err=ENOMEM` — mempool exhaustion on TX or internal allocation; with `err=EPERM_TW_REQUIRED` — `FORCE_TW_SKIP` flag ignored because RFC 6191 conditions not met.
 
-State changes and alerts are always emitted. Per-packet TCP trace events are gated by a boolean in `engine_config` so they don't clutter `resd_net_poll` results when not wanted.
+State changes, alerts, and ERROR events are always emitted. Per-packet TCP trace events (`TCP_RETRANS`, `TCP_LOSS_DETECTED`) are gated by the `tcp_per_packet_events` config flag so they don't clutter `resd_net_poll` results when not wanted.
 
 ### 9.4 What the stack explicitly does NOT provide
 
@@ -440,16 +459,23 @@ Layered testing, phased so Stage 1 ships with a defensible test story and later 
 
 ### 10.2 Layer B — RFC conformance via packetdrill (Luna-pattern shim)
 
-- `tools/packetdrill-shim`: link against libresd_net, redirect packetdrill's TUN read/write to stack rx/tx hooks. Packetdrill syscalls (`connect`, `write`, `close`) map to `resd_net_*`.
+- `tools/packetdrill-shim`: links against libresd_net, redirects packetdrill's TUN read/write to stack rx/tx hooks, and provides a **synchronous socket-shim wrapper** that drives `resd_net_poll` internally to fake blocking-syscall semantics for `connect`/`write`/`read`/`close`.
+- **Honest scope**: this exercises our wire-level TCP FSM, not our real asynchronous API. Packetdrill tests that depend on specific socket semantics we don't implement are not runnable:
+  - Anything using `SIGIO`, `FIONREAD`, `SO_RCVLOWAT`, `MSG_PEEK`, `TCP_DEFER_ACCEPT`, `TCP_CORK`, or similar socket options.
+  - Tests that assert partial-`read()` return values at specific buffer boundaries.
+  - Tests that depend on Linux-specific timer behavior around delayed-ACK and 3-dup-ACK (we document these as deviations).
+  The untranslatable subset is enumerated in `tools/packetdrill-shim/SKIPPED.md`; stage gates count pass rate among *runnable* scripts only.
 - Run these corpora:
-  - `github.com/ligurio/packetdrill-testcases` — ~1,500 cases, RFC 793/761/4413.
+  - `github.com/ligurio/packetdrill-testcases` — pre-written scripts covering TCP RFC behavior (RFC 793/9293 FSM, 7323 timestamps, 2018 SACK, 5681 CC, 6298 RTO, 8985 RACK, 5961 mitigations). Exact RFC coverage: verify and record per-script on first import.
   - `github.com/shivansh/TCP-IP-Regression-TestSuite` — FreeBSD regression suite.
   - `github.com/google/packetdrill` upstream — TCP FSM and options.
   - Our scripts for RFC 7323 PAWS edge cases, RFC 2018 SACK reneging / out-of-order SACK blocks, RFC 8985 RACK reorder detection and TLP trigger, RFC 5961 challenge-ACK.
 
 ### 10.3 Layer C — RFC 793bis MUST/SHOULD via tcpreq
 
-Run `github.com/TheJokr/tcpreq` against the stack. Produces pass/fail table aligned to RFC 793bis / RFC 9293 requirements (checksum validation, RST processing, MSS, illegal/unknown option handling). Output feeds the RFC compliance matrix automatically.
+`tcpreq` probes a TCP endpoint (typically a server) for conformance. Since `resd_net` is client-only in production, this layer requires the **stage-1 loopback-test-server** (see §10.12): a minimal server-side build of the stack behind a cargo feature flag, used only by the test harness. `tcpreq` is pointed at the loopback server and produces a pass/fail table aligned to RFC 793bis / RFC 9293 requirements (checksum validation, RST processing, MSS, illegal/unknown option handling). Output feeds the RFC compliance matrix automatically.
+
+Client-side conformance is covered indirectly by packetdrill-shim scripts that assert on the SYN/ACK/options *we emit* given specific peer behaviors.
 
 ### 10.4 Layer D — TTCN-3 via intel/net-test-suites
 
@@ -458,8 +484,9 @@ Black-box mode for bring-up; white-box mode (JSON protocol) when enough internal
 ### 10.5 Layer E — Differential fuzzing via TCP-Fuzz
 
 - `github.com/zouyonghao/TCP-Fuzz` in differential mode: identical packet+syscall sequences fed to `libresd_net` and Linux TCP; divergence is a bug.
-- This operationalizes the "A/B vs Linux" goal at fuzz time rather than prod time — earlier and cheaper signal.
-- TCP-Fuzz history: 56 bugs across TLDK/F-Stack/mTCP/FreeBSD/Linux; 48 semantic (RFC violations) that sanitizers would miss.
+- **Configuration requirement**: differential-vs-Linux is meaningful only in **RFC-compliance preset** — i.e., `cc_mode=reno`, delayed-ACK on (Linux-equivalent 40ms timer), `minRTO=200ms`, Nagle default. In this mode the two stacks should produce byte-identical wire behavior for equivalent inputs. Production-config differential fuzzing would produce false-positive divergences on every documented deviation (§6.4) and is explicitly **not** a useful test.
+- A second fuzz track regresses against **our own previous release**: same input → same output across versions. Catches unintended behavior changes that differential-vs-Linux misses (anything where both our old and new code diverge from Linux).
+- Motivation from prior work: TCP-Fuzz found semantic bugs across multiple userspace TCP stacks that sanitizer-based fuzzing does not catch, per USENIX ATC '22 reporting.
 - CI: smoke run per merge. 72h continuous run per stage cut.
 
 ### 10.6 Layer F — Property / bespoke fuzzing
@@ -479,8 +506,9 @@ Producer(strategy) ─► [kernel Linux socket   ]  ─┘
 
 - Inbound market data replayed from a captured pcap via fan-out to both stacks, preserving inter-arrival timing via HW timestamping.
 - Identical outbound order sequences.
-- Comparison: wire-level captures at mirror ports; end-to-end `tx_req → rx_resp` latency distributions (p50/p99/p999/max) per exchange; retransmit rate, dup-ACK rate, SACK-block usage; send-window utilization vs RTT.
-- Pass gate: `resd_net` p999 latency ≤ Linux p999 latency on all tested venues; zero RFC-conformance deltas from replay through the packetdrill shim.
+- Comparison: wire-level captures via **hardware tap** (NOT switch mirror port; tap insertion jitter <100ns documented and quantified via a loopback calibration run before each comparison session); end-to-end `tx_req → rx_resp` latency distributions (p50/p99/p999/max) per exchange; retransmit rate, dup-ACK rate, SACK-block usage; send-window utilization vs RTT.
+- Measurement protocol: tap jitter baseline is subtracted from measured deltas; reported latency parity is `(resd_net_p999 − Linux_p999) − tap_jitter_p999`.
+- Pass gate: `resd_net` p999 latency ≤ Linux p999 latency (after jitter subtraction) on all tested venues; zero RFC-conformance deltas from replay through the packetdrill shim.
 
 ### 10.8 Layer H — WAN-condition fault injection (stage 4)
 
@@ -497,23 +525,32 @@ Run `resd_net` alongside Linux-stack path in production. Same requests over both
 
 ### 10.10 Stage gates
 
-- **Stage 1 ship**: Layer A 100% unit pass; Layer B ligurio + shivansh passing on TCP FSM subset; Layer C tcpreq MUST rules passing.
+- **Stage 1 ship**:
+  - Layer A: 100% unit pass.
+  - Layer B: packetdrill-shim's runnable (non-skipped) scripts from ligurio + shivansh passing on TCP FSM subset.
+  - Layer C: tcpreq MUST rules passing against loopback-test-server.
+  - **Observability gate**: assert-exact counter values in a controlled scenario. A unit test produces N retransmits, M state transitions, K HTTP requests; the exposed counters match exactly (not "approximately"). State-change and ERROR events are delivered in the expected order and count.
+  - End-to-end smoke: place an order against the chosen staging exchange over plaintext HTTP/1.1.
 - **Stage 2 (TLS) ship**: + rustls fuzz targets; TLS 1.3 interop against an exchange staging endpoint.
-- **Stage 3 (WebSocket) ship**: + `crossbario/autobahn-testsuite` passing on client-side tests.
+- **Stage 3 (WebSocket) ship**: + `crossbario/autobahn-testsuite` `fuzzingserver` mode passing with 0 failures; skipped-case list (the `permessage-deflate`-related cases, expected to be approximately 60 out of ~300) committed under `tests/autobahn-skipped.txt`.
 - **Stage 4 (hardening) ship**: + Layers E/G/H passing; 7-day prod shadow with zero response divergence.
 
 ### 10.11 Tooling
 
-- `tools/packetdrill-shim` — Luna-pattern adapter.
+- `tools/packetdrill-shim` — Luna-pattern adapter + socket-shim wrapper + `SKIPPED.md` enumeration.
 - `tools/tcpreq-runner` — tcpreq wrapper with RFC-compliance report output.
-- `tools/tcp-fuzz-differential` — TCP-Fuzz driver with Linux oracle.
+- `tools/tcp-fuzz-differential` — TCP-Fuzz driver with Linux oracle; runs in RFC-compliance-preset config.
 - `tools/replay` — pcap replay preserving HW timestamps.
-- `tools/ab-bench` — dual-stack comparison harness + reporting.
+- `tools/ab-bench` — dual-stack comparison harness + reporting with tap-jitter baseline subtraction.
 - `tools/fuzz-corpus` — shared corpora, auto-updated from production pcaps.
+
+### 10.12 Loopback test server (Stage 1 tooling)
+
+A minimal server-side build of the stack behind the cargo feature flag `test-server`. Supports `accept` on a single listening port, plaintext HTTP/1.1 echo/fixed-response semantics. Used only by test harnesses (packetdrill-shim, tcpreq). Not compiled into production builds. This is Stage 1 scope — without it, Stage 1's tcpreq gate is unachievable.
 
 ## 11. Out of Scope for Stage 1
 
-- Server-side TCP in production (test-only loopback server behind a feature flag is allowed)
+- Server-side TCP in production (test-only loopback server is in Stage 1 tooling; see §10.12)
 - IPv6 / RFC 2460 / 8200 / 4443 / 4861 / 4862
 - HTTP/2 (RFC 9113), HTTP/3 (RFC 9114)
 - TLS (moves to Stage 2)
@@ -525,14 +562,17 @@ Run `resd_net` alongside Linux-stack path in production. Same requests over both
 
 ## 12. Open Questions to Resolve Before Stage 1 Starts
 
-- Specific NIC model and firmware version for the initial target hardware.
-- Staging exchange venue for the Stage-1 end-to-end gate.
-- Whether Rust nightly is allowed in CI (some DPDK-adjacent crates require it) or whether stable-only is required.
+**[BLOCKER]** — must be answered before implementation begins:
+- **Staging exchange venue** for the Stage-1 end-to-end gate. The choice determines whether the "plaintext HTTP/1.1" gate is even reachable — some testnets are HTTPS-only, others require auth handshakes Stage 1 doesn't support. Candidate list and selected venue must be committed before Stage 1 starts.
+- **Rust nightly in CI, or stable-only.** Some DPDK-adjacent and low-latency crates require nightly features (`core::intrinsics::unlikely`, specific atomic intrinsics, certain allocator APIs). If stable-only, architectural choices need re-evaluation (manual `#[cold]` vs. intrinsic `unlikely`, workarounds for allocator hooks).
+
+**[NICE-TO-HAVE]** — can be resolved during implementation:
+- Specific NIC model and firmware version for the initial target hardware. Mitigable if the design stays PMD-agnostic, but HW-timestamp dyn-field behavior varies across mlx5 vs. ice; §7.5 already handles the unsupported case.
 - Ownership of `tools/packetdrill-shim` — fork the packetdrill repo, or vendor it.
 
 ## 13. References
 
-- RFC 9293 (TCP, 2022 consolidated), 7323 (timestamps + window scale), 2018 (SACK), 5681 (Reno congestion control), 6298 (RTO), 8985 (RACK-TLP), 5961 (blind-data mitigations), 6528 (ISS), 6691 (MSS), 3168 (ECN), 791/792/815 (IP/ICMP/reassembly), 1122 (host requirements), 1191 (PMTUD), 9110/9112 (HTTP semantics + /1.1).
+- RFC 9293 (TCP, 2022 consolidated), 7323 (timestamps + window scale), 2018 (SACK), 5681 (Reno congestion control), 6298 (RTO), 8985 (RACK-TLP), 5961 (blind-data mitigations), 6528 (ISS), 6191 (TIME-WAIT reduction using timestamps), 6691 (MSS), 3168 (ECN), 791/792 (IP/ICMP), 1122 (host requirements, incl. reassembly), 1191 (PMTUD), 9110/9112 (HTTP semantics + /1.1).
 - mTCP: `github.com/mtcp-stack/mtcp` (reference only, not forked).
 - Alibaba Luna userspace TCP + packetdrill adaptation (referenced for the shim pattern).
-- Test suites: packetdrill (Google), ligurio/packetdrill-testcases, shivansh/TCP-IP-Regression-TestSuite, TheJokr/tcpreq, intel/net-test-suites, zouyonghao/TCP-Fuzz, smoltcp-rs/smoltcp (for `FaultInjector` pattern), crossbario/autobahn-testsuite.
+- Test suites: packetdrill (Google), ligurio/packetdrill-testcases, shivansh/TCP-IP-Regression-TestSuite, TheJokr/tcpreq, intel/net-test-suites, zouyonghao/TCP-Fuzz (USENIX ATC '22), smoltcp-rs/smoltcp (for `FaultInjector` pattern), crossbario/autobahn-testsuite.
