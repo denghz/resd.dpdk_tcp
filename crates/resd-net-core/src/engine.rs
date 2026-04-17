@@ -13,10 +13,10 @@ pub struct EngineConfig {
     pub port_id: u16,
     pub rx_queue_id: u16,
     pub tx_queue_id: u16,
-    pub rx_ring_size: u16,      // default 1024
-    pub tx_ring_size: u16,      // default 1024
-    pub rx_mempool_elems: u32,  // default 8192
-    pub mbuf_data_room: u16,    // default 2048
+    pub rx_ring_size: u16,     // default 1024
+    pub tx_ring_size: u16,     // default 1024
+    pub rx_mempool_elems: u32, // default 8192
+    pub mbuf_data_room: u16,   // default 2048
 }
 
 impl Default for EngineConfig {
@@ -51,12 +51,8 @@ pub fn eal_init(args: &[&str]) -> Result<(), Error> {
     if *guard {
         return Ok(());
     }
-    let cstrs: Vec<CString> = args
-        .iter()
-        .map(|s| CString::new(*s).unwrap())
-        .collect();
-    let mut argv: Vec<*mut libc::c_char> =
-        cstrs.iter().map(|c| c.as_ptr() as *mut _).collect();
+    let cstrs: Vec<CString> = args.iter().map(|s| CString::new(*s).unwrap()).collect();
+    let mut argv: Vec<*mut libc::c_char> = cstrs.iter().map(|c| c.as_ptr() as *mut _).collect();
     // Safety: rte_eal_init mutates argv internally; we pass the constructed array.
     let rc = unsafe { sys::rte_eal_init(argv.len() as i32, argv.as_mut_ptr()) };
     if rc < 0 {
@@ -109,11 +105,11 @@ impl Engine {
 
         // Configure port: one RX queue + one TX queue for Phase A1.
         let eth_conf: sys::rte_eth_conf = unsafe { std::mem::zeroed() };
-        let rc = unsafe {
-            sys::rte_eth_dev_configure(cfg.port_id, 1, 1, &eth_conf as *const _)
-        };
+        let rc = unsafe { sys::rte_eth_dev_configure(cfg.port_id, 1, 1, &eth_conf as *const _) };
         if rc != 0 {
-            return Err(Error::PortConfigure(cfg.port_id, unsafe { sys::resd_rte_errno() }));
+            return Err(Error::PortConfigure(cfg.port_id, unsafe {
+                sys::resd_rte_errno()
+            }));
         }
 
         let rc = unsafe {
@@ -127,7 +123,9 @@ impl Engine {
             )
         };
         if rc < 0 {
-            return Err(Error::RxQueueSetup(cfg.port_id, unsafe { sys::resd_rte_errno() }));
+            return Err(Error::RxQueueSetup(cfg.port_id, unsafe {
+                sys::resd_rte_errno()
+            }));
         }
 
         let rc = unsafe {
@@ -140,12 +138,16 @@ impl Engine {
             )
         };
         if rc < 0 {
-            return Err(Error::TxQueueSetup(cfg.port_id, unsafe { sys::resd_rte_errno() }));
+            return Err(Error::TxQueueSetup(cfg.port_id, unsafe {
+                sys::resd_rte_errno()
+            }));
         }
 
         let rc = unsafe { sys::rte_eth_dev_start(cfg.port_id) };
         if rc < 0 {
-            return Err(Error::PortStart(cfg.port_id, unsafe { sys::resd_rte_errno() }));
+            return Err(Error::PortStart(cfg.port_id, unsafe {
+                sys::resd_rte_errno()
+            }));
         }
 
         let counters = Box::new(Counters::new());

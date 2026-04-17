@@ -7,7 +7,7 @@ use std::time::Instant;
 pub struct TscEpoch {
     pub tsc0: u64,
     pub t0_ns: u64,
-    pub ns_per_tsc_scaled: u64,  // fixed-point: actual ns_per_tsc = ns_per_tsc_scaled / 2^32
+    pub ns_per_tsc_scaled: u64, // fixed-point: actual ns_per_tsc = ns_per_tsc_scaled / 2^32
 }
 
 static TSC_EPOCH: OnceLock<TscEpoch> = OnceLock::new();
@@ -113,6 +113,9 @@ mod tests {
         let tsc_ns = now_ns() - tsc_start;
         let diff = wall_ns.abs_diff(tsc_ns) as f64;
         let relative = diff / wall_ns as f64;
-        assert!(relative < 0.02, "TSC drift too large: wall={wall_ns} tsc={tsc_ns} rel={relative}");
+        assert!(
+            relative < 0.02,
+            "TSC drift too large: wall={wall_ns} tsc={tsc_ns} rel={relative}"
+        );
     }
 }

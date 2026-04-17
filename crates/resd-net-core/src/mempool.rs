@@ -34,7 +34,9 @@ impl Mempool {
                 socket_id,
             )
         };
-        let ptr = NonNull::new(p).ok_or(Error::MempoolCreate("rte_pktmbuf_pool_create returned NULL"))?;
+        let ptr = NonNull::new(p).ok_or(Error::MempoolCreate(
+            "rte_pktmbuf_pool_create returned NULL",
+        ))?;
         Ok(Self { ptr, name: cname })
     }
 

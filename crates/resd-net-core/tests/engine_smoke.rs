@@ -14,7 +14,8 @@ fn engine_lifecycle_on_tap() {
         "--in-memory",
         "--no-pci",
         "--vdev=net_tap0,iface=resdtap0",
-        "-l", "0-1",
+        "-l",
+        "0-1",
         "--log-level=3",
     ];
     resd_net_core::engine::eal_init(&args).expect("EAL init");

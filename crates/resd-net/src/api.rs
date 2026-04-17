@@ -40,7 +40,7 @@ pub struct resd_net_engine_config_t {
 
 #[repr(C)]
 pub struct resd_net_connect_opts_t {
-    pub peer_addr: u32,         // network byte order IPv4
+    pub peer_addr: u32, // network byte order IPv4
     pub peer_port: u16,
     pub local_addr: u32,
     pub local_port: u16,

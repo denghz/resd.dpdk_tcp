@@ -13,7 +13,7 @@ pub struct EthCounters {
     pub tx_bytes: AtomicU64,
     pub tx_drop_full_ring: AtomicU64,
     pub tx_drop_nomem: AtomicU64,
-    _pad: [u64; 8],  // keep struct size aligned
+    _pad: [u64; 8], // keep struct size aligned
 }
 
 #[repr(C, align(64))]
@@ -73,17 +73,31 @@ impl Counters {
     }
 }
 
+impl Default for Counters {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Default for EthCounters {
-    fn default() -> Self { unsafe { std::mem::zeroed() } }
+    fn default() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
 }
 impl Default for IpCounters {
-    fn default() -> Self { unsafe { std::mem::zeroed() } }
+    fn default() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
 }
 impl Default for TcpCounters {
-    fn default() -> Self { unsafe { std::mem::zeroed() } }
+    fn default() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
 }
 impl Default for PollCounters {
-    fn default() -> Self { unsafe { std::mem::zeroed() } }
+    fn default() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
 }
 
 /// Hot-path increment: atomic RMW with Relaxed ordering.

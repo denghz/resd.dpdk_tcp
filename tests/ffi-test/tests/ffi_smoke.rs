@@ -48,7 +48,8 @@ fn ffi_eal_init_and_engine_lifecycle() {
         "--in-memory",
         "--no-pci",
         "--vdev=net_tap0,iface=resdtap0",
-        "-l", "0-1",
+        "-l",
+        "0-1",
         "--log-level=3",
     ]
     .iter()
@@ -86,19 +87,30 @@ fn ffi_eal_init_and_engine_lifecycle() {
         _pad3: [u8; 2],
     }
     let cfg = Cfg {
-        port_id: 0, rx_queue_id: 0, tx_queue_id: 0, _pad1: 0,
+        port_id: 0,
+        rx_queue_id: 0,
+        tx_queue_id: 0,
+        _pad1: 0,
         max_connections: 16,
-        recv_buffer_bytes: 256 * 1024, send_buffer_bytes: 256 * 1024,
+        recv_buffer_bytes: 256 * 1024,
+        send_buffer_bytes: 256 * 1024,
         tcp_mss: 0,
-        tcp_timestamps: true, tcp_sack: true, tcp_ecn: false, tcp_nagle: false,
-        tcp_delayed_ack: false, cc_mode: 0, _pad2: [0; 2],
-        tcp_min_rto_ms: 20, tcp_initial_rto_ms: 50, tcp_msl_ms: 30000,
-        tcp_per_packet_events: false, preset: 0, _pad3: [0; 2],
+        tcp_timestamps: true,
+        tcp_sack: true,
+        tcp_ecn: false,
+        tcp_nagle: false,
+        tcp_delayed_ack: false,
+        cc_mode: 0,
+        _pad2: [0; 2],
+        tcp_min_rto_ms: 20,
+        tcp_initial_rto_ms: 50,
+        tcp_msl_ms: 30000,
+        tcp_per_packet_events: false,
+        preset: 0,
+        _pad3: [0; 2],
     };
 
-    let eng = unsafe {
-        resd_net_engine_create(0, &cfg as *const Cfg as *const core::ffi::c_void)
-    };
+    let eng = unsafe { resd_net_engine_create(0, &cfg as *const Cfg as *const core::ffi::c_void) };
     assert!(!eng.is_null(), "resd_net_engine_create returned null");
 
     for _ in 0..10 {

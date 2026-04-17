@@ -20,13 +20,12 @@ fn main() {
         .env_metadata(false)
         .probe("libdpdk")
         .ok()
-        .map(|_| {
+        .and_then(|_| {
             std::process::Command::new("pkg-config")
                 .args(["--cflags", "libdpdk"])
                 .output()
                 .ok()
-        })
-        .flatten();
+        });
 
     let mut clang_args: Vec<String> = Vec::new();
     if let Some(out) = pc_cflags {

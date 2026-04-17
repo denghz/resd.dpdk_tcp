@@ -1,4 +1,4 @@
-#![allow(non_camel_case_types, non_snake_case)]
+#![allow(non_camel_case_types, non_snake_case, clippy::missing_safety_doc)]
 
 pub mod api;
 
@@ -29,10 +29,7 @@ unsafe fn engine_from_raw<'a>(p: *mut resd_net_engine) -> Option<&'a Engine> {
 /// Safe to call multiple times; subsequent calls after the first return 0.
 /// Returns 0 on success, negative errno on failure.
 #[no_mangle]
-pub unsafe extern "C" fn resd_net_eal_init(
-    argc: i32,
-    argv: *const *const libc::c_char,
-) -> i32 {
+pub unsafe extern "C" fn resd_net_eal_init(argc: i32, argv: *const *const libc::c_char) -> i32 {
     if argc < 0 || argv.is_null() {
         return -libc::EINVAL;
     }
@@ -114,9 +111,7 @@ pub unsafe extern "C" fn resd_net_now_ns(_p: *mut resd_net_engine) -> u64 {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn resd_net_counters(
-    p: *mut resd_net_engine,
-) -> *const resd_net_counters_t {
+pub unsafe extern "C" fn resd_net_counters(p: *mut resd_net_engine) -> *const resd_net_counters_t {
     match engine_from_raw(p) {
         Some(e) => e.counters() as *const Counters as *const resd_net_counters_t,
         None => ptr::null(),
@@ -140,9 +135,7 @@ mod tests {
 
     #[test]
     fn poll_null_returns_einval() {
-        let rc = unsafe {
-            resd_net_poll(std::ptr::null_mut(), std::ptr::null_mut(), 0, 0)
-        };
+        let rc = unsafe { resd_net_poll(std::ptr::null_mut(), std::ptr::null_mut(), 0, 0) };
         assert_eq!(rc, -libc::EINVAL);
     }
 

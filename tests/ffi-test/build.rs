@@ -15,8 +15,8 @@ fn main() {
     // dir. During `cargo test`, the top-level target/<profile>/libresd_net.a
     // copy is not always refreshed in time, so point the linker at deps/
     // directly (where the canonical output lives).
-    let target_dir = std::env::var("CARGO_TARGET_DIR")
-        .unwrap_or_else(|_| format!("{manifest}/../../target"));
+    let target_dir =
+        std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| format!("{manifest}/../../target"));
     let profile = std::env::var("PROFILE").unwrap();
     println!("cargo:rustc-link-search=native={target_dir}/{profile}/deps");
     println!("cargo:rustc-link-search=native={target_dir}/{profile}");
