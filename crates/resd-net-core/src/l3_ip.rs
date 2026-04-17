@@ -179,6 +179,14 @@ mod tests {
     }
 
     #[test]
+    fn bad_total_len_dropped() {
+        let mut h = build_ip_hdr(IPPROTO_TCP, 1, 2, 0, false);
+        h[2] = 0x00;
+        h[3] = 0x10; // total_length=16 < header_len=20
+        assert_eq!(ip_decode(&h, 0, true), Err(L3Drop::BadTotalLen));
+    }
+
+    #[test]
     fn fragment_dropped_mf() {
         let mut h = build_ip_hdr(IPPROTO_TCP, 1, 2, 0, false);
         h[6] = 0x20; // set MF bit
