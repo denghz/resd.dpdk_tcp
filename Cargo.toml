@@ -2,7 +2,7 @@
 resolver = "2"
 members = [
     "crates/resd-net-sys",
-    # "crates/resd-net-core" added by Task 3
+    "crates/resd-net-core",
     # "crates/resd-net"      added by Task 8
 ]
 
