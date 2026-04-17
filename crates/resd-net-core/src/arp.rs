@@ -133,6 +133,55 @@ fn write_arp_body(
     body[24..28].copy_from_slice(&target_ip.to_be_bytes());
 }
 
+/// Parse one line of `/proc/net/arp` into (ip_host_order, mac_bytes).
+/// Returns None for the header line or for entries with flags==0x0
+/// (incomplete).
+pub(crate) fn parse_proc_arp_line(line: &str) -> Option<(u32, [u8; 6])> {
+    // Columns: IPaddress  HWtype  Flags  HWaddress  Mask  Device
+    let mut fields = line.split_whitespace();
+    let ip = fields.next()?;
+    let _hw = fields.next()?;
+    let flags = fields.next()?;
+    let mac = fields.next()?;
+
+    if !flags.starts_with("0x") {
+        return None;
+    }
+    let flags_u = u32::from_str_radix(&flags[2..], 16).ok()?;
+    if flags_u & 0x2 == 0 {
+        // ATF_COM bit not set — entry isn't complete.
+        return None;
+    }
+
+    let mut octets = ip.split('.');
+    let a = octets.next()?.parse::<u8>().ok()?;
+    let b = octets.next()?.parse::<u8>().ok()?;
+    let c = octets.next()?.parse::<u8>().ok()?;
+    let d = octets.next()?.parse::<u8>().ok()?;
+    let ip_u = u32::from_be_bytes([a, b, c, d]);
+
+    let mut mac_bytes = [0u8; 6];
+    let mut parts = mac.split(':');
+    for b in &mut mac_bytes {
+        *b = u8::from_str_radix(parts.next()?, 16).ok()?;
+    }
+    Some((ip_u, mac_bytes))
+}
+
+/// Read `/proc/net/arp` and return the MAC address for `ip`.
+pub fn resolve_from_proc_arp(ip: u32) -> Result<[u8; 6], crate::Error> {
+    let text = std::fs::read_to_string("/proc/net/arp")
+        .map_err(|e| crate::Error::ProcArpRead(e.to_string()))?;
+    for line in text.lines().skip(1) {
+        if let Some((entry_ip, mac)) = parse_proc_arp_line(line) {
+            if entry_ip == ip {
+                return Ok(mac);
+            }
+        }
+    }
+    Err(crate::Error::GatewayMacNotFound(ip))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,5 +256,28 @@ mod tests {
         let req = sample_request();
         let mut buf = [0u8; 10];
         assert!(build_arp_reply([1; 6], 0, &req, &mut buf).is_none());
+    }
+
+    #[test]
+    fn parse_proc_arp_line_sample() {
+        let line = "10.0.0.1         0x1         0x2         aa:bb:cc:dd:ee:ff     *        eth0\n";
+        let (ip, mac) = super::parse_proc_arp_line(line).expect("parsed");
+        assert_eq!(ip, 0x0a_00_00_01);
+        assert_eq!(mac, [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+    }
+
+    #[test]
+    fn parse_proc_arp_incomplete_entry_rejected() {
+        // Flags 0x0 means entry is incomplete — don't use it.
+        let line = "10.0.0.9         0x1         0x0         00:00:00:00:00:00     *        eth0\n";
+        assert!(super::parse_proc_arp_line(line).is_none());
+    }
+
+    #[test]
+    fn resolve_from_proc_arp_missing_returns_not_found() {
+        // Address we are extremely unlikely to have — 0.0.0.1 is never
+        // a valid gateway and will not appear in any /proc/net/arp.
+        let err = super::resolve_from_proc_arp(0x0000_0001).unwrap_err();
+        assert!(matches!(err, crate::Error::GatewayMacNotFound(_)));
     }
 }
