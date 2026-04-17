@@ -23,3 +23,13 @@
  * so bindgen emits a plain FFI stub for it.
  */
 int resd_rte_errno(void);
+
+/* Burst-path helpers and `rte_pktmbuf_free` are `static inline` in DPDK
+ * headers. bindgen skips inline functions, so we re-export them from
+ * shim.c as real extern symbols (prefixed `resd_`) for the Rust hot path.
+ */
+uint16_t resd_rte_eth_rx_burst(uint16_t port_id, uint16_t queue_id,
+                               struct rte_mbuf **rx_pkts, uint16_t nb_pkts);
+uint16_t resd_rte_eth_tx_burst(uint16_t port_id, uint16_t queue_id,
+                               struct rte_mbuf **tx_pkts, uint16_t nb_pkts);
+void resd_rte_pktmbuf_free(struct rte_mbuf *m);

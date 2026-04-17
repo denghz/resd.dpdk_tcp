@@ -12,6 +12,16 @@ pub struct TscEpoch {
 
 static TSC_EPOCH: OnceLock<TscEpoch> = OnceLock::new();
 
+/// Initialize the clock (check invariant TSC, trigger one-time calibration).
+/// Call once at engine creation. Idempotent across multiple calls — uses
+/// the same process-wide `OnceLock`.
+/// Returns `Error::NoInvariantTsc` if the CPU lacks invariant TSC.
+pub fn init() -> Result<(), crate::Error> {
+    check_invariant_tsc()?;
+    let _ = tsc_epoch();
+    Ok(())
+}
+
 pub fn tsc_epoch() -> &'static TscEpoch {
     TSC_EPOCH.get_or_init(calibrate)
 }
@@ -36,7 +46,16 @@ pub fn now_ns() -> u64 {
 }
 
 fn calibrate() -> TscEpoch {
-    check_invariant_tsc().expect("invariant TSC required");
+    // check_invariant_tsc is proactively called by `init()`; leave the expect
+    // as a last-resort guard in case `now_ns()` is called on an unsupported
+    // CPU without going through `init()`.
+    check_invariant_tsc().expect("invariant TSC required; call clock::init() first");
+    // TODO(spec §7.5): spec mandates CLOCK_MONOTONIC_RAW; Rust's Instant::now()
+    // uses CLOCK_MONOTONIC (absorbs NTP slew up to ~500 ppm). At the 50ms
+    // calibration window the worst-case skew is ~25µs = ~0.05% of a 50ms
+    // window — well under the 2% test tolerance. Migrate to
+    // libc::clock_gettime(CLOCK_MONOTONIC_RAW) if benchmarks need sub-ppm
+    // accuracy.
     let start_instant = Instant::now();
     let start_tsc = rdtsc();
     // Busy-loop a known-duration window for ratio measurement.
