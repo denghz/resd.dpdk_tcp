@@ -1,0 +1,42 @@
+language = "C"
+include_guard = "RESD_NET_H"
+pragma_once = true
+autogen_warning = "/* DO NOT EDIT: generated from Rust via cbindgen */"
+no_includes = false
+sys_includes = ["stdint.h", "stdbool.h", "stddef.h", "arpa/inet.h"]
+# Macro used to express `#[repr(C, align(N))]` in C. Defined in after_includes.
+after_includes = "\n#define RESD_NET_ALIGNED(N) __attribute__((aligned(N)))\n"
+style = "tag"
+
+[layout]
+aligned_n = "RESD_NET_ALIGNED"
+
+[export]
+# Types are already prefixed with `resd_net_` at their Rust source names, so
+# cbindgen doesn't need to prepend anything. (An additional `prefix` here
+# would double-prefix to `resd_net_resd_net_*`.)
+exclude = ["EngineConfigRustOnly"]
+# Force-include types that aren't yet referenced by any extern "C" function
+# (T9 adds those; until then cbindgen's reachability analysis would trim them).
+include = [
+    "resd_net_engine",
+    "resd_net_engine_config_t",
+    "resd_net_connect_opts_t",
+    "resd_net_event_kind_t",
+    "resd_net_event_readable_t",
+    "resd_net_event_error_t",
+    "resd_net_event_timer_t",
+    "resd_net_event_tcp_retrans_t",
+    "resd_net_event_tcp_loss_t",
+    "resd_net_event_tcp_state_t",
+    "resd_net_event_payload_t",
+    "resd_net_event_t",
+    "resd_net_eth_counters_t",
+    "resd_net_ip_counters_t",
+    "resd_net_tcp_counters_t",
+    "resd_net_poll_counters_t",
+    "resd_net_counters_t",
+]
+
+[parse]
+parse_deps = false

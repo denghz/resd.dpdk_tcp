@@ -1,0 +1,17 @@
+[package]
+name = "resd-net"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "resd_net"
+# staticlib for static linking into C++; cdylib for dynamic.
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+resd-net-core = { path = "../resd-net-core" }
+libc.workspace = true
+
+[build-dependencies]
+cbindgen = "0.26"
