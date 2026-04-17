@@ -601,6 +601,15 @@ Run `resd_net` alongside the Linux-stack path in production. The application mir
 
 A minimal server-side build of the stack behind the cargo feature flag `test-server`. Supports `accept` on a single listening port and byte-stream echo semantics. Used only by test harnesses (packetdrill-shim, tcpreq). Not compiled into production builds. This is Stage 1 scope — without it, Stage 1's tcpreq gate is unachievable.
 
+### 10.13 Per-phase mTCP comparison review (Stage 1 process gate)
+
+Every Stage 1 phase from A2 onward ends with a comparison review against mTCP as a mature userspace-TCP reference implementation. Scope is algorithm/correctness parity and edge-case parity (explicitly *not* architecture parity — our RTC model, epoll-like API, and Rust type system are deliberately unlike mTCP's). Phase A1 is exempt because it ships no algorithmic code.
+
+- **Source of truth:** `github.com/mtcp-stack/mtcp` added as a git submodule at `third_party/mtcp/`, pinned to a specific SHA recorded in each review report.
+- **Mechanism:** a project-local subagent at `.claude/agents/mtcp-comparison-reviewer.md` performs the comparison and emits `docs/superpowers/reviews/phase-aN-mtcp-compare.md` in a fixed schema (Must-fix / Missed edge cases / Accepted divergence / FYI / Verdict).
+- **Gate:** the `phase-aN-complete` git tag cannot be placed while any unresolved `[ ]` checkbox remains in the report's Must-fix or Missed-edge-cases sections, and every Accepted-divergence entry must carry a concrete spec-section or memory-file citation.
+- **Invocation:** each phase's sign-off task lists the review as an explicit step before the commit + tag step. Inputs to the subagent are the phase number, the phase plan path, the phase-scoped git diff, the spec §refs the phase claims to cover, and the mTCP focus areas (specific `mtcp/src/*.c` files corresponding to this phase's functionality).
+
 ## 11. Benchmark Plan
 
 Goal: quantify latency and stability under trading-representative workloads, catch regressions per-commit, and establish defensible comparisons against Linux TCP as the reference baseline. Performance is verified separately from correctness (§10) — both must pass for a stage ship.

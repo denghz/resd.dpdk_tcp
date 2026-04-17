@@ -2475,7 +2475,35 @@ Manual check of these spec sections mapped to code:
 - **§6.3 RFC 1122 (IPv4 reassembly not implemented)** — fragments dropped with `ip.rx_frag` bump.
 - **§8 "static gateway MAC"** — `arp::resolve_from_proc_arp` + `resd_net_resolve_gateway_mac` FFI; `build_gratuitous_arp` for the refresh path; `handle_arp` responds to inbound ARP requests.
 
-- [ ] **Step 5: Update roadmap status**
+- [ ] **Step 5: Run mTCP comparison review (first phase to do this — see spec §10.13)**
+
+This is the first phase to run the per-phase mTCP review gate. One-time submodule setup (only once across all phases):
+
+```sh
+git submodule add https://github.com/mtcp-stack/mtcp third_party/mtcp
+(cd third_party/mtcp && git rev-parse HEAD)  # record this SHA in the report
+git add .gitmodules third_party/mtcp
+```
+
+Dispatch the `mtcp-comparison-reviewer` subagent (`.claude/agents/mtcp-comparison-reviewer.md`) with:
+- Phase number: **A2**
+- Phase plan: `docs/superpowers/plans/2026-04-17-stage1-phase-a2-l2-l3.md`
+- Diff command: `git diff phase-a1-complete..HEAD -- crates/ include/ examples/`
+- Spec refs: §5.1, §6.3 rows for RFC 791 / 792 / 1122 / 1191, §8 (ARP)
+- mTCP focus areas: `third_party/mtcp/mtcp/src/eth_in.c`, `eth_out.c`, `ip_in.c`, `ip_out.c`, `arp.c`, `icmp.c`
+
+The subagent writes `docs/superpowers/reviews/phase-a2-mtcp-compare.md`. Human reviews: edits the **Accepted divergence** section with concrete spec/memory citations, promotes/demotes findings, toggles the final verdict to **PASS** or **PASS-WITH-ACCEPTED**.
+
+**Gate:** do not proceed to Step 6 while any unresolved `[ ]` checkbox remains in Must-fix or Missed-edge-cases. If findings require code changes, implement them in a separate commit before continuing.
+
+Commit the review:
+
+```sh
+git add docs/superpowers/reviews/phase-a2-mtcp-compare.md
+git commit -m "phase a2: mTCP comparison review report"
+```
+
+- [ ] **Step 6: Update roadmap status**
 
 Edit `docs/superpowers/plans/stage1-phase-roadmap.md` — replace the A2 row:
 
@@ -2483,7 +2511,7 @@ Edit `docs/superpowers/plans/stage1-phase-roadmap.md` — replace the A2 row:
 | A2 | L2/L3 + static ARP + ICMP-in (PMTUD) | **Complete** ✓ | `2026-04-17-stage1-phase-a2-l2-l3.md` |
 ```
 
-- [ ] **Step 6: Commit + tag**
+- [ ] **Step 7: Commit + tag**
 
 ```sh
 git add examples/cpp-consumer/main.cpp docs/superpowers/plans/stage1-phase-roadmap.md
@@ -2491,7 +2519,7 @@ git commit -m "mark phase a2 complete in roadmap; print ip counters from c++ con
 git tag -a phase-a2-complete -m "Phase A2: L2/L3 + static ARP + ICMP-in (PMTUD)"
 ```
 
-- [ ] **Step 7: Record next phase**
+- [ ] **Step 8: Record next phase**
 
 The next plan file to write is `docs/superpowers/plans/YYYY-MM-DD-stage1-phase-a3-tcp-basic.md` — TCP handshake + basic data transfer.
 
