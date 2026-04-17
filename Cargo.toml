@@ -4,6 +4,7 @@ members = [
     "crates/resd-net-sys",
     "crates/resd-net-core",
     "crates/resd-net",
+    "tests/ffi-test",
 ]
 
 [workspace.package]
