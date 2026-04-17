@@ -122,6 +122,28 @@ pub unsafe extern "C" fn resd_net_counters(p: *mut resd_net_engine) -> *const re
     }
 }
 
+/// Resolve the MAC address for `gateway_ip_host_order` by reading
+/// `/proc/net/arp`. Writes 6 bytes into `out_mac`.
+/// Returns 0 on success, -ENOENT if no entry, -EIO on /proc/net/arp read error,
+/// -EINVAL on null out_mac.
+#[no_mangle]
+pub unsafe extern "C" fn resd_net_resolve_gateway_mac(
+    gateway_ip_host_order: u32,
+    out_mac: *mut u8,
+) -> i32 {
+    if out_mac.is_null() {
+        return -libc::EINVAL;
+    }
+    match resd_net_core::arp::resolve_from_proc_arp(gateway_ip_host_order) {
+        Ok(mac) => {
+            std::ptr::copy_nonoverlapping(mac.as_ptr(), out_mac, 6);
+            0
+        }
+        Err(resd_net_core::Error::GatewayMacNotFound(_)) => -libc::ENOENT,
+        Err(_) => -libc::EIO,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,5 +203,19 @@ mod tests {
         assert_eq!(cfg.local_ip, 0x0a_00_00_02);
         assert_eq!(cfg.gateway_mac[2], 0xbe);
         assert_eq!(cfg.garp_interval_sec, 5);
+    }
+
+    #[test]
+    fn resolve_null_out_mac_returns_einval() {
+        let rc = unsafe { resd_net_resolve_gateway_mac(0x0a_00_00_01, std::ptr::null_mut()) };
+        assert_eq!(rc, -libc::EINVAL);
+    }
+
+    #[test]
+    fn resolve_unreachable_ip_returns_enoent() {
+        let mut mac = [0u8; 6];
+        // 0.0.0.1 will not be in any /proc/net/arp.
+        let rc = unsafe { resd_net_resolve_gateway_mac(0x0000_0001, mac.as_mut_ptr()) };
+        assert_eq!(rc, -libc::ENOENT);
     }
 }
