@@ -60,14 +60,7 @@ struct resd_net_engine_config_t {
   uint8_t preset;
 };
 
-struct resd_net_connect_opts_t {
-  uint32_t peer_addr;
-  uint16_t peer_port;
-  uint32_t local_addr;
-  uint16_t local_port;
-  uint32_t connect_timeout_ms;
-  uint32_t idle_keepalive_sec;
-};
+typedef uint64_t resd_net_conn_t;
 
 struct resd_net_event_readable_t {
   const uint8_t *data;
@@ -112,8 +105,6 @@ union resd_net_event_payload_t {
   struct resd_net_event_tcp_state_t tcp_state;
   uint8_t _pad[16];
 };
-
-typedef uint64_t resd_net_conn_t;
 
 struct resd_net_event_t {
   resd_net_event_kind_t kind;
@@ -185,5 +176,39 @@ struct resd_net_counters_t {
   struct resd_net_tcp_counters_t tcp;
   struct resd_net_poll_counters_t poll;
 };
+
+struct resd_net_connect_opts_t {
+  uint32_t peer_addr;
+  uint16_t peer_port;
+  uint32_t local_addr;
+  uint16_t local_port;
+  uint32_t connect_timeout_ms;
+  uint32_t idle_keepalive_sec;
+};
+
+/**
+ * Initialize DPDK EAL. Must be called before resd_net_engine_create.
+ * `argv` is a C-style argv array; the function does NOT take ownership
+ * (copies each argument into Rust-owned CStrings internally).
+ * Safe to call multiple times; subsequent calls after the first return 0.
+ * Returns 0 on success, negative errno on failure.
+ */
+int32_t resd_net_eal_init(int32_t argc, const char *const *argv);
+
+struct resd_net_engine *resd_net_engine_create(uint16_t lcore_id,
+                                               const struct resd_net_engine_config_t *cfg);
+
+void resd_net_engine_destroy(struct resd_net_engine *p);
+
+int32_t resd_net_poll(struct resd_net_engine *p,
+                      struct resd_net_event_t *_events_out,
+                      uint32_t _max_events,
+                      uint64_t _timeout_ns);
+
+void resd_net_flush(struct resd_net_engine *_p);
+
+uint64_t resd_net_now_ns(struct resd_net_engine *_p);
+
+const struct resd_net_counters_t *resd_net_counters(struct resd_net_engine *p);
 
 #endif /* RESD_NET_H */
