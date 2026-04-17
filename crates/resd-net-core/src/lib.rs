@@ -5,6 +5,7 @@ pub mod clock;
 pub mod counters;
 pub mod engine;
 pub mod error;
+pub mod icmp;
 pub mod l2;
 pub mod l3_ip;
 pub mod mempool;
