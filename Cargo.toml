@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/resd-net-sys",
+    "crates/resd-net-core",
+    "crates/resd-net",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.75"
+
+[workspace.dependencies]
+# pinned once, used by all crates
+libc = "0.2"
+thiserror = "1"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = 1  # line tables for perf/flame graphs

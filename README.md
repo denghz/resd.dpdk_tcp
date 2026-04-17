@@ -1,0 +1,21 @@
+# resd.dpdk_tcp
+
+DPDK-based userspace TCP stack in Rust with a C ABI for C++ consumers.
+
+See `docs/superpowers/specs/2026-04-17-dpdk-tcp-design.md` for the design.
+
+## Build
+
+Requires DPDK 23.11 installed (`pkg-config --exists libdpdk` must succeed).
+
+```sh
+cargo build --release
+cmake -S examples/cpp-consumer -B examples/cpp-consumer/build
+cmake --build examples/cpp-consumer/build
+```
+
+## Test
+
+```sh
+cargo test
+```
