@@ -621,6 +621,14 @@ impl Engine {
             );
         }
 
+        // A3 OOO policy: no reassembly queue (AD-6). Count one OOO
+        // event per segment; A4's reassembly will switch to byte-level
+        // accounting. See `docs/superpowers/reviews/phase-a3-rfc-compliance.md`
+        // I-1.
+        if outcome.ooo_drop > 0 {
+            inc(&self.counters.tcp.rx_out_of_order);
+        }
+
         if outcome.closed {
             self.events.borrow_mut().push(InternalEvent::Closed {
                 conn: handle, err: 0,

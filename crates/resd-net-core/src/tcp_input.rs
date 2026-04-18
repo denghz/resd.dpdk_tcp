@@ -164,6 +164,12 @@ pub struct Outcome {
     /// Engine bumps `tcp.recv_buf_drops` by this count. See
     /// `feedback_performance_first_flow_control.md`.
     pub buf_full_drop: u32,
+    /// Non-zero iff this segment carried in-window payload at a seq
+    /// ahead of `rcv_nxt` (hole). A3 has no reassembly queue (AD-6),
+    /// so the payload is dropped and counted. Engine bumps
+    /// `tcp.rx_out_of_order` by 1 when `> 0`. A4 replaces this with
+    /// real reassembly + byte-level accounting.
+    pub ooo_drop: u32,
     /// True iff this segment completed a handshake (SYN_SENT → ESTABLISHED).
     pub connected: bool,
     /// True iff this segment completed a clean close (→ CLOSED or
@@ -173,10 +179,10 @@ pub struct Outcome {
 
 impl Outcome {
     pub fn none() -> Self {
-        Self { tx: TxAction::None, new_state: None, delivered: 0, buf_full_drop: 0, connected: false, closed: false }
+        Self { tx: TxAction::None, new_state: None, delivered: 0, buf_full_drop: 0, ooo_drop: 0, connected: false, closed: false }
     }
     pub fn rst() -> Self {
-        Self { tx: TxAction::Rst, new_state: Some(TcpState::Closed), delivered: 0, buf_full_drop: 0, connected: false, closed: true }
+        Self { tx: TxAction::Rst, new_state: Some(TcpState::Closed), delivered: 0, buf_full_drop: 0, ooo_drop: 0, connected: false, closed: true }
     }
 }
 
@@ -213,6 +219,7 @@ fn handle_syn_sent(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
                 new_state: Some(TcpState::Closed),
                 delivered: 0,
                 buf_full_drop: 0,
+                ooo_drop: 0,
                 connected: false,
                 closed: true,
             };
@@ -229,6 +236,7 @@ fn handle_syn_sent(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
             new_state: Some(TcpState::Closed),
             delivered: 0,
             buf_full_drop: 0,
+            ooo_drop: 0,
             connected: false,
             closed: true,
         };
@@ -249,6 +257,7 @@ fn handle_syn_sent(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
             new_state: Some(TcpState::Closed),
             delivered: 0,
             buf_full_drop: 0,
+            ooo_drop: 0,
             connected: false,
             closed: true,
         };
@@ -268,6 +277,7 @@ fn handle_syn_sent(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
         new_state: Some(TcpState::Established),
         delivered: 0,
         buf_full_drop: 0,
+        ooo_drop: 0,
         connected: true,
         closed: false,
     }
@@ -283,6 +293,7 @@ fn handle_established(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
             new_state: Some(TcpState::Closed),
             delivered: 0,
             buf_full_drop: 0,
+            ooo_drop: 0,
             connected: false,
             closed: true,
         };
@@ -308,7 +319,7 @@ fn handle_established(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
     };
     if !in_win {
         // Out-of-window: challenge ACK and drop.
-        return Outcome { tx: TxAction::Ack, new_state: None, delivered: 0, buf_full_drop: 0, connected: false, closed: false };
+        return Outcome { tx: TxAction::Ack, new_state: None, delivered: 0, buf_full_drop: 0, ooo_drop: 0, connected: false, closed: false };
     }
 
     // ACK processing — RFC 9293 §3.10.7.4, "ESTABLISHED STATE" ACK handling.
@@ -329,17 +340,27 @@ fn handle_established(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
         }
     } else if seq_lt(conn.snd_nxt, seg.ack) {
         // ACK ahead of snd_nxt → we never sent that much; challenge ACK.
-        return Outcome { tx: TxAction::Ack, new_state: None, delivered: 0, buf_full_drop: 0, connected: false, closed: false };
+        return Outcome { tx: TxAction::Ack, new_state: None, delivered: 0, buf_full_drop: 0, ooo_drop: 0, connected: false, closed: false };
     }
     // Else: duplicate ACK (ack <= snd_una) — no-op for A3 (A5 uses it for fast retx).
 
     // Data delivery (only in-order).
     let mut delivered = 0u32;
     let mut buf_full_drop = 0u32;
-    if !seg.payload.is_empty() && seg.seq == conn.rcv_nxt {
-        delivered = conn.recv.append(seg.payload);
-        conn.rcv_nxt = conn.rcv_nxt.wrapping_add(delivered);
-        buf_full_drop = (seg.payload.len() as u32).saturating_sub(delivered);
+    let mut ooo_drop = 0u32;
+    if !seg.payload.is_empty() {
+        if seg.seq == conn.rcv_nxt {
+            delivered = conn.recv.append(seg.payload);
+            conn.rcv_nxt = conn.rcv_nxt.wrapping_add(delivered);
+            buf_full_drop = (seg.payload.len() as u32).saturating_sub(delivered);
+        } else {
+            // In-window but ahead of rcv_nxt: there's a hole. A3 has no
+            // reassembly queue (AD-6), so the payload is dropped and the
+            // challenge ACK emitted below signals the expected seq to the
+            // peer per RFC 9293 §3.10.7.4 / RFC 5681 §4.2. Engine bumps
+            // `tcp.rx_out_of_order` on `ooo_drop > 0`.
+            ooo_drop = seg.payload.len() as u32;
+        }
     }
 
     // FIN processing: consumes one seq and moves us to CLOSE_WAIT.
@@ -364,7 +385,7 @@ fn handle_established(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
         TxAction::None
     };
 
-    Outcome { tx, new_state, delivered, buf_full_drop, connected: false, closed: false }
+    Outcome { tx, new_state, delivered, buf_full_drop, ooo_drop, connected: false, closed: false }
 }
 
 fn handle_close_path(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
@@ -377,6 +398,7 @@ fn handle_close_path(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
             new_state: Some(TcpState::Closed),
             delivered: 0,
             buf_full_drop: 0,
+            ooo_drop: 0,
             connected: false,
             closed: true,
         };
@@ -385,7 +407,7 @@ fn handle_close_path(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
     // TIME_WAIT: replay-ACK anything the peer sends; reaper will move
     // us to CLOSED via the engine tick (Task 19).
     if conn.state == TcpState::TimeWait {
-        return Outcome { tx: TxAction::Ack, new_state: None, delivered: 0, buf_full_drop: 0, connected: false, closed: false };
+        return Outcome { tx: TxAction::Ack, new_state: None, delivered: 0, buf_full_drop: 0, ooo_drop: 0, connected: false, closed: false };
     }
 
     // Segment must have ACK in these states.
@@ -403,7 +425,7 @@ fn handle_close_path(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
             && in_window(conn.rcv_nxt, last, conn.rcv_wnd)
     };
     if !in_win {
-        return Outcome { tx: TxAction::Ack, new_state: None, delivered: 0, buf_full_drop: 0, connected: false, closed: false };
+        return Outcome { tx: TxAction::Ack, new_state: None, delivered: 0, buf_full_drop: 0, ooo_drop: 0, connected: false, closed: false };
     }
 
     // Advance snd_una if ack covers more of our stream.
@@ -435,7 +457,7 @@ fn handle_close_path(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
     };
 
     let closed = new_state == Some(TcpState::Closed);
-    Outcome { tx, new_state, delivered: 0, buf_full_drop: 0, connected: false, closed }
+    Outcome { tx, new_state, delivered: 0, buf_full_drop: 0, ooo_drop: 0, connected: false, closed }
 }
 
 /// Build the 4-tuple from a parsed segment's ports + the IPv4 header's
@@ -665,7 +687,50 @@ mod tests {
         let out = dispatch(&mut c, &seg);
         assert_eq!(out.tx, TxAction::Ack);
         assert_eq!(out.delivered, 0);
+        // A3 I-1 fix: OOO in-window payload is dropped and counted.
+        // Engine maps `ooo_drop > 0` to one `tcp.rx_out_of_order` bump.
+        assert_eq!(out.ooo_drop, 3);
         assert_eq!(c.rcv_nxt, 5001); // unchanged
+    }
+
+    #[test]
+    fn established_inorder_payload_does_not_flag_ooo() {
+        let mut c = est_conn(1000, 5000, 1024);
+        let seg = ParsedSegment {
+            src_port: 5000, dst_port: 40000,
+            seq: 5001, ack: 1001,
+            flags: TCP_ACK | TCP_PSH,
+            window: 65535,
+            header_len: 20,
+            payload: b"abc", options: &[],
+        };
+        let out = dispatch(&mut c, &seg);
+        assert_eq!(out.delivered, 3);
+        assert_eq!(out.ooo_drop, 0);
+        assert_eq!(out.buf_full_drop, 0);
+    }
+
+    #[test]
+    fn established_recv_buf_full_flags_buf_full_drop_not_ooo() {
+        // recv buffer cap is 1024 in `est_conn`; send 2000 bytes in-order.
+        let mut c = est_conn(1000, 5000, 4096);
+        // Widen rcv_wnd so the 2000-byte segment is in-window, else the
+        // handler would reject it before the delivery branch.
+        c.rcv_wnd = 4096;
+        let payload = vec![0u8; 2000];
+        let seg = ParsedSegment {
+            src_port: 5000, dst_port: 40000,
+            seq: 5001, ack: 1001,
+            flags: TCP_ACK | TCP_PSH,
+            window: 65535,
+            header_len: 20,
+            payload: &payload, options: &[],
+        };
+        let out = dispatch(&mut c, &seg);
+        // 1024 accepted, 976 dropped — overflow is `buf_full_drop`, not OOO.
+        assert_eq!(out.delivered, 1024);
+        assert_eq!(out.buf_full_drop, 2000 - 1024);
+        assert_eq!(out.ooo_drop, 0);
     }
 
     #[test]

@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use resd_net_core::engine::{eal_init, Engine, EngineConfig};
 use resd_net_core::tcp_events::InternalEvent;
+use resd_net_core::tcp_state::TcpState;
 
 const TAP_IFACE: &str = "resdtap2";
 // Use 10.99.2.0/24 instead of 10.99.1.0/24 to dodge collisions with
@@ -172,6 +173,7 @@ fn handshake_echo_close_over_tap() {
     assert!(closed, "did not receive CLOSED within deadline");
 
     let c = engine.counters();
+    // --- TCP-event counters (A3 presence checks preserved) ---
     assert!(c.tcp.tx_syn.load(Ordering::Relaxed) >= 1);
     assert!(c.tcp.rx_syn_ack.load(Ordering::Relaxed) >= 1);
     assert!(c.tcp.tx_data.load(Ordering::Relaxed) >= 1);
@@ -179,6 +181,84 @@ fn handshake_echo_close_over_tap() {
     assert!(c.tcp.rx_fin.load(Ordering::Relaxed) >= 1);
     assert!(c.tcp.conn_open.load(Ordering::Relaxed) >= 1);
     assert!(c.tcp.conn_close.load(Ordering::Relaxed) >= 1);
+
+    // --- eth / ip layers ---
+    // Expected inbound segment shape for a SYN/echo/FIN cycle against the
+    // kernel peer: SYN-ACK, ACK of our data, echoed-data, peer FIN-ACK,
+    // peer's ACK of our FIN. ARP replies may bring the count higher.
+    let eth_rx = c.eth.rx_pkts.load(Ordering::Relaxed);
+    assert!(eth_rx >= 5, "eth.rx_pkts = {}, want >= 5", eth_rx);
+    // Outbound: SYN, ACK of SYN-ACK, data w/ PSH|ACK, FIN+ACK.
+    let eth_tx = c.eth.tx_pkts.load(Ordering::Relaxed);
+    assert!(eth_tx >= 4, "eth.tx_pkts = {}, want >= 4", eth_tx);
+    // Every inbound TCP segment gets counted here before dispatch.
+    let ip_rx_tcp = c.ip.rx_tcp.load(Ordering::Relaxed);
+    assert!(ip_rx_tcp >= 4, "ip.rx_tcp = {}, want >= 4", ip_rx_tcp);
+
+    // --- TCP TX/RX accounting (beyond basic presence checks) ---
+    // At minimum: our ACK of the peer's SYN-ACK.
+    assert!(c.tcp.tx_ack.load(Ordering::Relaxed) >= 1);
+    // At least msg.len() bytes delivered into our recv buffer.
+    let delivered = c.tcp.recv_buf_delivered.load(Ordering::Relaxed);
+    assert!(
+        delivered >= msg.len() as u64,
+        "tcp.recv_buf_delivered = {}, want >= {}",
+        delivered, msg.len()
+    );
+    // --- Clean-path correctness invariants ---
+    // 24-byte echo against a 256KB recv buffer → no overflow.
+    assert_eq!(c.tcp.recv_buf_drops.load(Ordering::Relaxed), 0);
+    // Every segment should have matched our one flow.
+    assert_eq!(c.tcp.rx_unmatched.load(Ordering::Relaxed), 0);
+    // Kernel TCP doesn't send malformed frames at us.
+    assert_eq!(c.tcp.rx_bad_csum.load(Ordering::Relaxed), 0);
+    assert_eq!(c.tcp.rx_bad_flags.load(Ordering::Relaxed), 0);
+    assert_eq!(c.tcp.rx_short.load(Ordering::Relaxed), 0);
+
+    // --- state_trans[from][to] matrix for the client-side walk ---
+    let st = &c.tcp.state_trans;
+    let closed = TcpState::Closed as usize;
+    let syn_sent = TcpState::SynSent as usize;
+    let established = TcpState::Established as usize;
+    let fin_wait1 = TcpState::FinWait1 as usize;
+    let fin_wait2 = TcpState::FinWait2 as usize;
+    let closing = TcpState::Closing as usize;
+    let time_wait = TcpState::TimeWait as usize;
+
+    assert!(
+        st[closed][syn_sent].load(Ordering::Relaxed) >= 1,
+        "state_trans[Closed][SynSent] = {}, want >= 1",
+        st[closed][syn_sent].load(Ordering::Relaxed)
+    );
+    assert!(
+        st[syn_sent][established].load(Ordering::Relaxed) >= 1,
+        "state_trans[SynSent][Established] = {}, want >= 1",
+        st[syn_sent][established].load(Ordering::Relaxed)
+    );
+    assert!(
+        st[established][fin_wait1].load(Ordering::Relaxed) >= 1,
+        "state_trans[Established][FinWait1] = {}, want >= 1",
+        st[established][fin_wait1].load(Ordering::Relaxed)
+    );
+    // Exit from FinWait1 — three RFC 9293 paths:
+    //   • FinWait1→FinWait2 (our FIN ACKed, peer FIN deferred)
+    //   • FinWait1→Closing  (peer FIN arrives first, our FIN not yet ACKed — simultaneous close)
+    //   • FinWait1→TimeWait (peer piggy-backs FIN+ACK-of-our-FIN in one segment)
+    // The kernel TCP usually does path 3 here. All three are valid.
+    let fw1_to_fw2 = st[fin_wait1][fin_wait2].load(Ordering::Relaxed);
+    let fw1_to_closing = st[fin_wait1][closing].load(Ordering::Relaxed);
+    let fw1_to_tw = st[fin_wait1][time_wait].load(Ordering::Relaxed);
+    assert!(
+        fw1_to_fw2 + fw1_to_closing + fw1_to_tw >= 1,
+        "state_trans[FinWait1][FinWait2|Closing|TimeWait] = {}+{}+{}, want sum >= 1",
+        fw1_to_fw2, fw1_to_closing, fw1_to_tw
+    );
+    // TIME_WAIT reaper ran within the test's deadline (MSL=100ms).
+    assert!(
+        st[time_wait][closed].load(Ordering::Relaxed) >= 1,
+        "state_trans[TimeWait][Closed] = {}, want >= 1",
+        st[time_wait][closed].load(Ordering::Relaxed)
+    );
 
     drop(engine);
     let _ = done_rx.recv_timeout(Duration::from_secs(2));

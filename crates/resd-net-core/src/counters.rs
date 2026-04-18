@@ -235,4 +235,70 @@ mod tests {
             }
         }
     }
+
+    /// Every named AtomicU64 on EthCounters is zero at construction.
+    /// Fields: A1 = rx_pkts, rx_bytes, rx_drop_miss_mac, rx_drop_nomem,
+    /// tx_pkts, tx_bytes, tx_drop_full_ring, tx_drop_nomem; A2 = the
+    /// rx_drop_{short,unknown_ethertype} + rx_arp/tx_arp pair.
+    #[test]
+    fn all_eth_counters_zero_at_construction() {
+        let c = Counters::new();
+        // A1
+        assert_eq!(c.eth.rx_pkts.load(Ordering::Relaxed), 0);
+        assert_eq!(c.eth.rx_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(c.eth.rx_drop_miss_mac.load(Ordering::Relaxed), 0);
+        assert_eq!(c.eth.rx_drop_nomem.load(Ordering::Relaxed), 0);
+        assert_eq!(c.eth.tx_pkts.load(Ordering::Relaxed), 0);
+        assert_eq!(c.eth.tx_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(c.eth.tx_drop_full_ring.load(Ordering::Relaxed), 0);
+        assert_eq!(c.eth.tx_drop_nomem.load(Ordering::Relaxed), 0);
+        // A2
+        assert_eq!(c.eth.rx_drop_short.load(Ordering::Relaxed), 0);
+        assert_eq!(c.eth.rx_drop_unknown_ethertype.load(Ordering::Relaxed), 0);
+        assert_eq!(c.eth.rx_arp.load(Ordering::Relaxed), 0);
+        assert_eq!(c.eth.tx_arp.load(Ordering::Relaxed), 0);
+    }
+
+    /// Every named AtomicU64 on IpCounters is zero at construction.
+    #[test]
+    fn all_ip_counters_zero_at_construction() {
+        let c = Counters::new();
+        assert_eq!(c.ip.rx_csum_bad.load(Ordering::Relaxed), 0);
+        assert_eq!(c.ip.rx_ttl_zero.load(Ordering::Relaxed), 0);
+        assert_eq!(c.ip.rx_frag.load(Ordering::Relaxed), 0);
+        assert_eq!(c.ip.rx_icmp_frag_needed.load(Ordering::Relaxed), 0);
+        assert_eq!(c.ip.pmtud_updates.load(Ordering::Relaxed), 0);
+        assert_eq!(c.ip.rx_drop_short.load(Ordering::Relaxed), 0);
+        assert_eq!(c.ip.rx_drop_bad_version.load(Ordering::Relaxed), 0);
+        assert_eq!(c.ip.rx_drop_bad_hl.load(Ordering::Relaxed), 0);
+        assert_eq!(c.ip.rx_drop_not_ours.load(Ordering::Relaxed), 0);
+        assert_eq!(c.ip.rx_drop_unsupported_proto.load(Ordering::Relaxed), 0);
+        assert_eq!(c.ip.rx_tcp.load(Ordering::Relaxed), 0);
+        assert_eq!(c.ip.rx_icmp.load(Ordering::Relaxed), 0);
+    }
+
+    /// Every named AtomicU64 on PollCounters is zero at construction.
+    /// `iters_with_tx` is declared but not incremented until A6.
+    #[test]
+    fn all_poll_counters_zero_at_construction() {
+        let c = Counters::new();
+        assert_eq!(c.poll.iters.load(Ordering::Relaxed), 0);
+        assert_eq!(c.poll.iters_with_rx.load(Ordering::Relaxed), 0);
+        assert_eq!(c.poll.iters_with_tx.load(Ordering::Relaxed), 0);
+        assert_eq!(c.poll.iters_idle.load(Ordering::Relaxed), 0);
+    }
+
+    /// Counters declared for forward-phase accounting: A5 TX retransmit
+    /// (tx_retrans, tx_rto, tx_tlp), A5/A6 explicit RST (conn_rst). These
+    /// live in the struct so the public ABI is stable across phases and
+    /// bindgen doesn't re-layout on phase bumps; they stay at zero in A3.
+    #[test]
+    fn deferred_tcp_counters_zero_at_construction() {
+        let c = Counters::new();
+        assert_eq!(c.tcp.rx_out_of_order.load(Ordering::Relaxed), 0);
+        assert_eq!(c.tcp.tx_retrans.load(Ordering::Relaxed), 0);
+        assert_eq!(c.tcp.tx_rto.load(Ordering::Relaxed), 0);
+        assert_eq!(c.tcp.tx_tlp.load(Ordering::Relaxed), 0);
+        assert_eq!(c.tcp.conn_rst.load(Ordering::Relaxed), 0);
+    }
 }
