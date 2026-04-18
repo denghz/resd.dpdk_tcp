@@ -18,6 +18,7 @@ pub mod tcp_events;
 pub mod tcp_input;
 pub mod tcp_options;
 pub mod tcp_output;
+pub mod tcp_rack;
 pub mod tcp_reassembly;
 pub mod tcp_retrans;
 pub mod tcp_rtt;

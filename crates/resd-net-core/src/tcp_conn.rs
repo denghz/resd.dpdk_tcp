@@ -187,6 +187,8 @@ pub struct TcpConn {
     pub rack_aggressive: bool,
     /// Per-connect opt: when true, RTO does not double on retransmit.
     pub rto_no_backoff: bool,
+    /// A5: RFC 8985 RACK state.
+    pub rack: crate::tcp_rack::RackState,
 }
 
 impl TcpConn {
@@ -242,6 +244,7 @@ impl TcpConn {
             syn_retrans_timer_id: None,
             rack_aggressive: false,
             rto_no_backoff: false,
+            rack: crate::tcp_rack::RackState::new(),
         }
     }
 
@@ -373,5 +376,14 @@ mod tests {
         assert!(c.syn_retrans_timer_id.is_none());
         assert!(!c.rack_aggressive);
         assert!(!c.rto_no_backoff);
+    }
+
+    #[test]
+    fn a5_conn_has_default_rack_state() {
+        let c = TcpConn::new_client(tuple(), 1, 1460, 1024, 2048);
+        assert_eq!(c.rack.xmit_ts_ns, 0);
+        assert_eq!(c.rack.end_seq, 0);
+        assert_eq!(c.rack.min_rtt_us, 0);
+        assert!(!c.rack.dsack_seen);
     }
 }
