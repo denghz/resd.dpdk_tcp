@@ -311,6 +311,9 @@ fn apply_tcp_input_counters(
     if outcome.rx_zero_window {
         inc(&counters.rx_zero_window);
     }
+    if outcome.ws_shift_clamped {
+        inc(&counters.rx_ws_shift_clamped);
+    }
 }
 
 /// EAL is process-global; only initialize once.
@@ -3281,6 +3284,17 @@ mod tests {
         assert_eq!(c.rx_zero_window.load(Ordering::Relaxed), 1);
     }
 
+    // A5 Task 22: parser-layer WS>14 clamp signal → counter bump.
+    #[test]
+    fn apply_tcp_input_counters_maps_ws_shift_clamped() {
+        let c = crate::counters::TcpCounters::default();
+        let mut o = crate::tcp_input::Outcome::base();
+        o.ws_shift_clamped = true;
+        super::apply_tcp_input_counters(&o, &c);
+        use std::sync::atomic::Ordering;
+        assert_eq!(c.rx_ws_shift_clamped.load(Ordering::Relaxed), 1);
+    }
+
     #[test]
     fn apply_tcp_input_counters_base_outcome_no_bumps() {
         let c = crate::counters::TcpCounters::default();
@@ -3299,5 +3313,6 @@ mod tests {
         assert_eq!(c.rx_urgent_dropped.load(Ordering::Relaxed), 0);
         assert_eq!(c.rx_zero_window.load(Ordering::Relaxed), 0);
         assert_eq!(c.rx_dsack.load(Ordering::Relaxed), 0);
+        assert_eq!(c.rx_ws_shift_clamped.load(Ordering::Relaxed), 0);
     }
 }

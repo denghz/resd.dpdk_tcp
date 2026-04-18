@@ -60,6 +60,9 @@ pub struct TcpOpts {
     pub timestamps: Option<(u32, u32)>,
     pub sack_blocks: [SackBlock; MAX_SACK_BLOCKS_DECODE],
     pub sack_block_count: u8,
+    /// RFC 7323 §2.3: set true when the parser clamps a WS>14 advertisement
+    /// back down to 14. Engine observes + logs on handshake.
+    pub ws_clamped: bool,
 }
 
 impl TcpOpts {
@@ -221,7 +224,18 @@ pub fn parse_options(opts: &[u8]) -> Result<TcpOpts, OptionParseError> {
                         if olen != LEN_WSCALE as usize {
                             return Err(OptionParseError::BadKnownLen);
                         }
-                        out.wscale = Some(opts[i + 2]);
+                        // RFC 7323 §2.3 MUST: if shift.cnt > 14, use 14. The
+                        // handshake site (handle_syn_sent) also clamps as
+                        // defense-in-depth; we signal the clamp via
+                        // `ws_clamped` so the engine can log + bump
+                        // `tcp.rx_ws_shift_clamped`.
+                        let shift = opts[i + 2];
+                        if shift > 14 {
+                            out.wscale = Some(14);
+                            out.ws_clamped = true;
+                        } else {
+                            out.wscale = Some(shift);
+                        }
                     }
                     OPT_SACK_PERMITTED => {
                         if olen != LEN_SACK_PERMITTED as usize {
@@ -545,6 +559,28 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn parser_clamps_ws_shift_above_14_to_14_and_signals() {
+        // NOP + WSCALE(15): [0x01, 0x03, 0x03, 0x0F]
+        let buf = [0x01, 0x03, 0x03, 0x0F];
+        let parsed = parse_options(&buf).unwrap();
+        assert_eq!(parsed.wscale, Some(14));
+        assert!(parsed.ws_clamped);
+    }
+
+    #[test]
+    fn parser_does_not_flag_ws_shift_at_or_below_14() {
+        let buf = [0x01, 0x03, 0x03, 0x0E]; // WS=14 exactly
+        let parsed = parse_options(&buf).unwrap();
+        assert_eq!(parsed.wscale, Some(14));
+        assert!(!parsed.ws_clamped);
+
+        let buf2 = [0x01, 0x03, 0x03, 0x07]; // WS=7
+        let parsed2 = parse_options(&buf2).unwrap();
+        assert_eq!(parsed2.wscale, Some(7));
+        assert!(!parsed2.ws_clamped);
     }
 
     #[test]

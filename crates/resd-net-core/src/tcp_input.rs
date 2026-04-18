@@ -166,6 +166,10 @@ pub struct Outcome {
     /// A4 backfill: true iff the peer's advertised window is zero.
     /// Engine bumps `tcp.rx_zero_window`.
     pub rx_zero_window: bool,
+    /// A5 Task 22: peer advertised WS shift > 14 on handshake; parser
+    /// clamped to 14 per RFC 7323 §2.3 MUST. Engine bumps
+    /// `tcp.rx_ws_shift_clamped` + emits a one-shot stderr log.
+    pub ws_shift_clamped: bool,
     /// A5: if the ACK advanced snd.una, this is the new snd.una value.
     /// Engine uses this to prune snd_retrans and potentially cancel RTO.
     pub snd_una_advanced_to: Option<u32>,
@@ -212,6 +216,7 @@ impl Outcome {
             dup_ack: false,
             urgent_dropped: false,
             rx_zero_window: false,
+            ws_shift_clamped: false,
             snd_una_advanced_to: None,
             rtt_sample_taken: false,
             rack_lost_indexes: Vec::new(),
@@ -347,6 +352,21 @@ fn handle_syn_sent(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
         conn.ts_enabled = false;
     }
 
+    // A5 Task 22: parser-layer clamp signal — the peer advertised a WS
+    // shift > 14 and the decoder clamped it to 14 already (see
+    // `tcp_options.rs::parse_options`). The handshake site above is the
+    // defense-in-depth fallback; here we fulfill the RFC 7323 §2.3 SHOULD
+    // by logging once per-conn (the flag only latches on a valid SYN-ACK
+    // that reached this point, so each conn emits at most one line) and
+    // hand the engine an Outcome flag to bump `tcp.rx_ws_shift_clamped`.
+    let ws_shift_clamped = parsed_opts.ws_clamped;
+    if ws_shift_clamped {
+        eprintln!(
+            "resd_net: peer advertised WS shift > 14 on conn {:?}; clamped to 14 per RFC 7323 §2.3",
+            conn.four_tuple()
+        );
+    }
+
     // A5 Task 18: SYN-ACK accepted — hand the engine the SYN-retransmit
     // timer id so it can cancel the pending fire (we can't touch the
     // engine's timer wheel from here). `take()` zeros the field so a
@@ -358,6 +378,7 @@ fn handle_syn_sent(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
         new_state: Some(TcpState::Established),
         connected: true,
         syn_retrans_timer_to_cancel,
+        ws_shift_clamped,
         ..Outcome::base()
     }
 }
