@@ -573,6 +573,19 @@ impl Engine {
             dispatch(conn, &parsed)
         };
 
+        // RFC 9293 §3.10.7.8: restart the 2×MSL timer on any in-window
+        // segment received in TIME_WAIT.
+        {
+            let mut ft = self.flow_table.borrow_mut();
+            if let Some(conn) = ft.get_mut(handle) {
+                if conn.state == TcpState::TimeWait && outcome.tx == TxAction::Ack {
+                    let msl_ns = (self.cfg.tcp_msl_ms as u64) * 1_000_000;
+                    conn.time_wait_deadline_ns =
+                        Some(crate::clock::now_ns().saturating_add(2 * msl_ns));
+                }
+            }
+        }
+
         if let Some(new_state) = outcome.new_state {
             self.transition_conn(handle, new_state);
         }
@@ -581,6 +594,10 @@ impl Engine {
             TxAction::Ack => self.emit_ack(handle),
             TxAction::Rst => {
                 self.emit_rst(handle, &parsed);
+                self.transition_conn(handle, TcpState::Closed);
+            }
+            TxAction::RstForSynSentBadAck => {
+                self.emit_rst_for_syn_sent_bad_ack(&tuple, &parsed);
                 self.transition_conn(handle, TcpState::Closed);
             }
             TxAction::None => {}
@@ -688,6 +705,36 @@ impl Engine {
         }
     }
 
+    /// Per RFC 9293 §3.10.7.3 SYN_SENT: send `<SEQ=SEG.ACK><CTL=RST>`
+    /// to reject an ACK that doesn't cover our SYN. No ACK flag, no window.
+    fn emit_rst_for_syn_sent_bad_ack(
+        &self,
+        tuple: &FourTuple,
+        incoming: &crate::tcp_input::ParsedSegment,
+    ) {
+        use crate::counters::inc;
+        use crate::tcp_output::{build_segment, SegmentTx, TCP_RST};
+        let seg = SegmentTx {
+            src_mac: self.our_mac,
+            dst_mac: self.cfg.gateway_mac,
+            src_ip: tuple.local_ip,
+            dst_ip: tuple.peer_ip,
+            src_port: tuple.local_port,
+            dst_port: tuple.peer_port,
+            seq: incoming.ack,
+            ack: 0,
+            flags: TCP_RST, // no ACK flag
+            window: 0,
+            mss_option: None,
+            payload: &[],
+        };
+        let mut buf = [0u8; 64];
+        let Some(n) = build_segment(&seg, &mut buf) else { return; };
+        if self.tx_frame(&buf[..n]) {
+            inc(&self.counters.tcp.tx_rst);
+        }
+    }
+
     /// Reply RST to a segment whose 4-tuple has no matching flow.
     /// Per RFC 9293 §3.10.7.1: if the incoming has ACK set, seq=incoming.ack;
     /// else seq=0, ack=incoming.seq+payload_len+SYN_FLAG+FIN_FLAG, flags=RST|ACK.
@@ -785,7 +832,15 @@ impl Engine {
             peer_port,
         };
         let iss = self.iss_gen.next(&tuple);
-        let our_mss = self.cfg.tcp_mss.min(u16::MAX as u32) as u16;
+        // Clamp our advertised MSS to the NIC's actual MTU minus
+        // IPv4(20) + TCP(20) headers. Per RFC 6691 §5.1 / spec §6.3.
+        let mut nic_mtu: u16 = 1500;
+        unsafe {
+            // Best-effort: on failure, fall back to default MTU.
+            let _ = sys::resd_rte_eth_dev_get_mtu(self.cfg.port_id, &mut nic_mtu);
+        }
+        let mtu_mss = nic_mtu.saturating_sub(40) as u32; // 40 = IP(20) + TCP(20)
+        let our_mss = self.cfg.tcp_mss.min(mtu_mss).min(u16::MAX as u32) as u16;
         let recv_wnd = self.cfg.recv_buffer_bytes.min(u16::MAX as u32);
         let conn = TcpConn::new_client(
             tuple,

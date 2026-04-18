@@ -36,5 +36,6 @@ void resd_rte_pktmbuf_free(struct rte_mbuf *m);
 struct rte_mbuf *resd_rte_pktmbuf_alloc(struct rte_mempool *mp);
 char *resd_rte_pktmbuf_append(struct rte_mbuf *m, uint16_t len);
 int resd_rte_eth_macaddr_get(uint16_t port_id, struct rte_ether_addr *mac_addr);
+int resd_rte_eth_dev_get_mtu(uint16_t port_id, uint16_t *mtu);
 void *resd_rte_pktmbuf_data(const struct rte_mbuf *m);
 uint16_t resd_rte_pktmbuf_data_len(const struct rte_mbuf *m);

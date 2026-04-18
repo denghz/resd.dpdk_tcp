@@ -147,6 +147,9 @@ pub enum TxAction {
     None,
     Ack,
     Rst,
+    /// RFC 9293 §3.10.7.3: SYN_SENT rejects an ACK out of range with
+    /// `<SEQ=SEG.ACK><CTL=RST>`. No ACK bit; seq carries the peer's ack value.
+    RstForSynSentBadAck,
 }
 
 /// Outcome of dispatching a segment to a per-state handler.
@@ -216,7 +219,13 @@ fn handle_syn_sent(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
     // without ACK) transitions to SYN_RECEIVED per RFC 9293 — deferred
     // to A4. We drop it here.
     if (seg.flags & TCP_SYN) == 0 {
-        return Outcome::rst();
+        return Outcome {
+            tx: TxAction::RstForSynSentBadAck,
+            new_state: Some(TcpState::Closed),
+            delivered: 0,
+            connected: false,
+            closed: true,
+        };
     }
 
     if (seg.flags & TCP_ACK) == 0 {
@@ -229,7 +238,13 @@ fn handle_syn_sent(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
     if !seq_le(conn.snd_una.wrapping_add(1), seg.ack)
         || !seq_le(seg.ack, conn.snd_nxt)
     {
-        return Outcome::rst();
+        return Outcome {
+            tx: TxAction::RstForSynSentBadAck,
+            new_state: Some(TcpState::Closed),
+            delivered: 0,
+            connected: false,
+            closed: true,
+        };
     }
 
     // Update state per RFC 9293.
@@ -562,7 +577,7 @@ mod tests {
             payload: &[], options: &[],
         };
         let out = dispatch(&mut c, &seg);
-        assert_eq!(out.tx, TxAction::Rst);
+        assert_eq!(out.tx, TxAction::RstForSynSentBadAck);
     }
 
     #[test]

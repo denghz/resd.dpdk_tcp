@@ -41,6 +41,12 @@ int resd_rte_eth_macaddr_get(uint16_t port_id, struct rte_ether_addr *mac_addr) 
     return rte_eth_macaddr_get(port_id, mac_addr);
 }
 
+/* rte_eth_dev_get_mtu is a real extern but we re-export for shim-prefix
+ * consistency. Returns 0 on success + writes MTU to *mtu, negative errno otherwise. */
+int resd_rte_eth_dev_get_mtu(uint16_t port_id, uint16_t *mtu) {
+    return rte_eth_dev_get_mtu(port_id, mtu);
+}
+
 /* mbuf field accessors — struct rte_mbuf is opaque to bindgen (packed
  * anonymous unions defeat its layout engine), so expose the two fields
  * our hot path needs as real C functions.
