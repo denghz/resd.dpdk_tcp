@@ -347,7 +347,28 @@ impl Engine {
         )?;
 
         // Configure port: one RX queue + one TX queue for Phase A1.
-        let eth_conf: sys::rte_eth_conf = unsafe { std::mem::zeroed() };
+        // A5: enable MULTI_SEGS for retransmit mbuf-chain (spec §6.5, §8.2).
+        //
+        // `RTE_ETH_TX_OFFLOAD_MULTI_SEGS` is defined in `rte_ethdev.h` as
+        // `RTE_BIT64(15)`, a function-like macro bindgen does not expand,
+        // so the FFI crate does not expose it as a Rust const. The bit
+        // position is part of DPDK's stable ethdev ABI (DPDK 23.11).
+        const RTE_ETH_TX_OFFLOAD_MULTI_SEGS: u64 = 1u64 << 15;
+
+        let mut eth_conf: sys::rte_eth_conf = unsafe { std::mem::zeroed() };
+        eth_conf.txmode.offloads = RTE_ETH_TX_OFFLOAD_MULTI_SEGS;
+
+        // Warn if the PMD does not advertise support — retransmit will likely fail.
+        let mut dev_info: sys::rte_eth_dev_info = unsafe { std::mem::zeroed() };
+        let info_rc = unsafe { sys::rte_eth_dev_info_get(cfg.port_id, &mut dev_info) };
+        if info_rc == 0 && (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MULTI_SEGS) == 0 {
+            eprintln!(
+                "resd_net: PMD on port {} does not advertise RTE_ETH_TX_OFFLOAD_MULTI_SEGS; \
+                 A5 retransmit chain may fail — check NIC/PMD support",
+                cfg.port_id
+            );
+        }
+
         let rc = unsafe { sys::rte_eth_dev_configure(cfg.port_id, 1, 1, &eth_conf as *const _) };
         if rc != 0 {
             return Err(Error::PortConfigure(cfg.port_id, unsafe {
