@@ -572,6 +572,7 @@ fn handle_established(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
         };
         if let Some(rtt) = ts_sample {
             conn.rtt_est.sample(rtt);
+            conn.rack.update_min_rtt(rtt);
             rtt_sample_taken = true;
         } else if let Some(front) = conn.snd_retrans.front() {
             let front_end = front.seq.wrapping_add(front.len as u32);
@@ -579,6 +580,7 @@ fn handle_established(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
                 let rtt = now_us.wrapping_sub((front.first_tx_ts_ns / 1_000) as u32);
                 if (1..60_000_000).contains(&rtt) {
                     conn.rtt_est.sample(rtt);
+                    conn.rack.update_min_rtt(rtt);
                     rtt_sample_taken = true;
                 }
             }
@@ -655,8 +657,9 @@ fn handle_established(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
             }
         }
         // Compute reo_wnd from current conn state. `conn.rack.min_rtt_us`
-        // is 0 until a later task wires `update_min_rtt`;
-        // `compute_reo_wnd_us` tolerates that via the 1ms floor.
+        // is wired by the RTT sampling block above (TS-source + Karn's
+        // fallback); until the first sample lands, `compute_reo_wnd_us`
+        // tolerates a zero min_rtt via the 1ms floor.
         let reo_wnd_us = crate::tcp_rack::compute_reo_wnd_us(
             conn.rack_aggressive,
             conn.rack.min_rtt_us,

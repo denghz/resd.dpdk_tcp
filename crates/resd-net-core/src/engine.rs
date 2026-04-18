@@ -1544,6 +1544,65 @@ impl Engine {
                     c.timer_ids.retain(|t| *t != id);
                 }
             }
+
+            // A5 Task 33.2 / RFC 6298 §5.3 step 5.3: on any ACK advancing
+            // snd.una that leaves snd_retrans non-empty (partial ACK),
+            // restart the RTO timer with `now + rto_us`. The cancel-on-empty
+            // block above handles the full-drain case; here we re-arm the
+            // timer so the remaining in-flight segment gets a fresh window
+            // rather than inheriting the original arming from the oldest
+            // now-acked segment. Borrow ordering mirrors the Task 11/17
+            // 4-phase pattern:
+            //   1. shared-borrow flow_table to decide need_restart, release.
+            //   2. mut-borrow flow_table to `.take()` old rto_timer_id, release.
+            //   3. mut-borrow timer_wheel to cancel, release.
+            //   4. shared-borrow flow_table to read rto_us + now_ns, release.
+            //   5. mut-borrow timer_wheel to add new timer, release.
+            //   6. mut-borrow flow_table to stash new id + push to timer_ids.
+            let need_restart = {
+                let ft = self.flow_table.borrow();
+                ft.get(handle)
+                    .map(|c| !c.snd_retrans.is_empty() && c.rto_timer_id.is_some())
+                    .unwrap_or(false)
+            };
+            if need_restart {
+                let old_id = {
+                    let mut ft = self.flow_table.borrow_mut();
+                    ft.get_mut(handle).and_then(|c| c.rto_timer_id.take())
+                };
+                if let Some(id) = old_id {
+                    self.timer_wheel.borrow_mut().cancel(id);
+                    let mut ft = self.flow_table.borrow_mut();
+                    if let Some(c) = ft.get_mut(handle) {
+                        c.timer_ids.retain(|t| *t != id);
+                    }
+                }
+                let (rto_us, now_ns) = {
+                    let ft = self.flow_table.borrow();
+                    (
+                        ft.get(handle).map(|c| c.rtt_est.rto_us()).unwrap_or(0),
+                        crate::clock::now_ns(),
+                    )
+                };
+                if rto_us > 0 {
+                    let fire_at_ns = now_ns + (rto_us as u64 * 1_000);
+                    let id = self.timer_wheel.borrow_mut().add(
+                        now_ns,
+                        crate::tcp_timer_wheel::TimerNode {
+                            fire_at_ns,
+                            owner_handle: handle,
+                            kind: crate::tcp_timer_wheel::TimerKind::Rto,
+                            generation: 0,
+                            cancelled: false,
+                        },
+                    );
+                    let mut ft = self.flow_table.borrow_mut();
+                    if let Some(c) = ft.get_mut(handle) {
+                        c.rto_timer_id = Some(id);
+                        c.timer_ids.push(id);
+                    }
+                }
+            }
         }
 
         // A5 Task 17: TLP schedule (RFC 8985 §7.2). Arm a probe timer at
