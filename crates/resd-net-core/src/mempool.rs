@@ -62,3 +62,43 @@ impl Drop for Mempool {
 // mempool operations themselves are thread-safe per DPDK docs.
 unsafe impl Send for Mempool {}
 unsafe impl Sync for Mempool {}
+
+/// Non-owning handle to an rte_mbuf. Does NOT manage refcount — the engine
+/// explicitly alloc/frees and increments refcnt when stashing into
+/// `SendRetrans`. Per spec §7.2 design: keep unsafe pointer work in
+/// `engine.rs` so this module stays safe-code-only.
+///
+/// `Clone` is cheap (pointer copy) but does NOT refcnt_inc; the caller must
+/// call `rte_mbuf_refcnt_update` explicitly where refcount ownership is
+/// transferred. Tests use `null_for_test()` — the null pointer is never
+/// dereferenced in unit tests (SendRetrans just stores it).
+#[derive(Clone, Copy)]
+pub struct Mbuf {
+    ptr: *mut sys::rte_mbuf,
+}
+
+impl Mbuf {
+    /// Wrap a raw pointer. Caller owns the refcount responsibility.
+    #[inline]
+    pub fn from_ptr(ptr: *mut sys::rte_mbuf) -> Self {
+        Self { ptr }
+    }
+
+    #[inline]
+    pub fn as_ptr(&self) -> *mut sys::rte_mbuf {
+        self.ptr
+    }
+
+    /// Test-only null handle. The pointer is never dereferenced in tests.
+    #[cfg(test)]
+    pub fn null_for_test() -> Self {
+        Self {
+            ptr: std::ptr::null_mut(),
+        }
+    }
+}
+
+// Safety: mbuf pointers are moved between threads only in ways the engine
+// serializes; `SendRetrans` lives per-conn inside `TcpConn`, which is
+// accessed by one engine lcore at a time. Matches `Mempool`'s Send impl.
+unsafe impl Send for Mbuf {}
