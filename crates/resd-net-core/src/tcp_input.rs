@@ -110,36 +110,6 @@ fn tcp_pseudo_csum(src_ip: u32, dst_ip: u32, tcp_seg_len: u32, tcp_bytes: &[u8])
     crate::l3_ip::internet_checksum(&buf)
 }
 
-/// Parse the TCP options field for a MSS value. Returns 536 (RFC 9293
-/// §3.7.1 default) when absent. Unknown options are skipped by `len`.
-pub fn parse_mss_option(options: &[u8]) -> u16 {
-    let mut i = 0;
-    while i < options.len() {
-        match options[i] {
-            0 => return 536, // End of options
-            1 => { i += 1; } // NOP
-            2 => {
-                // MSS option
-                if i + 4 > options.len() || options[i + 1] != 4 {
-                    return 536;
-                }
-                return u16::from_be_bytes([options[i + 2], options[i + 3]]);
-            }
-            _ => {
-                if i + 1 >= options.len() {
-                    return 536;
-                }
-                let olen = options[i + 1] as usize;
-                if olen < 2 {
-                    return 536;
-                }
-                i += olen;
-            }
-        }
-    }
-    536
-}
-
 /// What the engine should do next after processing a segment. Emitted
 /// by the per-state handlers and consumed by the engine's dispatch code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,32 +127,52 @@ pub enum TxAction {
 pub struct Outcome {
     pub tx: TxAction,
     pub new_state: Option<TcpState>,
-    /// Number of payload bytes delivered to recv queue this segment.
-    /// `> 0` implies the engine should enqueue a Readable event.
     pub delivered: u32,
-    /// Bytes peer sent that exceeded our recv buffer's free_space.
-    /// Engine bumps `tcp.recv_buf_drops` by this count. See
-    /// `feedback_performance_first_flow_control.md`.
     pub buf_full_drop: u32,
-    /// Non-zero iff this segment carried in-window payload at a seq
-    /// ahead of `rcv_nxt` (hole). A3 has no reassembly queue (AD-6),
-    /// so the payload is dropped and counted. Engine bumps
-    /// `tcp.rx_out_of_order` by 1 when `> 0`. A4 replaces this with
-    /// real reassembly + byte-level accounting.
+    /// Legacy A3 counter path. A4 always leaves this at 0 (OOO payload
+    /// now goes through `reassembly_queued_bytes`); kept in the struct
+    /// until an A5+ task drops it from all call sites.
     pub ooo_drop: u32,
-    /// True iff this segment completed a handshake (SYN_SENT → ESTABLISHED).
+    /// A4: bytes newly buffered into `recv.reorder` on this segment.
+    /// Engine bumps `tcp.rx_reassembly_queued` once when > 0.
+    pub reassembly_queued_bytes: u32,
+    /// A4: OOO segments drained by the gap-close at the end of this
+    /// segment's processing. Engine bumps
+    /// `tcp.rx_reassembly_hole_filled` by this count.
+    pub reassembly_hole_filled: u32,
+    /// A4: true iff a PAWS check rejected this segment. Engine bumps
+    /// `tcp.rx_paws_rejected` when true.
+    pub paws_rejected: bool,
+    /// A4: true iff the option decoder rejected a malformed option on
+    /// this segment. Engine bumps `tcp.rx_bad_option` when true.
+    pub bad_option: bool,
+    /// A4: number of peer SACK blocks decoded from this segment's ACK.
+    /// Engine bumps `tcp.rx_sack_blocks` by this count.
+    pub sack_blocks_decoded: u32,
     pub connected: bool,
-    /// True iff this segment completed a clean close (→ CLOSED or
-    /// entered TIME_WAIT which reaps to CLOSED).
     pub closed: bool,
 }
 
 impl Outcome {
-    pub fn none() -> Self {
-        Self { tx: TxAction::None, new_state: None, delivered: 0, buf_full_drop: 0, ooo_drop: 0, connected: false, closed: false }
+    pub fn base() -> Self {
+        Self {
+            tx: TxAction::None,
+            new_state: None,
+            delivered: 0,
+            buf_full_drop: 0,
+            ooo_drop: 0,
+            reassembly_queued_bytes: 0,
+            reassembly_hole_filled: 0,
+            paws_rejected: false,
+            bad_option: false,
+            sack_blocks_decoded: 0,
+            connected: false,
+            closed: false,
+        }
     }
+    pub fn none() -> Self { Self::base() }
     pub fn rst() -> Self {
-        Self { tx: TxAction::Rst, new_state: Some(TcpState::Closed), delivered: 0, buf_full_drop: 0, ooo_drop: 0, connected: false, closed: true }
+        Self { tx: TxAction::Rst, new_state: Some(TcpState::Closed), closed: true, ..Self::base() }
     }
 }
 
@@ -217,11 +207,8 @@ fn handle_syn_sent(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
             return Outcome {
                 tx: TxAction::None,
                 new_state: Some(TcpState::Closed),
-                delivered: 0,
-                buf_full_drop: 0,
-                ooo_drop: 0,
-                connected: false,
                 closed: true,
+                ..Outcome::base()
             };
         }
         return Outcome::none();
@@ -234,11 +221,8 @@ fn handle_syn_sent(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
         return Outcome {
             tx: TxAction::RstForSynSentBadAck,
             new_state: Some(TcpState::Closed),
-            delivered: 0,
-            buf_full_drop: 0,
-            ooo_drop: 0,
-            connected: false,
             closed: true,
+            ..Outcome::base()
         };
     }
 
@@ -255,31 +239,51 @@ fn handle_syn_sent(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
         return Outcome {
             tx: TxAction::RstForSynSentBadAck,
             new_state: Some(TcpState::Closed),
-            delivered: 0,
-            buf_full_drop: 0,
-            ooo_drop: 0,
-            connected: false,
             closed: true,
+            ..Outcome::base()
         };
     }
 
-    // Update state per RFC 9293.
+    let parsed_opts = match crate::tcp_options::parse_options(seg.options) {
+        Ok(o) => o,
+        Err(_) => {
+            return Outcome {
+                tx: TxAction::Rst,
+                new_state: Some(TcpState::Closed),
+                closed: true,
+                bad_option: true,
+                ..Outcome::base()
+            };
+        }
+    };
+
     conn.irs = seg.seq;
     conn.rcv_nxt = seg.seq.wrapping_add(1);
     conn.snd_una = seg.ack;
-    conn.snd_wnd = seg.window as u32;
+    // Scale the peer's advertised window by their WS if they advertised one.
+    let peer_ws = parsed_opts.wscale.unwrap_or(0);
+    conn.snd_wnd = (seg.window as u32).wrapping_shl(peer_ws as u32);
     conn.snd_wl1 = seg.seq;
     conn.snd_wl2 = seg.ack;
-    conn.peer_mss = parse_mss_option(seg.options);
+    conn.peer_mss = parsed_opts.mss.unwrap_or(536);
+
+    match parsed_opts.wscale {
+        Some(ws_peer) => { conn.ws_shift_in = ws_peer; }
+        None => { conn.ws_shift_in = 0; conn.ws_shift_out = 0; }
+    }
+    conn.sack_enabled = parsed_opts.sack_permitted;
+    if let Some((tsval, _tsecr)) = parsed_opts.timestamps {
+        conn.ts_enabled = true;
+        conn.ts_recent = tsval;
+    } else {
+        conn.ts_enabled = false;
+    }
 
     Outcome {
         tx: TxAction::Ack,
         new_state: Some(TcpState::Established),
-        delivered: 0,
-        buf_full_drop: 0,
-        ooo_drop: 0,
         connected: true,
-        closed: false,
+        ..Outcome::base()
     }
 }
 
@@ -291,11 +295,8 @@ fn handle_established(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
         return Outcome {
             tx: TxAction::None,
             new_state: Some(TcpState::Closed),
-            delivered: 0,
-            buf_full_drop: 0,
-            ooo_drop: 0,
-            connected: false,
             closed: true,
+            ..Outcome::base()
         };
     }
 
@@ -319,7 +320,7 @@ fn handle_established(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
     };
     if !in_win {
         // Out-of-window: challenge ACK and drop.
-        return Outcome { tx: TxAction::Ack, new_state: None, delivered: 0, buf_full_drop: 0, ooo_drop: 0, connected: false, closed: false };
+        return Outcome { tx: TxAction::Ack, ..Outcome::base() };
     }
 
     // ACK processing — RFC 9293 §3.10.7.4, "ESTABLISHED STATE" ACK handling.
@@ -340,7 +341,7 @@ fn handle_established(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
         }
     } else if seq_lt(conn.snd_nxt, seg.ack) {
         // ACK ahead of snd_nxt → we never sent that much; challenge ACK.
-        return Outcome { tx: TxAction::Ack, new_state: None, delivered: 0, buf_full_drop: 0, ooo_drop: 0, connected: false, closed: false };
+        return Outcome { tx: TxAction::Ack, ..Outcome::base() };
     }
     // Else: duplicate ACK (ack <= snd_una) — no-op for A3 (A5 uses it for fast retx).
 
@@ -385,7 +386,7 @@ fn handle_established(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
         TxAction::None
     };
 
-    Outcome { tx, new_state, delivered, buf_full_drop, ooo_drop, connected: false, closed: false }
+    Outcome { tx, new_state, delivered, buf_full_drop, ooo_drop, ..Outcome::base() }
 }
 
 fn handle_close_path(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
@@ -396,18 +397,15 @@ fn handle_close_path(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
         return Outcome {
             tx: TxAction::None,
             new_state: Some(TcpState::Closed),
-            delivered: 0,
-            buf_full_drop: 0,
-            ooo_drop: 0,
-            connected: false,
             closed: true,
+            ..Outcome::base()
         };
     }
 
     // TIME_WAIT: replay-ACK anything the peer sends; reaper will move
     // us to CLOSED via the engine tick (Task 19).
     if conn.state == TcpState::TimeWait {
-        return Outcome { tx: TxAction::Ack, new_state: None, delivered: 0, buf_full_drop: 0, ooo_drop: 0, connected: false, closed: false };
+        return Outcome { tx: TxAction::Ack, ..Outcome::base() };
     }
 
     // Segment must have ACK in these states.
@@ -425,7 +423,7 @@ fn handle_close_path(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
             && in_window(conn.rcv_nxt, last, conn.rcv_wnd)
     };
     if !in_win {
-        return Outcome { tx: TxAction::Ack, new_state: None, delivered: 0, buf_full_drop: 0, ooo_drop: 0, connected: false, closed: false };
+        return Outcome { tx: TxAction::Ack, ..Outcome::base() };
     }
 
     // Advance snd_una if ack covers more of our stream.
@@ -457,7 +455,7 @@ fn handle_close_path(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
     };
 
     let closed = new_state == Some(TcpState::Closed);
-    Outcome { tx, new_state, delivered: 0, buf_full_drop: 0, ooo_drop: 0, connected: false, closed }
+    Outcome { tx, new_state, closed, ..Outcome::base() }
 }
 
 /// Build the 4-tuple from a parsed segment's ports + the IPv4 header's
@@ -474,6 +472,7 @@ pub fn tuple_from_segment(src_ip: u32, dst_ip: u32, seg: &ParsedSegment) -> Four
 }
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
     use crate::tcp_output::{build_segment, SegmentTx, TCP_PSH};
@@ -529,19 +528,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_mss_option_present() {
-        let frame = build_test_segment(TCP_SYN | TCP_ACK, Some(1460), &[]);
-        let tcp = &frame[14 + 20..];
-        let p = parse_segment(tcp, 0x0a_00_00_01, 0x0a_00_00_02, false).unwrap();
-        assert_eq!(parse_mss_option(p.options), 1460);
-    }
-
-    #[test]
-    fn parse_mss_absent_returns_default() {
-        assert_eq!(parse_mss_option(&[]), 536);
-    }
-
-    #[test]
     fn bad_tcp_csum_rejected() {
         let mut frame = build_test_segment(TCP_ACK, None, b"hi");
         // Flip a payload bit — csum must now mismatch.
@@ -564,33 +550,76 @@ mod tests {
     }
 
     #[test]
-    fn syn_sent_syn_ack_transitions_to_established() {
+    fn syn_sent_syn_ack_negotiates_full_option_set() {
         use crate::flow_table::FourTuple;
         use crate::tcp_conn::TcpConn;
+        use crate::tcp_options::TcpOpts;
 
         let t = FourTuple { local_ip: 0x0a_00_00_02, local_port: 40000,
                             peer_ip: 0x0a_00_00_01, peer_port: 5000 };
         let mut c = TcpConn::new_client(t, 1000, 1460, 1024, 2048);
         c.state = TcpState::SynSent;
-        c.snd_nxt = c.snd_nxt.wrapping_add(1); // after SYN TX
-        // Craft a SYN-ACK: their seq=5000, their ack=1001 (our iss+1), MSS=1400.
+        c.snd_nxt = c.snd_nxt.wrapping_add(1);
+        c.ws_shift_out = 7;
+
+        let mut peer_opts = TcpOpts::default();
+        peer_opts.mss = Some(1400);
+        peer_opts.wscale = Some(9);
+        peer_opts.sack_permitted = true;
+        peer_opts.timestamps = Some((0xCAFEBABE, 0x00001001));
+        let mut opts_buf = [0u8; 40];
+        let opts_len = peer_opts.encode(&mut opts_buf).unwrap();
+
         let seg = ParsedSegment {
             src_port: 5000, dst_port: 40000,
             seq: 5000, ack: 1001,
-            flags: TCP_SYN | TCP_ACK,
-            window: 65535,
-            header_len: 24,
-            payload: &[],
-            options: &[2, 4, 0x05, 0x78], // MSS=1400
+            flags: TCP_SYN | TCP_ACK, window: 65535,
+            header_len: 20 + opts_len, payload: &[],
+            options: &opts_buf[..opts_len],
         };
         let out = dispatch(&mut c, &seg);
         assert_eq!(out.new_state, Some(TcpState::Established));
         assert_eq!(out.tx, TxAction::Ack);
         assert!(out.connected);
-        assert_eq!(c.rcv_nxt, 5001);
-        assert_eq!(c.snd_una, 1001);
-        assert_eq!(c.irs, 5000);
         assert_eq!(c.peer_mss, 1400);
+        assert_eq!(c.ws_shift_in, 9);
+        assert_eq!(c.ws_shift_out, 7);
+        assert!(c.sack_enabled);
+        assert!(c.ts_enabled);
+        assert_eq!(c.ts_recent, 0xCAFEBABE);
+    }
+
+    #[test]
+    fn syn_sent_peer_without_wscale_zeroes_both_shifts() {
+        use crate::flow_table::FourTuple;
+        use crate::tcp_conn::TcpConn;
+        use crate::tcp_options::TcpOpts;
+
+        let t = FourTuple { local_ip: 0x0a_00_00_02, local_port: 40000,
+                            peer_ip: 0x0a_00_00_01, peer_port: 5000 };
+        let mut c = TcpConn::new_client(t, 1000, 1460, 1024, 2048);
+        c.state = TcpState::SynSent;
+        c.snd_nxt = c.snd_nxt.wrapping_add(1);
+        c.ws_shift_out = 7;
+
+        let mut peer_opts = TcpOpts::default();
+        peer_opts.mss = Some(1400);
+        peer_opts.timestamps = Some((1, 2));
+        let mut opts_buf = [0u8; 40];
+        let opts_len = peer_opts.encode(&mut opts_buf).unwrap();
+
+        let seg = ParsedSegment {
+            src_port: 5000, dst_port: 40000,
+            seq: 5000, ack: 1001,
+            flags: TCP_SYN | TCP_ACK, window: 65535,
+            header_len: 20 + opts_len, payload: &[],
+            options: &opts_buf[..opts_len],
+        };
+        let out = dispatch(&mut c, &seg);
+        assert_eq!(out.new_state, Some(TcpState::Established));
+        // RFC 7323 §1.3: WS only active if both sides advertise.
+        assert_eq!(c.ws_shift_in, 0);
+        assert_eq!(c.ws_shift_out, 0);
     }
 
     #[test]
