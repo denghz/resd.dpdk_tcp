@@ -145,6 +145,35 @@ impl ReorderQueue {
             self.segments.insert(idx, OooSegment { seq, payload });
         }
     }
+
+    /// Pop the contiguous prefix of segments whose seq range starts at
+    /// or before `rcv_nxt`. For each popped segment, yield the portion
+    /// of its payload that lies at or after `rcv_nxt`. Returns the
+    /// concatenated bytes and the number of segments drained.
+    pub fn drain_contiguous_from(&mut self, mut rcv_nxt: u32) -> (Vec<u8>, u32) {
+        let mut out = Vec::new();
+        let mut drained_segments = 0u32;
+
+        while !self.segments.is_empty() {
+            let seg = &self.segments[0];
+            if seq_lt(rcv_nxt, seg.seq) { break; }
+            let seg_end = seg.end_seq();
+            if seq_le(seg_end, rcv_nxt) {
+                // Entire segment behind rcv_nxt — drop.
+                self.total_bytes = self.total_bytes.saturating_sub(seg.payload.len() as u32);
+                self.segments.remove(0);
+                drained_segments += 1;
+                continue;
+            }
+            let skip = rcv_nxt.wrapping_sub(seg.seq) as usize;
+            out.extend_from_slice(&seg.payload[skip..]);
+            rcv_nxt = seg_end;
+            self.total_bytes = self.total_bytes.saturating_sub(seg.payload.len() as u32);
+            self.segments.remove(0);
+            drained_segments += 1;
+        }
+        (out, drained_segments)
+    }
 }
 
 #[cfg(test)]
@@ -236,5 +265,66 @@ mod tests {
         let out = q.insert(100, b"");
         assert_eq!(out.newly_buffered, 0);
         assert!(q.is_empty());
+    }
+
+    #[test]
+    fn drain_with_no_contiguous_front_returns_empty() {
+        let mut q = ReorderQueue::new(1024);
+        q.insert(200, b"zzz");
+        let (bytes, n) = q.drain_contiguous_from(100);
+        assert!(bytes.is_empty());
+        assert_eq!(n, 0);
+        assert_eq!(q.len(), 1);
+    }
+
+    #[test]
+    fn drain_single_adjacent_segment() {
+        let mut q = ReorderQueue::new(1024);
+        q.insert(100, b"abc");
+        let (bytes, n) = q.drain_contiguous_from(100);
+        assert_eq!(&bytes, b"abc");
+        assert_eq!(n, 1);
+        assert!(q.is_empty());
+        assert_eq!(q.total_bytes(), 0);
+    }
+
+    #[test]
+    fn drain_chains_through_touching_segments() {
+        let mut q = ReorderQueue::new(1024);
+        q.insert(100, b"aaa");
+        q.insert(103, b"bbb");
+        q.insert(200, b"zzz");
+        let (bytes, n) = q.drain_contiguous_from(100);
+        assert_eq!(&bytes, b"aaabbb");
+        assert_eq!(n, 1);
+        assert_eq!(q.len(), 1);
+        assert_eq!(q.segments()[0].seq, 200);
+    }
+
+    #[test]
+    fn drain_with_rcv_nxt_inside_segment_skips_prefix() {
+        let mut q = ReorderQueue::new(1024);
+        q.insert(100, b"abcdef");
+        let (bytes, n) = q.drain_contiguous_from(103);
+        assert_eq!(&bytes, b"def");
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn drain_past_end_of_segment_drops_entirely() {
+        let mut q = ReorderQueue::new(1024);
+        q.insert(100, b"abc");
+        let (bytes, n) = q.drain_contiguous_from(200);
+        assert!(bytes.is_empty());
+        assert_eq!(n, 1);
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn drain_empty_queue_is_noop() {
+        let mut q = ReorderQueue::new(1024);
+        let (bytes, n) = q.drain_contiguous_from(500);
+        assert!(bytes.is_empty());
+        assert_eq!(n, 0);
     }
 }
