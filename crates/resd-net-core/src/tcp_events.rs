@@ -7,6 +7,19 @@ use std::collections::VecDeque;
 use crate::flow_table::ConnHandle;
 use crate::tcp_state::TcpState;
 
+/// A5 Task 20: which loss detector fired. Carried on
+/// `InternalEvent::TcpLossDetected` for observability; the C ABI layer
+/// narrows this to a `u8` trigger on `resd_net_event_tcp_loss_t`.
+///
+/// Order matches the `u8` encoding at the ABI boundary:
+/// `Rack = 0`, `Tlp = 1`, `Rto = 2`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LossCause {
+    Rack,
+    Tlp,
+    Rto,
+}
+
 /// Event kinds internal to the engine. Translated to public
 /// `resd_net_event_t` values at the C ABI boundary.
 #[derive(Debug, Clone)]
@@ -40,6 +53,24 @@ pub enum InternalEvent {
     Error {
         conn: ConnHandle,
         err: i32,
+    },
+    /// A5 Task 20: retransmit observability. Emitted from each fire
+    /// handler (RTO, RACK, TLP) per-retransmitted segment, gated on
+    /// `EngineConfig::tcp_per_packet_events`. `seq` is the segment
+    /// start sequence number; `rtx_count` is the entry's `xmit_count`
+    /// after the retransmit (≥ 2 for RTO/TLP; ≥ 2 for RACK-driven).
+    TcpRetrans {
+        conn: ConnHandle,
+        seq: u32,
+        rtx_count: u32,
+    },
+    /// A5 Task 20: loss-detection observability. Emitted once per
+    /// detected-loss event (one per fire for RTO/TLP; one per
+    /// `rack_lost_indexes` entry for RACK). Gated on
+    /// `EngineConfig::tcp_per_packet_events`.
+    TcpLossDetected {
+        conn: ConnHandle,
+        cause: LossCause,
     },
 }
 
@@ -105,5 +136,30 @@ mod tests {
         assert_eq!(q.len(), 1);
         let _ = q.pop();
         assert!(q.is_empty());
+    }
+
+    #[test]
+    fn tcp_retrans_event_variant_exists() {
+        let _e = InternalEvent::TcpRetrans {
+            conn: 0,
+            seq: 0,
+            rtx_count: 0,
+        };
+    }
+
+    #[test]
+    fn tcp_loss_detected_event_with_each_cause() {
+        let _rack = InternalEvent::TcpLossDetected {
+            conn: 0,
+            cause: LossCause::Rack,
+        };
+        let _tlp = InternalEvent::TcpLossDetected {
+            conn: 0,
+            cause: LossCause::Tlp,
+        };
+        let _rto = InternalEvent::TcpLossDetected {
+            conn: 0,
+            cause: LossCause::Rto,
+        };
     }
 }

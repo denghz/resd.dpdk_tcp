@@ -192,6 +192,14 @@ pub struct EngineConfig {
     pub tcp_initial_rto_ms: u32,
     pub tcp_msl_ms: u32,
     pub tcp_nagle: bool,
+
+    // Phase A5 additions
+    /// A5 Task 20: when `true`, fire handlers (RTO, RACK, TLP) emit
+    /// `TcpRetrans` + `TcpLossDetected` events per retransmit / detected
+    /// loss. Default `false` — counters alone satisfy the default
+    /// observability contract; this flag is for forensic sessions where
+    /// per-packet event logging is desired.
+    pub tcp_per_packet_events: bool,
 }
 
 impl Default for EngineConfig {
@@ -216,6 +224,7 @@ impl Default for EngineConfig {
             tcp_initial_rto_ms: 50,
             tcp_msl_ms: 30_000,
             tcp_nagle: false,
+            tcp_per_packet_events: false,
         }
     }
 }
@@ -806,6 +815,34 @@ impl Engine {
         self.retransmit(handle, 0);
         crate::counters::inc(&self.counters.tcp.tx_rto);
 
+        // Task 20: forensic per-packet event emission, gated by
+        // `tcp_per_packet_events`. Order: TcpRetrans (the segment we
+        // just retransmitted) then TcpLossDetected{cause: Rto} (declares
+        // why). Placed BEFORE the max-retrans-count check so the final
+        // RTO that triggers ETIMEDOUT still emits its per-packet trail
+        // for forensic reconstruction. Both borrows are narrowly scoped
+        // so no nested RefCell overlap with the subsequent backoff /
+        // re-arm phases.
+        if self.cfg.tcp_per_packet_events {
+            let (seq, rtx_count) = {
+                let ft = self.flow_table.borrow();
+                ft.get(handle)
+                    .and_then(|c| c.snd_retrans.front())
+                    .map(|e| (e.seq, e.xmit_count as u32))
+                    .unwrap_or((0, 0))
+            };
+            let mut ev = self.events.borrow_mut();
+            ev.push(InternalEvent::TcpRetrans {
+                conn: handle,
+                seq,
+                rtx_count,
+            });
+            ev.push(InternalEvent::TcpLossDetected {
+                conn: handle,
+                cause: crate::tcp_events::LossCause::Rto,
+            });
+        }
+
         // Task 13: max-retrans-count check. `retransmit()` above bumped
         // `xmit_count` on the front entry; once it crosses the budget we
         // abandon the connection with ETIMEDOUT. A hardcoded constant
@@ -823,8 +860,6 @@ impl Engine {
             self.force_close_etimedout(handle);
             return;
         }
-
-        // Task 20 inserts the RESD_NET_EVT_TCP_RETRANS emission here.
 
         // Phase 4: apply backoff unless per-connect opt-out.
         if !rto_no_backoff {
@@ -919,12 +954,34 @@ impl Engine {
         // in-flight segment. True NewData probing (draining from
         // `snd.pending`) is a Stage 2 follow-up.
         if crate::tcp_tlp::select_probe(!pending_empty, retrans_len > 0).is_some() {
-            self.retransmit(handle, retrans_len - 1);
+            let probe_idx = retrans_len - 1;
+            self.retransmit(handle, probe_idx);
             crate::counters::inc(&self.counters.tcp.tx_tlp);
-        }
 
-        // Task 20 will add RESD_NET_EVT_TCP_LOSS_DETECTED emission here
-        // (cause = LossCause::Tlp) gated on tcp_per_packet_events.
+            // A5 Task 20: per-packet forensic emission, gated by
+            // `tcp_per_packet_events`. Order: TcpRetrans (the probe
+            // segment) then TcpLossDetected{cause: Tlp}. Read seq +
+            // xmit_count from the last entry after retransmit.
+            if self.cfg.tcp_per_packet_events {
+                let (seq, rtx_count) = {
+                    let ft = self.flow_table.borrow();
+                    ft.get(handle)
+                        .and_then(|c| c.snd_retrans.entries.get(probe_idx))
+                        .map(|e| (e.seq, e.xmit_count as u32))
+                        .unwrap_or((0, 0))
+                };
+                let mut ev = self.events.borrow_mut();
+                ev.push(InternalEvent::TcpRetrans {
+                    conn: handle,
+                    seq,
+                    rtx_count,
+                });
+                ev.push(InternalEvent::TcpLossDetected {
+                    conn: handle,
+                    cause: crate::tcp_events::LossCause::Tlp,
+                });
+            }
+        }
     }
 
     /// A5 Task 18: SYN-retransmit fire (spec §6.5). Budget is three
@@ -1379,12 +1436,38 @@ impl Engine {
         // its own flow_table borrows, so we call it in a loop without
         // holding one ourselves. `handle_established` already filtered
         // cum-ACKed entries out of `rack_lost_indexes`, so the forthcoming
-        // prune won't drop any entry referenced here. Event emission
-        // (`TcpLossDetected`) is deferred to Task 20 (per_packet_events gate).
+        // prune won't drop any entry referenced here.
+        //
+        // A5 Task 20: per-packet event emission, gated on
+        // `tcp_per_packet_events`. For each RACK-lost index we read
+        // the retransmitted entry's seq + xmit_count (after the retrans
+        // bumped xmit_count) and emit `TcpRetrans` + `TcpLossDetected
+        // { cause: Rack }`. Each event pair is its own narrow borrow of
+        // flow_table + events so we never hold two RefCell borrows at
+        // once.
         if !outcome.rack_lost_indexes.is_empty() {
             for i in &outcome.rack_lost_indexes {
                 self.retransmit(handle, *i as usize);
                 crate::counters::inc(&self.counters.tcp.tx_rack_loss);
+                if self.cfg.tcp_per_packet_events {
+                    let (seq, rtx_count) = {
+                        let ft = self.flow_table.borrow();
+                        ft.get(handle)
+                            .and_then(|c| c.snd_retrans.entries.get(*i as usize))
+                            .map(|e| (e.seq, e.xmit_count as u32))
+                            .unwrap_or((0, 0))
+                    };
+                    let mut ev = self.events.borrow_mut();
+                    ev.push(InternalEvent::TcpRetrans {
+                        conn: handle,
+                        seq,
+                        rtx_count,
+                    });
+                    ev.push(InternalEvent::TcpLossDetected {
+                        conn: handle,
+                        cause: crate::tcp_events::LossCause::Rack,
+                    });
+                }
             }
         }
 

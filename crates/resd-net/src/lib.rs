@@ -108,6 +108,7 @@ pub unsafe extern "C" fn resd_net_engine_create(
         tcp_initial_rto_ms: init_rto,
         tcp_msl_ms: msl,
         tcp_nagle: cfg.tcp_nagle,
+        tcp_per_packet_events: cfg.tcp_per_packet_events,
     };
     match Engine::new(core_cfg) {
         Ok(e) => box_to_raw(e),
@@ -216,6 +217,48 @@ pub unsafe extern "C" fn resd_net_poll(
                     error: resd_net_event_error_t { err: *err },
                 },
             },
+            // A5 Task 20: per-packet retransmit observability. Emitted
+            // (only) when `tcp_per_packet_events=true`; carries the
+            // just-retransmitted segment's seq + post-retrans xmit_count.
+            resd_net_core::tcp_events::InternalEvent::TcpRetrans {
+                conn,
+                seq,
+                rtx_count,
+            } => resd_net_event_t {
+                kind: resd_net_event_kind_t::RESD_NET_EVT_TCP_RETRANS,
+                conn: *conn as u64,
+                rx_hw_ts_ns: 0,
+                enqueued_ts_ns: ts,
+                u: resd_net_event_payload_t {
+                    tcp_retrans: resd_net_event_tcp_retrans_t {
+                        seq: *seq,
+                        rtx_count: *rtx_count,
+                    },
+                },
+            },
+            // A5 Task 20: loss-detector observability. `trigger` encodes
+            // `LossCause` as `Rack=0`, `Tlp=1`, `Rto=2` (matching enum
+            // order). `first_seq` is left 0 here — the paired TcpRetrans
+            // event that precedes each TcpLossDetected carries the seq.
+            resd_net_core::tcp_events::InternalEvent::TcpLossDetected { conn, cause } => {
+                let trigger: u8 = match cause {
+                    resd_net_core::tcp_events::LossCause::Rack => 0,
+                    resd_net_core::tcp_events::LossCause::Tlp => 1,
+                    resd_net_core::tcp_events::LossCause::Rto => 2,
+                };
+                resd_net_event_t {
+                    kind: resd_net_event_kind_t::RESD_NET_EVT_TCP_LOSS_DETECTED,
+                    conn: *conn as u64,
+                    rx_hw_ts_ns: 0,
+                    enqueued_ts_ns: ts,
+                    u: resd_net_event_payload_t {
+                        tcp_loss: resd_net_event_tcp_loss_t {
+                            first_seq: 0,
+                            trigger,
+                        },
+                    },
+                }
+            }
         };
         unsafe {
             std::ptr::write(events_out.add(filled as usize), event);
