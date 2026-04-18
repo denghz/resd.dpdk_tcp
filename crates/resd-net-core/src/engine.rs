@@ -537,6 +537,17 @@ impl Engine {
         inc(&self.counters.poll.iters_with_rx);
         add(&self.counters.eth.rx_pkts, n as u64);
 
+        // Hot-path poll-saturation signal. Bumped on every poll where
+        // the rx_burst returned the full `BURST` ceiling — "we may be
+        // falling behind the NIC". Single conditional fetch_add per
+        // poll iteration; default-on per spec §9.1.1.
+        #[cfg(feature = "obs-poll-saturation")]
+        {
+            if n == BURST {
+                inc(&self.counters.poll.iters_with_rx_burst_max);
+            }
+        }
+
         // Hot-path TCP-payload-byte accumulator. Per-burst-batched per
         // spec §9.1.1 rule 2: stack-local sum, single fetch_add after
         // the burst drains. Compiled out entirely without the feature.
