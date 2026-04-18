@@ -70,6 +70,43 @@ pub struct TcpCounters {
     /// rcv_wnd to throttle the peer; we keep accepting at full capacity and
     /// expose pressure here so the application can diagnose a slow consumer.
     pub recv_buf_drops: AtomicU64,
+    // Phase A4 additions — slow-path only per spec §9.1.1.
+    /// PAWS (RFC 7323 §5): segment dropped because `SEG.TSval < TS.Recent`.
+    pub rx_paws_rejected: AtomicU64,
+    /// TCP option decoder rejected a malformed option (runaway len, zero
+    /// optlen on unknown kind, known-option wrong length). Extends A3's
+    /// defensive posture (plan I-9) to WSCALE / TS / SACK-permitted / SACK.
+    pub rx_bad_option: AtomicU64,
+    /// OOO segment placed on the reassembly queue (fires on reorder/loss).
+    pub rx_reassembly_queued: AtomicU64,
+    /// Hole closed; contiguous prefix drained from reassembly into recv.
+    pub rx_reassembly_hole_filled: AtomicU64,
+    /// SACK blocks encoded in an outbound ACK (RFC 2018; fires only when
+    /// recv.reorder is non-empty).
+    pub tx_sack_blocks: AtomicU64,
+    /// SACK blocks decoded from an inbound ACK (RFC 2018; fires only on
+    /// peer-side loss).
+    pub rx_sack_blocks: AtomicU64,
+    // Cross-phase slow-path backfill — sites exist from earlier phases but
+    // had no counter until A4 wired them.
+    /// Segment with seq outside `rcv_wnd`; was silently dropped pre-A4.
+    pub rx_bad_seq: AtomicU64,
+    /// ACK acking nothing new or acking future data.
+    pub rx_bad_ack: AtomicU64,
+    /// Duplicate ACK (baseline for A5 fast-retransmit consumer).
+    pub rx_dup_ack: AtomicU64,
+    /// Peer advertised `rwnd=0` — critical trading signal ("exchange is slow").
+    pub rx_zero_window: AtomicU64,
+    /// URG flag segment; Stage 1 doesn't support URG, dropped.
+    pub rx_urgent_dropped: AtomicU64,
+    /// We advertised `rwnd=0` (our recv buffer full).
+    pub tx_zero_window: AtomicU64,
+    /// We emitted a pure window-update segment.
+    pub tx_window_update: AtomicU64,
+    /// `resd_net_connect` rejected because flow table at `max_connections`.
+    pub conn_table_full: AtomicU64,
+    /// TIME_WAIT deadline expired, connection reclaimed.
+    pub conn_time_wait_reaped: AtomicU64,
     /// 11×11 state transition matrix, indexed [from][to] where from/to are
     /// `TcpState as u8`. Per spec §9.1. Unused cells stay at zero.
     pub state_trans: [[AtomicU64; 11]; 11],
@@ -299,5 +336,27 @@ mod tests {
         assert_eq!(c.tcp.tx_retrans.load(Ordering::Relaxed), 0);
         assert_eq!(c.tcp.tx_rto.load(Ordering::Relaxed), 0);
         assert_eq!(c.tcp.tx_tlp.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn a4_new_tcp_counters_exist_and_zero() {
+        let c = Counters::new();
+        // A4 scope
+        assert_eq!(c.tcp.rx_paws_rejected.load(Ordering::Relaxed), 0);
+        assert_eq!(c.tcp.rx_bad_option.load(Ordering::Relaxed), 0);
+        assert_eq!(c.tcp.rx_reassembly_queued.load(Ordering::Relaxed), 0);
+        assert_eq!(c.tcp.rx_reassembly_hole_filled.load(Ordering::Relaxed), 0);
+        assert_eq!(c.tcp.tx_sack_blocks.load(Ordering::Relaxed), 0);
+        assert_eq!(c.tcp.rx_sack_blocks.load(Ordering::Relaxed), 0);
+        // Cross-phase backfill
+        assert_eq!(c.tcp.rx_bad_seq.load(Ordering::Relaxed), 0);
+        assert_eq!(c.tcp.rx_bad_ack.load(Ordering::Relaxed), 0);
+        assert_eq!(c.tcp.rx_dup_ack.load(Ordering::Relaxed), 0);
+        assert_eq!(c.tcp.rx_zero_window.load(Ordering::Relaxed), 0);
+        assert_eq!(c.tcp.rx_urgent_dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(c.tcp.tx_zero_window.load(Ordering::Relaxed), 0);
+        assert_eq!(c.tcp.tx_window_update.load(Ordering::Relaxed), 0);
+        assert_eq!(c.tcp.conn_table_full.load(Ordering::Relaxed), 0);
+        assert_eq!(c.tcp.conn_time_wait_reaped.load(Ordering::Relaxed), 0);
     }
 }
