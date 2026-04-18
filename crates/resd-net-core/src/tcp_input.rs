@@ -9,7 +9,7 @@
 
 use crate::flow_table::FourTuple;
 use crate::tcp_conn::TcpConn;
-use crate::tcp_output::{TCP_ACK, TCP_FIN, TCP_PSH, TCP_RST, TCP_SYN};
+use crate::tcp_output::{TCP_ACK, TCP_FIN, TCP_RST, TCP_SYN};
 use crate::tcp_state::TcpState;
 
 #[derive(Debug, Clone, Copy)]
@@ -250,8 +250,95 @@ fn handle_syn_sent(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
     }
 }
 
-fn handle_established(_conn: &mut TcpConn, _seg: &ParsedSegment) -> Outcome {
-    Outcome::none()
+fn handle_established(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
+    use crate::tcp_seq::{in_window, seq_le, seq_lt};
+
+    // RST → close per RFC 9293 §3.10.7.4.
+    if (seg.flags & TCP_RST) != 0 {
+        return Outcome {
+            tx: TxAction::None,
+            new_state: Some(TcpState::Closed),
+            delivered: 0,
+            connected: false,
+            closed: true,
+        };
+    }
+
+    // Segment must carry ACK in ESTABLISHED.
+    if (seg.flags & TCP_ACK) == 0 {
+        return Outcome::none();
+    }
+
+    // Sequence-window check — RFC 9293 §3.10.7.4. Accept iff either
+    // the seg has no payload and seq==rcv_nxt (pure ACK), or its
+    // payload's first byte lies within our recv window. Our check is
+    // stricter than mTCP's (both edges); see spec §6.1 + plan header.
+    let seg_len = seg.payload.len() as u32
+        + ((seg.flags & TCP_FIN) != 0) as u32; // FIN consumes one
+    let in_win = if seg_len == 0 {
+        seg.seq == conn.rcv_nxt
+    } else {
+        let last = seg.seq.wrapping_add(seg_len).wrapping_sub(1);
+        in_window(conn.rcv_nxt, seg.seq, conn.rcv_wnd)
+            && in_window(conn.rcv_nxt, last, conn.rcv_wnd)
+    };
+    if !in_win {
+        // Out-of-window: challenge ACK and drop.
+        return Outcome { tx: TxAction::Ack, new_state: None, delivered: 0, connected: false, closed: false };
+    }
+
+    // ACK processing — RFC 9293 §3.10.7.4, "ESTABLISHED STATE" ACK handling.
+    if seq_lt(conn.snd_una, seg.ack) && seq_le(seg.ack, conn.snd_nxt) {
+        let acked = seg.ack.wrapping_sub(conn.snd_una) as usize;
+        for _ in 0..acked.min(conn.snd.pending.len()) {
+            conn.snd.pending.pop_front();
+        }
+        conn.snd_una = seg.ack;
+        // Update send window. Only accept advances from newer segments
+        // per RFC 9293 §3.10.7.4 "SND.WL1 / SND.WL2" rules.
+        if seq_lt(conn.snd_wl1, seg.seq)
+            || (conn.snd_wl1 == seg.seq && seq_le(conn.snd_wl2, seg.ack))
+        {
+            conn.snd_wnd = seg.window as u32;
+            conn.snd_wl1 = seg.seq;
+            conn.snd_wl2 = seg.ack;
+        }
+    } else if seq_lt(conn.snd_nxt, seg.ack) {
+        // ACK ahead of snd_nxt → we never sent that much; challenge ACK.
+        return Outcome { tx: TxAction::Ack, new_state: None, delivered: 0, connected: false, closed: false };
+    }
+    // Else: duplicate ACK (ack <= snd_una) — no-op for A3 (A5 uses it for fast retx).
+
+    // Data delivery (only in-order).
+    let mut delivered = 0u32;
+    if !seg.payload.is_empty() && seg.seq == conn.rcv_nxt {
+        delivered = conn.recv.append(seg.payload);
+        conn.rcv_nxt = conn.rcv_nxt.wrapping_add(delivered);
+    }
+
+    // FIN processing: consumes one seq and moves us to CLOSE_WAIT.
+    let mut new_state = None;
+    if (seg.flags & TCP_FIN) != 0
+        && seg.seq.wrapping_add(seg.payload.len() as u32) == conn.rcv_nxt
+    {
+        conn.rcv_nxt = conn.rcv_nxt.wrapping_add(1);
+        new_state = Some(TcpState::CloseWait);
+    }
+
+    // Emit ACK whenever we advance rcv_nxt, take a FIN, or saw any
+    // in-window payload (in-order → confirms; OOO → dup-ACK signals
+    // expected seq per RFC 9293 §3.10.7.4 / RFC 5681 §4.2). Pure-ack
+    // segments that only advanced snd_una need no response.
+    let tx = if delivered > 0
+        || new_state == Some(TcpState::CloseWait)
+        || !seg.payload.is_empty()
+    {
+        TxAction::Ack
+    } else {
+        TxAction::None
+    };
+
+    Outcome { tx, new_state, delivered, connected: false, closed: false }
 }
 
 fn handle_close_path(_conn: &mut TcpConn, _seg: &ParsedSegment) -> Outcome {
@@ -274,7 +361,7 @@ pub fn tuple_from_segment(src_ip: u32, dst_ip: u32, seg: &ParsedSegment) -> Four
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tcp_output::{build_segment, SegmentTx};
+    use crate::tcp_output::{build_segment, SegmentTx, TCP_PSH};
 
     fn build_test_segment(flags: u8, mss: Option<u16>, payload: &[u8]) -> Vec<u8> {
         let seg = SegmentTx {
@@ -434,5 +521,110 @@ mod tests {
         assert_eq!(out.new_state, Some(TcpState::Closed));
         assert!(out.closed);
         assert_eq!(out.tx, TxAction::None);
+    }
+
+    fn est_conn(iss: u32, irs: u32, peer_wnd: u16) -> crate::tcp_conn::TcpConn {
+        use crate::flow_table::FourTuple;
+        let t = FourTuple { local_ip: 0x0a_00_00_02, local_port: 40000,
+                            peer_ip: 0x0a_00_00_01, peer_port: 5000 };
+        let mut c = crate::tcp_conn::TcpConn::new_client(t, iss, 1460, 1024, 2048);
+        c.state = TcpState::Established;
+        c.snd_una = iss.wrapping_add(1);
+        c.snd_nxt = iss.wrapping_add(1);
+        c.irs = irs;
+        c.rcv_nxt = irs.wrapping_add(1);
+        c.snd_wnd = peer_wnd as u32;
+        c
+    }
+
+    #[test]
+    fn established_inorder_data_delivered_and_acked() {
+        let mut c = est_conn(1000, 5000, 1024);
+        let payload = b"abcdef";
+        let seg = ParsedSegment {
+            src_port: 5000, dst_port: 40000,
+            seq: 5001, ack: 1001,
+            flags: TCP_ACK | TCP_PSH,
+            window: 65535,
+            header_len: 20,
+            payload, options: &[],
+        };
+        let out = dispatch(&mut c, &seg);
+        assert_eq!(out.tx, TxAction::Ack);
+        assert_eq!(out.delivered, 6);
+        assert_eq!(c.rcv_nxt, 5001 + 6);
+        assert_eq!(c.recv.bytes.len(), 6);
+        let got: Vec<u8> = c.recv.bytes.iter().copied().collect();
+        assert_eq!(&got, b"abcdef");
+    }
+
+    #[test]
+    fn established_ooo_segment_acked_but_not_delivered() {
+        let mut c = est_conn(1000, 5000, 1024);
+        let seg = ParsedSegment {
+            src_port: 5000, dst_port: 40000,
+            seq: 5100, ack: 1001, // jumps past rcv_nxt
+            flags: TCP_ACK,
+            window: 65535,
+            header_len: 20,
+            payload: b"xyz", options: &[],
+        };
+        let out = dispatch(&mut c, &seg);
+        assert_eq!(out.tx, TxAction::Ack);
+        assert_eq!(out.delivered, 0);
+        assert_eq!(c.rcv_nxt, 5001); // unchanged
+    }
+
+    #[test]
+    fn established_ack_field_advances_snd_una() {
+        let mut c = est_conn(1000, 5000, 1024);
+        // Simulate 5 bytes in flight: push to snd.pending and advance snd_nxt.
+        c.snd.push(b"hello");
+        c.snd_nxt = c.snd_una.wrapping_add(5);
+        let seg = ParsedSegment {
+            src_port: 5000, dst_port: 40000,
+            seq: 5001, ack: 1006, // acks 5 bytes
+            flags: TCP_ACK,
+            window: 32000,
+            header_len: 20,
+            payload: &[], options: &[],
+        };
+        let _ = dispatch(&mut c, &seg);
+        assert_eq!(c.snd_una, 1006);
+        assert_eq!(c.snd_wnd, 32000);
+        assert_eq!(c.snd.pending.len(), 0);
+    }
+
+    #[test]
+    fn established_fin_transitions_to_close_wait() {
+        let mut c = est_conn(1000, 5000, 1024);
+        let seg = ParsedSegment {
+            src_port: 5000, dst_port: 40000,
+            seq: 5001, ack: 1001,
+            flags: TCP_ACK | TCP_FIN,
+            window: 65535,
+            header_len: 20,
+            payload: &[], options: &[],
+        };
+        let out = dispatch(&mut c, &seg);
+        assert_eq!(out.new_state, Some(TcpState::CloseWait));
+        assert_eq!(out.tx, TxAction::Ack);
+        assert_eq!(c.rcv_nxt, 5002); // FIN consumes one seq
+    }
+
+    #[test]
+    fn established_rst_closes_immediately() {
+        let mut c = est_conn(1000, 5000, 1024);
+        let seg = ParsedSegment {
+            src_port: 5000, dst_port: 40000,
+            seq: 5001, ack: 1001,
+            flags: TCP_RST | TCP_ACK,
+            window: 0,
+            header_len: 20,
+            payload: &[], options: &[],
+        };
+        let out = dispatch(&mut c, &seg);
+        assert_eq!(out.new_state, Some(TcpState::Closed));
+        assert!(out.closed);
     }
 }
