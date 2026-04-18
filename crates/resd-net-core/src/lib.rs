@@ -12,6 +12,7 @@ pub mod iss;
 pub mod l2;
 pub mod l3_ip;
 pub mod mempool;
+pub mod siphash24;
 pub mod tcp_conn;
 pub mod tcp_events;
 pub mod tcp_input;
