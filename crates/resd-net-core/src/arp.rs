@@ -8,10 +8,16 @@
 //!   - build a gratuitous ARP announcement (our periodic "I'm still here"
 //!     per spec §8)
 //!
-//! All builders produce complete L2+ARP frames (42 bytes: 14 Eth + 28 ARP).
+//! All builders produce complete L2+ARP frames padded to the 60-byte
+//! Ethernet minimum (14 Eth + 28 ARP + 18 pad). Without padding, peers'
+//! MAC-layer RX is permitted by 802.3 to silently drop the runt frame.
 
 pub const ARP_HDR_LEN: usize = 28;
-pub const ARP_FRAME_LEN: usize = 14 + ARP_HDR_LEN;
+/// Ethernet requires a minimum payload of 46 bytes (60-byte min frame
+/// before FCS minus the 14-byte header). Our ARP body is only 28 bytes,
+/// so we pad by 18 to avoid runt-frame drops at the receiver.
+pub const ARP_PAD_LEN: usize = 18;
+pub const ARP_FRAME_LEN: usize = 14 + ARP_HDR_LEN + ARP_PAD_LEN;
 pub const ARP_HTYPE_ETH: u16 = 1;
 pub const ARP_PTYPE_IPV4: u16 = 0x0800;
 pub const ARP_OP_REQUEST: u16 = 1;
@@ -67,8 +73,8 @@ pub fn arp_decode(eth_payload: &[u8]) -> Result<ArpPacket, ArpDrop> {
 }
 
 /// Build a complete Eth+ARP reply frame answering `request`.
-/// Writes 42 bytes into `out`; returns 42 on success, or None if `out` is
-/// too small.
+/// Writes `ARP_FRAME_LEN` (60) bytes into `out`, zero-padded to the
+/// Ethernet minimum; returns 60 on success, or None if `out` is too small.
 pub fn build_arp_reply(
     our_mac: [u8; 6],
     our_ip: u32,
@@ -91,6 +97,8 @@ pub fn build_arp_reply(
         request.sender_mac,
         request.sender_ip,
     );
+    // Pad to Ethernet minimum to avoid runt-frame drops at the receiver.
+    out[14 + ARP_HDR_LEN..ARP_FRAME_LEN].fill(0);
     Some(ARP_FRAME_LEN)
 }
 
@@ -111,6 +119,8 @@ pub fn build_gratuitous_arp(our_mac: [u8; 6], our_ip: u32, out: &mut [u8]) -> Op
         [0u8; 6],   // target MAC unknown in gratuitous
         our_ip,     // target IP is us (that's what "gratuitous" means)
     );
+    // Pad to Ethernet minimum to avoid runt-frame drops at the receiver.
+    out[14 + ARP_HDR_LEN..ARP_FRAME_LEN].fill(0);
     Some(ARP_FRAME_LEN)
 }
 
@@ -231,6 +241,29 @@ mod tests {
         assert_eq!(decoded.target_ip, 0x0a_00_00_02);
         // broadcast dst
         assert_eq!(&buf[0..6], &[0xff; 6]);
+    }
+
+    #[test]
+    fn reply_is_padded_to_ethernet_minimum() {
+        let req = sample_request();
+        let mut buf = [0u8; ARP_FRAME_LEN];
+        let n = build_arp_reply([1, 2, 3, 4, 5, 6], 0x0a_00_00_02, &req, &mut buf).unwrap();
+        assert_eq!(n, 60, "ARP reply must be Ethernet-min (60 bytes) to avoid runts");
+        assert_eq!(ARP_FRAME_LEN, 60);
+        // Pad bytes (42..60) must be zero.
+        for (i, &b) in buf[42..].iter().enumerate() {
+            assert_eq!(b, 0, "pad byte {i} not zero");
+        }
+    }
+
+    #[test]
+    fn gratuitous_is_padded_to_ethernet_minimum() {
+        let mut buf = [0u8; ARP_FRAME_LEN];
+        let n = build_gratuitous_arp([1, 2, 3, 4, 5, 6], 0x0a_00_00_02, &mut buf).unwrap();
+        assert_eq!(n, 60);
+        for (i, &b) in buf[42..].iter().enumerate() {
+            assert_eq!(b, 0, "pad byte {i} not zero");
+        }
     }
 
     #[test]
