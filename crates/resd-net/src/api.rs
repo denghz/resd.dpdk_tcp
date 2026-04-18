@@ -206,6 +206,22 @@ pub struct resd_net_tcp_counters_t {
     /// rcv_wnd to throttle the peer; we keep accepting at full capacity and
     /// expose pressure here so the application can diagnose a slow consumer.
     pub recv_buf_drops: u64,
+    // Phase A4 additions — see core counters.rs for the full field doc.
+    pub rx_paws_rejected: u64,
+    pub rx_bad_option: u64,
+    pub rx_reassembly_queued: u64,
+    pub rx_reassembly_hole_filled: u64,
+    pub tx_sack_blocks: u64,
+    pub rx_sack_blocks: u64,
+    pub rx_bad_seq: u64,
+    pub rx_bad_ack: u64,
+    pub rx_dup_ack: u64,
+    pub rx_zero_window: u64,
+    pub rx_urgent_dropped: u64,
+    pub tx_zero_window: u64,
+    pub tx_window_update: u64,
+    pub conn_table_full: u64,
+    pub conn_time_wait_reaped: u64,
     pub state_trans: [[u64; 11]; 11],
     pub _pad: [u64; 3],
 }

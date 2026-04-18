@@ -197,6 +197,21 @@ struct RESD_NET_ALIGNED(64) resd_net_tcp_counters_t {
    * expose pressure here so the application can diagnose a slow consumer.
    */
   uint64_t recv_buf_drops;
+  uint64_t rx_paws_rejected;
+  uint64_t rx_bad_option;
+  uint64_t rx_reassembly_queued;
+  uint64_t rx_reassembly_hole_filled;
+  uint64_t tx_sack_blocks;
+  uint64_t rx_sack_blocks;
+  uint64_t rx_bad_seq;
+  uint64_t rx_bad_ack;
+  uint64_t rx_dup_ack;
+  uint64_t rx_zero_window;
+  uint64_t rx_urgent_dropped;
+  uint64_t tx_zero_window;
+  uint64_t tx_window_update;
+  uint64_t conn_table_full;
+  uint64_t conn_time_wait_reaped;
   uint64_t state_trans[11][11];
   uint64_t _pad[3];
 };
