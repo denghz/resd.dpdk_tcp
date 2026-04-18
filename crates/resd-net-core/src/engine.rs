@@ -413,7 +413,7 @@ impl Engine {
             last_garp_ns: RefCell::new(0),
             flow_table: RefCell::new(FlowTable::new(cfg.max_connections)),
             events: RefCell::new(EventQueue::new()),
-            iss_gen: IssGen::new(0),
+            iss_gen: IssGen::new(),
             // RFC 6056 ephemeral port hint range: start at 49152.
             last_ephemeral_port: Cell::new(49151),
             cfg,
