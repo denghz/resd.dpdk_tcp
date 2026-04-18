@@ -189,11 +189,23 @@ pub struct EngineConfig {
     pub recv_buffer_bytes: u32,
     pub send_buffer_bytes: u32,
     pub tcp_mss: u32,
-    pub tcp_initial_rto_ms: u32,
     pub tcp_msl_ms: u32,
     pub tcp_nagle: bool,
 
     // Phase A5 additions
+    /// A5 Task 21: RFC 6298 RTO floor (µs). Spec §6.4 default 5ms
+    /// (trading-latency policy; RFC recommends 1s floor).
+    pub tcp_min_rto_us: u32,
+    /// A5 Task 21: first-RTO value (µs) before any RTT sample. Used
+    /// for SYN arming and initial data arm.
+    pub tcp_initial_rto_us: u32,
+    /// A5 Task 21: RTO backoff cap (µs). Spec §6.4 default 1s
+    /// (trading-aligned fail-fast; RFC 6298 allows up to 60s).
+    pub tcp_max_rto_us: u32,
+    /// A5 Task 21: per-segment retransmit budget. After this many
+    /// RTO-driven retransmits without ACK progress, conn fails with
+    /// ETIMEDOUT. Default 15 (≈8.3s wall clock with default backoff).
+    pub tcp_max_retrans_count: u32,
     /// A5 Task 20: when `true`, fire handlers (RTO, RACK, TLP) emit
     /// `TcpRetrans` + `TcpLossDetected` events per retransmit / detected
     /// loss. Default `false` — counters alone satisfy the default
@@ -221,9 +233,12 @@ impl Default for EngineConfig {
             recv_buffer_bytes: 256 * 1024,
             send_buffer_bytes: 256 * 1024,
             tcp_mss: 1460,
-            tcp_initial_rto_ms: 50,
             tcp_msl_ms: 30_000,
             tcp_nagle: false,
+            tcp_min_rto_us: 5_000,
+            tcp_initial_rto_us: 5_000,
+            tcp_max_rto_us: 1_000_000,
+            tcp_max_retrans_count: 15,
             tcp_per_packet_events: false,
         }
     }
@@ -845,9 +860,8 @@ impl Engine {
 
         // Task 13: max-retrans-count check. `retransmit()` above bumped
         // `xmit_count` on the front entry; once it crosses the budget we
-        // abandon the connection with ETIMEDOUT. A hardcoded constant
-        // here; Task 21 plumbs this through engine config.
-        const TCP_MAX_RETRANS_COUNT: u16 = 15;
+        // abandon the connection with ETIMEDOUT. Task 21 plumbs the
+        // budget through engine config (`tcp_max_retrans_count`).
         let xmit_count = {
             let ft = self.flow_table.borrow();
             ft.get(handle)
@@ -855,7 +869,7 @@ impl Engine {
                 .map(|e| e.xmit_count)
                 .unwrap_or(0)
         };
-        if xmit_count > TCP_MAX_RETRANS_COUNT {
+        if xmit_count as u32 > self.cfg.tcp_max_retrans_count {
             crate::counters::inc(&self.counters.tcp.conn_timeout_retrans);
             self.force_close_etimedout(handle);
             return;
@@ -1054,8 +1068,7 @@ impl Engine {
         // well above the budget window and protects against overflow.
         // `checked_shl` returns None only for shift >= 32 — our clamp at
         // 6 means the `unwrap_or` is unreachable, but kept for safety.
-        let base_us =
-            crate::tcp_rtt::DEFAULT_INITIAL_RTO_US.max(crate::tcp_rtt::DEFAULT_MIN_RTO_US);
+        let base_us = self.cfg.tcp_initial_rto_us.max(self.cfg.tcp_min_rto_us);
         let delay_us = base_us
             .checked_shl(new_count.min(6) as u32)
             .unwrap_or(u32::MAX);
@@ -1529,10 +1542,10 @@ impl Engine {
 
         // A5 Task 17: TLP schedule (RFC 8985 §7.2). Arm a probe timer at
         // `now + PTO` when snd_retrans is non-empty AND no TLP is already
-        // pending. PTO = max(2·SRTT, DEFAULT_MIN_RTO_US); falls back to
-        // DEFAULT_MIN_RTO_US when the RTT estimator has no sample yet.
-        // Runs after the Task 11 prune so we don't arm a probe on a queue
-        // that just emptied.
+        // pending. PTO = max(2·SRTT, tcp_min_rto_us); falls back to
+        // tcp_min_rto_us when the RTT estimator has no sample yet. Task
+        // 21 plumbs the floor through engine config. Runs after the Task
+        // 11 prune so we don't arm a probe on a queue that just emptied.
         let tlp_arm = {
             let ft = self.flow_table.borrow();
             ft.get(handle)
@@ -1545,7 +1558,7 @@ impl Engine {
                 let srtt = ft.get(handle).and_then(|c| c.rtt_est.srtt_us());
                 (srtt, crate::clock::now_ns())
             };
-            let pto_us = crate::tcp_tlp::pto_us(srtt, crate::tcp_rtt::DEFAULT_MIN_RTO_US);
+            let pto_us = crate::tcp_tlp::pto_us(srtt, self.cfg.tcp_min_rto_us);
             let fire_at_ns = now_ns + (pto_us as u64 * 1_000);
             let id = self.timer_wheel.borrow_mut().add(
                 now_ns,
@@ -2040,6 +2053,9 @@ impl Engine {
             our_mss,
             self.cfg.recv_buffer_bytes,
             self.cfg.send_buffer_bytes,
+            self.cfg.tcp_min_rto_us,
+            self.cfg.tcp_initial_rto_us,
+            self.cfg.tcp_max_rto_us,
         );
         let handle = match self.flow_table.borrow_mut().insert(conn) {
             Some(h) => h,
@@ -2101,10 +2117,9 @@ impl Engine {
         // ETIMEDOUT force-close; exponential backoff starting at
         // `max(initial_rto_us, min_rto_us)`. Re-arms each fire inside
         // `on_syn_retrans_fire`; cancelled on SYN-ACK in `handle_syn_sent`
-        // via `Outcome::syn_retrans_timer_to_cancel`. Task 21 will plumb
+        // via `Outcome::syn_retrans_timer_to_cancel`. Task 21 plumbs
         // `tcp_initial_rto_us` / `tcp_min_rto_us` through engine config.
-        let initial_delay_us =
-            crate::tcp_rtt::DEFAULT_INITIAL_RTO_US.max(crate::tcp_rtt::DEFAULT_MIN_RTO_US);
+        let initial_delay_us = self.cfg.tcp_initial_rto_us.max(self.cfg.tcp_min_rto_us);
         let now_ns = crate::clock::now_ns();
         let fire_at_ns = now_ns + (initial_delay_us as u64 * 1_000);
         let id = self.timer_wheel.borrow_mut().add(
@@ -2727,9 +2742,18 @@ mod tests {
         assert_eq!(cfg.recv_buffer_bytes, 256 * 1024);
         assert_eq!(cfg.send_buffer_bytes, 256 * 1024);
         assert_eq!(cfg.tcp_mss, 1460);
-        assert_eq!(cfg.tcp_initial_rto_ms, 50);
         assert_eq!(cfg.tcp_msl_ms, 30_000);
         assert!(!cfg.tcp_nagle);
+    }
+
+    #[test]
+    fn engine_config_default_rto_values_match_spec() {
+        let cfg = EngineConfig::default();
+        assert_eq!(cfg.tcp_min_rto_us, 5_000);
+        assert_eq!(cfg.tcp_initial_rto_us, 5_000);
+        assert_eq!(cfg.tcp_max_rto_us, 1_000_000);
+        assert_eq!(cfg.tcp_max_retrans_count, 15);
+        assert!(!cfg.tcp_per_packet_events);
     }
 
     #[test]

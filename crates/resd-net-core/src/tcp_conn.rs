@@ -195,12 +195,22 @@ impl TcpConn {
     /// Create a fresh client-side connection ready to emit SYN.
     /// State = SYN_SENT; `snd_una = snd_nxt = iss`; our SYN will consume
     /// one seq (bumped to `iss+1` by the caller after successful TX).
+    ///
+    /// `min_rto_us` / `initial_rto_us` / `max_rto_us` are plumbed from
+    /// `EngineConfig::tcp_min_rto_us` / `tcp_initial_rto_us` /
+    /// `tcp_max_rto_us` (Task 21) so the RTT estimator construction
+    /// reflects engine-wide RTO policy. Unit tests outside the Engine
+    /// pass the defaults directly (5_000, 5_000, 1_000_000).
+    #[allow(clippy::too_many_arguments)]
     pub fn new_client(
         tuple: FourTuple,
         iss: u32,
         our_mss: u16,
         recv_buf_bytes: u32,
         send_buf_bytes: u32,
+        min_rto_us: u32,
+        initial_rto_us: u32,
+        max_rto_us: u32,
     ) -> Self {
         let rcv_wnd = recv_buf_bytes.min(u16::MAX as u32); // A3: no WSCALE, so ≤ 65535.
         Self {
@@ -233,11 +243,7 @@ impl TcpConn {
             last_sack_trigger: None,
             timer_ids: Vec::new(),
             snd_retrans: crate::tcp_retrans::SendRetrans::new(),
-            rtt_est: crate::tcp_rtt::RttEstimator::new(
-                crate::tcp_rtt::DEFAULT_MIN_RTO_US,
-                crate::tcp_rtt::DEFAULT_INITIAL_RTO_US,
-                crate::tcp_rtt::DEFAULT_MAX_RTO_US,
-            ),
+            rtt_est: crate::tcp_rtt::RttEstimator::new(min_rto_us, initial_rto_us, max_rto_us),
             rto_timer_id: None,
             tlp_timer_id: None,
             syn_retrans_count: 0,
@@ -282,7 +288,16 @@ mod tests {
 
     #[test]
     fn new_client_sets_iss_both_una_and_nxt() {
-        let c = TcpConn::new_client(tuple(), 0xDEAD_BEEF, 1460, 1024, 2048);
+        let c = TcpConn::new_client(
+            tuple(),
+            0xDEAD_BEEF,
+            1460,
+            1024,
+            2048,
+            5000,
+            5000,
+            1_000_000,
+        );
         assert_eq!(c.snd_una, 0xDEAD_BEEF);
         assert_eq!(c.snd_nxt, 0xDEAD_BEEF);
         assert_eq!(c.iss, 0xDEAD_BEEF);
@@ -291,7 +306,7 @@ mod tests {
 
     #[test]
     fn rcv_wnd_clamped_to_u16_max_without_wscale() {
-        let c = TcpConn::new_client(tuple(), 0, 1460, 1_000_000, 1024);
+        let c = TcpConn::new_client(tuple(), 0, 1460, 1_000_000, 1024, 5000, 5000, 1_000_000);
         assert_eq!(c.rcv_wnd, u16::MAX as u32);
     }
 
@@ -312,7 +327,7 @@ mod tests {
 
     #[test]
     fn fin_acked_checks_fin_seq_plus_one() {
-        let mut c = TcpConn::new_client(tuple(), 100, 1460, 1024, 2048);
+        let mut c = TcpConn::new_client(tuple(), 100, 1460, 1024, 2048, 5000, 5000, 1_000_000);
         assert!(!c.fin_has_been_acked(150));
         c.our_fin_seq = Some(200);
         assert!(!c.fin_has_been_acked(200));
@@ -331,7 +346,7 @@ mod tests {
 
     #[test]
     fn a4_options_fields_default_to_not_negotiated() {
-        let c = TcpConn::new_client(tuple(), 1000, 1460, 1024, 2048);
+        let c = TcpConn::new_client(tuple(), 1000, 1460, 1024, 2048, 5000, 5000, 1_000_000);
         // No WS negotiated: no left shift on either direction.
         assert_eq!(c.ws_shift_out, 0);
         assert_eq!(c.ws_shift_in, 0);
@@ -345,7 +360,7 @@ mod tests {
 
     #[test]
     fn a4_sack_scoreboard_starts_empty() {
-        let c = TcpConn::new_client(tuple(), 1000, 1460, 1024, 2048);
+        let c = TcpConn::new_client(tuple(), 1000, 1460, 1024, 2048, 5000, 5000, 1_000_000);
         assert!(c.sack_scoreboard.is_empty());
         assert_eq!(c.sack_scoreboard.len(), 0);
     }
@@ -355,19 +370,19 @@ mod tests {
         // F-8 RFC 2018 §4 MUST-26: conn.last_sack_trigger is set by
         // tcp_input on OOO-insert and cleared by emit_ack after use.
         // Starts `None` on a fresh client connection.
-        let c = TcpConn::new_client(tuple(), 1000, 1460, 1024, 2048);
+        let c = TcpConn::new_client(tuple(), 1000, 1460, 1024, 2048, 5000, 5000, 1_000_000);
         assert!(c.last_sack_trigger.is_none());
     }
 
     #[test]
     fn new_client_timer_ids_starts_empty() {
-        let c = TcpConn::new_client(tuple(), 1, 1460, 1024, 2048);
+        let c = TcpConn::new_client(tuple(), 1, 1460, 1024, 2048, 5000, 5000, 1_000_000);
         assert!(c.timer_ids.is_empty());
     }
 
     #[test]
     fn a5_conn_starts_with_empty_snd_retrans_and_default_rtt() {
-        let c = TcpConn::new_client(tuple(), 100, 1460, 1024, 2048);
+        let c = TcpConn::new_client(tuple(), 100, 1460, 1024, 2048, 5000, 5000, 1_000_000);
         assert!(c.snd_retrans.is_empty());
         assert_eq!(c.rtt_est.rto_us(), crate::tcp_rtt::DEFAULT_INITIAL_RTO_US);
         assert!(c.rto_timer_id.is_none());
@@ -380,7 +395,7 @@ mod tests {
 
     #[test]
     fn a5_conn_has_default_rack_state() {
-        let c = TcpConn::new_client(tuple(), 1, 1460, 1024, 2048);
+        let c = TcpConn::new_client(tuple(), 1, 1460, 1024, 2048, 5000, 5000, 1_000_000);
         assert_eq!(c.rack.xmit_ts_ns, 0);
         assert_eq!(c.rack.end_seq, 0);
         assert_eq!(c.rack.min_rtt_us, 0);

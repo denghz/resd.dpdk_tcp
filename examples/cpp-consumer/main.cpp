@@ -19,7 +19,11 @@ int main() {
     cfg.tcp_delayed_ack = false;
     cfg.cc_mode = 0;
     cfg.tcp_min_rto_ms = 20;
-    cfg.tcp_initial_rto_ms = 50;
+    // A5 Task 21: RTO config in µs replaces the A3 single-value knob.
+    cfg.tcp_min_rto_us = 5000;
+    cfg.tcp_initial_rto_us = 5000;
+    cfg.tcp_max_rto_us = 1000000;
+    cfg.tcp_max_retrans_count = 15;
     cfg.tcp_msl_ms = 30000;
     cfg.tcp_per_packet_events = false;
     cfg.preset = 0;

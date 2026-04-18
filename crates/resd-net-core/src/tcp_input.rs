@@ -927,7 +927,7 @@ mod tests {
             peer_ip: 0x0a_00_00_01,
             peer_port: 5000,
         };
-        let mut c = TcpConn::new_client(t, 1000, 1460, 1024, 2048);
+        let mut c = TcpConn::new_client(t, 1000, 1460, 1024, 2048, 5000, 5000, 1_000_000);
         c.state = TcpState::SynSent;
         c.snd_nxt = c.snd_nxt.wrapping_add(1);
         c.ws_shift_out = 7;
@@ -975,7 +975,7 @@ mod tests {
             peer_ip: 0x0a_00_00_01,
             peer_port: 5000,
         };
-        let mut c = TcpConn::new_client(t, 1000, 1460, 1024, 2048);
+        let mut c = TcpConn::new_client(t, 1000, 1460, 1024, 2048, 5000, 5000, 1_000_000);
         c.state = TcpState::SynSent;
         c.snd_nxt = c.snd_nxt.wrapping_add(1);
         c.ws_shift_out = 7;
@@ -1019,7 +1019,7 @@ mod tests {
             peer_ip: 0x0a_00_00_01,
             peer_port: 5000,
         };
-        let mut c = TcpConn::new_client(t, 1000, 1460, 1024, 2048);
+        let mut c = TcpConn::new_client(t, 1000, 1460, 1024, 2048, 5000, 5000, 1_000_000);
         c.state = TcpState::SynSent;
         c.snd_nxt = c.snd_nxt.wrapping_add(1);
         c.ws_shift_out = 7;
@@ -1059,7 +1059,7 @@ mod tests {
             peer_ip: 0x0a_00_00_01,
             peer_port: 5000,
         };
-        let mut c = TcpConn::new_client(t, 1000, 1460, 1024, 2048);
+        let mut c = TcpConn::new_client(t, 1000, 1460, 1024, 2048, 5000, 5000, 1_000_000);
         c.state = TcpState::SynSent;
         c.snd_nxt = c.snd_nxt.wrapping_add(1);
 
@@ -1125,7 +1125,7 @@ mod tests {
             peer_ip: 0x0a_00_00_01,
             peer_port: 5000,
         };
-        let mut c = TcpConn::new_client(t, 1000, 1460, 1024, 2048);
+        let mut c = TcpConn::new_client(t, 1000, 1460, 1024, 2048, 5000, 5000, 1_000_000);
         c.state = TcpState::SynSent;
         c.snd_nxt = c.snd_nxt.wrapping_add(1);
         // Bogus: ACK-only with an ack that doesn't cover our SYN.
@@ -1155,7 +1155,7 @@ mod tests {
             peer_ip: 0x0a_00_00_01,
             peer_port: 5000,
         };
-        let mut c = TcpConn::new_client(t, 1000, 1460, 1024, 2048);
+        let mut c = TcpConn::new_client(t, 1000, 1460, 1024, 2048, 5000, 5000, 1_000_000);
         c.state = TcpState::SynSent;
         c.snd_nxt = c.snd_nxt.wrapping_add(1);
         let seg = ParsedSegment {
@@ -1183,7 +1183,8 @@ mod tests {
             peer_ip: 0x0a_00_00_01,
             peer_port: 5000,
         };
-        let mut c = crate::tcp_conn::TcpConn::new_client(t, iss, 1460, 1024, 2048);
+        let mut c =
+            crate::tcp_conn::TcpConn::new_client(t, iss, 1460, 1024, 2048, 5000, 5000, 1_000_000);
         c.state = TcpState::Established;
         c.snd_una = iss.wrapping_add(1);
         c.snd_nxt = iss.wrapping_add(1);
@@ -1424,7 +1425,7 @@ mod tests {
             peer_ip: 0x0a_00_00_01,
             peer_port: 5000,
         };
-        let mut c = TcpConn::new_client(t, 1000, 1460, 1024, 2048);
+        let mut c = TcpConn::new_client(t, 1000, 1460, 1024, 2048, 5000, 5000, 1_000_000);
         c.state = TcpState::FinWait1;
         c.snd_una = 1001;
         c.snd_nxt = 1002; // after our FIN
@@ -1458,7 +1459,7 @@ mod tests {
             peer_ip: 0x0a_00_00_01,
             peer_port: 5000,
         };
-        let mut c = TcpConn::new_client(t, 1000, 1460, 1024, 2048);
+        let mut c = TcpConn::new_client(t, 1000, 1460, 1024, 2048, 5000, 5000, 1_000_000);
         c.state = TcpState::FinWait2;
         c.snd_una = 1002;
         c.snd_nxt = 1002;
@@ -1494,7 +1495,7 @@ mod tests {
             peer_ip: 0x0a_00_00_01,
             peer_port: 5000,
         };
-        let mut c = TcpConn::new_client(t, 1000, 1460, 1024, 2048);
+        let mut c = TcpConn::new_client(t, 1000, 1460, 1024, 2048, 5000, 5000, 1_000_000);
         c.state = TcpState::FinWait1;
         c.snd_una = 1001;
         c.snd_nxt = 1002;
@@ -1528,7 +1529,7 @@ mod tests {
             peer_ip: 0x0a_00_00_01,
             peer_port: 5000,
         };
-        let mut c = TcpConn::new_client(t, 1000, 1460, 1024, 2048);
+        let mut c = TcpConn::new_client(t, 1000, 1460, 1024, 2048, 5000, 5000, 1_000_000);
         c.state = TcpState::Closing;
         c.snd_una = 1001;
         c.snd_nxt = 1002;
@@ -1562,7 +1563,7 @@ mod tests {
             peer_ip: 0x0a_00_00_01,
             peer_port: 5000,
         };
-        let mut c = TcpConn::new_client(t, 1000, 1460, 1024, 2048);
+        let mut c = TcpConn::new_client(t, 1000, 1460, 1024, 2048, 5000, 5000, 1_000_000);
         c.state = TcpState::LastAck;
         c.snd_una = 1001;
         c.snd_nxt = 1002;
@@ -1962,7 +1963,7 @@ mod tests {
             peer_ip: 0x0a_00_00_01,
             peer_port: 5000,
         };
-        let mut c = TcpConn::new_client(t, 1000, 1460, 1024, 2048);
+        let mut c = TcpConn::new_client(t, 1000, 1460, 1024, 2048, 5000, 5000, 1_000_000);
         c.state = TcpState::TimeWait;
         c.our_fin_seq = Some(1001);
         c.rcv_nxt = 5002;
@@ -2114,7 +2115,7 @@ mod tests {
             peer_ip: 0x0a_00_00_01,
             peer_port: 5000,
         };
-        let mut c = TcpConn::new_client(t, 1000, 1460, 1024, 2048);
+        let mut c = TcpConn::new_client(t, 1000, 1460, 1024, 2048, 5000, 5000, 1_000_000);
         c.state = TcpState::FinWait2;
         c.snd_una = 1001;
         c.snd_nxt = 1002;

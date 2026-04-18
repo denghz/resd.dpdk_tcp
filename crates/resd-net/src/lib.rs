@@ -77,10 +77,26 @@ pub unsafe extern "C" fn resd_net_engine_create(
         cfg.send_buffer_bytes
     };
     let mss = if cfg.tcp_mss == 0 { 1460 } else { cfg.tcp_mss };
-    let init_rto = if cfg.tcp_initial_rto_ms == 0 {
-        50
+    // A5 Task 21: RTO config in µs; zero means "use default".
+    let min_rto_us = if cfg.tcp_min_rto_us == 0 {
+        5_000
     } else {
-        cfg.tcp_initial_rto_ms
+        cfg.tcp_min_rto_us
+    };
+    let initial_rto_us = if cfg.tcp_initial_rto_us == 0 {
+        5_000
+    } else {
+        cfg.tcp_initial_rto_us
+    };
+    let max_rto_us = if cfg.tcp_max_rto_us == 0 {
+        1_000_000
+    } else {
+        cfg.tcp_max_rto_us
+    };
+    let max_retrans = if cfg.tcp_max_retrans_count == 0 {
+        15
+    } else {
+        cfg.tcp_max_retrans_count
     };
     let msl = if cfg.tcp_msl_ms == 0 {
         30_000
@@ -105,9 +121,12 @@ pub unsafe extern "C" fn resd_net_engine_create(
         recv_buffer_bytes: recv_buf,
         send_buffer_bytes: send_buf,
         tcp_mss: mss,
-        tcp_initial_rto_ms: init_rto,
         tcp_msl_ms: msl,
         tcp_nagle: cfg.tcp_nagle,
+        tcp_min_rto_us: min_rto_us,
+        tcp_initial_rto_us: initial_rto_us,
+        tcp_max_rto_us: max_rto_us,
+        tcp_max_retrans_count: max_retrans,
         tcp_per_packet_events: cfg.tcp_per_packet_events,
     };
     match Engine::new(core_cfg) {
@@ -437,7 +456,10 @@ mod tests {
             tcp_delayed_ack: false,
             cc_mode: 0,
             tcp_min_rto_ms: 0,
-            tcp_initial_rto_ms: 0,
+            tcp_min_rto_us: 0,
+            tcp_initial_rto_us: 0,
+            tcp_max_rto_us: 0,
+            tcp_max_retrans_count: 0,
             tcp_msl_ms: 0,
             tcp_per_packet_events: false,
             preset: 0,

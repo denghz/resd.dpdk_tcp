@@ -60,7 +60,10 @@ struct resd_net_engine_config_t {
   bool tcp_delayed_ack;
   uint8_t cc_mode;
   uint32_t tcp_min_rto_ms;
-  uint32_t tcp_initial_rto_ms;
+  uint32_t tcp_min_rto_us;
+  uint32_t tcp_initial_rto_us;
+  uint32_t tcp_max_rto_us;
+  uint32_t tcp_max_retrans_count;
   uint32_t tcp_msl_ms;
   bool tcp_per_packet_events;
   uint8_t preset;
@@ -219,6 +222,14 @@ struct RESD_NET_ALIGNED(64) resd_net_tcp_counters_t {
   uint64_t tx_payload_bytes;
   uint64_t rx_payload_bytes;
   uint64_t state_trans[11][11];
+  uint64_t conn_timeout_retrans;
+  uint64_t conn_timeout_syn_sent;
+  uint64_t rtt_samples;
+  uint64_t tx_rack_loss;
+  uint64_t rack_reo_wnd_override_active;
+  uint64_t rto_no_backoff_active;
+  uint64_t rx_ws_shift_clamped;
+  uint64_t rx_dsack;
   uint64_t _pad[1];
 };
 
@@ -249,6 +260,8 @@ struct resd_net_connect_opts_t {
   uint16_t local_port;
   uint32_t connect_timeout_ms;
   uint32_t idle_keepalive_sec;
+  bool rack_aggressive;
+  bool rto_no_backoff;
 };
 
 #ifdef __cplusplus

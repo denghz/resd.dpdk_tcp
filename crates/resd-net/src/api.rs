@@ -32,7 +32,14 @@ pub struct resd_net_engine_config_t {
     pub tcp_delayed_ack: bool,
     pub cc_mode: u8,
     pub tcp_min_rto_ms: u32,
-    pub tcp_initial_rto_ms: u32,
+    // A5 Task 21: RTO config in µs. `tcp_initial_rto_ms` was removed
+    // in favor of `tcp_initial_rto_us`; the surrounding `_us` fields
+    // replace the A3 single-value knob with a full floor/initial/max
+    // tuple plus the per-segment retransmit budget.
+    pub tcp_min_rto_us: u32,
+    pub tcp_initial_rto_us: u32,
+    pub tcp_max_rto_us: u32,
+    pub tcp_max_retrans_count: u32,
     pub tcp_msl_ms: u32,
     pub tcp_per_packet_events: bool,
     pub preset: u8,

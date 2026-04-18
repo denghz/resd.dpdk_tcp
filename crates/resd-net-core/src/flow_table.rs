@@ -126,7 +126,7 @@ mod tests {
     #[test]
     fn insert_and_lookup_by_handle() {
         let mut ft = FlowTable::new(4);
-        let c = TcpConn::new_client(tuple(5000), 12345, 1460, 1024, 2048);
+        let c = TcpConn::new_client(tuple(5000), 12345, 1460, 1024, 2048, 5000, 5000, 1_000_000);
         let h = ft.insert(c).expect("insert ok");
         assert!(h >= 1);
         assert!(ft.get(h).is_some());
@@ -136,7 +136,7 @@ mod tests {
     fn lookup_by_tuple_roundtrip() {
         let mut ft = FlowTable::new(4);
         let t = tuple(5000);
-        let c = TcpConn::new_client(t, 12345, 1460, 1024, 2048);
+        let c = TcpConn::new_client(t, 12345, 1460, 1024, 2048, 5000, 5000, 1_000_000);
         let h = ft.insert(c).unwrap();
         assert_eq!(ft.lookup_by_tuple(&t), Some(h));
     }
@@ -144,9 +144,9 @@ mod tests {
     #[test]
     fn full_table_returns_none() {
         let mut ft = FlowTable::new(2);
-        let a = TcpConn::new_client(tuple(5000), 1, 1460, 1024, 2048);
-        let b = TcpConn::new_client(tuple(5001), 2, 1460, 1024, 2048);
-        let c = TcpConn::new_client(tuple(5002), 3, 1460, 1024, 2048);
+        let a = TcpConn::new_client(tuple(5000), 1, 1460, 1024, 2048, 5000, 5000, 1_000_000);
+        let b = TcpConn::new_client(tuple(5001), 2, 1460, 1024, 2048, 5000, 5000, 1_000_000);
+        let c = TcpConn::new_client(tuple(5002), 3, 1460, 1024, 2048, 5000, 5000, 1_000_000);
         assert!(ft.insert(a).is_some());
         assert!(ft.insert(b).is_some());
         assert!(ft.insert(c).is_none());
@@ -156,8 +156,8 @@ mod tests {
     fn duplicate_tuple_rejected() {
         let mut ft = FlowTable::new(4);
         let t = tuple(5000);
-        let a = TcpConn::new_client(t, 1, 1460, 1024, 2048);
-        let b = TcpConn::new_client(t, 2, 1460, 1024, 2048);
+        let a = TcpConn::new_client(t, 1, 1460, 1024, 2048, 5000, 5000, 1_000_000);
+        let b = TcpConn::new_client(t, 2, 1460, 1024, 2048, 5000, 5000, 1_000_000);
         assert!(ft.insert(a).is_some());
         assert!(ft.insert(b).is_none());
     }
@@ -166,7 +166,7 @@ mod tests {
     fn remove_frees_slot_and_tuple() {
         let mut ft = FlowTable::new(4);
         let t = tuple(5000);
-        let c = TcpConn::new_client(t, 1, 1460, 1024, 2048);
+        let c = TcpConn::new_client(t, 1, 1460, 1024, 2048, 5000, 5000, 1_000_000);
         let h = ft.insert(c).unwrap();
         assert!(ft.remove(h).is_some());
         assert!(ft.remove(h).is_none());
@@ -183,7 +183,7 @@ mod tests {
     fn get_mut_roundtrip_mutation() {
         let mut ft = FlowTable::new(4);
         let t = tuple(5000);
-        let c = TcpConn::new_client(t, 42, 1460, 1024, 2048);
+        let c = TcpConn::new_client(t, 42, 1460, 1024, 2048, 5000, 5000, 1_000_000);
         let h = ft.insert(c).unwrap();
         // Mutate via get_mut and observe via get.
         ft.get_mut(h).unwrap().state = crate::tcp_state::TcpState::SynSent;
@@ -197,13 +197,40 @@ mod tests {
     fn iter_handles_skips_freed_slots() {
         let mut ft = FlowTable::new(4);
         let h1 = ft
-            .insert(TcpConn::new_client(tuple(5000), 1, 1460, 1024, 2048))
+            .insert(TcpConn::new_client(
+                tuple(5000),
+                1,
+                1460,
+                1024,
+                2048,
+                5000,
+                5000,
+                1_000_000,
+            ))
             .unwrap();
         let h2 = ft
-            .insert(TcpConn::new_client(tuple(5001), 2, 1460, 1024, 2048))
+            .insert(TcpConn::new_client(
+                tuple(5001),
+                2,
+                1460,
+                1024,
+                2048,
+                5000,
+                5000,
+                1_000_000,
+            ))
             .unwrap();
         let h3 = ft
-            .insert(TcpConn::new_client(tuple(5002), 3, 1460, 1024, 2048))
+            .insert(TcpConn::new_client(
+                tuple(5002),
+                3,
+                1460,
+                1024,
+                2048,
+                5000,
+                5000,
+                1_000_000,
+            ))
             .unwrap();
         ft.remove(h2);
         let got: Vec<_> = ft.iter_handles().collect();
