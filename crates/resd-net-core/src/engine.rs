@@ -76,11 +76,14 @@ struct AckOutcome {
 /// * Timestamps: when `ts_enabled`, echoes `TSval = now_us, TSecr = ts_recent`
 ///   per RFC 7323 §3 MUST-22.
 /// * SACK blocks: when `sack_enabled` and recv-side gaps exist, emits
-///   up to `MAX_SACK_BLOCKS_EMIT` blocks. RFC 2018 §4 requires the first
-///   block to cover the most-recently-received data. `reorder_segments`
-///   arrives sorted by seq ascending; we reverse to emit highest-seq
-///   first (approximating "most recent" — exact arrival-order tracking
-///   is mTCP's refinement, deferred).
+///   up to `MAX_SACK_BLOCKS_EMIT` blocks. RFC 2018 §4 MUST-26 requires
+///   the first block to cover the segment that triggered this ACK.
+///   The caller passes `trigger_range` (the seq range of the OOO insert
+///   that caused the ACK); if that range falls inside a reorder block,
+///   emit that block first. Remaining blocks emit in highest-seq-first
+///   order (reverse of the ascending input) for RFC 2018 §4 "most recent
+///   info carried through ACK loss" intent.
+#[allow(clippy::too_many_arguments)]
 fn build_ack_outcome(
     ws_shift_out: u8,
     ts_enabled: bool,
@@ -88,6 +91,7 @@ fn build_ack_outcome(
     now_us: u32,
     sack_enabled: bool,
     reorder_segments: &[(u32, u32)],
+    trigger_range: Option<(u32, u32)>,
     free_space: u32,
 ) -> AckOutcome {
     let scaled = if ws_shift_out > 0 {
@@ -111,15 +115,47 @@ fn build_ack_outcome(
 
     let mut sack_blocks_emitted = 0u32;
     if sack_enabled && !reorder_segments.is_empty() {
-        // RFC 2018 §4: most-recent block first. Input is sorted by seq
-        // ascending; reverse + take N gives highest-seq first.
-        let take = reorder_segments
-            .len()
-            .min(crate::tcp_options::MAX_SACK_BLOCKS_EMIT);
-        for &(left, right) in reorder_segments.iter().rev().take(take) {
-            opts.push_sack_block(crate::tcp_options::SackBlock { left, right });
+        let max_emit = crate::tcp_options::MAX_SACK_BLOCKS_EMIT;
+
+        // F-8 RFC 2018 §4 MUST-26: find the reorder block that contains
+        // the triggering seq range, if any. After merge-on-insert the
+        // triggering payload may have coalesced with neighbours; we match
+        // by "contains `trigger.0`" which identifies the merged block.
+        let trigger_idx = match trigger_range {
+            Some((t_left, _)) => reorder_segments.iter().position(|&(l, r)| {
+                crate::tcp_seq::seq_le(l, t_left) && crate::tcp_seq::seq_lt(t_left, r)
+            }),
+            None => None,
+        };
+
+        let take = reorder_segments.len().min(max_emit);
+        if let Some(idx) = trigger_idx {
+            // Trigger block first (RFC 2018 §4 MUST-26).
+            let (l, r) = reorder_segments[idx];
+            opts.push_sack_block(crate::tcp_options::SackBlock { left: l, right: r });
+            sack_blocks_emitted = 1;
+            // Remaining blocks: highest-seq-first, excluding the trigger.
+            let remaining_cap = take.saturating_sub(1);
+            let mut emitted_more = 0;
+            for (i, &(left, right)) in reorder_segments.iter().enumerate().rev() {
+                if i == idx {
+                    continue;
+                }
+                if emitted_more == remaining_cap {
+                    break;
+                }
+                opts.push_sack_block(crate::tcp_options::SackBlock { left, right });
+                emitted_more += 1;
+            }
+            sack_blocks_emitted += emitted_more as u32;
+        } else {
+            // No trigger match (pure-ACK or trigger long-ago pruned):
+            // fall back to highest-seq-first to approximate "most recent".
+            for &(left, right) in reorder_segments.iter().rev().take(take) {
+                opts.push_sack_block(crate::tcp_options::SackBlock { left, right });
+            }
+            sack_blocks_emitted = take as u32;
         }
-        sack_blocks_emitted = take as u32;
     }
 
     AckOutcome {
@@ -989,6 +1025,9 @@ impl Engine {
         let seq = conn.snd_nxt;
         let ack = conn.rcv_nxt;
         let last_advertised_wnd = conn.last_advertised_wnd;
+        // F-8 RFC 2018 §4 MUST-26: the OOO-insert that triggered this
+        // ACK; drives first-block ordering in `build_ack_outcome`.
+        let trigger_range = conn.last_sack_trigger;
         // Snapshot reorder ranges as (seq, end_seq) pairs so the pure
         // helper doesn't need to know about `OooSegment`.
         let reorder_snapshot: Vec<(u32, u32)> = conn
@@ -1009,6 +1048,7 @@ impl Engine {
             now_us,
             sack_enabled,
             &reorder_snapshot,
+            trigger_range,
             free_space,
         );
 
@@ -1045,11 +1085,15 @@ impl Engine {
                 inc(&self.counters.tcp.tx_window_update);
             }
             // Record what we advertised so the next emit_ack can detect a
-            // 0 → nonzero transition.
+            // 0 → nonzero transition. Also clear the SACK trigger (F-8):
+            // its purpose was to steer first-block ordering on THIS ACK;
+            // re-using it on a subsequent ACK would falsely claim the
+            // triggering segment is still freshly-arrived.
             {
                 let mut ft = self.flow_table.borrow_mut();
                 if let Some(c) = ft.get_mut(handle) {
                     c.last_advertised_wnd = Some(outcome.window);
+                    c.last_sack_trigger = None;
                 }
             }
             if outcome.sack_blocks_emitted > 0 {
@@ -1323,7 +1367,19 @@ impl Engine {
         use crate::counters::inc;
         use crate::tcp_output::{build_segment, SegmentTx, TCP_ACK, TCP_PSH};
 
-        let (tuple, seq_start, snd_una, snd_wnd, peer_mss, state, rcv_nxt, rcv_wnd) = {
+        let (
+            tuple,
+            seq_start,
+            snd_una,
+            snd_wnd,
+            peer_mss,
+            state,
+            rcv_nxt,
+            rcv_wnd,
+            ws_shift_out,
+            ts_enabled,
+            ts_recent,
+        ) = {
             let ft = self.flow_table.borrow();
             let Some(c) = ft.get(handle) else {
                 return Err(Error::InvalidConnHandle(handle as u64));
@@ -1337,6 +1393,9 @@ impl Engine {
                 c.state,
                 c.rcv_nxt,
                 c.rcv_wnd,
+                c.ws_shift_out,
+                c.ts_enabled,
+                c.ts_recent,
             )
         };
         if state != TcpState::Established {
@@ -1357,6 +1416,11 @@ impl Engine {
         let mut accepted = 0u32;
         let mut cur_seq = seq_start;
 
+        // F-4 RFC 7323 §2.3 / §2.2: SEG.WND on every non-SYN segment MUST
+        // be right-shifted by Rcv.Wind.Shift. `ws_shift_out` is bounded at
+        // 14 by compute_ws_shift_for, so `>>` is safe.
+        let advertised_window = (rcv_wnd >> ws_shift_out).min(u16::MAX as u32) as u16;
+
         // Hot-path TCP-payload-byte accumulator. Per-burst-batched per
         // spec §9.1.1 rule 2: stack-local sum across the per-segment
         // loop, single fetch_add at method exit. Compiled out entirely
@@ -1368,6 +1432,18 @@ impl Engine {
         while remaining > 0 {
             let take = remaining.min(mss_cap as usize);
             let payload = &bytes[offset..offset + take];
+            // F-6 RFC 7323 §3 MUST-22: once TS is negotiated, every
+            // non-RST segment MUST carry TSopt. TSval = now_µs per
+            // §4.1; TSecr = the ts_recent we snapshot'd pre-loop.
+            let options = if ts_enabled {
+                let tsval = (crate::clock::now_ns() / 1000) as u32;
+                crate::tcp_options::TcpOpts {
+                    timestamps: Some((tsval, ts_recent)),
+                    ..Default::default()
+                }
+            } else {
+                crate::tcp_options::TcpOpts::default()
+            };
             let seg = SegmentTx {
                 src_mac: self.our_mac,
                 dst_mac: self.cfg.gateway_mac,
@@ -1378,15 +1454,20 @@ impl Engine {
                 seq: cur_seq,
                 ack: rcv_nxt,
                 flags: TCP_ACK | TCP_PSH,
-                window: rcv_wnd.min(u16::MAX as u32) as u16,
-                options: crate::tcp_options::TcpOpts::default(),
+                window: advertised_window,
+                options,
                 payload,
             };
-            if frame.len() < crate::tcp_output::FRAME_HDRS_MIN + take {
-                frame.resize(crate::tcp_output::FRAME_HDRS_MIN + take, 0);
+            // Budget 40 bytes for max TCP options (RFC 9293 §3.1 limit).
+            // F-6 introduces TS option on data segments; with MSS-sized
+            // payloads the frame grows by 12 bytes. Keep a 40-byte
+            // cushion for any future option additions under A5+.
+            let needed = crate::tcp_output::FRAME_HDRS_MIN + 40 + take;
+            if frame.len() < needed {
+                frame.resize(needed, 0);
             }
             let Some(n) = build_segment(&seg, &mut frame) else {
-                // Shouldn't happen; buf is sized for hdrs+take.
+                // Shouldn't happen; buf is sized for hdrs+opts+take.
                 break;
             };
             if !self.tx_data_frame(&frame[..n]) {
@@ -1439,12 +1520,21 @@ impl Engine {
         use crate::counters::inc;
         use crate::tcp_output::{build_segment, SegmentTx, TCP_ACK, TCP_FIN};
 
-        let (tuple, seq, rcv_nxt, state, rcv_wnd) = {
+        let (tuple, seq, rcv_nxt, state, rcv_wnd, ws_shift_out, ts_enabled, ts_recent) = {
             let ft = self.flow_table.borrow();
             let Some(c) = ft.get(handle) else {
                 return Err(Error::InvalidConnHandle(handle as u64));
             };
-            (c.four_tuple(), c.snd_nxt, c.rcv_nxt, c.state, c.rcv_wnd)
+            (
+                c.four_tuple(),
+                c.snd_nxt,
+                c.rcv_nxt,
+                c.state,
+                c.rcv_wnd,
+                c.ws_shift_out,
+                c.ts_enabled,
+                c.ts_recent,
+            )
         };
 
         // Only ESTABLISHED and CLOSE_WAIT may initiate FIN. Others are
@@ -1453,6 +1543,22 @@ impl Engine {
             TcpState::Established => TcpState::FinWait1,
             TcpState::CloseWait => TcpState::LastAck,
             _ => return Ok(()),
+        };
+
+        // F-5 RFC 7323 §2.3 / §2.2: FIN is a non-SYN segment; SEG.WND
+        // MUST be right-shifted by `ws_shift_out`. `ws_shift_out` is
+        // bounded at 14 so `>>` is safe.
+        let advertised_window = (rcv_wnd >> ws_shift_out).min(u16::MAX as u32) as u16;
+        // F-7 RFC 7323 §3 MUST-22: FIN is a non-RST segment; when TS
+        // is negotiated, TSopt MUST be present. TSval = now_µs per §4.1.
+        let fin_options = if ts_enabled {
+            let tsval = (crate::clock::now_ns() / 1000) as u32;
+            crate::tcp_options::TcpOpts {
+                timestamps: Some((tsval, ts_recent)),
+                ..Default::default()
+            }
+        } else {
+            crate::tcp_options::TcpOpts::default()
         };
 
         let seg = SegmentTx {
@@ -1465,11 +1571,15 @@ impl Engine {
             seq,
             ack: rcv_nxt,
             flags: TCP_ACK | TCP_FIN,
-            window: rcv_wnd.min(u16::MAX as u32) as u16,
-            options: crate::tcp_options::TcpOpts::default(),
+            window: advertised_window,
+            options: fin_options,
             payload: &[],
         };
-        let mut buf = [0u8; 64];
+        // Sized to cover max TCP-options budget (matching emit_ack): 14
+        // (eth) + 20 (ip) + 20 (tcp min) + 40 (max tcp opts) = 94; round
+        // to 128. Earlier 64-byte buffer only held header-only FINs and
+        // would fail once F-7 (TS option on FIN) lands.
+        let mut buf = [0u8; 128];
         let Some(n) = build_segment(&seg, &mut buf) else {
             return Err(Error::PeerUnreachable(tuple.peer_ip));
         };
@@ -1668,6 +1778,7 @@ mod tests {
             /* now_us */ 0xaabb_ccdd,
             /* sack_enabled */ false,
             /* reorder */ &[],
+            /* trigger_range */ None,
             /* free_space */ 256 * 1024,
         );
         // 262144 >> 7 = 2048.
@@ -1683,7 +1794,7 @@ mod tests {
     #[test]
     fn build_ack_outcome_ts_disabled_skips_option() {
         // Mirrors A3 defaults: no TS negotiated ⇒ no TS option.
-        let out = super::build_ack_outcome(0, false, 0, 12345, false, &[], 4096);
+        let out = super::build_ack_outcome(0, false, 0, 12345, false, &[], None, 4096);
         assert!(out.opts.timestamps.is_none());
         assert_eq!(out.window, 4096);
     }
@@ -1691,37 +1802,38 @@ mod tests {
     #[test]
     fn build_ack_outcome_ws_shift_zero_passes_free_space_through() {
         // ws_shift=0 ⇒ no scaling; clamp still bounds at u16::MAX.
-        let out = super::build_ack_outcome(0, false, 0, 0, false, &[], 50_000);
+        let out = super::build_ack_outcome(0, false, 0, 0, false, &[], None, 50_000);
         assert_eq!(out.window, 50_000);
     }
 
     #[test]
     fn build_ack_outcome_window_clamps_to_u16_max() {
         // Unscaled 2 MiB ⇒ clamp to 65535 (what A3 did).
-        let out = super::build_ack_outcome(0, false, 0, 0, false, &[], 2 * 1024 * 1024);
+        let out = super::build_ack_outcome(0, false, 0, 0, false, &[], None, 2 * 1024 * 1024);
         assert_eq!(out.window, u16::MAX);
     }
 
     #[test]
     fn build_ack_outcome_scaled_window_clamps_to_u16_max() {
         // 512 MiB >> 3 = 64 MiB ⇒ still >> u16::MAX, so clamp.
-        let out = super::build_ack_outcome(3, false, 0, 0, false, &[], 512 * 1024 * 1024);
+        let out = super::build_ack_outcome(3, false, 0, 0, false, &[], None, 512 * 1024 * 1024);
         assert_eq!(out.window, u16::MAX);
     }
 
     #[test]
     fn build_ack_outcome_zero_free_space_signals_zero_window_and_window_zero() {
-        let out = super::build_ack_outcome(7, false, 0, 0, false, &[], 0);
+        let out = super::build_ack_outcome(7, false, 0, 0, false, &[], None, 0);
         assert_eq!(out.window, 0);
         assert!(out.zero_window);
     }
 
     #[test]
-    fn build_ack_outcome_sack_blocks_emit_in_reverse_seq_order() {
-        // Reorder queue is sorted ascending — simulate three OOO ranges.
-        // RFC 2018 §4: most-recent (highest-seq) block comes first.
+    fn build_ack_outcome_sack_blocks_emit_in_reverse_seq_order_without_trigger() {
+        // No trigger_range supplied (e.g. pure-ACK path, no OOO insert
+        // in this turn). Fallback: highest-seq-first per RFC 2018 §4's
+        // "most recent" intent. Locks in the pre-F-8 ordering semantics.
         let reorder = [(1_000u32, 1_100u32), (2_000, 2_100), (3_000, 3_100)];
-        let out = super::build_ack_outcome(0, false, 0, 0, true, &reorder, 4096);
+        let out = super::build_ack_outcome(0, false, 0, 0, true, &reorder, None, 4096);
         assert_eq!(out.sack_blocks_emitted, 3);
         assert_eq!(out.opts.sack_block_count, 3);
         // Reversed: highest seq (3000/3100) first.
@@ -1749,10 +1861,86 @@ mod tests {
     }
 
     #[test]
+    fn build_ack_outcome_trigger_middle_block_emitted_first() {
+        // F-8 RFC 2018 §4 MUST-26: the block containing the triggering
+        // segment's seq range MUST come first, even when it is not the
+        // highest-seq block. Trigger (400, 500) should surface the
+        // [400, 500) block; remaining emit reverse-seq (highest first).
+        let reorder = [(200u32, 300u32), (400, 500), (600, 700)];
+        let out = super::build_ack_outcome(0, false, 0, 0, true, &reorder, Some((400, 500)), 4096);
+        assert_eq!(out.sack_blocks_emitted, 3);
+        assert_eq!(out.opts.sack_block_count, 3);
+        // Trigger block first.
+        assert_eq!(
+            out.opts.sack_blocks[0],
+            crate::tcp_options::SackBlock {
+                left: 400,
+                right: 500
+            }
+        );
+        // Remaining: highest-seq-first among non-trigger.
+        assert_eq!(
+            out.opts.sack_blocks[1],
+            crate::tcp_options::SackBlock {
+                left: 600,
+                right: 700
+            }
+        );
+        assert_eq!(
+            out.opts.sack_blocks[2],
+            crate::tcp_options::SackBlock {
+                left: 200,
+                right: 300
+            }
+        );
+    }
+
+    #[test]
+    fn build_ack_outcome_trigger_merged_into_existing_block_emits_merged_first() {
+        // Trigger (420, 450) fell inside an existing block (400, 500)
+        // after merge-on-insert. `build_ack_outcome` finds the merged
+        // block by `left <= trigger.0 < right` and emits it first.
+        let reorder = [(200u32, 300u32), (400, 500)];
+        let out = super::build_ack_outcome(0, false, 0, 0, true, &reorder, Some((420, 450)), 4096);
+        assert_eq!(out.sack_blocks_emitted, 2);
+        assert_eq!(
+            out.opts.sack_blocks[0],
+            crate::tcp_options::SackBlock {
+                left: 400,
+                right: 500
+            }
+        );
+        assert_eq!(
+            out.opts.sack_blocks[1],
+            crate::tcp_options::SackBlock {
+                left: 200,
+                right: 300
+            }
+        );
+    }
+
+    #[test]
+    fn build_ack_outcome_trigger_no_match_falls_back_to_reverse_order() {
+        // Trigger range outside all reorder blocks (e.g. it was fully
+        // consumed by drain_contiguous_from before emit). Fallback to
+        // reverse-seq-first.
+        let reorder = [(1_000u32, 1_100u32), (2_000, 2_100)];
+        let out = super::build_ack_outcome(0, false, 0, 0, true, &reorder, Some((500, 600)), 4096);
+        assert_eq!(out.sack_blocks_emitted, 2);
+        assert_eq!(
+            out.opts.sack_blocks[0],
+            crate::tcp_options::SackBlock {
+                left: 2_000,
+                right: 2_100
+            }
+        );
+    }
+
+    #[test]
     fn build_ack_outcome_sack_disabled_skips_blocks_even_with_reorder() {
         // Peer didn't negotiate SACK-permitted ⇒ no blocks on wire.
         let reorder = [(100u32, 200u32)];
-        let out = super::build_ack_outcome(0, false, 0, 0, false, &reorder, 4096);
+        let out = super::build_ack_outcome(0, false, 0, 0, false, &reorder, None, 4096);
         assert_eq!(out.sack_blocks_emitted, 0);
         assert_eq!(out.opts.sack_block_count, 0);
     }
@@ -1767,7 +1955,7 @@ mod tests {
             (4_000, 4_100),
             (5_000, 5_100),
         ];
-        let out = super::build_ack_outcome(0, false, 0, 0, true, &reorder, 4096);
+        let out = super::build_ack_outcome(0, false, 0, 0, true, &reorder, None, 4096);
         assert_eq!(out.sack_blocks_emitted, 3);
         assert_eq!(out.opts.sack_block_count, 3);
         assert_eq!(
@@ -1804,6 +1992,7 @@ mod tests {
             /* now_us */ 0x1234_5678,
             /* sack_enabled */ true,
             /* reorder */ &reorder,
+            /* trigger_range */ None,
             /* free_space */ 256 * 1024,
         );
         assert_eq!(out.window, 2048);

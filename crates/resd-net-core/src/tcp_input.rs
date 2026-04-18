@@ -520,6 +520,13 @@ fn handle_established(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
                 if (take as usize) < seg.payload.len() {
                     buf_full_drop += seg.payload.len() as u32 - take;
                 }
+                // F-8 RFC 2018 §4 MUST-26: record the seq range that
+                // triggered this OOO-insert so `build_ack_outcome` emits
+                // it as the first SACK block. `emit_ack` clears the
+                // trigger after consuming it.
+                if outcome.newly_buffered > 0 {
+                    conn.last_sack_trigger = Some((seg.seq, seg.seq.wrapping_add(take)));
+                }
             } else {
                 buf_full_drop = seg.payload.len() as u32;
             }
@@ -1056,6 +1063,9 @@ mod tests {
         assert_eq!(c.rcv_nxt, 5001);
         assert_eq!(c.recv.reorder.len(), 1);
         assert_eq!(&c.recv.reorder.segments()[0].payload, b"xyz");
+        // F-8 RFC 2018 §4 MUST-26: triggering OOO range recorded for
+        // the upcoming ACK's first SACK block.
+        assert_eq!(c.last_sack_trigger, Some((5100, 5103)));
     }
 
     #[test]

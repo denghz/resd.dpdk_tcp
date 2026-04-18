@@ -157,6 +157,14 @@ pub struct TcpConn {
     /// that bumps `tcp.tx_window_update` (A4 cross-phase backfill). `None`
     /// means no ACK has been emitted yet on this conn.
     pub last_advertised_wnd: Option<u16>,
+
+    /// A4 / F-8 RFC 2018 §4 MUST-26: `(left, right)` seq range of the
+    /// most-recent OOO segment that caused an ACK to be emitted. Used by
+    /// `build_ack_outcome` to satisfy the "first SACK block MUST specify
+    /// the contiguous block containing the segment that triggered this
+    /// ACK" rule. Cleared after consumption. `None` between triggers
+    /// (in-order data + pure ACKs don't set it).
+    pub last_sack_trigger: Option<(u32, u32)>,
 }
 
 impl TcpConn {
@@ -198,6 +206,7 @@ impl TcpConn {
             our_fin_seq: None,
             time_wait_deadline_ns: None,
             last_advertised_wnd: None,
+            last_sack_trigger: None,
         }
     }
 
@@ -301,5 +310,14 @@ mod tests {
         let c = TcpConn::new_client(tuple(), 1000, 1460, 1024, 2048);
         assert!(c.sack_scoreboard.is_empty());
         assert_eq!(c.sack_scoreboard.len(), 0);
+    }
+
+    #[test]
+    fn a4_last_sack_trigger_starts_none() {
+        // F-8 RFC 2018 §4 MUST-26: conn.last_sack_trigger is set by
+        // tcp_input on OOO-insert and cleared by emit_ack after use.
+        // Starts `None` on a fresh client connection.
+        let c = TcpConn::new_client(tuple(), 1000, 1460, 1024, 2048);
+        assert!(c.last_sack_trigger.is_none());
     }
 }
