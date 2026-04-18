@@ -1,12 +1,16 @@
 use resd_net_sys as sys;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ffi::CString;
 use std::sync::Mutex;
 
 use crate::arp;
 use crate::counters::Counters;
+use crate::flow_table::{ConnHandle, FlowTable, FourTuple};
+use crate::iss::IssGen;
 use crate::icmp::PmtuTable;
 use crate::mempool::Mempool;
+use crate::tcp_events::{EventQueue, InternalEvent};
+use crate::tcp_state::TcpState;
 use crate::Error;
 
 /// Config passed to Engine::new.
@@ -70,10 +74,16 @@ pub struct Engine {
     counters: Box<Counters>,
     _rx_mempool: Mempool,
     tx_hdr_mempool: Mempool,
-    _tx_data_mempool: Mempool,
+    tx_data_mempool: Mempool,
     our_mac: [u8; 6],
     pmtu: RefCell<PmtuTable>,
     last_garp_ns: RefCell<u64>,
+
+    // Phase A3 additions
+    flow_table: RefCell<FlowTable>,
+    events: RefCell<EventQueue>,
+    iss_gen: IssGen,
+    last_ephemeral_port: Cell<u16>,
 }
 
 /// EAL is process-global; only initialize once.
@@ -195,14 +205,19 @@ impl Engine {
         let counters = Box::new(Counters::new());
 
         Ok(Self {
-            cfg,
             counters,
             _rx_mempool: rx_mempool,
             tx_hdr_mempool,
-            _tx_data_mempool: tx_data_mempool,
+            tx_data_mempool,
             our_mac,
             pmtu: RefCell::new(PmtuTable::new()),
             last_garp_ns: RefCell::new(0),
+            flow_table: RefCell::new(FlowTable::new(cfg.max_connections)),
+            events: RefCell::new(EventQueue::new()),
+            iss_gen: IssGen::new(0),
+            // RFC 6056 ephemeral port hint range: start at 49152.
+            last_ephemeral_port: Cell::new(49151),
+            cfg,
         })
     }
 
@@ -270,6 +285,72 @@ impl Engine {
             inc(&self.counters.eth.tx_drop_full_ring);
             false
         }
+    }
+
+    /// TX a full-size frame via `tx_data_mempool`. Used for TCP data
+    /// segments where the frame size exceeds the small-mbuf pool's
+    /// data room. Behavior is otherwise identical to `tx_frame`.
+    pub(crate) fn tx_data_frame(&self, bytes: &[u8]) -> bool {
+        use crate::counters::{add, inc};
+        if bytes.len() > u16::MAX as usize {
+            inc(&self.counters.eth.tx_drop_nomem);
+            return false;
+        }
+        let m = unsafe { sys::resd_rte_pktmbuf_alloc(self.tx_data_mempool.as_ptr()) };
+        if m.is_null() {
+            inc(&self.counters.eth.tx_drop_nomem);
+            return false;
+        }
+        let dst = unsafe { sys::resd_rte_pktmbuf_append(m, bytes.len() as u16) };
+        if dst.is_null() {
+            unsafe { sys::resd_rte_pktmbuf_free(m) };
+            inc(&self.counters.eth.tx_drop_nomem);
+            return false;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst as *mut u8, bytes.len());
+        }
+        let mut pkts = [m];
+        let sent = unsafe {
+            sys::resd_rte_eth_tx_burst(
+                self.cfg.port_id,
+                self.cfg.tx_queue_id,
+                pkts.as_mut_ptr(),
+                1,
+            )
+        } as usize;
+        if sent == 1 {
+            add(&self.counters.eth.tx_bytes, bytes.len() as u64);
+            inc(&self.counters.eth.tx_pkts);
+            true
+        } else {
+            unsafe { sys::resd_rte_pktmbuf_free(m) };
+            inc(&self.counters.eth.tx_drop_full_ring);
+            false
+        }
+    }
+
+    /// Pick the next ephemeral source port in the IANA range [49152, 65535].
+    /// Simple wraparound counter; collisions with existing flows in the
+    /// table are not checked (at <=100 connections the odds are negligible).
+    fn next_ephemeral_port(&self) -> u16 {
+        let mut p = self.last_ephemeral_port.get();
+        p = p.wrapping_add(1);
+        if p < 49152 {
+            p = 49152;
+        }
+        self.last_ephemeral_port.set(p);
+        p
+    }
+
+    pub fn flow_table(&self) -> std::cell::RefMut<'_, FlowTable> {
+        self.flow_table.borrow_mut()
+    }
+    pub fn events(&self) -> std::cell::RefMut<'_, EventQueue> {
+        self.events.borrow_mut()
+    }
+    pub fn iss_gen(&self) -> &IssGen {
+        &self.iss_gen
     }
 
     /// One iteration of the run-to-completion loop.
@@ -375,7 +456,7 @@ impl Engine {
                 match ip.protocol {
                     crate::l3_ip::IPPROTO_TCP => {
                         inc(&self.counters.ip.rx_tcp);
-                        self.tcp_input_stub(&ip, inner);
+                        self.tcp_input(&ip, inner);
                     }
                     crate::l3_ip::IPPROTO_ICMP => {
                         inc(&self.counters.ip.rx_icmp);
@@ -401,11 +482,222 @@ impl Engine {
         }
     }
 
-    /// Phase A2 TCP input stub — real FSM lands in A3.
-    /// Kept separate so A3 can replace this with a real implementation
-    /// without touching the L3 dispatch code above.
-    fn tcp_input_stub(&self, _ip: &crate::l3_ip::L3Decoded, _tcp_payload: &[u8]) {
-        // No-op. Counter already bumped in the caller.
+    /// Real TCP input path (A3). Parses the segment, finds the flow,
+    /// dispatches to per-state handler, emits ACK/RST and events.
+    fn tcp_input(&self, ip: &crate::l3_ip::L3Decoded, tcp_bytes: &[u8]) {
+        use crate::counters::inc;
+        use crate::tcp_input::{dispatch, parse_segment, tuple_from_segment, TxAction};
+
+        let parsed = match parse_segment(tcp_bytes, ip.src_ip, ip.dst_ip, false) {
+            Ok(p) => p,
+            Err(e) => {
+                match e {
+                    crate::tcp_input::TcpParseError::Short => inc(&self.counters.tcp.rx_short),
+                    crate::tcp_input::TcpParseError::BadFlags => inc(&self.counters.tcp.rx_bad_flags),
+                    crate::tcp_input::TcpParseError::Csum => inc(&self.counters.tcp.rx_bad_csum),
+                    crate::tcp_input::TcpParseError::BadDataOffset => inc(&self.counters.tcp.rx_short),
+                }
+                return;
+            }
+        };
+
+        let tuple = tuple_from_segment(ip.src_ip, ip.dst_ip, &parsed);
+        let handle = { self.flow_table.borrow().lookup_by_tuple(&tuple) };
+        let Some(handle) = handle else {
+            // Unmatched: reply RST per spec §5.1 `reply_rst`.
+            inc(&self.counters.tcp.rx_unmatched);
+            self.send_rst_unmatched(&tuple, &parsed);
+            return;
+        };
+
+        // Bump per-flag counters for observability before dispatch.
+        use crate::tcp_output::{TCP_ACK, TCP_FIN, TCP_RST, TCP_SYN};
+        if (parsed.flags & TCP_SYN) != 0 && (parsed.flags & TCP_ACK) != 0 {
+            inc(&self.counters.tcp.rx_syn_ack);
+        }
+        if (parsed.flags & TCP_ACK) != 0 { inc(&self.counters.tcp.rx_ack); }
+        if (parsed.flags & TCP_FIN) != 0 { inc(&self.counters.tcp.rx_fin); }
+        if (parsed.flags & TCP_RST) != 0 { inc(&self.counters.tcp.rx_rst); }
+        if !parsed.payload.is_empty() { inc(&self.counters.tcp.rx_data); }
+
+        let outcome = {
+            let mut ft = self.flow_table.borrow_mut();
+            let Some(conn) = ft.get_mut(handle) else { return; };
+            dispatch(conn, &parsed)
+        };
+
+        if let Some(new_state) = outcome.new_state {
+            self.transition_conn(handle, new_state);
+        }
+
+        match outcome.tx {
+            TxAction::Ack => self.emit_ack(handle),
+            TxAction::Rst => {
+                self.emit_rst(handle, &parsed);
+                self.transition_conn(handle, TcpState::Closed);
+            }
+            TxAction::None => {}
+        }
+
+        if outcome.connected {
+            self.events.borrow_mut().push(InternalEvent::Connected {
+                conn: handle, rx_hw_ts_ns: 0,
+            });
+            inc(&self.counters.tcp.conn_open);
+        }
+
+        if outcome.delivered > 0 {
+            self.deliver_readable(handle, outcome.delivered);
+        }
+
+        if outcome.closed {
+            self.events.borrow_mut().push(InternalEvent::Closed {
+                conn: handle, err: 0,
+            });
+            inc(&self.counters.tcp.conn_close);
+            // Remove the flow on final close (but leave TIME_WAIT alive
+            // for the reaper — that's handled via `transition_conn`).
+            let state = self.flow_table.borrow().get(handle).map(|c| c.state);
+            if state == Some(TcpState::Closed) {
+                self.flow_table.borrow_mut().remove(handle);
+            }
+        }
+    }
+
+    fn transition_conn(&self, handle: ConnHandle, to: TcpState) {
+        use crate::counters::inc;
+        let mut ft = self.flow_table.borrow_mut();
+        let Some(conn) = ft.get_mut(handle) else { return; };
+        let from = conn.state;
+        if from == to { return; }
+        conn.state = to;
+        // TIME_WAIT entry: arm the reaping deadline.
+        if to == TcpState::TimeWait {
+            let msl_ns = (self.cfg.tcp_msl_ms as u64) * 1_000_000;
+            conn.time_wait_deadline_ns = Some(crate::clock::now_ns().saturating_add(2 * msl_ns));
+        }
+        drop(ft);
+        inc(&self.counters.tcp.state_trans[from as usize][to as usize]);
+        self.events.borrow_mut().push(InternalEvent::StateChange {
+            conn: handle, from, to,
+        });
+    }
+
+    /// Emit a bare ACK for `handle`. The advertised window is the CURRENT
+    /// recv buffer free_space (fix for Task 12 reviewer I-3 finding).
+    fn emit_ack(&self, handle: ConnHandle) {
+        use crate::counters::inc;
+        use crate::tcp_output::{build_segment, SegmentTx, TCP_ACK};
+        let ft = self.flow_table.borrow();
+        let Some(conn) = ft.get(handle) else { return; };
+        let t = conn.four_tuple();
+        let window = conn.recv.free_space().min(u16::MAX as u32) as u16;
+        let seg = SegmentTx {
+            src_mac: self.our_mac,
+            dst_mac: self.cfg.gateway_mac,
+            src_ip: t.local_ip,
+            dst_ip: t.peer_ip,
+            src_port: t.local_port,
+            dst_port: t.peer_port,
+            seq: conn.snd_nxt,
+            ack: conn.rcv_nxt,
+            flags: TCP_ACK,
+            window,
+            mss_option: None,
+            payload: &[],
+        };
+        let mut buf = [0u8; 64];
+        let Some(n) = build_segment(&seg, &mut buf) else { return; };
+        drop(ft);
+        if self.tx_frame(&buf[..n]) {
+            inc(&self.counters.tcp.tx_ack);
+        }
+    }
+
+    fn emit_rst(&self, handle: ConnHandle, incoming: &crate::tcp_input::ParsedSegment) {
+        use crate::counters::inc;
+        use crate::tcp_output::{build_segment, SegmentTx, TCP_ACK, TCP_RST};
+        let ft = self.flow_table.borrow();
+        let Some(conn) = ft.get(handle) else { return; };
+        let t = conn.four_tuple();
+        let ack = incoming.seq.wrapping_add(incoming.payload.len() as u32);
+        let seg = SegmentTx {
+            src_mac: self.our_mac,
+            dst_mac: self.cfg.gateway_mac,
+            src_ip: t.local_ip, dst_ip: t.peer_ip,
+            src_port: t.local_port, dst_port: t.peer_port,
+            seq: conn.snd_nxt,
+            ack,
+            flags: TCP_RST | TCP_ACK,
+            window: 0,
+            mss_option: None,
+            payload: &[],
+        };
+        let mut buf = [0u8; 64];
+        let Some(n) = build_segment(&seg, &mut buf) else { return; };
+        drop(ft);
+        if self.tx_frame(&buf[..n]) {
+            inc(&self.counters.tcp.tx_rst);
+        }
+    }
+
+    /// Reply RST to a segment whose 4-tuple has no matching flow.
+    /// Per RFC 9293 §3.10.7.1: if the incoming has ACK set, seq=incoming.ack;
+    /// else seq=0, ack=incoming.seq+payload_len+SYN_FLAG+FIN_FLAG, flags=RST|ACK.
+    fn send_rst_unmatched(&self, tuple: &FourTuple, incoming: &crate::tcp_input::ParsedSegment) {
+        use crate::counters::inc;
+        use crate::tcp_output::{build_segment, SegmentTx, TCP_ACK, TCP_FIN, TCP_RST, TCP_SYN};
+        if (incoming.flags & TCP_RST) != 0 {
+            return; // don't RST a RST.
+        }
+        let syn_len = ((incoming.flags & TCP_SYN) != 0) as u32;
+        let fin_len = ((incoming.flags & TCP_FIN) != 0) as u32;
+        let (seq, ack, flags) = if (incoming.flags & TCP_ACK) != 0 {
+            (incoming.ack, 0, TCP_RST)
+        } else {
+            let ack = incoming.seq
+                .wrapping_add(incoming.payload.len() as u32)
+                .wrapping_add(syn_len)
+                .wrapping_add(fin_len);
+            (0, ack, TCP_RST | TCP_ACK)
+        };
+        let seg = SegmentTx {
+            src_mac: self.our_mac,
+            dst_mac: self.cfg.gateway_mac,
+            src_ip: tuple.local_ip, dst_ip: tuple.peer_ip,
+            src_port: tuple.local_port, dst_port: tuple.peer_port,
+            seq, ack, flags, window: 0,
+            mss_option: None, payload: &[],
+        };
+        let mut buf = [0u8; 64];
+        let Some(n) = build_segment(&seg, &mut buf) else { return; };
+        if self.tx_frame(&buf[..n]) {
+            inc(&self.counters.tcp.tx_rst);
+        }
+    }
+
+    fn deliver_readable(&self, handle: ConnHandle, delivered: u32) {
+        use crate::counters::add;
+        let mut ft = self.flow_table.borrow_mut();
+        let Some(conn) = ft.get_mut(handle) else { return; };
+        // Drain the VecDeque's two slices into the last_read_buf so the
+        // caller sees one contiguous view. The buf is cleared at the top
+        // of the next poll by the caller (see Task 19).
+        conn.recv.last_read_buf.clear();
+        conn.recv.last_read_buf.reserve(delivered as usize);
+        let (a, b) = conn.recv.bytes.as_slices();
+        let from_a = a.len().min(delivered as usize);
+        conn.recv.last_read_buf.extend_from_slice(&a[..from_a]);
+        let remaining = delivered as usize - from_a;
+        conn.recv.last_read_buf.extend_from_slice(&b[..remaining]);
+        for _ in 0..delivered {
+            conn.recv.bytes.pop_front();
+        }
+        drop(ft);
+        add(&self.counters.tcp.recv_buf_delivered, delivered as u64);
+        self.events.borrow_mut().push(InternalEvent::Readable {
+            conn: handle, byte_len: delivered, rx_hw_ts_ns: 0,
+        });
     }
 
     fn maybe_emit_gratuitous_arp(&self) {
