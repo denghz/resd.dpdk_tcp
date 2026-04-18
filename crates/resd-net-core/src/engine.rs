@@ -619,6 +619,7 @@ impl Engine {
 
         if n == 0 {
             inc(&self.counters.poll.iters_idle);
+            self.advance_timer_wheel();
             self.reap_time_wait();
             self.maybe_emit_gratuitous_arp();
             return 0;
@@ -662,9 +663,119 @@ impl Engine {
             }
         }
 
+        self.advance_timer_wheel();
         self.reap_time_wait();
         self.maybe_emit_gratuitous_arp();
         n
+    }
+
+    /// A5 Task 12: advance the timer wheel to `now_ns` and dispatch fired
+    /// timers by kind. `advance()` returns an owned `Vec`, so the
+    /// `timer_wheel` borrow ends at the semicolon — per-timer handlers are
+    /// free to re-borrow the wheel (e.g. `on_rto_fire` re-arms).
+    fn advance_timer_wheel(&self) {
+        let fired = self
+            .timer_wheel
+            .borrow_mut()
+            .advance(crate::clock::now_ns());
+        for (id, node) in fired {
+            match node.kind {
+                crate::tcp_timer_wheel::TimerKind::Rto => {
+                    self.on_rto_fire(node.owner_handle, id);
+                }
+                crate::tcp_timer_wheel::TimerKind::Tlp
+                | crate::tcp_timer_wheel::TimerKind::SynRetrans
+                | crate::tcp_timer_wheel::TimerKind::ApiPublic => {
+                    // Wired in Tasks 17 / 18 / A6. Silent no-op for now.
+                }
+            }
+        }
+    }
+
+    /// A5 Task 12: RTO fire. Retransmits the front `snd_retrans` entry,
+    /// bumps `tcp.tx_rto`, applies backoff (unless `rto_no_backoff`), and
+    /// re-arms the RTO timer at `now + rto_us`. Silent no-op when the
+    /// fired `TimerId` is stale (doesn't match `conn.rto_timer_id`) or
+    /// `snd_retrans` is already empty (ACK raced the fire). Task 13
+    /// inserts the max-retrans-count check between retransmit and
+    /// backoff; Task 20 inserts the `RESD_NET_EVT_TCP_RETRANS` emission.
+    pub(crate) fn on_rto_fire(
+        &self,
+        handle: ConnHandle,
+        fired_id: crate::tcp_timer_wheel::TimerId,
+    ) {
+        // Phase 1: validate fired_id + read flags.
+        let (is_current, is_empty, rto_no_backoff) = {
+            let ft = self.flow_table.borrow();
+            let Some(c) = ft.get(handle) else { return };
+            let current = c.rto_timer_id == Some(fired_id);
+            (current, c.snd_retrans.is_empty(), c.rto_no_backoff)
+        };
+        if !is_current {
+            // Stale fire (pre-cancel raced, or slot reused). Ignore.
+            return;
+        }
+
+        // Phase 2: clear rto_timer_id + prune timer_ids.
+        {
+            let mut ft = self.flow_table.borrow_mut();
+            if let Some(c) = ft.get_mut(handle) {
+                c.rto_timer_id = None;
+                c.timer_ids.retain(|t| *t != fired_id);
+            }
+        }
+
+        if is_empty {
+            // Nothing to retransmit (ACK just pruned the last entry before
+            // the fire cancel took effect). RTO stays disarmed.
+            return;
+        }
+
+        // Phase 3: retransmit the front in-flight entry.
+        self.retransmit(handle, 0);
+        crate::counters::inc(&self.counters.tcp.tx_rto);
+
+        // Task 13 inserts the max-retrans-count check here.
+        // Task 20 inserts the RESD_NET_EVT_TCP_RETRANS emission here.
+
+        // Phase 4: apply backoff unless per-connect opt-out.
+        if !rto_no_backoff {
+            let mut ft = self.flow_table.borrow_mut();
+            if let Some(c) = ft.get_mut(handle) {
+                c.rtt_est.apply_backoff();
+            }
+        }
+
+        // Phase 5: compute new fire_at and arm a fresh RTO timer.
+        let now_ns = crate::clock::now_ns();
+        let new_rto_us = {
+            let ft = self.flow_table.borrow();
+            ft.get(handle).map(|c| c.rtt_est.rto_us()).unwrap_or(0)
+        };
+        if new_rto_us == 0 {
+            // Defensive: don't arm a zero-delay timer.
+            return;
+        }
+        let fire_at_ns = now_ns + (new_rto_us as u64 * 1_000);
+        let id = self.timer_wheel.borrow_mut().add(
+            now_ns,
+            crate::tcp_timer_wheel::TimerNode {
+                fire_at_ns,
+                owner_handle: handle,
+                kind: crate::tcp_timer_wheel::TimerKind::Rto,
+                generation: 0,
+                cancelled: false,
+            },
+        );
+
+        // Phase 6: write the new timer id back onto the conn.
+        {
+            let mut ft = self.flow_table.borrow_mut();
+            if let Some(c) = ft.get_mut(handle) {
+                c.rto_timer_id = Some(id);
+                c.timer_ids.push(id);
+            }
+        }
     }
 
     /// Walk the flow table and move any TIME_WAIT connection past its
@@ -2153,6 +2264,21 @@ mod tests {
     fn retransmit_signature_exists() {
         fn _check(e: &Engine, h: crate::flow_table::ConnHandle) {
             e.retransmit(h, 0);
+        }
+    }
+
+    // Task 12: `on_rto_fire` signature compile-check. Body coverage
+    // lives in Task 28 (RTO/RACK/TLP TAP integration) — a real fire
+    // needs EAL/DPDK. The handler itself is exercised indirectly via
+    // `advance_timer_wheel` from `poll_once`.
+    #[test]
+    fn on_rto_fire_signature_exists() {
+        fn _check(
+            e: &Engine,
+            h: crate::flow_table::ConnHandle,
+            id: crate::tcp_timer_wheel::TimerId,
+        ) {
+            e.on_rto_fire(h, id);
         }
     }
 
