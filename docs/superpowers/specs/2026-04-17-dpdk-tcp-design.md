@@ -369,7 +369,8 @@ struct TcpConn {
 
 | Default | RFC stance | Our default | Rationale |
 |---|---|---|---|
-| Delayed ACK | RFC 1122 SHOULD (§4.2.3.2 ≤500ms, ≥1/2 full-size segments) | **off** | 200ms ACK delay is catastrophic for trading. Within each `resd_net_poll` iteration the stack emits at most one ACK per connection covering the in-order RX delta (burst-scope coalescing, not time-based delay). This bounds ACK rate at `(conn_count × poll_rate)` Hz. On bulk inbound market-data bursts, ACK rate can approach line-rate/MSS — acceptable because the TX path to the exchange is low-volume and not bandwidth-starved. |
+| Delayed ACK | RFC 1122 SHOULD (§4.2.3.2 ≤500ms, ≥1/2 full-size segments); RFC 9293 MUST-58/-59 aggregate ACKs within an RX burst | **off + per-segment ACK in A3; burst-scope coalescing in A6** | 200ms ACK delay is catastrophic for trading. The spec-intent end state is: within each `resd_net_poll` iteration the stack emits at most one ACK per connection covering the in-order RX delta (burst-scope coalescing, not time-based delay). **Phase A3 ships a simpler per-segment-ACK baseline** — each inbound in-order data segment triggers one ACK in the same poll iteration. This over-ACKs relative to MUST-58 but never causes correctness issues (each ACK is individually valid). Burst-scope coalescing is finalized in A6 alongside the `preset=rfc_compliance` switch. This bounds ACK rate at `(conn_count × poll_rate × inbound_segs_per_poll)` Hz under A3 and `(conn_count × poll_rate)` Hz under A6 — acceptable in both modes because the TX path to the exchange is low-volume and not bandwidth-starved. |
+| Receive-window shrinkage vs. buffer occupancy | RFC 9293 §3.10.7.4 (implicit: advertise `rcv_wnd = recv-buffer free space` and use the same value for ingress acceptance) | **advertise free_space; accept at full capacity** | Trading workload is market-data ingress at peer line-rate. Shrinking the ingress-acceptance window to match local buffer occupancy would throttle the peer's send rate — masking a real upstream "slow application consumer" problem as a protocol-layer artifact. We keep the ingress seq-window check at initial capacity (`recv_buffer_bytes`, default 256 KiB) so we accept everything the peer sends, and expose the drop condition via `tcp.recv_buf_drops` (bytes dropped because `recv.append` clamped at `free_space`). The peer's retransmit path recovers the dropped bytes; the application sees the counter climb and knows to speed up its consumer. The ACK we emit always advertises the real free space so well-behaved peers still throttle themselves based on *advertised* window; our wider ingress check just avoids being doubly-conservative. See `feedback_performance_first_flow_control.md`. |
 | Nagle (`TCP_NODELAY` inverse) | RFC 896 | **off** | user sends complete requests; coalescing is their choice |
 | TCP keepalive | optional | **off** | exchanges close idle; application heartbeats are preferred |
 | minRTO | RFC 6298 RECOMMENDS 1s | **20ms** (tunable) | intra-region WAN RTT is 1–10ms |
@@ -690,6 +691,49 @@ Same hardware, same traffic, two stacks. Linux run uses `AF_PACKET` mmap sockets
 
 Publish as "latency at 95% confidence interval, resd_net vs. Linux, N=100k measurements per bucket" with machine-readable CSV output so the comparison is reproducible.
 
+### 11.5.1 Comparative benchmark vs. mTCP (burst throughput on reused connections)
+
+Same hardware, same peer, two userspace DPDK stacks. Workload is a persistent connection reused across many bursts, each burst being a block of bytes pushed as fast as the stack will send them — the pattern market-data replay and order-batch flows produce.
+
+Workload grid (product = 20 buckets):
+- One connection per lcore, established once, reused for the whole run.
+- Burst size K ∈ {64 KiB, 256 KiB, 1 MiB, 4 MiB, 16 MiB} — spans short-burst to near-continuous regimes.
+- Idle gap G ∈ {0 ms (back-to-back), 1 ms, 10 ms, 100 ms} — G=0 collapses to sustained-flow, cross-checks §11.5.2.
+- Each burst is K bytes in MSS-sized segments; peer is the §11.5 kernel-side TCP sink (receives + ACKs, no echo).
+- `cc_mode=off` on both stacks (comparison axis is the fast-path stack, not congestion control); documented in CSV header.
+
+Measurement contract (identical instrumentation on both stacks):
+- `t0` = inline TSC read immediately before the first `resd_net_send` / `mtcp_write` of the burst.
+- `t1` = NIC HW TX timestamp on the **last segment** of the burst (read from `rte_mbuf::tx_timestamp` once the burst drains).
+- `throughput_per_burst = K / (t1 − t0)`. One sample per burst; aggregate into p50/p99/p999.
+- Secondary decomposition: `t_first_wire` = HW TX timestamp on segment 1 → `initiation = t_first_wire − t0`, `steady = K / (t1 − t_first_wire)`. Surfaces whether we are losing on spin-up or sustained rate.
+- Warmup: first 100 bursts per bucket discarded (mempool cold, cache cold, TSC settle).
+- Pre-run checks (bucket invalid and must be re-run if any fail): peer's advertised receive window ≥ K so we aren't measuring peer-window stall; identical MSS (1460) and TX burst size on both stacks; achieved rate stays ≤ 70% of NIC max pps/bps so we aren't NIC-bound; §11.1 measurement-discipline check green.
+- Sanity invariant checked at run end: `sum_over_bursts(K) == stack_tx_bytes_counter`. Divergence = the harness is lying about what it sent.
+
+Aggregation: p50, p99, p999 of `throughput_per_burst` across ≥10k bursts per bucket. CSV schema matches §11.5 so `tools/bench-report` feeds it into the same dashboard.
+
+Rationale: mTCP is the natural userspace-DPDK comparator, designed for sustained-flow throughput. The {K, G} grid spans the pattern we actually care about, from short intense bursts through to near-continuous high-rate delivery, and exposes whether `resd_net`'s small-connection-count / latency-oriented design concedes meaningful ground on burst throughput.
+
+### 11.5.2 Comparative max sustained throughput vs. mTCP, varied application write size
+
+Complement to §11.5.1: instead of discrete bursts, pump bytes continuously for a fixed wall-time window and measure maximum sustained rate. Exposes per-write overhead vs per-byte cost as a function of application write size — a trading client emitting many small order messages has a very different stack-call shape than one streaming bulk data, and the crossover point between call-cost-bound and byte-cost-bound is a real design parameter.
+
+Workload grid (product = 28 buckets per stack):
+- Persistent connection(s); application writes in a tight loop for T = 60 s per bucket post-warmup.
+- Application write size W ∈ {64 B, 256 B, 1 KiB, 4 KiB, 16 KiB, 64 KiB, 256 KiB}.
+- Connection count C ∈ {1, 4, 16, 64} — 1 isolates per-connection ceiling; 4/16/64 measure aggregate under lcore contention.
+- Peer: the §11.5.1 kernel-side TCP sink.
+- Same `cc_mode=off`, same MSS, same TX burst size, same pre-run checks as §11.5.1.
+
+Measurement:
+- Primary metric: sustained goodput = `(bytes ACKed in [t_warmup_end, t_warmup_end + T]) / T`, in bytes/sec, per (W, C) bucket.
+- Secondary: packet rate = `segments_tx_counter_delta / T` — small-W buckets are pps-limited, not bps-limited, and reporting both makes the limit explicit.
+- Warmup: 10 s pumping before the measurement window starts.
+- Sanity invariant: ACKed bytes during window == `stack_tx_bytes_counter_delta` during window (minus any bytes still in-flight at `t_end`, bounded by cwnd + rwnd).
+
+Rationale: small W tests per-call overhead (FFI dispatch, flow-table lookup, send-coalescing logic); large W tests per-byte cost (mbuf-chain setup, segmentation, header pseudo-checksum). The curve W → goodput(W) localizes where we're spending budget and whether the cross-over sits in a worse place than mTCP's. The C axis lets us tell "one hot connection" from "aggregate under contention," which for our workload profile (small connection count) are different questions with different answers.
+
 ### 11.6 Throughput benchmarks (secondary)
 
 Throughput is not the primary goal but must not collapse:
@@ -712,7 +756,8 @@ Pass criteria: within 20% of Linux single-connection goodput (Linux has years of
 - `tools/bench-micro` — cargo-criterion harness.
 - `tools/bench-e2e` — end-to-end RTT harness with HW-timestamp attribution.
 - `tools/bench-stress` — netem/FaultInjector driver for stability runs.
-- `tools/bench-vs-linux` — dual-stack comparison harness (reuses `tools/ab-bench` from §10.11).
+- `tools/bench-vs-linux` — dual-stack comparison harness vs Linux TCP (reuses `tools/ab-bench` from §10.11).
+- `tools/bench-vs-mtcp` — dual-stack comparison harness vs mTCP, two sub-workloads: `burst` (§11.5.1 burst-throughput grid) and `maxtp` (§11.5.2 sustained-throughput sweep by write size and connection count). mTCP built from `third_party/mtcp/` (already a submodule for the §10.13 review gate).
 - `tools/bench-report` — converts CSV outputs into shareable tables, feeds the dashboard.
 
 ### 11.9 Stage gates tied to benchmarks
