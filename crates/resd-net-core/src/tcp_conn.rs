@@ -93,6 +93,35 @@ pub struct TcpConn {
     /// to 536 if the peer omits the option (RFC 9293 §3.7.1 / RFC 6691).
     pub peer_mss: u16,
 
+    // Phase A4: option-negotiated fields per spec §6.2.
+    /// Our outbound window-scale shift (applied to `rcv_wnd` when writing
+    /// the TCP header's window field). `0` = no scaling (RFC 7323
+    /// pre-negotiation default). Negotiated on SYN-ACK: if the peer's
+    /// SYN-ACK carries a Window Scale option, we set `ws_shift_out` to
+    /// our advertised shift (typically 7 for 256 KiB recv buffer).
+    pub ws_shift_out: u8,
+    /// Peer's window-scale shift (applied when READING inbound windows
+    /// into our `snd_wnd`). Negotiated on SYN-ACK; `0` otherwise.
+    pub ws_shift_in: u8,
+    /// True iff both sides sent the Timestamps option in the SYN/SYN-ACK
+    /// exchange (RFC 7323 §2). When true, every non-SYN segment MUST
+    /// carry Timestamps (RFC 7323 §3, MUST-22).
+    pub ts_enabled: bool,
+    /// Last in-sequence TSval we saw from the peer (RFC 7323 §3.2
+    /// TS.Recent). Used as the TSecr we echo on outbound segments.
+    pub ts_recent: u32,
+    /// Our `now_ns()` reading when `ts_recent` was last updated. Used
+    /// by RFC 7323 §5.5 "ts_recent expiration" — we invalidate ts_recent
+    /// after 24 days of idle to prevent PAWS from rejecting legitimate
+    /// long-idle-flow resumes. Stage 1 trading flows rarely idle that
+    /// long; the check is cheap and future-proof.
+    pub ts_recent_age: u64,
+    /// True iff the SYN exchange negotiated SACK-permitted. When true,
+    /// outbound ACKs carry SACK blocks for recv-side gaps, and inbound
+    /// ACKs may carry SACK blocks the decoder feeds into
+    /// `sack_scoreboard` for A5 retransmit consumption.
+    pub sack_enabled: bool,
+
     pub snd: SendQueue,
     pub recv: RecvQueue,
 
@@ -132,6 +161,14 @@ impl TcpConn {
             rcv_wnd,
             irs: 0,
             peer_mss: our_mss, // placeholder until SYN-ACK; our_mss is a sane floor.
+            // A4 options — default "not negotiated"; Task 15 sets them
+            // from the SYN-ACK options.
+            ws_shift_out: 0,
+            ws_shift_in: 0,
+            ts_enabled: false,
+            ts_recent: 0,
+            ts_recent_age: 0,
+            sack_enabled: false,
             snd: SendQueue::new(send_buf_bytes),
             recv: RecvQueue::new(recv_buf_bytes),
             our_fin_seq: None,
@@ -209,5 +246,19 @@ mod tests {
         assert!(!c.fin_has_been_acked(200));
         assert!(c.fin_has_been_acked(201));
         assert!(c.fin_has_been_acked(500));
+    }
+
+    #[test]
+    fn a4_options_fields_default_to_not_negotiated() {
+        let c = TcpConn::new_client(tuple(), 1000, 1460, 1024, 2048);
+        // No WS negotiated: no left shift on either direction.
+        assert_eq!(c.ws_shift_out, 0);
+        assert_eq!(c.ws_shift_in, 0);
+        // TS disabled until SYN-ACK confirms it.
+        assert!(!c.ts_enabled);
+        assert_eq!(c.ts_recent, 0);
+        assert_eq!(c.ts_recent_age, 0);
+        // SACK disabled until SYN-ACK confirms it.
+        assert!(!c.sack_enabled);
     }
 }
