@@ -16,16 +16,25 @@ pub struct EngineConfig {
     pub port_id: u16,
     pub rx_queue_id: u16,
     pub tx_queue_id: u16,
-    pub rx_ring_size: u16,     // default 1024
-    pub tx_ring_size: u16,     // default 1024
-    pub rx_mempool_elems: u32, // default 8192
-    pub mbuf_data_room: u16,   // default 2048
+    pub rx_ring_size: u16,
+    pub tx_ring_size: u16,
+    pub rx_mempool_elems: u32,
+    pub mbuf_data_room: u16,
 
     // Phase A2 additions (host byte order for IPs; raw bytes for MAC)
-    pub local_ip: u32,         // our IPv4 on this lcore's port; 0 = "accept any" in tests
-    pub gateway_ip: u32,       // next-hop IPv4
-    pub gateway_mac: [u8; 6],  // MAC to target for TX; [0;6] = "resolve at create"
-    pub garp_interval_sec: u32,// 0 = disabled; else emit gratuitous ARP every N seconds
+    pub local_ip: u32,
+    pub gateway_ip: u32,
+    pub gateway_mac: [u8; 6],
+    pub garp_interval_sec: u32,
+
+    // Phase A3 additions (all carry through from the public config)
+    pub max_connections: u32,
+    pub recv_buffer_bytes: u32,
+    pub send_buffer_bytes: u32,
+    pub tcp_mss: u32,
+    pub tcp_initial_rto_ms: u32,
+    pub tcp_msl_ms: u32,
+    pub tcp_nagle: bool,
 }
 
 impl Default for EngineConfig {
@@ -43,6 +52,13 @@ impl Default for EngineConfig {
             gateway_ip: 0,
             gateway_mac: [0u8; 6],
             garp_interval_sec: 0,
+            max_connections: 16,
+            recv_buffer_bytes: 256 * 1024,
+            send_buffer_bytes: 256 * 1024,
+            tcp_mss: 1460,
+            tcp_initial_rto_ms: 50,
+            tcp_msl_ms: 30_000,
+            tcp_nagle: false,
         }
     }
 }
@@ -436,6 +452,18 @@ mod tests {
         assert_eq!(cfg.gateway_mac, [0u8; 6]);
         // 0 = disabled (no gratuitous ARP emitted).
         assert_eq!(cfg.garp_interval_sec, 0);
+    }
+
+    #[test]
+    fn default_engine_config_has_a3_fields() {
+        let cfg = EngineConfig::default();
+        assert_eq!(cfg.max_connections, 16);
+        assert_eq!(cfg.recv_buffer_bytes, 256 * 1024);
+        assert_eq!(cfg.send_buffer_bytes, 256 * 1024);
+        assert_eq!(cfg.tcp_mss, 1460);
+        assert_eq!(cfg.tcp_initial_rto_ms, 50);
+        assert_eq!(cfg.tcp_msl_ms, 30_000);
+        assert!(!cfg.tcp_nagle);
     }
 
     #[test]

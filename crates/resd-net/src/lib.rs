@@ -59,6 +59,15 @@ pub unsafe extern "C" fn resd_net_engine_create(
         return ptr::null_mut();
     }
     let cfg = &*cfg;
+    // A3 fields with 0 sentinels fall back to defaults so callers that
+    // don't supply them get sensible behavior.
+    let max_conns = if cfg.max_connections == 0 { 16 } else { cfg.max_connections };
+    let recv_buf = if cfg.recv_buffer_bytes == 0 { 256 * 1024 } else { cfg.recv_buffer_bytes };
+    let send_buf = if cfg.send_buffer_bytes == 0 { 256 * 1024 } else { cfg.send_buffer_bytes };
+    let mss = if cfg.tcp_mss == 0 { 1460 } else { cfg.tcp_mss };
+    let init_rto = if cfg.tcp_initial_rto_ms == 0 { 50 } else { cfg.tcp_initial_rto_ms };
+    let msl = if cfg.tcp_msl_ms == 0 { 30_000 } else { cfg.tcp_msl_ms };
+
     let core_cfg = EngineConfig {
         lcore_id,
         port_id: cfg.port_id,
@@ -72,6 +81,13 @@ pub unsafe extern "C" fn resd_net_engine_create(
         gateway_ip: cfg.gateway_ip,
         gateway_mac: cfg.gateway_mac,
         garp_interval_sec: cfg.garp_interval_sec,
+        max_connections: max_conns,
+        recv_buffer_bytes: recv_buf,
+        send_buffer_bytes: send_buf,
+        tcp_mss: mss,
+        tcp_initial_rto_ms: init_rto,
+        tcp_msl_ms: msl,
+        tcp_nagle: cfg.tcp_nagle,
     };
     match Engine::new(core_cfg) {
         Ok(e) => box_to_raw(e),
