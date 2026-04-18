@@ -1,0 +1,213 @@
+//! Per-connection state (spec §6.2, subset for Phase A3).
+//! Fields deferred to A4/A5 are NOT here yet; the struct grows
+//! additively. Keeping the struct small also keeps the `Vec<Option<TcpConn>>`
+//! slot array cacheline-sparse — the per-slot size today is ~128 bytes.
+
+use std::collections::VecDeque;
+
+use crate::flow_table::FourTuple;
+use crate::tcp_state::TcpState;
+
+/// Per-connection send buffer. In A3 this is a raw byte ring; A4 will
+/// gain a SACK scoreboard + in-flight tracking per spec §6.2.
+pub struct SendQueue {
+    /// User-submitted bytes not yet handed to `rte_eth_tx_burst`. Pop
+    /// from the front in MSS-sized chunks; bytes remain here until ACKed
+    /// (A3 drops on ACK; A5 will retain for retransmit).
+    pub pending: VecDeque<u8>,
+    pub cap: u32,
+}
+
+impl SendQueue {
+    pub fn new(cap: u32) -> Self {
+        Self {
+            pending: VecDeque::with_capacity(cap as usize),
+            cap,
+        }
+    }
+
+    pub fn free_space(&self) -> u32 {
+        self.cap.saturating_sub(self.pending.len() as u32)
+    }
+
+    /// Append up to `free_space` bytes; returns how many were accepted.
+    pub fn push(&mut self, bytes: &[u8]) -> u32 {
+        let take = bytes.len().min(self.free_space() as usize);
+        self.pending.extend(&bytes[..take]);
+        take as u32
+    }
+}
+
+/// Per-connection receive buffer. A3 holds contiguous in-order bytes only.
+/// Out-of-order segments are dropped (counted); A4 replaces this with a
+/// reassembly list.
+pub struct RecvQueue {
+    pub bytes: VecDeque<u8>,
+    pub cap: u32,
+    /// Scratch buffer for the borrow-view exposed to
+    /// `RESD_NET_EVT_READABLE.data`. Cleared at the start of each
+    /// `resd_net_poll` on the owning engine (not here).
+    pub last_read_buf: Vec<u8>,
+}
+
+impl RecvQueue {
+    pub fn new(cap: u32) -> Self {
+        Self {
+            bytes: VecDeque::with_capacity(cap as usize),
+            cap,
+            last_read_buf: Vec::new(),
+        }
+    }
+
+    pub fn free_space(&self) -> u32 {
+        self.cap.saturating_sub(self.bytes.len() as u32)
+    }
+
+    /// Append `payload` to the receive queue, up to free space.
+    /// Returns the number of bytes accepted (may be < payload.len() if
+    /// the queue would overflow).
+    pub fn append(&mut self, payload: &[u8]) -> u32 {
+        let take = payload.len().min(self.free_space() as usize);
+        self.bytes.extend(&payload[..take]);
+        take as u32
+    }
+}
+
+pub struct TcpConn {
+    four_tuple: FourTuple,
+    pub state: TcpState,
+
+    // Sequence space (RFC 9293 §3.3.1). All host byte order.
+    pub snd_una: u32,
+    pub snd_nxt: u32,
+    pub snd_wnd: u32,
+    pub snd_wl1: u32,
+    pub snd_wl2: u32,
+    pub iss: u32,
+
+    pub rcv_nxt: u32,
+    pub rcv_wnd: u32,
+    pub irs: u32,
+
+    /// MSS negotiated on SYN-ACK (peer's advertised MSS option). Defaults
+    /// to 536 if the peer omits the option (RFC 9293 §3.7.1 / RFC 6691).
+    pub peer_mss: u16,
+
+    pub snd: SendQueue,
+    pub recv: RecvQueue,
+
+    /// Snapshot of the sequence number *we* used for our FIN, so
+    /// `ProcessACK` can detect "FIN has been ACKed" unambiguously.
+    /// `None` when no FIN has been emitted yet.
+    pub our_fin_seq: Option<u32>,
+
+    /// `tcp_msl_ms`-derived deadline when this connection entered
+    /// TIME_WAIT. `None` in all other states. Engine's tick reaps the
+    /// connection once `clock::now_ns() >= time_wait_deadline_ns`.
+    pub time_wait_deadline_ns: Option<u64>,
+}
+
+impl TcpConn {
+    /// Create a fresh client-side connection ready to emit SYN.
+    /// State = SYN_SENT; `snd_una = snd_nxt = iss`; our SYN will consume
+    /// one seq (bumped to `iss+1` by the caller after successful TX).
+    pub fn new_client(
+        tuple: FourTuple,
+        iss: u32,
+        our_mss: u16,
+        recv_buf_bytes: u32,
+        send_buf_bytes: u32,
+    ) -> Self {
+        let rcv_wnd = recv_buf_bytes.min(u16::MAX as u32); // A3: no WSCALE, so ≤ 65535.
+        Self {
+            four_tuple: tuple,
+            state: TcpState::Closed, // engine transitions to SynSent once SYN is TX'd.
+            snd_una: iss,
+            snd_nxt: iss,
+            snd_wnd: 0,
+            snd_wl1: 0,
+            snd_wl2: 0,
+            iss,
+            rcv_nxt: 0,
+            rcv_wnd,
+            irs: 0,
+            peer_mss: our_mss, // placeholder until SYN-ACK; our_mss is a sane floor.
+            snd: SendQueue::new(send_buf_bytes),
+            recv: RecvQueue::new(recv_buf_bytes),
+            our_fin_seq: None,
+            time_wait_deadline_ns: None,
+        }
+    }
+
+    pub fn four_tuple(&self) -> FourTuple {
+        self.four_tuple
+    }
+
+    /// True iff our FIN has been sent and ACKed (i.e. ACK covers
+    /// `our_fin_seq + 1`). Implementations use this to decide FIN_WAIT_1
+    /// → FIN_WAIT_2 and CLOSING → TIME_WAIT transitions.
+    pub fn fin_has_been_acked(&self, ack_seq: u32) -> bool {
+        match self.our_fin_seq {
+            Some(fs) => {
+                let required = fs.wrapping_add(1);
+                // Treat ack_seq covering `required` as "FIN acked".
+                !crate::tcp_seq::seq_lt(ack_seq, required)
+            }
+            None => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tuple() -> FourTuple {
+        FourTuple {
+            local_ip: 0x0a_00_00_02,
+            local_port: 40000,
+            peer_ip: 0x0a_00_00_01,
+            peer_port: 5000,
+        }
+    }
+
+    #[test]
+    fn new_client_sets_iss_both_una_and_nxt() {
+        let c = TcpConn::new_client(tuple(), 0xDEAD_BEEF, 1460, 1024, 2048);
+        assert_eq!(c.snd_una, 0xDEAD_BEEF);
+        assert_eq!(c.snd_nxt, 0xDEAD_BEEF);
+        assert_eq!(c.iss, 0xDEAD_BEEF);
+        assert_eq!(c.state, TcpState::Closed);
+    }
+
+    #[test]
+    fn rcv_wnd_clamped_to_u16_max_without_wscale() {
+        let c = TcpConn::new_client(tuple(), 0, 1460, 1_000_000, 1024);
+        assert_eq!(c.rcv_wnd, u16::MAX as u32);
+    }
+
+    #[test]
+    fn send_queue_push_respects_cap() {
+        let mut sq = SendQueue::new(4);
+        assert_eq!(sq.push(b"hello"), 4);
+        assert_eq!(sq.pending.len(), 4);
+        assert_eq!(sq.free_space(), 0);
+    }
+
+    #[test]
+    fn recv_queue_append_respects_cap() {
+        let mut rq = RecvQueue::new(3);
+        assert_eq!(rq.append(b"hello"), 3);
+        assert_eq!(rq.bytes.len(), 3);
+    }
+
+    #[test]
+    fn fin_acked_checks_fin_seq_plus_one() {
+        let mut c = TcpConn::new_client(tuple(), 100, 1460, 1024, 2048);
+        assert!(!c.fin_has_been_acked(150));
+        c.our_fin_seq = Some(200);
+        assert!(!c.fin_has_been_acked(200));
+        assert!(c.fin_has_been_acked(201));
+        assert!(c.fin_has_been_acked(500));
+    }
+}

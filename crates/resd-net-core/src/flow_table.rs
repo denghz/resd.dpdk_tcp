@@ -178,4 +178,26 @@ mod tests {
         let ft = FlowTable::new(4);
         assert!(ft.get(INVALID_HANDLE).is_none());
     }
+
+    #[test]
+    fn get_mut_roundtrip_mutation() {
+        let mut ft = FlowTable::new(4);
+        let t = tuple(5000);
+        let c = TcpConn::new_client(t, 42, 1460, 1024, 2048);
+        let h = ft.insert(c).unwrap();
+        // Mutate via get_mut and observe via get.
+        ft.get_mut(h).unwrap().state = crate::tcp_state::TcpState::SynSent;
+        assert_eq!(ft.get(h).unwrap().state, crate::tcp_state::TcpState::SynSent);
+    }
+
+    #[test]
+    fn iter_handles_skips_freed_slots() {
+        let mut ft = FlowTable::new(4);
+        let h1 = ft.insert(TcpConn::new_client(tuple(5000), 1, 1460, 1024, 2048)).unwrap();
+        let h2 = ft.insert(TcpConn::new_client(tuple(5001), 2, 1460, 1024, 2048)).unwrap();
+        let h3 = ft.insert(TcpConn::new_client(tuple(5002), 3, 1460, 1024, 2048)).unwrap();
+        ft.remove(h2);
+        let got: Vec<_> = ft.iter_handles().collect();
+        assert_eq!(got, vec![h1, h3]);
+    }
 }

@@ -3,6 +3,9 @@
 
 pub mod tcp_seq;
 pub mod tcp_state;
+pub mod flow_table;
+pub mod tcp_conn;
+pub mod iss;
 pub mod arp;
 pub mod clock;
 pub mod counters;
