@@ -201,8 +201,13 @@ pub struct resd_net_tcp_counters_t {
     pub rx_bad_csum: u64,
     pub rx_bad_flags: u64,
     pub rx_short: u64,
+    /// Phase A3: bytes peer sent beyond our current recv buffer free_space.
+    /// See `feedback_performance_first_flow_control.md` — we don't shrink
+    /// rcv_wnd to throttle the peer; we keep accepting at full capacity and
+    /// expose pressure here so the application can diagnose a slow consumer.
+    pub recv_buf_drops: u64,
     pub state_trans: [[u64; 11]; 11],
-    pub _pad: [u64; 4],
+    pub _pad: [u64; 3],
 }
 #[repr(C, align(64))]
 pub struct resd_net_poll_counters_t {

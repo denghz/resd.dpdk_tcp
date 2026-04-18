@@ -65,10 +65,15 @@ pub struct TcpCounters {
     pub rx_bad_csum: AtomicU64,
     pub rx_bad_flags: AtomicU64,
     pub rx_short: AtomicU64,
+    /// Phase A3: bytes peer sent beyond our current recv buffer free_space.
+    /// See `feedback_performance_first_flow_control.md` — we don't shrink
+    /// rcv_wnd to throttle the peer; we keep accepting at full capacity and
+    /// expose pressure here so the application can diagnose a slow consumer.
+    pub recv_buf_drops: AtomicU64,
     /// 11×11 state transition matrix, indexed [from][to] where from/to are
     /// `TcpState as u8`. Per spec §9.1. Unused cells stay at zero.
     pub state_trans: [[AtomicU64; 11]; 11],
-    _pad: [u64; 4],
+    _pad: [u64; 3],
 }
 
 #[repr(C, align(64))]
@@ -222,6 +227,7 @@ mod tests {
         assert_eq!(c.tcp.rx_bad_csum.load(Ordering::Relaxed), 0);
         assert_eq!(c.tcp.rx_bad_flags.load(Ordering::Relaxed), 0);
         assert_eq!(c.tcp.rx_short.load(Ordering::Relaxed), 0);
+        assert_eq!(c.tcp.recv_buf_drops.load(Ordering::Relaxed), 0);
         // Transition matrix is 11×11 = 121 u64s; all zero at construction.
         for row in &c.tcp.state_trans {
             for cell in row {

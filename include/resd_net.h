@@ -190,8 +190,15 @@ struct RESD_NET_ALIGNED(64) resd_net_tcp_counters_t {
   uint64_t rx_bad_csum;
   uint64_t rx_bad_flags;
   uint64_t rx_short;
+  /**
+   * Phase A3: bytes peer sent beyond our current recv buffer free_space.
+   * See `feedback_performance_first_flow_control.md` — we don't shrink
+   * rcv_wnd to throttle the peer; we keep accepting at full capacity and
+   * expose pressure here so the application can diagnose a slow consumer.
+   */
+  uint64_t recv_buf_drops;
   uint64_t state_trans[11][11];
-  uint64_t _pad[4];
+  uint64_t _pad[3];
 };
 
 struct RESD_NET_ALIGNED(64) resd_net_poll_counters_t {

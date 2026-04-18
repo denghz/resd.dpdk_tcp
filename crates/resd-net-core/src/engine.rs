@@ -614,6 +614,13 @@ impl Engine {
             self.deliver_readable(handle, outcome.delivered);
         }
 
+        if outcome.buf_full_drop > 0 {
+            crate::counters::add(
+                &self.counters.tcp.recv_buf_drops,
+                outcome.buf_full_drop as u64,
+            );
+        }
+
         if outcome.closed {
             self.events.borrow_mut().push(InternalEvent::Closed {
                 conn: handle, err: 0,
