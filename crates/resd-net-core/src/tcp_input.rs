@@ -323,6 +323,39 @@ fn handle_established(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
         return Outcome { tx: TxAction::Ack, ..Outcome::base() };
     }
 
+    // A4: parse options (TS + SACK blocks). Malformed → bad_option drop.
+    // `parsed_opts` is left in scope for Tasks 17/18 (OOO enqueue + SACK decode).
+    let parsed_opts = if seg.options.is_empty() {
+        crate::tcp_options::TcpOpts::default()
+    } else {
+        match crate::tcp_options::parse_options(seg.options) {
+            Ok(o) => o,
+            Err(_) => {
+                return Outcome { tx: TxAction::None, bad_option: true, ..Outcome::base() };
+            }
+        }
+    };
+
+    // PAWS (RFC 7323 §5) — only when TS is negotiated. Missing TS on a
+    // TS-enabled conn is RFC 7323 §3.2 MUST-24 violation.
+    if conn.ts_enabled {
+        match parsed_opts.timestamps {
+            None => {
+                return Outcome { tx: TxAction::None, bad_option: true, ..Outcome::base() };
+            }
+            Some((ts_val, _ts_ecr)) => {
+                if crate::tcp_seq::seq_lt(ts_val, conn.ts_recent) {
+                    return Outcome { tx: TxAction::Ack, paws_rejected: true, ..Outcome::base() };
+                }
+                // RFC 7323 §4.3 MUST-25: only update ts_recent on a
+                // segment whose seq is at or before rcv_nxt.
+                if crate::tcp_seq::seq_le(seg.seq, conn.rcv_nxt) {
+                    conn.ts_recent = ts_val;
+                }
+            }
+        }
+    }
+
     // ACK processing — RFC 9293 §3.10.7.4, "ESTABLISHED STATE" ACK handling.
     if seq_lt(conn.snd_una, seg.ack) && seq_le(seg.ack, conn.snd_nxt) {
         let acked = seg.ack.wrapping_sub(conn.snd_una) as usize;
@@ -973,6 +1006,71 @@ mod tests {
         let out = dispatch(&mut c, &seg);
         assert_eq!(out.new_state, Some(TcpState::Closed));
         assert!(out.closed);
+    }
+
+    fn est_conn_ts(iss: u32, irs: u32, peer_wnd: u16, ts_recent: u32) -> crate::tcp_conn::TcpConn {
+        let mut c = est_conn(iss, irs, peer_wnd);
+        c.ts_enabled = true;
+        c.ts_recent = ts_recent;
+        c
+    }
+
+    #[test]
+    fn paws_drops_segment_with_stale_tsval_and_emits_challenge_ack() {
+        use crate::tcp_options::TcpOpts;
+        let mut c = est_conn_ts(1000, 5000, 1024, 200);
+        let mut peer_opts = TcpOpts::default();
+        peer_opts.timestamps = Some((100, 0));
+        let mut buf = [0u8; 40];
+        let n = peer_opts.encode(&mut buf).unwrap();
+        let seg = ParsedSegment {
+            src_port: 5000, dst_port: 40000,
+            seq: 5001, ack: 1001,
+            flags: TCP_ACK, window: 65535,
+            header_len: 20 + n, payload: b"xxx",
+            options: &buf[..n],
+        };
+        let out = dispatch(&mut c, &seg);
+        assert!(out.paws_rejected);
+        assert_eq!(out.tx, TxAction::Ack);
+        assert_eq!(out.delivered, 0);
+        assert_eq!(c.ts_recent, 200); // unchanged
+    }
+
+    #[test]
+    fn paws_accepts_fresh_tsval_and_updates_ts_recent() {
+        use crate::tcp_options::TcpOpts;
+        let mut c = est_conn_ts(1000, 5000, 1024, 200);
+        let mut peer_opts = TcpOpts::default();
+        peer_opts.timestamps = Some((300, 0));
+        let mut buf = [0u8; 40];
+        let n = peer_opts.encode(&mut buf).unwrap();
+        let seg = ParsedSegment {
+            src_port: 5000, dst_port: 40000,
+            seq: 5001, ack: 1001,
+            flags: TCP_ACK | TCP_PSH, window: 65535,
+            header_len: 20 + n, payload: b"hello",
+            options: &buf[..n],
+        };
+        let out = dispatch(&mut c, &seg);
+        assert!(!out.paws_rejected);
+        assert_eq!(out.delivered, 5);
+        assert_eq!(c.ts_recent, 300);
+    }
+
+    #[test]
+    fn missing_ts_on_ts_enabled_conn_bumps_bad_option_and_drops() {
+        let mut c = est_conn_ts(1000, 5000, 1024, 200);
+        let seg = ParsedSegment {
+            src_port: 5000, dst_port: 40000,
+            seq: 5001, ack: 1001,
+            flags: TCP_ACK | TCP_PSH, window: 65535,
+            header_len: 20, payload: b"x",
+            options: &[],
+        };
+        let out = dispatch(&mut c, &seg);
+        assert!(out.bad_option);
+        assert_eq!(out.delivered, 0);
     }
 
     #[test]
