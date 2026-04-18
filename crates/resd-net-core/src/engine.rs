@@ -237,6 +237,9 @@ pub struct Engine {
     events: RefCell<EventQueue>,
     iss_gen: IssGen,
     last_ephemeral_port: Cell<u16>,
+
+    // Phase A5 additions
+    pub(crate) timer_wheel: RefCell<crate::tcp_timer_wheel::TimerWheel>,
 }
 
 /// A4: map an `Outcome` to per-segment `TcpCounters` bumps. Pure slow-path
@@ -416,6 +419,9 @@ impl Engine {
             iss_gen: IssGen::new(),
             // RFC 6056 ephemeral port hint range: start at 49152.
             last_ephemeral_port: Cell::new(49151),
+            timer_wheel: RefCell::new(crate::tcp_timer_wheel::TimerWheel::new(
+                (cfg.max_connections as usize).saturating_mul(4),
+            )),
             cfg,
         })
     }
@@ -659,6 +665,33 @@ impl Engine {
             crate::counters::inc(&self.counters.tcp.conn_close);
             // A4 cross-phase backfill: TIME_WAIT deadline expired.
             crate::counters::inc(&self.counters.tcp.conn_time_wait_reaped);
+            // A5: cancel any armed timers owned by this conn before
+            // removing its slot. `cancel()` is idempotent (Task 5), so
+            // overlap between `timer_ids` and named-handle fields is fine.
+            let to_cancel: Vec<crate::tcp_timer_wheel::TimerId> = {
+                let ft = self.flow_table.borrow();
+                if let Some(conn) = ft.get(h) {
+                    let mut ids: Vec<_> = conn.timer_ids.to_vec();
+                    if let Some(id) = conn.rto_timer_id {
+                        ids.push(id);
+                    }
+                    if let Some(id) = conn.tlp_timer_id {
+                        ids.push(id);
+                    }
+                    if let Some(id) = conn.syn_retrans_timer_id {
+                        ids.push(id);
+                    }
+                    ids
+                } else {
+                    Vec::new()
+                }
+            };
+            {
+                let mut w = self.timer_wheel.borrow_mut();
+                for id in to_cancel {
+                    w.cancel(id);
+                }
+            }
             self.flow_table.borrow_mut().remove(h);
         }
     }
@@ -950,6 +983,34 @@ impl Engine {
             // for the reaper — that's handled via `transition_conn`).
             let state = self.flow_table.borrow().get(handle).map(|c| c.state);
             if state == Some(TcpState::Closed) {
+                // A5: cancel any armed timers owned by this conn before
+                // removing its slot. `cancel()` is idempotent (Task 5),
+                // so overlap between `timer_ids` and the named-handle
+                // fields is fine.
+                let to_cancel: Vec<crate::tcp_timer_wheel::TimerId> = {
+                    let ft = self.flow_table.borrow();
+                    if let Some(conn) = ft.get(handle) {
+                        let mut ids: Vec<_> = conn.timer_ids.to_vec();
+                        if let Some(id) = conn.rto_timer_id {
+                            ids.push(id);
+                        }
+                        if let Some(id) = conn.tlp_timer_id {
+                            ids.push(id);
+                        }
+                        if let Some(id) = conn.syn_retrans_timer_id {
+                            ids.push(id);
+                        }
+                        ids
+                    } else {
+                        Vec::new()
+                    }
+                };
+                {
+                    let mut w = self.timer_wheel.borrow_mut();
+                    for id in to_cancel {
+                        w.cancel(id);
+                    }
+                }
                 self.flow_table.borrow_mut().remove(handle);
             }
         }

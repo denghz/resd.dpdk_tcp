@@ -169,6 +169,24 @@ pub struct TcpConn {
     /// A5: wheel-timer handles owned by this conn (RTO, TLP, SYN).
     /// `close_conn` walks this list on close; spec §7.4.
     pub timer_ids: Vec<crate::tcp_timer_wheel::TimerId>,
+
+    // Phase A5 additions:
+    /// In-flight (TX'd but unacked) segments — spec §7.2 snd_retrans.
+    pub snd_retrans: crate::tcp_retrans::SendRetrans,
+    /// RFC 6298 Jacobson/Karels RTT estimator.
+    pub rtt_est: crate::tcp_rtt::RttEstimator,
+    /// Handle of the conn's RTO timer on the engine wheel (lazy re-arm per §6.5).
+    pub rto_timer_id: Option<crate::tcp_timer_wheel::TimerId>,
+    /// Handle of the conn's TLP timer (RFC 8985 §7).
+    pub tlp_timer_id: Option<crate::tcp_timer_wheel::TimerId>,
+    /// How many SYN retransmits have been issued (spec §6.5; max 3).
+    pub syn_retrans_count: u8,
+    /// Handle of the SYN retrans timer.
+    pub syn_retrans_timer_id: Option<crate::tcp_timer_wheel::TimerId>,
+    /// Per-connect opt: when true, RACK `reo_wnd` forced to 0.
+    pub rack_aggressive: bool,
+    /// Per-connect opt: when true, RTO does not double on retransmit.
+    pub rto_no_backoff: bool,
 }
 
 impl TcpConn {
@@ -212,6 +230,18 @@ impl TcpConn {
             last_advertised_wnd: None,
             last_sack_trigger: None,
             timer_ids: Vec::new(),
+            snd_retrans: crate::tcp_retrans::SendRetrans::new(),
+            rtt_est: crate::tcp_rtt::RttEstimator::new(
+                crate::tcp_rtt::DEFAULT_MIN_RTO_US,
+                crate::tcp_rtt::DEFAULT_INITIAL_RTO_US,
+                crate::tcp_rtt::DEFAULT_MAX_RTO_US,
+            ),
+            rto_timer_id: None,
+            tlp_timer_id: None,
+            syn_retrans_count: 0,
+            syn_retrans_timer_id: None,
+            rack_aggressive: false,
+            rto_no_backoff: false,
         }
     }
 
@@ -330,5 +360,18 @@ mod tests {
     fn new_client_timer_ids_starts_empty() {
         let c = TcpConn::new_client(tuple(), 1, 1460, 1024, 2048);
         assert!(c.timer_ids.is_empty());
+    }
+
+    #[test]
+    fn a5_conn_starts_with_empty_snd_retrans_and_default_rtt() {
+        let c = TcpConn::new_client(tuple(), 100, 1460, 1024, 2048);
+        assert!(c.snd_retrans.is_empty());
+        assert_eq!(c.rtt_est.rto_us(), crate::tcp_rtt::DEFAULT_INITIAL_RTO_US);
+        assert!(c.rto_timer_id.is_none());
+        assert!(c.tlp_timer_id.is_none());
+        assert_eq!(c.syn_retrans_count, 0);
+        assert!(c.syn_retrans_timer_id.is_none());
+        assert!(!c.rack_aggressive);
+        assert!(!c.rto_no_backoff);
     }
 }
