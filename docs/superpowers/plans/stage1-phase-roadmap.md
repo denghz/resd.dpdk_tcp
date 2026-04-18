@@ -13,7 +13,7 @@
 | Phase | Slug | Status | Plan file |
 |---|---|---|---|
 | A1 | Workspace skeleton + DPDK init + empty engine | **Complete** ✓ | `2026-04-17-stage1-phase-a1-skeleton.md` |
-| A2 | L2/L3 + static ARP + ICMP-in (PMTUD) | Not started | — |
+| A2 | L2/L3 + static ARP + ICMP-in (PMTUD) | **Complete** ✓ | `2026-04-17-stage1-phase-a2-l2-l3.md` |
 | A3 | TCP handshake + basic data transfer | Not started | — |
 | A4 | TCP options + PAWS + reassembly + SACK scoreboard | Not started | — |
 | A5 | RACK-TLP + RTO + retransmit + ISS | Not started | — |
