@@ -166,6 +166,12 @@ pub struct Outcome {
     /// A4 backfill: true iff the peer's advertised window is zero.
     /// Engine bumps `tcp.rx_zero_window`.
     pub rx_zero_window: bool,
+    /// A5: if the ACK advanced snd.una, this is the new snd.una value.
+    /// Engine uses this to prune snd_retrans and potentially cancel RTO.
+    pub snd_una_advanced_to: Option<u32>,
+    /// A5: true iff a valid RTT sample was taken from this ACK. Counter
+    /// wiring lives in Task 26 (counter batch); this field is observable here.
+    pub rtt_sample_taken: bool,
     pub connected: bool,
     pub closed: bool,
 }
@@ -188,6 +194,8 @@ impl Outcome {
             dup_ack: false,
             urgent_dropped: false,
             rx_zero_window: false,
+            snd_una_advanced_to: None,
+            rtt_sample_taken: false,
             connected: false,
             closed: false,
         }
@@ -448,12 +456,50 @@ fn handle_established(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
 
     // ACK processing — RFC 9293 §3.10.7.4, "ESTABLISHED STATE" ACK handling.
     let mut dup_ack = false;
+    let mut snd_una_advanced_to: Option<u32> = None;
+    let mut rtt_sample_taken = false;
     if seq_lt(conn.snd_una, seg.ack) && seq_le(seg.ack, conn.snd_nxt) {
         let acked = seg.ack.wrapping_sub(conn.snd_una) as usize;
         for _ in 0..acked.min(conn.snd.pending.len()) {
             conn.snd.pending.pop_front();
         }
         conn.snd_una = seg.ack;
+        snd_una_advanced_to = Some(conn.snd_una);
+
+        // A5 RTT sampling (spec §3.2 + RFC 6298 §3 Karn's). TS source is
+        // preferred; Karn's fallback only when the front entry was sent
+        // exactly once AND the ACK covers it end-to-end.
+        let now_us = (crate::clock::now_ns() / 1_000) as u32;
+        let ts_sample: Option<u32> = if conn.ts_enabled {
+            parsed_opts.timestamps.and_then(|(_tsval, tsecr)| {
+                if tsecr == 0 {
+                    return None;
+                }
+                let rtt = now_us.wrapping_sub(tsecr);
+                // Sanity: 1 ≤ rtt < 60s (wrap produces unboundedly large values).
+                if (1..60_000_000).contains(&rtt) {
+                    Some(rtt)
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
+        };
+        if let Some(rtt) = ts_sample {
+            conn.rtt_est.sample(rtt);
+            rtt_sample_taken = true;
+        } else if let Some(front) = conn.snd_retrans.front() {
+            let front_end = front.seq.wrapping_add(front.len as u32);
+            if front.xmit_count == 1 && seq_le(front_end, conn.snd_una) {
+                let rtt = now_us.wrapping_sub((front.first_tx_ts_ns / 1_000) as u32);
+                if (1..60_000_000).contains(&rtt) {
+                    conn.rtt_est.sample(rtt);
+                    rtt_sample_taken = true;
+                }
+            }
+        }
+
         if conn.sack_enabled {
             conn.sack_scoreboard.prune_below(conn.snd_una);
         }
@@ -562,6 +608,8 @@ fn handle_established(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
         sack_blocks_decoded,
         dup_ack,
         rx_zero_window,
+        snd_una_advanced_to,
+        rtt_sample_taken,
         ..Outcome::base()
     }
 }
@@ -1759,5 +1807,12 @@ mod tests {
         assert!(!out.dup_ack);
         assert!(!out.urgent_dropped);
         assert!(!out.rx_zero_window);
+    }
+
+    #[test]
+    fn outcome_snd_una_advanced_to_field_defaults() {
+        let o = Outcome::base();
+        assert!(o.snd_una_advanced_to.is_none());
+        assert!(!o.rtt_sample_taken);
     }
 }

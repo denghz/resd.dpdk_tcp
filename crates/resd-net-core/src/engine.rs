@@ -934,6 +934,51 @@ impl Engine {
         // hot-path stays straight-line.
         apply_tcp_input_counters(&outcome, &self.counters.tcp);
 
+        // A5 task 11: on an ACK that advanced snd.una, prune snd_retrans
+        // below the new snd.una and free each dropped mbuf (its stashed
+        // refcount 1→0 returns the mbuf to the mempool). If snd_retrans
+        // is now empty AND snd.una == snd.nxt, cancel the RTO timer.
+        //
+        // Borrow ordering (no double-borrow on any RefCell):
+        //   1. mut-borrow flow_table, prune, release.
+        //   2. `resd_rte_pktmbuf_free` FFI calls outside any borrow.
+        //   3. shared-borrow flow_table to check empty + read rto_timer_id, release.
+        //   4. mut-borrow timer_wheel to cancel, release.
+        //   5. mut-borrow flow_table to clear rto_timer_id + prune timer_ids.
+        if let Some(new_snd_una) = outcome.snd_una_advanced_to {
+            let dropped = {
+                let mut ft = self.flow_table.borrow_mut();
+                if let Some(c) = ft.get_mut(handle) {
+                    c.snd_retrans.prune_below(new_snd_una)
+                } else {
+                    Vec::new()
+                }
+            };
+            for entry in dropped {
+                unsafe { sys::resd_rte_pktmbuf_free(entry.mbuf.as_ptr()) };
+            }
+            let rto_id_to_cancel = {
+                let ft = self.flow_table.borrow();
+                if let Some(c) = ft.get(handle) {
+                    if c.snd_retrans.is_empty() && c.snd_una == c.snd_nxt {
+                        c.rto_timer_id
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            };
+            if let Some(id) = rto_id_to_cancel {
+                self.timer_wheel.borrow_mut().cancel(id);
+                let mut ft = self.flow_table.borrow_mut();
+                if let Some(c) = ft.get_mut(handle) {
+                    c.rto_timer_id = None;
+                    c.timer_ids.retain(|t| *t != id);
+                }
+            }
+        }
+
         // RFC 9293 §3.10.7.8: restart the 2×MSL timer on any in-window
         // segment received in TIME_WAIT.
         {
