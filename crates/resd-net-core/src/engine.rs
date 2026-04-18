@@ -2407,7 +2407,7 @@ impl Engine {
         use crate::counters::inc;
         use crate::tcp_output::{build_segment, SegmentTx, TCP_ACK, TCP_FIN};
 
-        let (tuple, seq, rcv_nxt, state, rcv_wnd, ws_shift_out, ts_enabled, ts_recent) = {
+        let (tuple, seq, rcv_nxt, state, free_space_total, ws_shift_out, ts_enabled, ts_recent) = {
             let ft = self.flow_table.borrow();
             let Some(c) = ft.get(handle) else {
                 return Err(Error::InvalidConnHandle(handle as u64));
@@ -2417,7 +2417,7 @@ impl Engine {
                 c.snd_nxt,
                 c.rcv_nxt,
                 c.state,
-                c.rcv_wnd,
+                c.recv.free_space_total(),
                 c.ws_shift_out,
                 c.ts_enabled,
                 c.ts_recent,
@@ -2435,7 +2435,7 @@ impl Engine {
         // F-5 RFC 7323 §2.3 / §2.2: FIN is a non-SYN segment; SEG.WND
         // MUST be right-shifted by `ws_shift_out`. `ws_shift_out` is
         // bounded at 14 so `>>` is safe.
-        let advertised_window = (rcv_wnd >> ws_shift_out).min(u16::MAX as u32) as u16;
+        let advertised_window = (free_space_total >> ws_shift_out).min(u16::MAX as u32) as u16;
         // F-7 RFC 7323 §3 MUST-22: FIN is a non-RST segment; when TS
         // is negotiated, TSopt MUST be present. TSval = now_µs per §4.1.
         let fin_options = if ts_enabled {
