@@ -13,6 +13,44 @@ use crate::tcp_events::{EventQueue, InternalEvent};
 use crate::tcp_state::TcpState;
 use crate::Error;
 
+/// RFC 7323 §2.3: pick the Window Scale shift so that `(u16::MAX << ws)`
+/// covers our full recv buffer. Bounded at 14 per the RFC's cap. Called
+/// once at `Engine::connect` time to advertise WS in our SYN; the same
+/// shift is stored on the conn as `ws_shift_out` so Task 13's data-ACK
+/// path can scale `rcv_wnd` consistently.
+fn compute_ws_shift_for(recv_buffer_bytes: u32) -> u8 {
+    let mut ws = 0u8;
+    let mut cap = u16::MAX as u32;
+    while cap < recv_buffer_bytes && ws < 14 {
+        cap = (cap << 1) | 1;
+        ws += 1;
+    }
+    ws
+}
+
+/// Pure helper: build the TCP-options bundle for the SYN we emit from
+/// `Engine::connect`. Split out so unit tests can exercise it without
+/// constructing a full Engine (which requires EAL/DPDK).
+///
+/// Emits MSS + WS (from `compute_ws_shift_for`) + SACK-permitted + TS
+/// (TSval = `now_ns / 1000` microsecond ticks per RFC 7323 §4.1;
+/// TSecr = 0 — no received TSval yet on an initial SYN).
+fn build_connect_syn_opts(
+    recv_buffer_bytes: u32,
+    our_mss: u16,
+    now_ns: u64,
+) -> crate::tcp_options::TcpOpts {
+    let ws_out = compute_ws_shift_for(recv_buffer_bytes);
+    let tsval_initial = (now_ns / 1000) as u32;
+    crate::tcp_options::TcpOpts {
+        mss: Some(our_mss),
+        wscale: Some(ws_out),
+        sack_permitted: true,
+        timestamps: Some((tsval_initial, 0)),
+        ..Default::default()
+    }
+}
+
 /// Config passed to Engine::new.
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
@@ -866,7 +904,6 @@ impl Engine {
         }
         let mtu_mss = nic_mtu.saturating_sub(40) as u32; // 40 = IP(20) + TCP(20)
         let our_mss = self.cfg.tcp_mss.min(mtu_mss).min(u16::MAX as u32) as u16;
-        let recv_wnd = self.cfg.recv_buffer_bytes.min(u16::MAX as u32);
         let conn = TcpConn::new_client(
             tuple,
             iss,
@@ -880,7 +917,15 @@ impl Engine {
             .insert(conn)
             .ok_or(Error::TooManyConns)?;
 
-        // Build and transmit SYN.
+        // Build and transmit SYN with the full Stage-1 option set: MSS
+        // (already clamped to MTU-40 above) + Window Scale + SACK-permitted
+        // + Timestamps (RFC 7323 §4.1 initial TSval). Pre-WS-negotiation,
+        // we advertise the maximum unscaled window — the SYN itself has no
+        // scaled-window semantics; `ws_shift_out` kicks in for non-SYN
+        // segments (Task 13).
+        let now_ns = crate::clock::now_ns();
+        let ws_out = compute_ws_shift_for(self.cfg.recv_buffer_bytes);
+        let syn_opts = build_connect_syn_opts(self.cfg.recv_buffer_bytes, our_mss, now_ns);
         let seg = SegmentTx {
             src_mac: self.our_mac,
             dst_mac: self.cfg.gateway_mac,
@@ -891,13 +936,16 @@ impl Engine {
             seq: iss,
             ack: 0,
             flags: TCP_SYN,
-            window: recv_wnd.min(u16::MAX as u32) as u16,
-            options: crate::tcp_options::TcpOpts { mss: Some(our_mss), ..Default::default() },
+            window: u16::MAX, // pre-WS-negotiation: advertise maximum.
+            options: syn_opts,
             payload: &[],
         };
-        let mut buf = [0u8; 64];
+        // A full SYN (MSS + WS + SACK-perm + TS, padded to 20 bytes of
+        // options) produces a 14+20+20+20 = 74-byte frame; reserve 128 to
+        // stay safely above that ceiling.
+        let mut buf = [0u8; 128];
         let Some(n) = build_segment(&seg, &mut buf) else {
-            // Header-too-small is impossible with 64-byte buf; keep explicit.
+            // Header-too-small is impossible with 128-byte buf; keep explicit.
             self.flow_table.borrow_mut().remove(handle);
             return Err(Error::PeerUnreachable(peer_ip));
         };
@@ -910,11 +958,14 @@ impl Engine {
         // Bump snd_nxt past the SYN's seq and mark SYN_SENT. Direct
         // state mutation (not transition_conn) because this transition
         // has no from-state event — we're coming from the just-inserted
-        // TcpState::Closed default.
+        // TcpState::Closed default. Also record our advertised WS shift
+        // so Task 15's SYN-ACK handler can confirm it against the peer's
+        // response, and Task 13's data path can scale `rcv_wnd`.
         {
             let mut ft = self.flow_table.borrow_mut();
             if let Some(c) = ft.get_mut(handle) {
                 c.snd_nxt = iss.wrapping_add(1);
+                c.ws_shift_out = ws_out;
             }
         }
         self.transition_conn(handle, TcpState::SynSent);
@@ -1166,5 +1217,60 @@ mod tests {
         fn _check(e: &Engine) {
             e.drain_events(1, |_ev, _engine| {});
         }
+    }
+
+    // Task 12: `Engine::connect` emits full SYN options (MSS + WS + SACK-perm
+    // + TS). The engine itself can't be unit-constructed (needs EAL/DPDK),
+    // so we test via two seams: (1) `compute_ws_shift_for` — the pure
+    // WS-shift policy; (2) `build_connect_syn_opts` — the pure option-bundle
+    // builder that `connect` delegates to. Frame-level emission is covered
+    // by the TAP integration test (`tcp_basic_tap.rs`) and the
+    // `tcp_output::build_segment` round-trip tests.
+
+    #[test]
+    fn compute_ws_shift_for_below_64kib_returns_zero() {
+        // 65535 is exactly u16::MAX — no scaling needed.
+        assert_eq!(super::compute_ws_shift_for(65535), 0);
+        assert_eq!(super::compute_ws_shift_for(1), 0);
+        assert_eq!(super::compute_ws_shift_for(0), 0);
+    }
+
+    #[test]
+    fn compute_ws_shift_for_256kib_returns_three() {
+        // Trace: cap=65535 (ws=0) < 262144 → cap=131071 (ws=1) < 262144 →
+        // cap=262143 (ws=2) < 262144 (by 1!) → cap=524287 (ws=3) ≥ 262144.
+        assert_eq!(super::compute_ws_shift_for(256 * 1024), 3);
+    }
+
+    #[test]
+    fn compute_ws_shift_for_caps_at_fourteen() {
+        // RFC 7323 §2.3: WS option value MUST NOT exceed 14.
+        assert_eq!(super::compute_ws_shift_for(u32::MAX), 14);
+    }
+
+    #[test]
+    fn build_connect_syn_opts_has_mss_ws_sack_perm_ts() {
+        // This is the data that `connect()` feeds into SegmentTx.options;
+        // `tcp_output::build_segment` is already exercised by its own
+        // unit tests to turn these opts into wire bytes correctly.
+        let our_mss: u16 = 1460;
+        let recv_buffer_bytes: u32 = 256 * 1024;
+        let now_ns: u64 = 1_234_567_000; // ~1.2s since epoch; tsval will be 1_234_567 µs
+        let opts = super::build_connect_syn_opts(recv_buffer_bytes, our_mss, now_ns);
+        assert_eq!(opts.mss, Some(our_mss));
+        assert!(opts.sack_permitted);
+        assert_eq!(opts.wscale, Some(3));
+        let (tsval, tsecr) = opts.timestamps.expect("timestamps set on SYN");
+        assert_eq!(tsval, 1_234_567);
+        assert_eq!(tsecr, 0, "SYN has no received TSval to echo");
+    }
+
+    #[test]
+    fn build_connect_syn_opts_tsval_nonzero_for_nonzero_clock() {
+        // Sanity: we truncate `now_ns / 1000` to u32; a realistic
+        // engine-uptime reading produces a nonzero TSval.
+        let opts = super::build_connect_syn_opts(65_536, 1460, 1_000);
+        let (tsval, _) = opts.timestamps.expect("timestamps set");
+        assert_eq!(tsval, 1);
     }
 }
