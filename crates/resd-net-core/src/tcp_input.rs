@@ -7,7 +7,7 @@
 //! `rcv_nxt` or transitions state triggers an ACK on the same poll
 //! iteration (wired in the handlers via `TxAction::Ack`).
 
-use crate::flow_table::{ConnHandle, FourTuple};
+use crate::flow_table::FourTuple;
 use crate::tcp_conn::TcpConn;
 use crate::tcp_output::{TCP_ACK, TCP_FIN, TCP_PSH, TCP_RST, TCP_SYN};
 use crate::tcp_state::TcpState;
@@ -190,8 +190,64 @@ pub fn dispatch(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
 }
 
 // Stubs filled in by subsequent tasks.
-fn handle_syn_sent(_conn: &mut TcpConn, _seg: &ParsedSegment) -> Outcome {
-    Outcome::none()
+fn handle_syn_sent(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
+    use crate::tcp_seq::seq_le;
+
+    // RFC 9293 §3.10.7.3 — SYN_SENT processing.
+    // RST without a valid ACK of our SYN → drop silently. With a valid
+    // ACK (snd_una < ack <= snd_nxt) → close.
+    if (seg.flags & TCP_RST) != 0 {
+        if (seg.flags & TCP_ACK) != 0
+            && seq_le(conn.snd_una.wrapping_add(1), seg.ack)
+            && seq_le(seg.ack, conn.snd_nxt)
+        {
+            return Outcome {
+                tx: TxAction::None,
+                new_state: Some(TcpState::Closed),
+                delivered: 0,
+                connected: false,
+                closed: true,
+            };
+        }
+        return Outcome::none();
+    }
+
+    // Must have SYN to advance from SYN_SENT. Simultaneous-open (SYN
+    // without ACK) transitions to SYN_RECEIVED per RFC 9293 — deferred
+    // to A4. We drop it here.
+    if (seg.flags & TCP_SYN) == 0 {
+        return Outcome::rst();
+    }
+
+    if (seg.flags & TCP_ACK) == 0 {
+        // SYN-only (simultaneous-open): deferred.
+        return Outcome::none();
+    }
+
+    // ACK must cover exactly iss+1 (our SYN). Accept only when
+    // snd_una+1 <= ack <= snd_nxt (RFC 9293 §3.10.7.3).
+    if !seq_le(conn.snd_una.wrapping_add(1), seg.ack)
+        || !seq_le(seg.ack, conn.snd_nxt)
+    {
+        return Outcome::rst();
+    }
+
+    // Update state per RFC 9293.
+    conn.irs = seg.seq;
+    conn.rcv_nxt = seg.seq.wrapping_add(1);
+    conn.snd_una = seg.ack;
+    conn.snd_wnd = seg.window as u32;
+    conn.snd_wl1 = seg.seq;
+    conn.snd_wl2 = seg.ack;
+    conn.peer_mss = parse_mss_option(seg.options);
+
+    Outcome {
+        tx: TxAction::Ack,
+        new_state: Some(TcpState::Established),
+        delivered: 0,
+        connected: true,
+        closed: false,
+    }
 }
 
 fn handle_established(_conn: &mut TcpConn, _seg: &ParsedSegment) -> Outcome {
@@ -301,5 +357,82 @@ mod tests {
         assert_eq!(t.local_port, 40000);
         assert_eq!(t.peer_ip, 0x0a_00_00_01);
         assert_eq!(t.peer_port, 5000);
+    }
+
+    #[test]
+    fn syn_sent_syn_ack_transitions_to_established() {
+        use crate::flow_table::FourTuple;
+        use crate::tcp_conn::TcpConn;
+
+        let t = FourTuple { local_ip: 0x0a_00_00_02, local_port: 40000,
+                            peer_ip: 0x0a_00_00_01, peer_port: 5000 };
+        let mut c = TcpConn::new_client(t, 1000, 1460, 1024, 2048);
+        c.state = TcpState::SynSent;
+        c.snd_nxt = c.snd_nxt.wrapping_add(1); // after SYN TX
+        // Craft a SYN-ACK: their seq=5000, their ack=1001 (our iss+1), MSS=1400.
+        let seg = ParsedSegment {
+            src_port: 5000, dst_port: 40000,
+            seq: 5000, ack: 1001,
+            flags: TCP_SYN | TCP_ACK,
+            window: 65535,
+            header_len: 24,
+            payload: &[],
+            options: &[2, 4, 0x05, 0x78], // MSS=1400
+        };
+        let out = dispatch(&mut c, &seg);
+        assert_eq!(out.new_state, Some(TcpState::Established));
+        assert_eq!(out.tx, TxAction::Ack);
+        assert!(out.connected);
+        assert_eq!(c.rcv_nxt, 5001);
+        assert_eq!(c.snd_una, 1001);
+        assert_eq!(c.irs, 5000);
+        assert_eq!(c.peer_mss, 1400);
+    }
+
+    #[test]
+    fn syn_sent_plain_ack_wrong_seq_sends_rst() {
+        use crate::flow_table::FourTuple;
+        use crate::tcp_conn::TcpConn;
+
+        let t = FourTuple { local_ip: 0x0a_00_00_02, local_port: 40000,
+                            peer_ip: 0x0a_00_00_01, peer_port: 5000 };
+        let mut c = TcpConn::new_client(t, 1000, 1460, 1024, 2048);
+        c.state = TcpState::SynSent;
+        c.snd_nxt = c.snd_nxt.wrapping_add(1);
+        // Bogus: ACK-only with an ack that doesn't cover our SYN.
+        let seg = ParsedSegment {
+            src_port: 5000, dst_port: 40000,
+            seq: 5000, ack: 999,
+            flags: TCP_ACK,
+            window: 65535,
+            header_len: 20,
+            payload: &[], options: &[],
+        };
+        let out = dispatch(&mut c, &seg);
+        assert_eq!(out.tx, TxAction::Rst);
+    }
+
+    #[test]
+    fn syn_sent_rst_matching_our_ack_closes() {
+        use crate::flow_table::FourTuple;
+        use crate::tcp_conn::TcpConn;
+
+        let t = FourTuple { local_ip: 0x0a_00_00_02, local_port: 40000,
+                            peer_ip: 0x0a_00_00_01, peer_port: 5000 };
+        let mut c = TcpConn::new_client(t, 1000, 1460, 1024, 2048);
+        c.state = TcpState::SynSent;
+        c.snd_nxt = c.snd_nxt.wrapping_add(1);
+        let seg = ParsedSegment {
+            src_port: 5000, dst_port: 40000,
+            seq: 0, ack: 1001,
+            flags: TCP_RST | TCP_ACK,
+            window: 0,
+            header_len: 20,
+            payload: &[], options: &[],
+        };
+        let out = dispatch(&mut c, &seg);
+        assert_eq!(out.new_state, Some(TcpState::Closed));
+        assert!(out.closed);
+        assert_eq!(out.tx, TxAction::None);
     }
 }
