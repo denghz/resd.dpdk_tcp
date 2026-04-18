@@ -792,9 +792,13 @@ impl Engine {
     /// Emit a bare ACK for `handle`. Post-handshake ACKs carry the full
     /// Stage-1 option set per spec §6.2:
     ///
-    /// * Window: `recv.free_space() >> ws_shift_out`, clamped to `u16::MAX`
-    ///   (RFC 7323 §2.2). Fixed in Task 12 to use the CURRENT free-space
-    ///   rather than the stale `rcv_wnd` snapshot (reviewer I-3).
+    /// * Window: `recv.free_space_total() >> ws_shift_out`, clamped to
+    ///   `u16::MAX` (RFC 7323 §2.2). Uses the combined in-order + reorder
+    ///   capacity so we don't advertise room the peer can legally fill
+    ///   past what we can actually hold once OOO segments accumulate.
+    ///   Fixed in Task 12 to use CURRENT free-space over stale `rcv_wnd`;
+    ///   widened in Task 17 to `free_space_total` to keep the invariant
+    ///   "advertised window ≤ actual room" once `recv.reorder` is non-empty.
     /// * Timestamps: echoes `TSval=now_µs, TSecr=ts_recent` when
     ///   `ts_enabled` (RFC 7323 §3 MUST-22 — every non-SYN segment MUST
     ///   carry TS after SYN-exchange negotiation).
@@ -815,7 +819,7 @@ impl Engine {
         let ts_enabled = conn.ts_enabled;
         let ts_recent = conn.ts_recent;
         let sack_enabled = conn.sack_enabled;
-        let free_space = conn.recv.free_space();
+        let free_space = conn.recv.free_space_total();
         let seq = conn.snd_nxt;
         let ack = conn.rcv_nxt;
         // Snapshot reorder ranges as (seq, end_seq) pairs so the pure
