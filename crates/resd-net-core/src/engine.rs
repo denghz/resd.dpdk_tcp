@@ -806,10 +806,16 @@ impl Engine {
     ///
     /// Borrow discipline (no nested borrows across phases):
     /// P1 mut flow_table → drain + take + snapshot; P2 FFI free (no
-    /// borrows); P3 mut timer_wheel; P4 mut events; P5 mut flow_table.
-    /// Each phase's borrow ends at the block's closing `}`.
+    /// borrows); P3 mut timer_wheel; P4 transition_conn (takes its own
+    /// flow_table + events borrows internally, sequentially); P5 mut
+    /// events; P6 mut flow_table. Each phase's borrow ends at the
+    /// block's closing `}`.
     pub(crate) fn force_close_etimedout(&self, handle: ConnHandle) {
-        // Phase 1: snapshot timer ids + drain snd_retrans mbufs.
+        // Phase 1: snapshot timer ids + drain snd_retrans mbufs. Note: do
+        // NOT write conn.state here — transition_conn below owns that
+        // transition so StateChange emission + state_trans[from][to]
+        // counter bumps (spec §9.1 core TCP observability) are not
+        // skipped.
         let (timer_ids_to_cancel, dropped_entries) = {
             let mut ft = self.flow_table.borrow_mut();
             let Some(conn) = ft.get_mut(handle) else {
@@ -828,7 +834,6 @@ impl Engine {
             conn.timer_ids.clear();
             let entries: Vec<crate::tcp_retrans::RetransEntry> =
                 conn.snd_retrans.entries.drain(..).collect();
-            conn.state = TcpState::Closed;
             (ids, entries)
         };
         // Phase 2: free mbufs (outside any RefCell borrow).
@@ -845,9 +850,16 @@ impl Engine {
                 w.cancel(id);
             }
         }
-        // Phase 4: push Error + Closed events (both carry -ETIMEDOUT;
+        // Phase 4: state transition via transition_conn — emits the
+        // StateChange event and bumps state_trans[from][Closed], keeping
+        // the observability contract intact on ETIMEDOUT force-close.
+        self.transition_conn(handle, TcpState::Closed);
+        // Phase 5: push Error + Closed events (both carry -ETIMEDOUT;
         // the C ABI boundary translates the negative errno in Task 20).
         // `libc::ETIMEDOUT` is already `i32` on Linux — no cast needed.
+        // Ordered AFTER transition_conn so StateChange lands before
+        // Error/Closed in the event queue, matching the ordering used
+        // elsewhere when a transition accompanies terminal events.
         {
             let mut ev = self.events.borrow_mut();
             ev.push(InternalEvent::Error {
@@ -859,7 +871,7 @@ impl Engine {
                 err: -libc::ETIMEDOUT,
             });
         }
-        // Phase 5: remove from flow_table.
+        // Phase 6: remove from flow_table.
         self.flow_table.borrow_mut().remove(handle);
         crate::counters::inc(&self.counters.tcp.conn_close);
     }
