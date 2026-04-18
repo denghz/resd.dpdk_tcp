@@ -616,9 +616,32 @@ fn handle_established(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
             ..Outcome::base()
         };
     } else {
-        // Duplicate ACK (ack <= snd_una) — no-op for A3 (A5 uses for fast
-        // retx). Account via `tcp.rx_dup_ack` (A4 cross-phase backfill).
-        dup_ack = true;
+        // RFC 5681 §2 strict duplicate-ACK: all 5 conditions must hold.
+        // A4 used a loose `ack <= snd_una` test; A5 Task 23 tightens to
+        // spec so diagnostic `tcp.rx_dup_ack` only fires on real dup ACKs.
+        //   c1: seg.ack == snd.una   (ACK of largest seen ACK)
+        //   c2: seg.payload.is_empty()  (no data)
+        //   c3: seg.window unchanged  (no window update)
+        //   c4: snd.una != snd.nxt    (outstanding data)
+        //   c5: state in { ESTABLISHED, CLOSE_WAIT, FIN_WAIT_1/2, CLOSING }
+        //
+        // c3 window comparison: on-wire `seg.window` is pre-scale (u16);
+        // `conn.snd_wnd` is post-scale (u32). Right-shift snd_wnd back by
+        // `ws_shift_in` to compare against the u16 on-wire value. When
+        // ws_shift_in == 0 this reduces to plain u16 equality.
+        let c1 = seg.ack == conn.snd_una;
+        let c2 = seg.payload.is_empty();
+        let c3 = (seg.window as u32) == (conn.snd_wnd >> conn.ws_shift_in);
+        let c4 = conn.snd_una != conn.snd_nxt;
+        let c5 = matches!(
+            conn.state,
+            TcpState::Established
+                | TcpState::CloseWait
+                | TcpState::FinWait1
+                | TcpState::FinWait2
+                | TcpState::Closing
+        );
+        dup_ack = c1 && c2 && c3 && c4 && c5;
     }
 
     // A5 Task 15: RACK detect-lost pass (RFC 8985 §6.2).
@@ -2074,7 +2097,14 @@ mod tests {
     #[test]
     fn established_duplicate_ack_sets_dup_ack() {
         let mut c = est_conn(1000, 5000, 1024);
-        // ack == snd_una == 1001 ⇒ duplicate ACK.
+        // RFC 5681 §2 strict dup_ack — all 5 conditions must hold.
+        // Advance snd_nxt so there is outstanding data (c4), and pick a
+        // segment whose window matches the current snd_wnd (c3).
+        c.snd_nxt = c.snd_una.wrapping_add(100);
+        c.snd_wnd = 65535;
+        c.ws_shift_in = 0;
+        // ack == snd_una (c1), empty payload (c2), window == snd_wnd (c3),
+        // snd_una != snd_nxt (c4), state Established (c5) → dup_ack.
         let seg = ParsedSegment {
             src_port: 5000,
             dst_port: 40000,
@@ -2082,6 +2112,97 @@ mod tests {
             ack: 1001,
             flags: TCP_ACK,
             window: 65535,
+            header_len: 20,
+            payload: &[],
+            options: &[],
+        };
+        let out = dispatch(&mut c, &seg);
+        assert!(out.dup_ack);
+    }
+
+    #[test]
+    fn dup_ack_ignored_when_seg_has_data() {
+        // c2 violated: payload non-empty.
+        let mut c = est_conn(1000, 5000, 1024);
+        c.snd_nxt = c.snd_una.wrapping_add(100);
+        c.snd_wnd = 65535;
+        c.ws_shift_in = 0;
+        let seg = ParsedSegment {
+            src_port: 5000,
+            dst_port: 40000,
+            seq: 5001,
+            ack: 1001,
+            flags: TCP_ACK,
+            window: 65535,
+            header_len: 20,
+            payload: b"xxx",
+            options: &[],
+        };
+        let out = dispatch(&mut c, &seg);
+        assert!(!out.dup_ack);
+    }
+
+    #[test]
+    fn dup_ack_ignored_when_seg_updates_window() {
+        // c3 violated: seg.window differs from conn.snd_wnd (no-shift).
+        let mut c = est_conn(1000, 5000, 1024);
+        c.snd_nxt = c.snd_una.wrapping_add(100);
+        c.snd_wnd = 65535;
+        c.ws_shift_in = 0;
+        let seg = ParsedSegment {
+            src_port: 5000,
+            dst_port: 40000,
+            seq: 5001,
+            ack: 1001,
+            flags: TCP_ACK,
+            window: 30000,
+            header_len: 20,
+            payload: &[],
+            options: &[],
+        };
+        let out = dispatch(&mut c, &seg);
+        assert!(!out.dup_ack);
+    }
+
+    #[test]
+    fn dup_ack_ignored_when_no_outstanding_data() {
+        // c4 violated: snd_una == snd_nxt (nothing in flight).
+        let mut c = est_conn(1000, 5000, 1024);
+        // est_conn already sets snd_una == snd_nxt == 1001.
+        c.snd_wnd = 65535;
+        c.ws_shift_in = 0;
+        let seg = ParsedSegment {
+            src_port: 5000,
+            dst_port: 40000,
+            seq: 5001,
+            ack: 1001,
+            flags: TCP_ACK,
+            window: 65535,
+            header_len: 20,
+            payload: &[],
+            options: &[],
+        };
+        let out = dispatch(&mut c, &seg);
+        assert!(!out.dup_ack);
+    }
+
+    #[test]
+    fn dup_ack_set_when_all_five_conditions_hold_with_ws_shift() {
+        // Parallel to `established_duplicate_ack_sets_dup_ack`, but with a
+        // non-zero ws_shift_in to exercise the right-shift in c3.
+        let mut c = est_conn(1000, 5000, 1024);
+        c.snd_nxt = c.snd_una.wrapping_add(100);
+        c.ws_shift_in = 4;
+        // snd_wnd is post-scale; pick a value evenly divisible by 1<<4 so
+        // (snd_wnd >> 4) round-trips back to a u16 on-wire value.
+        c.snd_wnd = 65535u32 << 4; // 0x000F_FFF0
+        let seg = ParsedSegment {
+            src_port: 5000,
+            dst_port: 40000,
+            seq: 5001,
+            ack: 1001,
+            flags: TCP_ACK,
+            window: 65535, // matches snd_wnd >> 4
             header_len: 20,
             payload: &[],
             options: &[],
