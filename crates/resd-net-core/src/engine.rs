@@ -1143,6 +1143,23 @@ impl Engine {
         // hot-path stays straight-line.
         apply_tcp_input_counters(&outcome, &self.counters.tcp);
 
+        // A5 Task 15: RACK-detected lost segments — retransmit each +
+        // bump `tcp.tx_rack_loss`. Runs BEFORE the Task-11 prune below
+        // so the `entry_index` values collected in `handle_established`
+        // remain valid (prune_below pops from the front and would shift
+        // remaining entries' indexes otherwise). `retransmit` manages
+        // its own flow_table borrows, so we call it in a loop without
+        // holding one ourselves. `handle_established` already filtered
+        // cum-ACKed entries out of `rack_lost_indexes`, so the forthcoming
+        // prune won't drop any entry referenced here. Event emission
+        // (`TcpLossDetected`) is deferred to Task 20 (per_packet_events gate).
+        if !outcome.rack_lost_indexes.is_empty() {
+            for i in &outcome.rack_lost_indexes {
+                self.retransmit(handle, *i as usize);
+                crate::counters::inc(&self.counters.tcp.tx_rack_loss);
+            }
+        }
+
         // A5 task 11: on an ACK that advanced snd.una, prune snd_retrans
         // below the new snd.una and free each dropped mbuf (its stashed
         // refcount 1→0 returns the mbuf to the mempool). If snd_retrans

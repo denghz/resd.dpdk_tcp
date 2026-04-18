@@ -123,7 +123,7 @@ pub enum TxAction {
 }
 
 /// Outcome of dispatching a segment to a per-state handler.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Outcome {
     pub tx: TxAction,
     pub new_state: Option<TcpState>,
@@ -172,6 +172,14 @@ pub struct Outcome {
     /// A5: true iff a valid RTT sample was taken from this ACK. Counter
     /// wiring lives in Task 26 (counter batch); this field is observable here.
     pub rtt_sample_taken: bool,
+    /// A5 Task 15: indexes into `conn.snd_retrans.entries` that RACK
+    /// marked lost this ACK. Engine retransmits each and bumps
+    /// `tcp.tx_rack_loss`. Vec<u16> chosen to allow ≥4 simultaneous
+    /// losses while keeping the Outcome small (a fresh Vec is allocated
+    /// per ACK — at typical rates ≤1k ACKs/sec per conn, this is
+    /// acceptable; a Stage-2 optimization could use an inline
+    /// fixed-size array).
+    pub rack_lost_indexes: Vec<u16>,
     pub connected: bool,
     pub closed: bool,
 }
@@ -196,6 +204,7 @@ impl Outcome {
             rx_zero_window: false,
             snd_una_advanced_to: None,
             rtt_sample_taken: false,
+            rack_lost_indexes: Vec::new(),
             connected: false,
             closed: false,
         }
@@ -446,10 +455,14 @@ fn handle_established(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
     // info is advisory — on full-array overflow `SackScoreboard::insert`
     // drops the oldest block; the peer re-advertises on subsequent ACKs
     // so the loss is self-correcting. A5 retransmit reads the board.
+    // A5 Task 15: also mark matching snd_retrans entries sacked so the
+    // RACK pass below sees them (RFC 8985 §6.1 treats SACKed entries as
+    // delivered for RACK.xmit_ts update purposes).
     let mut sack_blocks_decoded = 0u32;
     if conn.sack_enabled && parsed_opts.sack_block_count > 0 {
         for block in &parsed_opts.sack_blocks[..parsed_opts.sack_block_count as usize] {
             conn.sack_scoreboard.insert(*block);
+            conn.snd_retrans.mark_sacked(*block);
         }
         sack_blocks_decoded = parsed_opts.sack_block_count as u32;
     }
@@ -532,6 +545,64 @@ fn handle_established(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
         dup_ack = true;
     }
 
+    // A5 Task 15: RACK detect-lost pass (RFC 8985 §6.2).
+    //
+    // Pre-reqs: `conn.snd_retrans` entries have had `sacked` flags set
+    // from this segment's SACK blocks above, and `conn.snd_una` has
+    // advanced for the cumulative-ACKed portion. (Entry pruning below
+    // `snd_una` runs later in the engine; we still detect lost entries
+    // that lie above `snd_una` — the intended RACK scope.)
+    //
+    // Runs regardless of whether this ACK advanced `snd_una` — a
+    // SACK-only ACK with no cumulative advance can still trigger RACK.
+    let mut rack_lost_indexes: Vec<u16> = Vec::new();
+    if !conn.snd_retrans.is_empty() {
+        let now_ns = crate::clock::now_ns();
+        // Update RACK state from newly-acked-or-sacked entries.
+        // `update_on_ack` is newest-wins, so iteration order doesn't matter.
+        for e_ in conn.snd_retrans.iter_for_rack() {
+            let end_seq = e_.seq.wrapping_add(e_.len as u32);
+            let cum_acked = seq_le(end_seq, conn.snd_una);
+            if e_.sacked || cum_acked {
+                conn.rack.update_on_ack(e_.xmit_ts_ns, end_seq);
+            }
+        }
+        // Compute reo_wnd from current conn state. `conn.rack.min_rtt_us`
+        // is 0 until a later task wires `update_min_rtt`;
+        // `compute_reo_wnd_us` tolerates that via the 1ms floor.
+        let reo_wnd_us = crate::tcp_rack::compute_reo_wnd_us(
+            conn.rack_aggressive,
+            conn.rack.min_rtt_us,
+            conn.rtt_est.srtt_us(),
+        );
+        conn.rack.reo_wnd_us = reo_wnd_us;
+        // Walk entries for loss detection. Collect indexes first, then
+        // mark lost=true in a second pass to keep the iter-immutable.
+        // RFC 8985 §6.2 runs only over packets not yet acknowledged; we
+        // skip sacked/already-lost AND cum-ACKed entries (the engine's
+        // prune_below runs after dispatch — cum-ACKed entries are
+        // transiently visible here and we must not flag them lost since
+        // the index would become stale after the prune shifts the deque).
+        for (i, e_) in conn.snd_retrans.entries.iter().enumerate() {
+            if e_.sacked || e_.lost {
+                continue;
+            }
+            let end_seq = e_.seq.wrapping_add(e_.len as u32);
+            if seq_le(end_seq, conn.snd_una) {
+                continue;
+            }
+            if conn
+                .rack
+                .detect_lost(e_.xmit_ts_ns, end_seq, now_ns, reo_wnd_us)
+            {
+                rack_lost_indexes.push(i as u16);
+            }
+        }
+        for i in &rack_lost_indexes {
+            conn.snd_retrans.entries[*i as usize].lost = true;
+        }
+    }
+
     // Data delivery — A4: in-order append + OOO reassembly enqueue +
     // drain-on-gap-close per spec §7.2.
     let mut delivered = 0u32;
@@ -610,6 +681,7 @@ fn handle_established(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
         rx_zero_window,
         snd_una_advanced_to,
         rtt_sample_taken,
+        rack_lost_indexes,
         ..Outcome::base()
     }
 }
@@ -1814,5 +1886,100 @@ mod tests {
         let o = Outcome::base();
         assert!(o.snd_una_advanced_to.is_none());
         assert!(!o.rtt_sample_taken);
+    }
+
+    #[test]
+    fn outcome_rack_lost_indexes_defaults_empty() {
+        let o = Outcome::base();
+        assert!(o.rack_lost_indexes.is_empty());
+    }
+
+    // A5 Task 15: a RACK detect-lost pass runs inside handle_established.
+    // Construct a conn with two in-flight entries: A (older xmit) and B
+    // (newer xmit, SACKed by the incoming ACK). After the ACK, A's
+    // xmit_ts is older than RACK.xmit_ts + age exceeds reo_wnd, so it's
+    // marked lost and its index is surfaced via Outcome.rack_lost_indexes.
+    #[test]
+    fn rack_detects_older_entry_as_lost_when_newer_sacked_and_beyond_reo_wnd() {
+        use crate::mempool::Mbuf;
+        use crate::tcp_retrans::RetransEntry;
+        let mut c = est_conn(1000, 5000, 1024);
+        c.sack_enabled = true;
+        // Bump snd_nxt so both entries sit within (snd_una, snd_nxt].
+        c.snd_nxt = 2000;
+        // A: seq=1001, len=50, xmit_ts very old.
+        c.snd_retrans.push_after_tx(RetransEntry {
+            seq: 1001,
+            len: 50,
+            mbuf: Mbuf::null_for_test(),
+            first_tx_ts_ns: 0,
+            xmit_count: 1,
+            sacked: false,
+            lost: false,
+            xmit_ts_ns: 0,
+        });
+        // B: seq=1051, len=50, xmit_ts = now (much later than A).
+        let now_ns = crate::clock::now_ns();
+        c.snd_retrans.push_after_tx(RetransEntry {
+            seq: 1051,
+            len: 50,
+            mbuf: Mbuf::null_for_test(),
+            first_tx_ts_ns: now_ns,
+            xmit_count: 1,
+            sacked: false,
+            lost: false,
+            xmit_ts_ns: now_ns,
+        });
+        // Build an ACK segment carrying a SACK block covering B (1051..1101).
+        // `parse_options` expects the raw options bytes; construct them
+        // directly: SACK option kind=5, len=2+8=10, one block big-endian.
+        let mut opts = Vec::new();
+        opts.push(5u8); // kind
+        opts.push(10u8); // len
+        opts.extend_from_slice(&1051u32.to_be_bytes());
+        opts.extend_from_slice(&1101u32.to_be_bytes());
+        // Pad to 4-byte boundary with NOPs.
+        while opts.len() % 4 != 0 {
+            opts.push(1u8); // NOP
+        }
+        let seg = ParsedSegment {
+            src_port: 5000,
+            dst_port: 40000,
+            seq: 5001,
+            ack: 1001, // cumulative-ack unchanged (dup-ACK path)
+            flags: TCP_ACK,
+            window: 65535,
+            header_len: 20 + opts.len(),
+            payload: &[],
+            options: &opts,
+        };
+        let out = dispatch(&mut c, &seg);
+        // A (index 0) should be marked lost; B (index 1) is SACKed.
+        assert!(
+            out.rack_lost_indexes.contains(&0),
+            "entry A (older xmit) should be RACK-lost, got {:?}",
+            out.rack_lost_indexes
+        );
+        assert!(c.snd_retrans.entries[0].lost);
+        assert!(c.snd_retrans.entries[1].sacked);
+    }
+
+    // Empty snd_retrans → RACK pass is a no-op, rack_lost_indexes stays empty.
+    #[test]
+    fn rack_pass_noop_when_no_inflight_segments() {
+        let mut c = est_conn(1000, 5000, 1024);
+        let seg = ParsedSegment {
+            src_port: 5000,
+            dst_port: 40000,
+            seq: 5001,
+            ack: 1001,
+            flags: TCP_ACK,
+            window: 65535,
+            header_len: 20,
+            payload: &[],
+            options: &[],
+        };
+        let out = dispatch(&mut c, &seg);
+        assert!(out.rack_lost_indexes.is_empty());
     }
 }
