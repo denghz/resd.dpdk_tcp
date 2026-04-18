@@ -184,6 +184,12 @@ pub struct Outcome {
     /// bumps `tcp.rx_dsack` by this count. Visibility only — A5 does
     /// not adapt reo_wnd or scoreboard prune based on DSACK.
     pub rx_dsack_count: u32,
+    /// A5 Task 18: the SYN-retransmit timer id to cancel on the engine's
+    /// side. Set by `handle_syn_sent` when a valid SYN-ACK lands — the
+    /// conn's `syn_retrans_timer_id` field is `.take()`n here so the
+    /// engine can `timer_wheel.cancel()` it post-dispatch and prune it
+    /// from `conn.timer_ids`. `None` on every other segment / state.
+    pub syn_retrans_timer_to_cancel: Option<crate::tcp_timer_wheel::TimerId>,
     pub connected: bool,
     pub closed: bool,
 }
@@ -210,6 +216,7 @@ impl Outcome {
             rtt_sample_taken: false,
             rack_lost_indexes: Vec::new(),
             rx_dsack_count: 0,
+            syn_retrans_timer_to_cancel: None,
             connected: false,
             closed: false,
         }
@@ -340,10 +347,17 @@ fn handle_syn_sent(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
         conn.ts_enabled = false;
     }
 
+    // A5 Task 18: SYN-ACK accepted — hand the engine the SYN-retransmit
+    // timer id so it can cancel the pending fire (we can't touch the
+    // engine's timer wheel from here). `take()` zeros the field so a
+    // subsequent fire observes the cancelled-without-id path.
+    let syn_retrans_timer_to_cancel = conn.syn_retrans_timer_id.take();
+
     Outcome {
         tx: TxAction::Ack,
         new_state: Some(TcpState::Established),
         connected: true,
+        syn_retrans_timer_to_cancel,
         ..Outcome::base()
     }
 }

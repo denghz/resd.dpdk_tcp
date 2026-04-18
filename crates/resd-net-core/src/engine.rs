@@ -565,6 +565,52 @@ impl Engine {
         }
     }
 
+    /// A5 Task 18: build and transmit a SYN for conn `handle`. Used by
+    /// `connect` (initial SYN) and `on_syn_retrans_fire` (retransmits).
+    /// Returns `true` on successful TX; `false` on alloc / tx-ring-full.
+    ///
+    /// Pre-SYN-ACK the conn has no negotiated peer_mss, so `new_client`
+    /// stashes `our_mss` into `peer_mss` as a placeholder (see
+    /// `TcpConn::new_client`). Reading `c.peer_mss` here reliably gives
+    /// back the MSS we advertised in the initial SYN — which is exactly
+    /// what retransmits must carry per RFC 9293 §3.7.1.
+    fn emit_syn(&self, handle: ConnHandle) -> bool {
+        use crate::tcp_output::{build_segment, SegmentTx, TCP_SYN};
+        let (tuple, iss, our_mss, recv_buffer_bytes, now_ns) = {
+            let ft = self.flow_table.borrow();
+            let Some(c) = ft.get(handle) else {
+                return false;
+            };
+            (
+                c.four_tuple(),
+                c.iss,
+                c.peer_mss,
+                self.cfg.recv_buffer_bytes,
+                crate::clock::now_ns(),
+            )
+        };
+        let syn_opts = build_connect_syn_opts(recv_buffer_bytes, our_mss, now_ns);
+        let seg = SegmentTx {
+            src_mac: self.our_mac,
+            dst_mac: self.cfg.gateway_mac,
+            src_ip: tuple.local_ip,
+            dst_ip: tuple.peer_ip,
+            src_port: tuple.local_port,
+            dst_port: tuple.peer_port,
+            seq: iss,
+            ack: 0,
+            flags: TCP_SYN,
+            window: u16::MAX, // pre-WS-negotiation: advertise maximum.
+            options: syn_opts,
+            payload: &[],
+        };
+        let mut buf = [0u8; 128];
+        let Some(n) = build_segment(&seg, &mut buf) else {
+            return false;
+        };
+        self.tx_frame(&buf[..n])
+    }
+
     /// Pick the next ephemeral source port in the IANA range [49152, 65535].
     /// Simple wraparound counter; collisions with existing flows in the
     /// table are not checked (at <=100 connections the odds are negligible).
@@ -689,9 +735,11 @@ impl Engine {
                 crate::tcp_timer_wheel::TimerKind::Tlp => {
                     self.on_tlp_fire(node.owner_handle, id);
                 }
-                crate::tcp_timer_wheel::TimerKind::SynRetrans
-                | crate::tcp_timer_wheel::TimerKind::ApiPublic => {
-                    // Wired in Tasks 18 / A6. Silent no-op for now.
+                crate::tcp_timer_wheel::TimerKind::SynRetrans => {
+                    self.on_syn_retrans_fire(node.owner_handle, id);
+                }
+                crate::tcp_timer_wheel::TimerKind::ApiPublic => {
+                    // Wired in A6 public timer API. Silent no-op for now.
                 }
             }
         }
@@ -859,6 +907,102 @@ impl Engine {
 
         // Task 20 will add RESD_NET_EVT_TCP_LOSS_DETECTED emission here
         // (cause = LossCause::Tlp) gated on tcp_per_packet_events.
+    }
+
+    /// A5 Task 18: SYN-retransmit fire (spec §6.5). Budget is three
+    /// retransmits plus the initial SYN = four total TXes; exponential
+    /// backoff starts at `max(initial_rto_us, min_rto_us)`. On the
+    /// fourth fire (count crosses three) we force-close the connection
+    /// with ETIMEDOUT and bump `tcp.conn_timeout_syn_sent`.
+    ///
+    /// Borrow discipline mirrors `on_rto_fire` / `on_tlp_fire`: five
+    /// phases with no nested RefCell borrows. Validate → clear fired id
+    /// → bump count → (retrans or force-close) → re-arm.
+    pub(crate) fn on_syn_retrans_fire(
+        &self,
+        handle: ConnHandle,
+        fired_id: crate::tcp_timer_wheel::TimerId,
+    ) {
+        // Phase 1: validate fired_id + capture current state.
+        let (is_current, in_syn_sent) = {
+            let ft = self.flow_table.borrow();
+            let Some(c) = ft.get(handle) else { return };
+            let current = c.syn_retrans_timer_id == Some(fired_id);
+            let in_syn = c.state == TcpState::SynSent;
+            (current, in_syn)
+        };
+        if !is_current {
+            // Stale fire (cancel raced, or slot reused). Ignore.
+            return;
+        }
+
+        // Phase 2: clear syn_retrans_timer_id + prune timer_ids.
+        {
+            let mut ft = self.flow_table.borrow_mut();
+            if let Some(c) = ft.get_mut(handle) {
+                c.syn_retrans_timer_id = None;
+                c.timer_ids.retain(|t| *t != fired_id);
+            }
+        }
+        if !in_syn_sent {
+            // SYN-ACK already landed (or conn already closed). The
+            // Outcome-path cancel normally beats us, but on a race the
+            // cleared id above is sufficient — nothing more to do.
+            return;
+        }
+
+        // Phase 3: bump retrans count + check budget. Count semantics:
+        // initial SYN = 0; fire 1/2/3 = 1/2/3 retransmit; fire 4 → > 3 →
+        // abandon. Total: 3 retransmits + 1 initial = 4 SYN TXes ≈ 75 ms
+        // to ETIMEDOUT with 5 ms base (5+10+20+40).
+        let new_count = {
+            let mut ft = self.flow_table.borrow_mut();
+            match ft.get_mut(handle) {
+                Some(c) => {
+                    c.syn_retrans_count = c.syn_retrans_count.saturating_add(1);
+                    c.syn_retrans_count
+                }
+                None => return,
+            }
+        };
+        if new_count > 3 {
+            crate::counters::inc(&self.counters.tcp.conn_timeout_syn_sent);
+            self.force_close_etimedout(handle);
+            return;
+        }
+
+        // Phase 4: re-TX SYN via the shared helper.
+        self.emit_syn(handle);
+
+        // Phase 5: re-arm with exponential backoff. `shl` clamp at 6
+        // caps the backoff multiplier at 64× base (~320 ms), which is
+        // well above the budget window and protects against overflow.
+        // `checked_shl` returns None only for shift >= 32 — our clamp at
+        // 6 means the `unwrap_or` is unreachable, but kept for safety.
+        let base_us =
+            crate::tcp_rtt::DEFAULT_INITIAL_RTO_US.max(crate::tcp_rtt::DEFAULT_MIN_RTO_US);
+        let delay_us = base_us
+            .checked_shl(new_count.min(6) as u32)
+            .unwrap_or(u32::MAX);
+        let now_ns = crate::clock::now_ns();
+        let fire_at_ns = now_ns + (delay_us as u64 * 1_000);
+        let id = self.timer_wheel.borrow_mut().add(
+            now_ns,
+            crate::tcp_timer_wheel::TimerNode {
+                fire_at_ns,
+                owner_handle: handle,
+                kind: crate::tcp_timer_wheel::TimerKind::SynRetrans,
+                generation: 0,
+                cancelled: false,
+            },
+        );
+        {
+            let mut ft = self.flow_table.borrow_mut();
+            if let Some(c) = ft.get_mut(handle) {
+                c.syn_retrans_timer_id = Some(id);
+                c.timer_ids.push(id);
+            }
+        }
     }
 
     /// A5 Task 13: force-close a connection due to RTO or SYN-retransmit
@@ -1319,6 +1463,20 @@ impl Engine {
             }
         }
 
+        // A5 Task 18: cancel the SYN-retransmit timer on SYN-ACK.
+        // `handle_syn_sent` `.take()`s the conn's `syn_retrans_timer_id`
+        // and plumbs it up via the Outcome so we can cancel it on the
+        // timer wheel without re-borrowing the flow table inside the
+        // handler. `cancel()` is idempotent — a racing fire that already
+        // cleared the wheel entry is a silent no-op here.
+        if let Some(id) = outcome.syn_retrans_timer_to_cancel {
+            self.timer_wheel.borrow_mut().cancel(id);
+            let mut ft = self.flow_table.borrow_mut();
+            if let Some(c) = ft.get_mut(handle) {
+                c.timer_ids.retain(|t| *t != id);
+            }
+        }
+
         // RFC 9293 §3.10.7.8: restart the 2×MSL timer on any in-window
         // segment received in TIME_WAIT.
         {
@@ -1731,7 +1889,6 @@ impl Engine {
     ) -> Result<ConnHandle, Error> {
         use crate::counters::inc;
         use crate::tcp_conn::TcpConn;
-        use crate::tcp_output::{build_segment, SegmentTx, TCP_SYN};
 
         if self.cfg.local_ip == 0 {
             return Err(Error::PeerUnreachable(peer_ip));
@@ -1781,34 +1938,10 @@ impl Engine {
         // + Timestamps (RFC 7323 §4.1 initial TSval). Pre-WS-negotiation,
         // we advertise the maximum unscaled window — the SYN itself has no
         // scaled-window semantics; `ws_shift_out` kicks in for non-SYN
-        // segments (Task 13).
-        let now_ns = crate::clock::now_ns();
+        // segments (Task 13). Delegates to `emit_syn`, which is also the
+        // retransmit path from `on_syn_retrans_fire` (Task 18).
         let ws_out = compute_ws_shift_for(self.cfg.recv_buffer_bytes);
-        let syn_opts = build_connect_syn_opts(self.cfg.recv_buffer_bytes, our_mss, now_ns);
-        let seg = SegmentTx {
-            src_mac: self.our_mac,
-            dst_mac: self.cfg.gateway_mac,
-            src_ip: tuple.local_ip,
-            dst_ip: tuple.peer_ip,
-            src_port: tuple.local_port,
-            dst_port: tuple.peer_port,
-            seq: iss,
-            ack: 0,
-            flags: TCP_SYN,
-            window: u16::MAX, // pre-WS-negotiation: advertise maximum.
-            options: syn_opts,
-            payload: &[],
-        };
-        // A full SYN (MSS + WS + SACK-perm + TS, padded to 20 bytes of
-        // options) produces a 14+20+20+20 = 74-byte frame; reserve 128 to
-        // stay safely above that ceiling.
-        let mut buf = [0u8; 128];
-        let Some(n) = build_segment(&seg, &mut buf) else {
-            // Header-too-small is impossible with 128-byte buf; keep explicit.
-            self.flow_table.borrow_mut().remove(handle);
-            return Err(Error::PeerUnreachable(peer_ip));
-        };
-        if !self.tx_frame(&buf[..n]) {
+        if !self.emit_syn(handle) {
             self.flow_table.borrow_mut().remove(handle);
             return Err(Error::PeerUnreachable(peer_ip));
         }
@@ -1828,6 +1961,35 @@ impl Engine {
             }
         }
         self.transition_conn(handle, TcpState::SynSent);
+
+        // A5 Task 18: arm the SYN retransmit timer. 3 retransmits before
+        // ETIMEDOUT force-close; exponential backoff starting at
+        // `max(initial_rto_us, min_rto_us)`. Re-arms each fire inside
+        // `on_syn_retrans_fire`; cancelled on SYN-ACK in `handle_syn_sent`
+        // via `Outcome::syn_retrans_timer_to_cancel`. Task 21 will plumb
+        // `tcp_initial_rto_us` / `tcp_min_rto_us` through engine config.
+        let initial_delay_us =
+            crate::tcp_rtt::DEFAULT_INITIAL_RTO_US.max(crate::tcp_rtt::DEFAULT_MIN_RTO_US);
+        let now_ns = crate::clock::now_ns();
+        let fire_at_ns = now_ns + (initial_delay_us as u64 * 1_000);
+        let id = self.timer_wheel.borrow_mut().add(
+            now_ns,
+            crate::tcp_timer_wheel::TimerNode {
+                fire_at_ns,
+                owner_handle: handle,
+                kind: crate::tcp_timer_wheel::TimerKind::SynRetrans,
+                generation: 0,
+                cancelled: false,
+            },
+        );
+        {
+            let mut ft = self.flow_table.borrow_mut();
+            if let Some(c) = ft.get_mut(handle) {
+                c.syn_retrans_timer_id = Some(id);
+                c.timer_ids.push(id);
+            }
+        }
+
         Ok(handle)
     }
 
@@ -2533,6 +2695,22 @@ mod tests {
             id: crate::tcp_timer_wheel::TimerId,
         ) {
             e.on_tlp_fire(h, id);
+        }
+    }
+
+    // Task 18: `on_syn_retrans_fire` signature compile-check. Body
+    // coverage lives in Task 28 TAP integration (SYN-budget exhaustion
+    // end-to-end). A real fire needs EAL/DPDK. Handler is pub(crate) so
+    // this test can reference it; exercised via `advance_timer_wheel`
+    // from `poll_once`.
+    #[test]
+    fn on_syn_retrans_fire_signature_exists() {
+        fn _check(
+            e: &Engine,
+            h: crate::flow_table::ConnHandle,
+            id: crate::tcp_timer_wheel::TimerId,
+        ) {
+            e.on_syn_retrans_fire(h, id);
         }
     }
 
