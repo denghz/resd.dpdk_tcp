@@ -190,7 +190,19 @@ pub struct resd_net_tcp_counters_t {
     pub conn_rst: u64,
     pub send_buf_full: u64,
     pub recv_buf_delivered: u64,
-    pub _pad: [u64; 3],
+    // Phase A3 additions
+    pub tx_syn: u64,
+    pub tx_ack: u64,
+    pub tx_data: u64,
+    pub tx_fin: u64,
+    pub tx_rst: u64,
+    pub rx_fin: u64,
+    pub rx_unmatched: u64,
+    pub rx_bad_csum: u64,
+    pub rx_bad_flags: u64,
+    pub rx_short: u64,
+    pub state_trans: [[u64; 11]; 11],
+    pub _pad: [u64; 4],
 }
 #[repr(C, align(64))]
 pub struct resd_net_poll_counters_t {

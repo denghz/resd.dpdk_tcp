@@ -54,7 +54,21 @@ pub struct TcpCounters {
     pub conn_rst: AtomicU64,
     pub send_buf_full: AtomicU64,
     pub recv_buf_delivered: AtomicU64,
-    _pad: [u64; 3],
+    // Phase A3 additions
+    pub tx_syn: AtomicU64,
+    pub tx_ack: AtomicU64,
+    pub tx_data: AtomicU64,
+    pub tx_fin: AtomicU64,
+    pub tx_rst: AtomicU64,
+    pub rx_fin: AtomicU64,
+    pub rx_unmatched: AtomicU64,
+    pub rx_bad_csum: AtomicU64,
+    pub rx_bad_flags: AtomicU64,
+    pub rx_short: AtomicU64,
+    /// 11×11 state transition matrix, indexed [from][to] where from/to are
+    /// `TcpState as u8`. Per spec §9.1. Unused cells stay at zero.
+    pub state_trans: [[AtomicU64; 11]; 11],
+    _pad: [u64; 4],
 }
 
 #[repr(C, align(64))]
@@ -193,5 +207,26 @@ mod tests {
         assert_eq!(c.ip.rx_drop_unsupported_proto.load(Ordering::Relaxed), 0);
         assert_eq!(c.ip.rx_tcp.load(Ordering::Relaxed), 0);
         assert_eq!(c.ip.rx_icmp.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn a3_new_tcp_counters_exist_and_zero() {
+        let c = Counters::new();
+        assert_eq!(c.tcp.tx_syn.load(Ordering::Relaxed), 0);
+        assert_eq!(c.tcp.tx_ack.load(Ordering::Relaxed), 0);
+        assert_eq!(c.tcp.tx_data.load(Ordering::Relaxed), 0);
+        assert_eq!(c.tcp.tx_fin.load(Ordering::Relaxed), 0);
+        assert_eq!(c.tcp.tx_rst.load(Ordering::Relaxed), 0);
+        assert_eq!(c.tcp.rx_fin.load(Ordering::Relaxed), 0);
+        assert_eq!(c.tcp.rx_unmatched.load(Ordering::Relaxed), 0);
+        assert_eq!(c.tcp.rx_bad_csum.load(Ordering::Relaxed), 0);
+        assert_eq!(c.tcp.rx_bad_flags.load(Ordering::Relaxed), 0);
+        assert_eq!(c.tcp.rx_short.load(Ordering::Relaxed), 0);
+        // Transition matrix is 11×11 = 121 u64s; all zero at construction.
+        for row in &c.tcp.state_trans {
+            for cell in row {
+                assert_eq!(cell.load(Ordering::Relaxed), 0);
+            }
+        }
     }
 }
