@@ -17,6 +17,7 @@
 | A3 | TCP handshake + basic data transfer | **Complete** ✓ | `2026-04-18-stage1-phase-a3-tcp-basic.md` |
 | A4 | TCP options + PAWS + reassembly + SACK scoreboard | **Complete** ✓ | `2026-04-18-stage1-phase-a4-options-paws-reassembly-sack.md` |
 | A5 | RACK-TLP + RTO + retransmit + ISS | Not started | — |
+| A-HW | ENA hardware offload enablement (LLQ verify + TX/RX checksum + MBUF_FAST_FREE + RSS-hash plumbing) | Not started | — |
 | A6 | Public API surface completeness | Not started | — |
 | A7 | Loopback test server + packetdrill-shim | Not started | — |
 | A8 | tcpreq + observability gate | Not started | — |
@@ -24,6 +25,8 @@
 | A10 | Benchmark harness (micro + e2e + stress) | Not started | — |
 | A11 | Stage 1 ship gate verification | Not started | — |
 | A12 | Documentation (user + maintainer + future-work) + Stage 1 release tag | Not started | — |
+| A13 | HTTP/1.1 + TLS client integration + bench (via `contek-io/cpp_common`) | Not started | — |
+| A14 | WebSocket + TLS client integration + bench (via `contek-io/cpp_common`) | Not started | — |
 
 ---
 
@@ -183,6 +186,73 @@
 
 ---
 
+## A-HW — ENA hardware offload enablement
+
+**Numbering note:** Inserted between A5 and A6 after the Stage 1 deployment environment was pinned down as AWS ENA on AMD EPYC Milan (spec §8.1–§8.5). Uses the non-numeric "A-HW" tag rather than renumbering A6–A12 because existing per-phase plan files (notably the in-progress A4 plan) already reference A5 / A6 / A8 / A10 by number.
+
+**Goal:** Flip the port configuration from Phase A1's zeroed `rte_eth_conf` to the Stage 1 production-shape offload set: verify LLQ is active, enable TX+RX IPv4/TCP/UDP checksum offload, enable `MBUF_FAST_FREE`, and wire `RSS_HASH` plumbing (even on single-queue deployments) so the flow table can consume it once multi-queue lands. **Every offload is gated by a compile-time cargo feature flag** so that A10's benchmark harness can produce an on-vs-off A/B comparison per offload via rebuilds. Capability-gate every offload at runtime as well so `net_vdev` / `net_tap` test harnesses degrade to the software path even when the feature is compiled in.
+
+**Spec refs:** §8.1–§8.5, §7.5 (dynfield lookup + inline accessor wired here), §9.2 (`rx_hw_ts_ns` plumbed end-to-end; stays 0 on ENA since ENA doesn't register the dynfield, but the code path is exercised and future-hardware-ready on mlx5 / newer-gen ENA), §11.1 (measurement-discipline preconditions reference offloads), §11.3 (TSC-only attribution fallback).
+
+**Deliverables:**
+
+- **Compile-time feature gates** in `crates/resd-net-core/Cargo.toml` — one per Tier 1 offload, all on by default:
+
+  | Feature flag | Default | Gates |
+  |---|---|---|
+  | `hw-offload-llq` | ON | Passes `enable_llq=1` to the ENA PMD devargs; with the feature off, passes `enable_llq=0` so LLQ is explicitly disabled |
+  | `hw-offload-tx-cksum` | ON | TX IPv4+TCP+UDP checksum offload bits + pseudo-header-only checksum in `tcp_output.rs` / `l3_ip.rs`; with feature off, software full-fold stays on the TX path |
+  | `hw-offload-rx-cksum` | ON | RX IPv4+TCP+UDP checksum offload bits + `mbuf.ol_flags` inspection in `tcp_input.rs` / `l3_ip.rs`; with feature off, software verify runs on the RX path |
+  | `hw-offload-mbuf-fast-free` | ON | `RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE` bit in `txmode.offloads` |
+  | `hw-offload-rss-hash` | ON | `RTE_ETH_RX_OFFLOAD_RSS_HASH` bit + `rss_conf` setup + `mbuf.hash.rss` consumption in `flow_table.rs` (SipHash fallback when feature off) |
+  | `hw-offload-rx-timestamp` | ON | `rte_mbuf_dynfield_lookup("rte_dynfield_timestamp")` + `rte_mbuf_dynflag_lookup("rte_dynflag_rx_timestamp")` at `engine_create`; inline RX accessor populates `event.rx_hw_ts_ns`; with feature off (or dynfield absent), accessor folds to constant 0, events carry 0, and callers fall back to `enqueued_ts_ns` per §7.5 |
+
+  `[features]` table adds these as leaf features plus a convenience `hw-offloads-all` meta-feature that pulls in every `hw-offload-*` flag for explicit override. `default = [...all hw-offload-* flags...]`. Rebuilds with `--no-default-features --features hw-offloads-all` / `hw-offload-tx-cksum` / `<none>` / individual combinations are what A10's benchmark harness consumes to produce the A/B comparison.
+
+  Each feature gate is placed at the **code site**, not the struct field, so the C ABI is unchanged across feature sets (same pattern as §9.1.1 for observability flags). A feature-off build compiles away the offload code path entirely; the binary is strictly smaller and does not execute any offload-path instructions.
+
+- `engine.rs` port config upgraded:
+  - Query `rte_eth_dev_info_get`; log one-line banner of `rx_offload_capa` / `tx_offload_capa` / `dev_flags`.
+  - For each offload that is compile-time enabled, AND the requested bit against `dev_info.*_offload_capa`; WARN + one-shot counter per requested-but-unadvertised capability (`eth.offload_missing_<name>`); software path stays reachable (runtime capability gate per §8.5).
+  - Populate `rte_eth_conf.rxmode.offloads` / `txmode.offloads` with bits that are both compile-time enabled AND runtime advertised.
+  - When `hw-offload-rss-hash` is on: populate `rte_eth_conf.rx_adv_conf.rss_conf = { rss_hf: RTE_ETH_RSS_NONFRAG_IPV4_TCP | RTE_ETH_RSS_NONFRAG_IPV6_TCP, rss_key: NULL }` (NULL key → PMD default Toeplitz key); on single queue, program the RSS indirection table so every hash lands on queue 0.
+- LLQ verification (when `hw-offload-llq` on): parse PMD startup log + read `dev_info.default_rxportconf` / `default_txportconf` signals; fail-hard if the device advertises LLQ capability but LLQ did not activate at bring-up.
+- `tcp_output.rs` / `l3_ip.rs` TX checksum split, compile-gated by `hw-offload-tx-cksum`:
+  - Feature ON: set `mbuf.ol_flags |= RTE_MBUF_F_TX_IPV4 | RTE_MBUF_F_TX_IP_CKSUM | RTE_MBUF_F_TX_TCP_CKSUM` (and UDP analog); set `mbuf.l2_len = 14`, `mbuf.l3_len = 20`, `mbuf.l4_len = tcp_hdr_len`; write **only** the TCP / UDP pseudo-header checksum per RFC 9293 §3.1. Runtime-fallback branch (if the PMD didn't advertise the capability) reverts to full-fold for that engine instance only.
+  - Feature OFF: software full-fold on the TX path; no offload bits set.
+- `tcp_input.rs` / `l3_ip.rs` RX checksum consumption, compile-gated by `hw-offload-rx-cksum`:
+  - Feature ON: inspect `mbuf.ol_flags & RTE_MBUF_F_RX_IP_CKSUM_MASK` / `RTE_MBUF_F_RX_L4_CKSUM_MASK`; `GOOD` → verified, `BAD` → drop with counter, `NONE` / `UNKNOWN` → fall back to software fold.
+  - Feature OFF: software verify runs unconditionally on the RX path.
+- RSS-hash plumbing in `flow_table.rs`, compile-gated by `hw-offload-rss-hash`:
+  - Feature ON: read `mbuf.hash.rss` as the initial 4-tuple hash when `RTE_MBUF_F_RX_RSS_HASH` is set; fall back to SipHash otherwise.
+  - Feature OFF: always compute SipHash locally.
+- NIC RX timestamp plumbing in `engine.rs` + event-emission sites, compile-gated by `hw-offload-rx-timestamp`:
+  - Feature ON: at `engine_create`, call `rte_mbuf_dynfield_lookup("rte_dynfield_timestamp")` → store `ts_offset: Option<i32>` on engine state; call `rte_mbuf_dynflag_lookup("rte_dynflag_rx_timestamp")` → store `ts_flag_mask: Option<u64>`. Provide an always-inline accessor `hw_rx_ts_ns(mbuf) -> u64` that returns `*(uint64_t*)((char*)mbuf + ts_offset)` when **both** lookups succeeded **and** `mbuf.ol_flags & ts_flag_mask != 0`; returns 0 otherwise. RX paths that currently hardcode `rx_hw_ts_ns: 0` (`crates/resd-net-core/src/engine.rs:725`, `:995`; `crates/resd-net/src/lib.rs:161`, `:172`, `:185`) read the accessor from the originating mbuf instead. A3/A4 emission sites that have already dropped their source mbuf reference get the timestamp threaded through the internal event struct at the RX-decode boundary.
+  - Feature OFF: accessor is `const fn hw_rx_ts_ns(_mbuf) -> u64 { 0 }`; no dynfield lookup at startup; all `rx_hw_ts_ns` fields stay 0.
+  - On ENA (Stage 1 reference target): both dynfield and dynflag lookups return negative; accessor always yields 0; `rx_hw_ts_ns = 0` in every event as §8.3 / §9.2 already document. Callers use `enqueued_ts_ns` per §7.5. This is the exercised path in the Stage 1 smoke tests — the positive path is reachable but not asserted until a host with the dynfield is available (Stage 2 hardening).
+- Counter additions (all slow-path per §9.1.1 — fire on bring-up + on `BAD` checksum only; fields always allocated for C-ABI stability even when the feature is off):
+  - `eth.offload_missing_rx_cksum_ipv4`, `eth.offload_missing_rx_cksum_tcp`, `eth.offload_missing_rx_cksum_udp`, `eth.offload_missing_tx_cksum_ipv4`, `eth.offload_missing_tx_cksum_tcp`, `eth.offload_missing_tx_cksum_udp`, `eth.offload_missing_mbuf_fast_free`, `eth.offload_missing_rss_hash`, `eth.offload_missing_llq` — one-shot counters incremented once at `engine_create` per capability that was compile-time-enabled + runtime-requested but not advertised by the PMD. All zero in the reference ENA deployment; non-zero exposes a test-harness bring-up or a hardware change.
+  - `eth.offload_missing_rx_timestamp` — one-shot counter incremented once at `engine_create` when `hw-offload-rx-timestamp` was compile-time-enabled but `rte_mbuf_dynfield_lookup` / `rte_mbuf_dynflag_lookup` returned negative. **Expected 1 on ENA** (dynfield not registered) — unlike the other `offload_missing_*` counters, this one being nonzero is the documented steady state for the Stage 1 target host, not an anomaly. 0 on hardware/PMDs that expose the dynfield (mlx5, ice on supporting NICs, future ENA generations).
+  - `eth.rx_drop_cksum_bad` — drop count for segments where NIC reported `BAD` for IP or L4 checksum. Fires only on actual bad packets, not on offload misses.
+- Software-fallback smoke test: build with default features AND run on `net_vdev` / `net_tap` where offloads are unavailable; assert the `offload_missing_*` counters are set as expected (including `offload_missing_rx_timestamp`) and that the runtime-fallback software checksum path correctly computes IP/TCP/UDP checksums end-to-end via the A3 TAP-pair harness; additionally assert every event's `rx_hw_ts_ns == 0` (dynfield-absent path). Second smoke run with `--no-default-features` asserts the compile-time-gated-off build also passes the same correctness harness (no offload path compiled in, pure software, `rx_hw_ts_ns = 0` by construction).
+- Hardware-path smoke test: build with default features; bring the engine up on the actual ENA VF; log the negotiated offload banner; drive one full request-response cycle; assert all `offload_missing_*` counters are zero **except** `offload_missing_rx_timestamp == 1` (documented ENA steady state — the dynfield-absent path is the expected Stage 1 ground truth, not a failure); assert `eth.rx_drop_cksum_bad` is zero on well-formed traffic; assert every event's `rx_hw_ts_ns == 0`.
+- **Measurement of actual offload benefit is deferred to A10** — A10's `tools/bench-offload-ab/` (added to A10's deliverables) will rebuild with each feature-flag combination and produce the p50/p99/p999 comparison that drives the final "keep/remove per offload" decision. A-HW's job is to make the code path switchable at compile time and correct under both settings; A10's job is to measure.
+
+**Does NOT include:**
+- Multi-queue enablement (Stage 1 single-queue per §12 — RSS indirection-table reprogramming for multiple queues is deferred, though the hash machinery is wired).
+- Header/data split, TSO, GRO, GSO (explicitly excluded per §8.4 Tier 3).
+- Any hot-path counter tracking "offload used" vs "software path" (startup log is authoritative per §8.5 / §9.1.1).
+- Multi-segment RX/TX general enablement (A5's retransmit header-chained-to-data mbuf pattern keeps `MULTI_SEGS` enabled on TX, but the RX scatter offload stays off at MTU 1500).
+- Validation of the HW-timestamp **positive** path on a PMD that actually registers `rte_dynfield_timestamp` (mlx5 / ice / future-gen ENA). The wiring is correct by construction + reviewed against the DPDK dynfield API, but end-to-end assertion on real timestamps is deferred to Stage 2 hardening when a target host with the dynfield is available. Stage 1 correctness gate is that the ENA dynfield-absent path works and `rx_hw_ts_ns = 0` propagates cleanly.
+
+**Dependencies:** A5 (retransmit path goes through the same `tcp_output.rs` checksum branch; doing A-HW before A5 would require two visits to that file).
+
+**Ship gate:** phase-a-hw-complete tag requires (a) software-fallback smoke tests green with both `--default-features` (runtime-fallback path exercised) and `--no-default-features` (compile-gated-off path exercised), (b) hardware-path smoke test green on the ENA VF with default features, (c) CI matrix builds every per-offload feature combination (or a sampled subset documented in the report) to prevent bit-rot of the feature-off branches. Final kept-vs-removed decision per offload is **not** gated here — it's gated in A10 once the A/B benchmark data exists.
+
+**Rough scale:** ~14 tasks (port-config upgrade, LLQ verify, TX checksum feature gate + branch, RX checksum feature gate + branch, RSS-hash feature gate + flow-table read, MBUF_FAST_FREE feature gate, LLQ feature gate, RX-timestamp feature gate + dynfield/dynflag lookup at `engine_create`, RX-timestamp inline accessor + threading through A3/A4 event-emission sites, capability-gated runtime fallback paths, software-fallback smoke × 2 build configs, hardware-path smoke, counter additions + coverage entries, startup-banner format + CI feature-matrix build).
+
+---
+
 ## A6 — Public API surface completeness
 
 **Goal:** Finalize the public C ABI per §4: `resd_net_flush` actually flushes, `WRITABLE` events on send-buffer drain, timer API (`timer_add`/`cancel` + `TIMER` event), `resd_net_close(flags)` with `FORCE_TW_SKIP` + RFC 6191 guard, poll event-overflow queueing, mempool exhaustion error paths, `preset=rfc_compliance` runtime switch.
@@ -285,6 +355,13 @@
 - `tools/bench-e2e/` — request/response RTT harness with HW-timestamp attribution buckets and per-measurement sum-identity assertion.
 - `tools/bench-stress/` — netem + FaultInjector scenario runner for §11.4 matrix.
 - `tools/bench-vs-linux/` — dual-stack comparison vs Linux TCP with tap-jitter baseline subtraction.
+- `tools/bench-offload-ab/` — per-offload A/B harness that consumes A-HW's `hw-offload-*` cargo feature flags (`hw-offload-llq`, `hw-offload-tx-cksum`, `hw-offload-rx-cksum`, `hw-offload-mbuf-fast-free`, `hw-offload-rss-hash`) by rebuilding the engine once per feature-combination and running a 128 B / 128 B request-response micro-workload on the ENA target host.
+  - Config matrix: `baseline` (no features), per-offload-only (one feature each), `full` (all default features). Additional compositions optional if any single-offload result is ambiguous.
+  - Workload: ≥ 10 000 round-trips per config post-warmup (drop first 1 000); fresh engine bring-up between configs with `rte_eal_cleanup`; same RNG seed across runs.
+  - Measurement discipline: same preconditions as §11.1 (isolcpus, governor, C-states, TSC invariant, no thermal throttle during the run). Harness fails-fast on any precondition miss.
+  - Report: p50 / p99 / p999 per config with bootstrap 95% CI; per-offload `delta_p99 = p99_baseline − p99_with_offload`; pass/fail per offload against the decision rule (`delta_p99 > 3 × noise_floor`, where noise_floor = p99 of two back-to-back baseline runs).
+  - Report artifact: `docs/superpowers/reports/offload-ab.md` — CSV + decision table + rationale for any offload kept without signal (e.g. correctness defense-in-depth for `hw-offload-mbuf-fast-free`). Drives the final committed default feature set in `Cargo.toml`.
+  - Sanity invariant: `full` config p99 not worse than the best individual-offload p99 (offloads compose). A violation blocks the A10 sign-off pending investigation.
 - `tools/bench-vs-mtcp/` — dual-stack comparison vs mTCP, two sub-workloads:
   - `burst` (spec §11.5.1): K × G grid = 20 buckets. Burst size K ∈ {64 KiB, 256 KiB, 1 MiB, 4 MiB, 16 MiB}; idle gap G ∈ {0 ms, 1 ms, 10 ms, 100 ms}. Measurement: `t0` = inline TSC pre-send; `t1` = NIC HW TX timestamp on last segment of burst; per-burst throughput = K / (t1 − t0); aggregate p50/p99/p999 across ≥10k bursts/bucket. Secondary decomposition into initiation (spin-up) vs steady-state.
   - `maxtp` (spec §11.5.2): W × C grid = 28 buckets. Write size W ∈ {64 B, 256 B, 1 KiB, 4 KiB, 16 KiB, 64 KiB, 256 KiB}; connection count C ∈ {1, 4, 16, 64}. 60 s sustained pump per bucket post-warmup. Metrics: goodput (bytes/sec) and packet rate (pps) per (W, C).
@@ -293,9 +370,9 @@
 - CI: cargo-criterion per commit with 5% regression gate; nightly e2e on dedicated host (includes `bench-vs-mtcp`).
 - Measurement-discipline precondition check script: `isolcpus`, `nohz_full`, governor, TSC invariant, thermal-throttle detection.
 
-**Dependencies:** A6 (full API needed for meaningful e2e), A9 (FaultInjector used by bench-stress). `third_party/mtcp` already present from the A2 review-gate setup — no new submodule work.
+**Dependencies:** A6 (full API needed for meaningful e2e), A9 (FaultInjector used by bench-stress), A-HW (offloads must be enabled so benchmarks measure the production-shape hot path, not the Phase A1 zeroed-`eth_conf` path). `third_party/mtcp` already present from the A2 review-gate setup — no new submodule work.
 
-**Rough scale:** ~21 tasks (+6 for the mTCP comparator: build integration, peer wiring, `burst` grid runner, `maxtp` grid runner, measurement-contract harness with HW TX timestamps + TSC, result/CSV plumbing).
+**Rough scale:** ~21 tasks (+6 for the mTCP comparator: build integration, peer wiring, `burst` grid runner, `maxtp` grid runner, measurement-contract harness with HW TX timestamps + TSC, result/CSV plumbing; +5 for `bench-offload-ab`: feature-matrix rebuild driver, fresh-engine run loop, percentile + CI computation, per-offload decision-rule evaluator, report writer).
 
 ---
 
@@ -388,6 +465,89 @@ docs/
 **Dependencies:** A11 complete (ship report is the source for several sections in `future-work/`).
 
 **Rough scale:** ~12 tasks — 3 for the user-guide tree (index + 12 sections grouped into ~3 commits by theme: overview/build/lifecycle, config/threading/send-recv/close, errors/counters/events/limitations/troubleshooting), 4 for the maintainer-guide tree (architecture+invariants, state+options+flow+timers+iss+mempool, ffi+tests+bench, reviews+debugging+conventions), 2 for the future-work tree (reviews-consolidation + remainder), 1 for the TODO-audit script, 1 for root README+CHANGELOG refresh, 1 for the tag.
+
+---
+
+## A13 — HTTP/1.1 + TLS client integration + bench (via `contek-io/cpp_common`)
+
+**Parallelism note:** A13 and A14 are **independent of each other** and can (and should) run in parallel once A12 is complete. Whichever starts first lands the `Transport` abstraction in `contek-io/cpp_common` (see shared groundwork below); the other rebases onto it. Both phases depend on A12 (ship tag) but not on each other.
+
+**Framing:** This phase does not add HTTP, TLS, or WebSocket to `libresd_net` — Stage 1 stays raw-TCP (spec §1 / §2.1). Instead, it validates that the Stage 1 byte-stream API is fit-for-purpose for a real HTTP/1.1 + TLS client that lives **outside** the stack, in the user's existing C++ library `contek-io/cpp_common`. `libresd_net` sees only the encrypted byte stream; TLS handshake + record layer + HTTP/1.1 parsing all happen inside `cpp_common` as today.
+
+**Goal:** Prove the byte-stream API is enough for a real HTTP/1.1 + TLS client. Build `cpp_common`'s HTTP client on top of a new `resd_net`-backed transport; run integration tests against a TLS HTTP server; benchmark p50 / p99 / p999 latency against the same client on kernel TCP as the comparator baseline.
+
+**Spec refs:** §4 (public byte-stream API), §5.3 (buffer ownership — application owns TLS buffering), §6.4 (trading defaults like Nagle off / delayed-ACK off apply cleanly to encrypted byte streams), §11 (benchmark plan — this extends it with an HTTP+TLS bucket).
+
+**Upstream prerequisite (shared with A14 — whichever phase starts first lands this):**
+
+- `contek-io/cpp_common` PR: add a `Transport` abstraction (C++ interface) with two concrete impls:
+  - `KernelTransport` — existing behavior, wraps POSIX `::send` / `::recv` / epoll on a kernel socket.
+  - `ResdNetTransport` — wraps `resd_net_connect` / `resd_net_send` / `resd_net_poll` (consumes `RESD_NET_EVT_READABLE` / `WRITABLE` / `CLOSED` / `ERROR`) behind the same `Transport` interface.
+- Existing HTTP/1.1 and WebSocket clients in `cpp_common` are ported to consume the `Transport` interface rather than the POSIX socket API directly.
+- TLS layer in `cpp_common` (OpenSSL or rustls-backed, whichever cpp_common uses today) is unchanged except that its BIO / read-callback-write-callback pair sits on top of `Transport` instead of a raw socket FD. Both transports look identical to the TLS code.
+- cpp_common unit tests: `Transport` contract tests pass on both impls; end-to-end `GET https://<server>/echo` yields byte-identical responses on both.
+
+The PR is reviewed and merged in `contek-io/cpp_common`'s own process; this repo's phase depends on the merge landing but the PR itself is tracked out-of-tree.
+
+**Deliverables (this repo):**
+
+- `tools/bench-http-tls/` — C++ harness that uses `cpp_common`'s HTTP/1.1 + TLS client configured with `ResdNetTransport`; drives a mixed request workload against a TLS HTTP server; measures end-to-end latency (`send_request` → `full_response_parsed`); writes CSV in the same schema as `tools/bench-vs-linux` so `tools/bench-report` (A10) handles it.
+  - Workload mix (three independent sub-benches):
+    1. `small-get`: 100 B request, 1 KB response, new connection per request — measures TLS handshake cost under the stack.
+    2. `keep-alive-get`: same sizes but persistent connection, 10 000 sequential requests — measures steady-state request-response RTT.
+    3. `post-body`: 4 KB request body, 200 response, keep-alive — measures TX chain + TLS write-path behavior.
+  - Comparator runs: same harness, same server, `KernelTransport`. Reported per sub-bench as `resd_p99 − kernel_p99` (after the §11.1 measurement-discipline preconditions).
+- `tools/bench-http-tls/SERVER.md` — documents the test server matrix:
+  - Local CI server: `nginx` with a self-signed cert + TLS 1.3 enabled + `/echo`, `/small`, `/large` endpoints. Containerized so CI is reproducible. TLS cert pinning documented.
+  - Release validation server: a real exchange REST testnet (venue TBD by the user; the doc enumerates which venues the cpp_common client already connects to today, and selects one for the published numbers).
+- Integration test in `tests/` (cargo + cmake mixed crate): one end-to-end HTTP+TLS request/response exercising `resd_net_connect → send → poll → recv events → close`, asserting byte-identical response vs kernel transport.
+- Results artifact: `docs/superpowers/reports/app-fit-http-tls.md` — CSV of p50 / p99 / p999 per sub-bench × per transport, delta vs kernel, plus a bug/gap section listing any issues found in `libresd_net` or `cpp_common` with links to the fix commits / upstream PRs.
+
+**Does NOT include:**
+- TLS, HTTP/1.1, or HTTP/2/3 implementations inside `libresd_net` — these stay in Stage 3 / Stage 4 (spec §2.1) and are explicitly out of Stage 1.
+- Parsing HTTP inside the library (Stage 3).
+- Server-side HTTP (spec §1 explicitly: no production server-side TCP).
+- Benchmark-harness work that duplicates A10 — this reuses A10's measurement-discipline checker, CSV writer, and `bench-report` dashboard.
+
+**Dependencies:** A12 (Stage 1 ship tag exists; documentation-level API contract frozen). **Not dependent on A14** — A13 and A14 run in parallel.
+
+**Rough scale:** ~10 tasks (cpp_common `Transport` abstraction + upstream PR if not yet landed; cpp_common HTTP/1.1-on-Transport port; `bench-http-tls` harness + 3 sub-benches; test server setup + CI container; integration test; CSV writer wiring into `bench-report`; kernel-transport comparator run; p99-delta evaluator; report generator; any `libresd_net` bugfix cycles uncovered by the run).
+
+---
+
+## A14 — WebSocket + TLS client integration + bench (via `contek-io/cpp_common`)
+
+**Parallelism note:** See A13 — A13 and A14 are independent of each other and run in parallel after A12. Shared `Transport` abstraction in `cpp_common` is a one-time groundwork landed by whichever phase starts first.
+
+**Framing:** Mirror of A13 for the WebSocket + TLS client in `cpp_common`. Validates the byte-stream API under a long-lived, asymmetric-traffic (server-push) workload typical of market-data WebSocket feeds — a more demanding shape than HTTP/1.1 request-response, and the dominant real-world consumer of the stack in trading deployments.
+
+**Goal:** Prove the byte-stream API is enough for a real WebSocket + TLS client under market-data-shaped traffic. Build `cpp_common`'s WS client on top of the `ResdNetTransport`; run integration tests against a TLS WS echo server; benchmark server-push latency and echo RTT against the kernel-transport baseline.
+
+**Spec refs:** §4, §5.3, §6.4, §11.
+
+**Upstream prerequisite (shared with A13):** Same `Transport` abstraction in `cpp_common` as A13 describes. The WS client is ported to consume `Transport`; TLS layer unchanged. If A13 landed the PR first, A14 rebases; if A14 lands first, A13 rebases. The upstream PR covers both clients together unless the phases are genuinely interleaved.
+
+**Deliverables (this repo):**
+
+- `tools/bench-ws-tls/` — C++ harness using `cpp_common`'s WS + TLS client on `ResdNetTransport`. Two independent sub-benches:
+  1. `echo-rtt`: small (64 B) frames in a tight request → server echoes → measure RTT loop, 10 000 frames post-warmup. p50 / p99 / p999 RTT. Exercises the stack's per-segment TX/RX path under encrypted framing.
+  2. `server-push`: connect, subscribe-pattern (configurable topic list), server pushes binary frames at sustained ~1 MB/s for 60 s with a realistic frame-size distribution (most 200 B, occasional 4 KB, rare 64 KB). Measure per-frame `server_push_send_ts → RESD_NET_EVT_READABLE delivered` latency. Drives the canonical market-data shape.
+- `tools/bench-ws-tls/SERVER.md` — documents the test server matrix:
+  - Local CI server: `websocketd` or a small purpose-built server wrapping an echo + configurable-push endpoint, with TLS 1.3 + self-signed cert. Containerized. Push-rate and frame-size distribution configurable per bench run.
+  - Release validation: a real exchange WebSocket market-data testnet (venue TBD; document which venues cpp_common connects to today and pick one).
+- Integration test: WS handshake → subscribe → receive N frames → close cleanly; asserts byte-identical frame payloads vs kernel-transport run.
+- Frame-size coverage: small (64 B), medium (1 KB), large (64 KB) — exercises WS frame fragmentation in cpp_common and `libresd_net`'s single-mbuf vs mbuf-chain paths.
+- Results artifact: `docs/superpowers/reports/app-fit-ws-tls.md` — CSV + percentile table per sub-bench × per transport, delta vs kernel, per-frame-size decomposition for the large end, plus bug/gap section. Same schema as A13's report so both can be consumed by a single dashboard.
+
+**Does NOT include:**
+- WebSocket implementation inside `libresd_net` (spec §2.1 Stage 5, and §12 explicitly for `permessage-deflate` — that stays permanently out of scope).
+- Server-side WebSocket (spec §1 no production server-side).
+- TLS implementation inside `libresd_net`.
+- HTTP/1.1 handshake upgrade path — cpp_common owns the WS upgrade; this repo only sees the encrypted byte stream after upgrade.
+
+**Dependencies:** A12. **Not dependent on A13** — A14 and A13 run in parallel.
+
+**Rough scale:** ~10 tasks (cpp_common WS-on-Transport port — shared upstream PR with A13 if it hasn't landed; `bench-ws-tls` harness + 2 sub-benches; test server setup + CI container; integration test with frame-size coverage; CSV writer wiring; kernel-transport comparator; p99-delta evaluator; report generator; bugfix cycles for any issues uncovered).
 
 ---
 

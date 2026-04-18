@@ -444,13 +444,90 @@ Copies on Stage 1:
 
 ## 8. Hardware Assumptions
 
-- NIC: Mellanox ConnectX-6/7 or Intel E810 class, 25/100 GbE.
-- RSS enabled for connection→lcore pinning via NIC hash.
-- RX hardware timestamping on.
-- Checksum offload on (IP + TCP).
-- TSO/LRO **off** — LRO breaks per-segment timing attribution on the RX path.
-- SR-IOV VF or PF; works with bifurcated driver.
-- DPDK 23.11 LTS.
+### 8.1 Target deployment environment (Stage 1 host)
+
+Stage 1 is developed and benchmarked on the actual production-shape hardware:
+
+- **Host**: AWS EC2, Ubuntu 22.04 LTS, kernel 6.8 (aws flavour).
+- **CPU**: AMD EPYC 7R13 (Milan / Zen 3). Available ISA for packet work: AVX2, SHA-NI, VAES, VPCLMULQDQ, SSE4.2 (CRC32), RDRAND/RDSEED, CLWB. **No AVX-512** — Milan does not have it; any SIMD fast-paths must target ≤ AVX2.
+- **NIC**: single **Amazon ENA** (`1d0f:ec20`) on PCIe 00:05.0. SR-IOV VF semantics via the ENA interface; bound to DPDK via `vfio-pci` at runtime.
+- **DPDK**: 23.11 LTS. ENA PMD source referenced in this section from `drivers/net/ena/`.
+- **Hugepages**: ≥ 1 GB of 2 MB pages reserved at boot; EAL binds them at init.
+
+Stage 1 design defaults (single RX / single TX queue, RTC loop, one-engine-per-lcore) are sized for this environment. Multi-queue expansion is out of scope for Stage 1 (§12) but the flow table and RSS wiring are designed so that enabling it later is a port-config change, not a code rewrite.
+
+### 8.2 ENA offload capabilities (what the NIC can do for us)
+
+Advertised by the DPDK ENA PMD (`drivers/net/ena/ena_ethdev.c:2471–2503`):
+
+| Direction | Capability | DPDK flag |
+|---|---|---|
+| RX | IPv4 header checksum verify | `RTE_ETH_RX_OFFLOAD_IPV4_CKSUM` |
+| RX | TCP checksum verify | `RTE_ETH_RX_OFFLOAD_TCP_CKSUM` |
+| RX | UDP checksum verify | `RTE_ETH_RX_OFFLOAD_UDP_CKSUM` |
+| RX | 4-tuple Toeplitz hash → `mbuf.hash.rss` | `RTE_ETH_RX_OFFLOAD_RSS_HASH` |
+| RX | Multi-segment (scatter) | `RTE_ETH_RX_OFFLOAD_SCATTER` |
+| TX | IPv4 header checksum compute | `RTE_ETH_TX_OFFLOAD_IPV4_CKSUM` |
+| TX | TCP checksum compute (SW writes pseudo-header sum only) | `RTE_ETH_TX_OFFLOAD_TCP_CKSUM` |
+| TX | UDP checksum compute | `RTE_ETH_TX_OFFLOAD_UDP_CKSUM` |
+| TX | TCP Segmentation Offload | `RTE_ETH_TX_OFFLOAD_TCP_TSO` |
+| TX | Scatter/gather (multi-segment) | `RTE_ETH_TX_OFFLOAD_MULTI_SEGS` |
+| TX | Fast-free (skip per-mbuf pool check on TX completion) | `RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE` |
+| RSS | IPv4/IPv6 TCP/UDP + frag + L2 payload + L3/L4 src/dst-only masks | `ENA_ALL_RSS_HF` |
+
+**ENA-specific (enabled by default in the PMD, `ena_ethdev.c:2239`): Low-Latency Queues (LLQ).** LLQ has the host write the TX descriptor + packet header directly into the NIC's MMIO BAR (device memory), eliminating the NIC-side DMA-read round-trip that would otherwise fetch descriptor + header over PCIe. On ENA this is the single largest per-send latency reduction (~0.5–1 µs off `rte_eth_tx_burst` → wire). No application action is required; the PMD auto-enables LLQ when the device exposes the memory BAR and the `enable_llq` devarg is at its default.
+
+### 8.3 ENA non-capabilities (important absences)
+
+The ENA PMD does **not** offer:
+
+- **No hardware RX timestamps.** ENA does not expose the `rte_mbuf_dynfield_timestamp` dynfield; `rte_mbuf_dynflag_lookup("rte_dynflag_rx_timestamp")` returns negative at startup. `resd_net_event_t.rx_hw_ts_ns` falls back to the TSC read captured at `rx_burst` return, per the §7.5 / §4.2 dynfield-miss path. The field stays in the ABI for future portability to hardware with PTP / per-packet timestamps.
+- **No LRO.** Software GRO via `librte_gro` is available but deliberately off for trading (coalescing obscures per-segment timing attribution).
+- **No `rte_flow` / Flow Director beyond the RSS indirection table.** 5-tuple → specific queue steering is available only through reprogramming the RSS indirection table, not precise rule-based steering.
+- **No inline crypto / IPsec / TLS.** If TLS arrives in Stage 4 it is software-only.
+- **No hardware rate pacing / traffic shaping.**
+- **No header/data split on RX.**
+- **No VLAN insert/strip.** (Irrelevant on EC2 anyway.)
+
+Design consequences:
+- §9.2's `rx_hw_ts_ns` is **not** ground truth on this host; §7.5's fallback path (return 0, caller uses `enqueued_ts_ns`) is the production path, not an edge case. The same dynfield-presence check in §7.5 still applies — portability to future hardware with PTP is preserved.
+- §11.3 wire-RTT attribution is done by comparing TSC reads on the local host at both ends of a loopback peer, not by subtracting NIC timestamps.
+- §11.6 / §11.5 do not measure TSO or LRO paths; neither is used.
+
+### 8.4 Offload-enablement policy (tiered, driven by trading-latency goal)
+
+**Compile-time gates.** Every offload is behind a cargo feature flag — `hw-offload-llq`, `hw-offload-tx-cksum`, `hw-offload-rx-cksum`, `hw-offload-mbuf-fast-free`, `hw-offload-rss-hash`. All default to ON. A feature-off build compiles the offload code path away entirely; the software path is what the binary executes. This lets A10's benchmark harness produce an on-vs-off A/B comparison per offload via rebuilds, without the runtime cost of a toggle on the hot path. Gates live at the code site, not on struct fields, so the C ABI is stable across feature sets (same pattern as §9.1.1 observability flags).
+
+**Runtime capability gate.** Separately from the compile-time gate, every offload that is compile-time-enabled is also AND-ed against `rte_eth_dev_info_get`'s `*_offload_capa` at `engine_create`. A requested-but-unadvertised capability degrades to the software path for that engine instance, logs WARN, and bumps a one-shot counter (`eth.offload_missing_<name>`). This preserves portability to non-ENA hardware (including `net_vdev` / `net_tap` in tests) without a separate build.
+
+**Evidence gate.** Tier 1 is the **proposed** production default — each offload only stays as a default feature if A10's offload A/B measurement harness (`tools/bench-offload-ab/`) shows a reproducible p99 improvement on this specific host/NIC beyond the measurement noise floor. An offload that does not clear the noise floor is either removed from the default feature set or kept with a rationale committed alongside the CSV evidence (for example: correctness defense-in-depth for `hw-offload-mbuf-fast-free`). The final committed default set is recorded in `docs/superpowers/reports/offload-ab.md` and reflected in `crates/resd-net-core/Cargo.toml`'s `default = [...]` list. The text below lists the proposed set; the source of truth post-A10 is the report.
+
+**Tier 1 (proposed) — enable at port-config bring-up (phase A-HW adds the code + gates; phase A10 measures + decides):**
+
+1. **LLQ**: on by default in the PMD; verified via PMD log + runtime dev-info check; no code change beyond the EAL bring-up. Startup fails if `dev_info` reports LLQ-capable but it did not activate.
+2. **`RTE_ETH_TX_OFFLOAD_TCP_CKSUM`, `RTE_ETH_TX_OFFLOAD_IPV4_CKSUM`, `RTE_ETH_TX_OFFLOAD_UDP_CKSUM`**: TX path sets `ol_flags |= RTE_MBUF_F_TX_TCP_CKSUM | RTE_MBUF_F_TX_IP_CKSUM | RTE_MBUF_F_TX_IPV4`, sets `mbuf.l2_len / l3_len / l4_len`, and writes only the TCP / UDP pseudo-header checksum (per RFC 9293 §3.1 / RFC 768). The software full-fold path stays in the source tree behind a capability check for the fallback case (vdev / TAP / non-ENA test harnesses).
+3. **`RTE_ETH_RX_OFFLOAD_IPV4_CKSUM`, `RTE_ETH_RX_OFFLOAD_TCP_CKSUM`, `RTE_ETH_RX_OFFLOAD_UDP_CKSUM`**: RX path inspects `mbuf.ol_flags & RTE_MBUF_F_RX_*_CKSUM_MASK` and branches on the per-packet `GOOD` / `BAD` / `NONE` / `UNKNOWN` flag. `BAD` → drop with counter (`eth.rx_drop_cksum_bad`). `NONE` / `UNKNOWN` → software fold (fallback when offload is unavailable on a test device).
+4. **`RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE`**: single offload bit; the TX-completion path drops the per-mbuf pool-ID check. Free latency win with one invariant: all TX mbufs come from the same per-lcore mempool, which is already true by spec §7.1.
+
+**Tier 2 — enable when multi-queue lands (out of Stage 1 scope per §12, but spec'd so the flow table accommodates):**
+
+5. **`RTE_ETH_RX_OFFLOAD_RSS_HASH`**: port configured with `rss_hf = RTE_ETH_RSS_NONFRAG_IPV4_TCP | RTE_ETH_RSS_NONFRAG_IPV6_TCP`; the flow table reads `mbuf.hash.rss` as the initial bucket index (and falls back to SipHash when the RSS-valid flag is absent). Single-queue deployments still set the RSS indirection table so every hash points to queue 0 — the hash is present for the flow-table fast-path, steering stays trivial.
+
+**Tier 3 — deliberately NOT enabled in Stage 1:**
+
+6. **TSO (`RTE_ETH_TX_OFFLOAD_TCP_TSO`)** — trading send sizes are sub-MSS; TSO's descriptor-setup cost is overhead, not savings.
+7. **Software GRO / LRO (none on ENA anyway)** — merges segments and obscures per-segment timing attribution, which is the opposite of what trading measurement needs.
+8. **Multi-segment RX/TX (`RTE_ETH_RX_OFFLOAD_SCATTER`, `RTE_ETH_TX_OFFLOAD_MULTI_SEGS`)** — unnecessary at MTU 1500 with single-mbuf payloads; adds branch complexity on the hot path. Retransmit's header-mbuf-chained-to-data-mbuf pattern (§5.3) does need multi-seg TX, so it is enabled as a dependency of retransmit; general data-path multi-seg is not.
+9. **Generic Segmentation Offload (`librte_gso`)** — same argument as TSO.
+
+### 8.5 Capability-gated bring-up (portability preservation)
+
+`engine_create` queries `rte_eth_dev_info_get` once and ANDs the requested offload mask against `dev_info.tx_offload_capa` / `dev_info.rx_offload_capa`. Missing capabilities degrade to the software path with a startup WARN log and a one-shot counter (`eth.offload_missing_<name>`) — no runtime hot-swap. This preserves portability to non-ENA hardware (including `net_vdev` / `net_tap` in tests) without requiring a separate "offload off" build.
+
+A startup banner logs the negotiated offload set (one line per direction) so operators can verify at deploy time. Per §9.1.1, no per-segment hot-path counter tracks "offload used" vs "offload software-path" — the startup log is authoritative because offload state does not hot-swap during a run.
+
+### 8.6 Other assumptions (carry-over from Stage 1 initial draft)
+
 - ARP: static gateway MAC seeded at startup via netlink helper (one-shot), refreshed via gratuitous ARP every N seconds. No dynamic ARP resolution on the data path.
 - DNS: resolved out-of-band via `getaddrinfo()` on a control thread before `resd_net_connect`.
 
@@ -499,8 +576,8 @@ Each hot-path counter must be documented inline at its declaration with: (1) the
 ### 9.2 Timestamps on events
 
 Every `resd_net_event_t` carries:
-- `rx_hw_ts_ns` — NIC hardware timestamp (ground truth for RX).
-- `enqueued_ts_ns` — TSC when the event entered user-visible form (set inside `resd_net_poll`).
+- `rx_hw_ts_ns` — NIC hardware timestamp when the PMD registers the `rte_dynflag_rx_timestamp` dynfield; 0 otherwise. On the Stage 1 deployment target (ENA, per §8.3) this dynfield is not exposed, so the field is 0 in the reference configuration and callers use `enqueued_ts_ns` as the ground-truth RX time per §7.5. The field stays in the ABI for future portability to hardware with PTP / per-packet timestamps.
+- `enqueued_ts_ns` — TSC when the event entered user-visible form (set inside `resd_net_poll`). On ENA this is the RX ground truth.
 
 For TX: `resd_net_send` returns after pushing to the TX batch; the application records its own wall-clock at that moment if it cares. `resd_net_flush` is where the NIC actually sees the packet; applications that want ground-truth TX timing can read `resd_net_now_ns()` (or the inline variant) immediately before/after flush.
 
@@ -656,7 +733,7 @@ Goal: quantify latency and stability under trading-representative workloads, cat
 Measurements are meaningless without a pinned-down environment. Every benchmark run records and asserts the following preconditions:
 
 - CPU: `isolcpus` covering every engine lcore and every measurement-core. `nohz_full` on those lcores. `rcu_nocbs` for the same set. No IRQ affinity on benchmark cores. Governor = `performance`, no C-states below C1 (`intel_idle.max_cstate=1`), turbo documented (fixed frequency preferred for reproducibility).
-- NIC: interrupt coalescing off; TSO/LRO off; RSS enabled; HW timestamping on; flow-control off on the trading link.
+- NIC: interrupt coalescing off; TSO/LRO off; RSS enabled; HW timestamping on **when the PMD registers the `rte_dynflag_rx_timestamp` dynfield** — on the Stage 1 ENA deployment target (§8.3) it does not, so wire-RTT attribution in §11.3 uses the TSC-at-`rx_burst` capture via `enqueued_ts_ns` instead of NIC timestamps; flow-control off on the trading link. Offload set: the Tier 1 offloads per §8.4 are **on** (LLQ, TX/RX IPv4+TCP+UDP checksum, MBUF_FAST_FREE); software-fallback paths are exercised separately in the A-HW capability-gated bring-up test run.
 - Memory: 2MiB or 1GiB huge pages for DPDK mempools; numa-local mempool/lcore binding asserted at engine_create.
 - Clock: TSC invariant (§7.5 precondition). `rdtsc` baseline measured per-host.
 - Kernel: non-PREEMPT_RT baseline; thermal throttling events logged by `turbostat` during the run — any throttle invalidates the run.
@@ -688,7 +765,8 @@ Each measures one unit of work in isolation; target is the function call cost, n
 Run against the loopback-test-server (same-host) and against a dedicated peer on a cross-cable link.
 
 - **Request-response RTT** (single connection, single outstanding): `send N bytes → recv N bytes` round-trip. Histogram reported as p50/p90/p99/p999/max.
-- **HW-timestamp attribution**: for each measurement, record `rx_hw_ts_ns` minus `tx_sched_ts_ns` (wire RTT); record `enqueued_ts_ns` minus `rx_hw_ts_ns` (stack RX cost); record `user_return_ns` minus `enqueued_ts_ns` (event-handler cost in the user's poll loop); record `tx_burst_ns` minus `user_send_ns` (stack TX cost). These attribution buckets sum to the wall-clock RTT — the sum identity is asserted per-measurement (any mismatch invalidates the run).
+- **HW-timestamp attribution** (when `rx_hw_ts_ns` is available — see §7.5 dynfield-lookup): for each measurement, record `rx_hw_ts_ns` minus `tx_sched_ts_ns` (wire RTT); record `enqueued_ts_ns` minus `rx_hw_ts_ns` (stack RX cost); record `user_return_ns` minus `enqueued_ts_ns` (event-handler cost in the user's poll loop); record `tx_burst_ns` minus `user_send_ns` (stack TX cost). These attribution buckets sum to the wall-clock RTT — the sum identity is asserted per-measurement (any mismatch invalidates the run).
+- **TSC-only attribution fallback** (when `rx_hw_ts_ns == 0`, which is the production case on ENA — §8.3): the wire-RTT bucket collapses into the "stack RX cost" bucket because we cannot separate "wire + RX IRQ handling" from "PMD → rx_burst return". The attribution buckets reduce to: `tx_sched → enqueued` (wire + full RX), `enqueued → user_return` (event-handler cost), `user_send → tx_burst` (stack TX cost). The sum identity still holds and is still asserted per-measurement. Reports explicitly tag which attribution model was active so numbers from HW-TS and TSC-only hosts are never silently averaged.
 - **One-way latency**: send-only tests with synchronized clocks (PTP or shared NIC tap) to measure TX-direction latency distribution independent of the peer's response latency.
 - **Head-of-line latency under load**: while a background stream saturates the link at 80% of line rate, measure RTT on a separate connection. Target: no p99 degradation vs. idle-link RTT.
 
