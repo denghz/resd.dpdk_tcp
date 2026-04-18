@@ -355,12 +355,12 @@ struct TcpConn {
 | 9293 | TCP | client FSM complete | no LISTEN/accept |
 | 7323 | Timestamps + Window Scale | yes | enables RTT + PAWS + large windows |
 | 2018 | SACK | yes | essential for WAN loss recovery |
-| 5681 | Congestion control | off-by-default; Reno via `cc_mode` | |
+| 5681 | Congestion control | off-by-default; Reno via `cc_mode` | `dup_ack` counter strict per §2 in A5 (was loose in A3/A4). |
 | 6298 | RTO | yes | minRTO=20ms (tunable) |
 | 6582 | NewReno | with Reno mode | |
 | 6691 | MSS | yes | clamp to local MTU |
 | 3168 | ECN | off-by-default (flag) | |
-| 8985 | RACK-TLP | yes | primary loss detection; replaces 3-dup-ACK |
+| 8985 | RACK-TLP | yes | A5 implements RACK-TLP as the primary loss-detection path; 3-dup-ACK fast retrans is disabled (counter visibility only via `rx_dup_ack`). |
 | 6528 | ISS generation | yes | `ISS = (ticks_since_boot_at_4µs) + SipHash(4-tuple \|\| secret \|\| boot_nonce)` — clock outside the hash for monotonicity across reconnects |
 | 5961 | Blind-data-attack mitigations | yes | challenge-ACK on out-of-window seqs |
 | 7413 | TCP Fast Open | **NO** | not useful for long-lived connections |
@@ -373,7 +373,8 @@ struct TcpConn {
 | Receive-window shrinkage vs. buffer occupancy | RFC 9293 §3.10.7.4 (implicit: advertise `rcv_wnd = recv-buffer free space` and use the same value for ingress acceptance) | **advertise free_space; accept at full capacity** | Trading workload is market-data ingress at peer line-rate. Shrinking the ingress-acceptance window to match local buffer occupancy would throttle the peer's send rate — masking a real upstream "slow application consumer" problem as a protocol-layer artifact. We keep the ingress seq-window check at initial capacity (`recv_buffer_bytes`, default 256 KiB) so we accept everything the peer sends, and expose the drop condition via `tcp.recv_buf_drops` (bytes dropped because `recv.append` clamped at `free_space`). The peer's retransmit path recovers the dropped bytes; the application sees the counter climb and knows to speed up its consumer. The ACK we emit always advertises the real free space so well-behaved peers still throttle themselves based on *advertised* window; our wider ingress check just avoids being doubly-conservative. See `feedback_performance_first_flow_control.md`. |
 | Nagle (`TCP_NODELAY` inverse) | RFC 896 | **off** | user sends complete requests; coalescing is their choice |
 | TCP keepalive | optional | **off** | exchanges close idle; application heartbeats are preferred |
-| minRTO | RFC 6298 RECOMMENDS 1s | **20ms** (tunable) | intra-region WAN RTT is 1–10ms |
+| minRTO | RFC 6298 RECOMMENDS 1s | **5ms** (tunable) | Exchange-direct RTT is 50–100µs, so 5ms is already 50× median. |
+| RTO maximum | RFC 6298 ≥60s | **1s** | Trading fail-fast — reconnecting is cheaper than sitting on a 30s deadline. |
 | Congestion control | RFC 5681 MUST | **off-by-default** | ≤100 connections, well-provisioned WAN; Reno available behind `cc_mode` for A/B-vs-Linux and RFC-compliance modes |
 | PermitTFO (RFC 7413) | optional | **disabled** | long-lived connections don't benefit; adds 0-RTT security complexity |
 
@@ -383,6 +384,7 @@ struct TcpConn {
 - **Segment-level mbuf tracking**: every TX segment holds an mbuf refcount until ACK or RST. **Retransmit allocates a fresh header mbuf** chained to the original data mbuf (see §5.3) — never edits an in-flight mbuf in place.
 - **ISS**: `ISS = (monotonic_time_4µs_ticks_low_32) + SipHash64(local_ip || local_port || remote_ip || remote_port || secret || boot_nonce)` per RFC 6528 §3. Clock value is added outside the hash so reconnects to the same 4-tuple within MSL yield monotonically-increasing ISS. `secret` is a 128-bit per-process random constant; `boot_nonce` survives reboots via `/proc/sys/kernel/random/boot_id` or equivalent.
 - **SYN retransmit**: schedule respects `connect_timeout_ms` from `resd_net_connect_opts_t`. Default: 3 attempts with initial backoff `max(initial_rto_ms, minRTO)` (config default: `initial_rto_ms=50`), exponential up to the total budget. Never exceed `connect_timeout_ms` in total; the connection fails fast for trading, not per RFC 6298's 1s recommendation.
+- **Data retransmit budget**: `tcp_max_retrans_count` (default 15). After this many RTO-driven retransmits of a single segment with no ACK progress, the connection fails with `RESD_NET_EVT_ERROR{err=ETIMEDOUT}`. With backoff + `tcp_max_rto_us=1s`, the total wall-clock budget is ≈8.3s (5 + 10 + 20 + 40 + ...). Opt-out of backoff per-connect (`rto_no_backoff=true`) makes the budget linear in `count × rto_us`.
 - **RTO timer re-arm**: lazy. On ACK, update `snd.una`; the existing wheel entry fires at its originally-scheduled deadline. When it fires, the handler re-checks `snd.una` vs `snd.nxt` — if fully ACKed, the timer cancels itself; otherwise it retransmits and re-arms. Avoids remove+insert on every ACK.
 - **TIME_WAIT shortening**: `resd_net_close(engine, conn, RESD_NET_CLOSE_FORCE_TW_SKIP)` is honored only when RFC 6191 / RFC 7323 §5 conditions are met — specifically, timestamps are enabled on both sides AND `SEG.TSval > TS.Recent` at reconnect. When conditions aren't met, the flag is ignored and the connection stays in TIME_WAIT; a `RESD_NET_EVT_ERROR` with `err=EPERM_TW_REQUIRED` is emitted so the caller knows.
 
@@ -545,6 +547,20 @@ const resd_net_counters_t* resd_net_counters(resd_net_engine_t*);
 
 Counter groups (Stage 1): `eth`, `ip`, `tcp`, `poll`. Examples in `eth`: `rx_pkts`, `rx_bytes`, `rx_drop_miss_mac`, `rx_drop_nomem`, `tx_pkts`, `tx_bytes`, `tx_drop_full_ring`, `tx_drop_nomem`. In `tcp`: `rx_syn_ack`, `rx_data`, `rx_out_of_order`, `tx_retrans`, `tx_rto`, `tx_tlp`, `state_trans[11][11]`, `conn_open`, `conn_close`, `conn_rst`, `send_buf_full`, `recv_buf_delivered`.
 
+**A5 additions** (slow-path counters for RACK-TLP, RTO, retrans-budget, config-visibility):
+
+- `tcp.rtt_samples` — RTT sample taken (TS source or Karn's).
+- `tcp.tx_rack_loss` — RACK marked a segment lost.
+- `tcp.tx_retrans` — a retransmit frame TX'd (any cause).
+- `tcp.tx_rto` — RTO fire attempted a retransmit.
+- `tcp.tx_tlp` — TLP fire probed the last in-flight segment.
+- `tcp.conn_timeout_retrans` — `tcp_max_retrans_count` exhausted → ETIMEDOUT.
+- `tcp.conn_timeout_syn_sent` — SYN retransmit budget exhausted → ETIMEDOUT.
+- `tcp.rack_reo_wnd_override_active` — conn has `rack_aggressive=true`.
+- `tcp.rto_no_backoff_active` — conn has `rto_no_backoff=true`.
+- `tcp.rx_ws_shift_clamped` — peer advertised WS>14; clamped to 14.
+- `tcp.rx_dsack` — peer sent a DSACK block (visibility only).
+
 Counter writes are `fetch_add(1, Ordering::Relaxed)` (`lock xadd` on x86_64; ~8-12 cycles uncontended). Cross-lcore snapshot readers use `load(Ordering::Relaxed)` — no torn reads. `Relaxed` is sufficient because counters are non-ordering observability data, not synchronization primitives. The alternative — `load(Relaxed)` + `store(val+1, Relaxed)` — is cheaper by a few cycles under the single-owner-lcore invariant but drops increments if that invariant ever slips (e.g., a future refactor moves a counter to a shared path); `fetch_add` is robust under any producer layout. The additional alternative — "plain `u64` + `memcpy`" — is a data race by the Rust / C++ abstract machine and is rejected. Slow-path counters pay the `fetch_add` cost unconditionally (see §9.1.1); hot-path counters follow the §9.1.1 policy (feature-gated + per-burst batched into a stack-local accumulator + single aggregate `fetch_add`).
 
 ### 9.1.1 Counter-addition policy
@@ -584,10 +600,10 @@ For TX: `resd_net_send` returns after pushing to the TX batch; the application r
 ### 9.3 Stability-visibility events
 
 Delivered through the normal `resd_net_poll` interface:
-- `RESD_NET_EVT_TCP_RETRANS` — seq, rtx_count.
-- `RESD_NET_EVT_TCP_LOSS_DETECTED` — RACK or RTO trigger.
+- `RESD_NET_EVT_TCP_RETRANS {seq, rtx_count}` — gated by `tcp_per_packet_events`.
+- `RESD_NET_EVT_TCP_LOSS_DETECTED {cause: Rack|Tlp|Rto}` — gated by `tcp_per_packet_events`.
 - `RESD_NET_EVT_TCP_STATE_CHANGE` — from/to state.
-- `RESD_NET_EVT_ERROR` with `err=ENOMEM` — mempool exhaustion on TX or internal allocation; with `err=EPERM_TW_REQUIRED` — `FORCE_TW_SKIP` flag ignored because RFC 6191 conditions not met.
+- `RESD_NET_EVT_ERROR` with `err=ENOMEM` — mempool exhaustion on TX or internal allocation; with `err=EPERM_TW_REQUIRED` — `FORCE_TW_SKIP` flag ignored because RFC 6191 conditions not met; with `err=ETIMEDOUT` — SYN retransmit budget exhausted (4th SYN attempt) or data retransmit budget exhausted (`tcp_max_retrans_count`+1).
 
 State changes and ERROR events are always emitted. Per-packet TCP trace events (`TCP_RETRANS`, `TCP_LOSS_DETECTED`) are gated by the `tcp_per_packet_events` config flag so they don't clutter `resd_net_poll` results when not wanted.
 
