@@ -134,6 +134,11 @@ pub struct TcpConn {
     /// `sack_scoreboard` for A5 retransmit consumption.
     pub sack_enabled: bool,
 
+    /// A4: received-SACK scoreboard. Populated by `tcp_input` from
+    /// inbound-ACK SACK blocks; pruned on snd_una advance. A5 consumes
+    /// via `is_sacked(seq)` in RACK-TLP retransmit decisions.
+    pub sack_scoreboard: crate::tcp_sack::SackScoreboard,
+
     pub snd: SendQueue,
     pub recv: RecvQueue,
 
@@ -181,6 +186,7 @@ impl TcpConn {
             ts_recent: 0,
             ts_recent_age: 0,
             sack_enabled: false,
+            sack_scoreboard: crate::tcp_sack::SackScoreboard::new(),
             snd: SendQueue::new(send_buf_bytes),
             recv: RecvQueue::new(recv_buf_bytes),
             our_fin_seq: None,
@@ -281,5 +287,12 @@ mod tests {
         assert_eq!(c.ts_recent_age, 0);
         // SACK disabled until SYN-ACK confirms it.
         assert!(!c.sack_enabled);
+    }
+
+    #[test]
+    fn a4_sack_scoreboard_starts_empty() {
+        let c = TcpConn::new_client(tuple(), 1000, 1460, 1024, 2048);
+        assert!(c.sack_scoreboard.is_empty());
+        assert_eq!(c.sack_scoreboard.len(), 0);
     }
 }
