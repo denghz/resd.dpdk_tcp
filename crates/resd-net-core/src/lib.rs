@@ -7,6 +7,7 @@ pub mod flow_table;
 pub mod tcp_conn;
 pub mod tcp_output;
 pub mod tcp_events;
+pub mod tcp_input;
 pub mod iss;
 pub mod arp;
 pub mod clock;
