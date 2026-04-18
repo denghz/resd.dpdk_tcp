@@ -51,6 +51,85 @@ fn build_connect_syn_opts(
     }
 }
 
+/// Outcome of computing the window + option bundle for a bare ACK. The
+/// caller drains conn state, invokes `build_ack_outcome`, and uses the
+/// returned `window` / `opts` on the `SegmentTx`; counter bumps
+/// (`tx_zero_window`, `tx_sack_blocks`) are driven by the flags fields
+/// so the helper stays pure and unit-testable without an Engine.
+#[derive(Debug, Clone, Default)]
+struct AckOutcome {
+    window: u16,
+    opts: crate::tcp_options::TcpOpts,
+    /// `true` when `free_space == 0` (recv buffer full); caller bumps
+    /// `tcp.tx_zero_window`.
+    zero_window: bool,
+    /// Number of SACK blocks emitted; caller adds to `tcp.tx_sack_blocks`.
+    sack_blocks_emitted: u32,
+}
+
+/// Pure helper: compute the window + TCP-options bundle for a bare ACK
+/// (non-SYN, post-handshake). Split out so tests can exercise the WS /
+/// TS / SACK matrix without an Engine (which needs EAL/DPDK).
+///
+/// * Window: `free_space >> ws_shift_out`, clamped to `u16::MAX`. When
+///   `ws_shift_out == 0` this is the raw free-space (capped at 65535).
+/// * Timestamps: when `ts_enabled`, echoes `TSval = now_us, TSecr = ts_recent`
+///   per RFC 7323 §3 MUST-22.
+/// * SACK blocks: when `sack_enabled` and recv-side gaps exist, emits
+///   up to `MAX_SACK_BLOCKS_EMIT` blocks. RFC 2018 §4 requires the first
+///   block to cover the most-recently-received data. `reorder_segments`
+///   arrives sorted by seq ascending; we reverse to emit highest-seq
+///   first (approximating "most recent" — exact arrival-order tracking
+///   is mTCP's refinement, deferred).
+fn build_ack_outcome(
+    ws_shift_out: u8,
+    ts_enabled: bool,
+    ts_recent: u32,
+    now_us: u32,
+    sack_enabled: bool,
+    reorder_segments: &[(u32, u32)],
+    free_space: u32,
+) -> AckOutcome {
+    let scaled = if ws_shift_out > 0 {
+        free_space >> ws_shift_out
+    } else {
+        free_space
+    };
+    let window = scaled.min(u16::MAX as u32) as u16;
+    let zero_window = free_space == 0;
+
+    let timestamps = if ts_enabled {
+        Some((now_us, ts_recent))
+    } else {
+        None
+    };
+
+    let mut opts = crate::tcp_options::TcpOpts {
+        timestamps,
+        ..Default::default()
+    };
+
+    let mut sack_blocks_emitted = 0u32;
+    if sack_enabled && !reorder_segments.is_empty() {
+        // RFC 2018 §4: most-recent block first. Input is sorted by seq
+        // ascending; reverse + take N gives highest-seq first.
+        let take = reorder_segments
+            .len()
+            .min(crate::tcp_options::MAX_SACK_BLOCKS_EMIT);
+        for &(left, right) in reorder_segments.iter().rev().take(take) {
+            opts.push_sack_block(crate::tcp_options::SackBlock { left, right });
+        }
+        sack_blocks_emitted = take as u32;
+    }
+
+    AckOutcome {
+        window,
+        opts,
+        zero_window,
+        sack_blocks_emitted,
+    }
+}
+
 /// Config passed to Engine::new.
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
@@ -710,15 +789,58 @@ impl Engine {
         });
     }
 
-    /// Emit a bare ACK for `handle`. The advertised window is the CURRENT
-    /// recv buffer free_space (fix for Task 12 reviewer I-3 finding).
+    /// Emit a bare ACK for `handle`. Post-handshake ACKs carry the full
+    /// Stage-1 option set per spec §6.2:
+    ///
+    /// * Window: `recv.free_space() >> ws_shift_out`, clamped to `u16::MAX`
+    ///   (RFC 7323 §2.2). Fixed in Task 12 to use the CURRENT free-space
+    ///   rather than the stale `rcv_wnd` snapshot (reviewer I-3).
+    /// * Timestamps: echoes `TSval=now_µs, TSecr=ts_recent` when
+    ///   `ts_enabled` (RFC 7323 §3 MUST-22 — every non-SYN segment MUST
+    ///   carry TS after SYN-exchange negotiation).
+    /// * SACK blocks: when `sack_enabled` and the reorder queue is
+    ///   non-empty, emits up to `MAX_SACK_BLOCKS_EMIT` blocks covering
+    ///   recv-side gaps (RFC 2018 §4).
+    ///
+    /// Delegates the pure computation to `build_ack_outcome` so the WS
+    /// / TS / SACK matrix can be unit-tested without constructing an
+    /// Engine (which requires EAL/DPDK).
     fn emit_ack(&self, handle: ConnHandle) {
-        use crate::counters::inc;
+        use crate::counters::{add, inc};
         use crate::tcp_output::{build_segment, SegmentTx, TCP_ACK};
         let ft = self.flow_table.borrow();
         let Some(conn) = ft.get(handle) else { return; };
         let t = conn.four_tuple();
-        let window = conn.recv.free_space().min(u16::MAX as u32) as u16;
+        let ws_shift_out = conn.ws_shift_out;
+        let ts_enabled = conn.ts_enabled;
+        let ts_recent = conn.ts_recent;
+        let sack_enabled = conn.sack_enabled;
+        let free_space = conn.recv.free_space();
+        let seq = conn.snd_nxt;
+        let ack = conn.rcv_nxt;
+        // Snapshot reorder ranges as (seq, end_seq) pairs so the pure
+        // helper doesn't need to know about `OooSegment`.
+        let reorder_snapshot: Vec<(u32, u32)> = conn
+            .recv
+            .reorder
+            .segments()
+            .iter()
+            .map(|s| (s.seq, s.end_seq()))
+            .collect();
+        drop(ft);
+
+        // TSval per RFC 7323 §4.1 = our monotonic-us reading.
+        let now_us = (crate::clock::now_ns() / 1000) as u32;
+        let outcome = build_ack_outcome(
+            ws_shift_out,
+            ts_enabled,
+            ts_recent,
+            now_us,
+            sack_enabled,
+            &reorder_snapshot,
+            free_space,
+        );
+
         let seg = SegmentTx {
             src_mac: self.our_mac,
             dst_mac: self.cfg.gateway_mac,
@@ -726,18 +848,28 @@ impl Engine {
             dst_ip: t.peer_ip,
             src_port: t.local_port,
             dst_port: t.peer_port,
-            seq: conn.snd_nxt,
-            ack: conn.rcv_nxt,
+            seq,
+            ack,
             flags: TCP_ACK,
-            window,
-            options: crate::tcp_options::TcpOpts::default(),
+            window: outcome.window,
+            options: outcome.opts,
             payload: &[],
         };
-        let mut buf = [0u8; 64];
+        // Sized to cover max TCP-options budget: 14 (eth) + 20 (ip) +
+        // 20 (tcp min) + 40 (max tcp opts) = 94; round up to 128.
+        let mut buf = [0u8; 128];
         let Some(n) = build_segment(&seg, &mut buf) else { return; };
-        drop(ft);
         if self.tx_frame(&buf[..n]) {
             inc(&self.counters.tcp.tx_ack);
+            if outcome.zero_window {
+                inc(&self.counters.tcp.tx_zero_window);
+            }
+            if outcome.sack_blocks_emitted > 0 {
+                add(
+                    &self.counters.tcp.tx_sack_blocks,
+                    outcome.sack_blocks_emitted as u64,
+                );
+            }
         }
     }
 
@@ -1272,5 +1404,153 @@ mod tests {
         let opts = super::build_connect_syn_opts(65_536, 1460, 1_000);
         let (tsval, _) = opts.timestamps.expect("timestamps set");
         assert_eq!(tsval, 1);
+    }
+
+    // Task 13: post-handshake `emit_ack` carries TS option + WS-scaled
+    // window + SACK blocks. The engine needs EAL/DPDK to construct, so
+    // we test the pure helper `build_ack_outcome` that `emit_ack`
+    // delegates to. Frame-level TS echo + SACK encoding is already
+    // round-trip-tested in `tcp_options::tests`.
+
+    #[test]
+    fn build_ack_outcome_ts_and_ws_scaled_window() {
+        // TS enabled + WS shift 7 + free_space well above 0 ⇒ window
+        // scales down by 7 bits, TSecr echoes `ts_recent`, no SACK.
+        let out = super::build_ack_outcome(
+            /* ws_shift_out */ 7,
+            /* ts_enabled */ true,
+            /* ts_recent */ 0x1122_3344,
+            /* now_us */ 0xaabb_ccdd,
+            /* sack_enabled */ false,
+            /* reorder */ &[],
+            /* free_space */ 256 * 1024,
+        );
+        // 262144 >> 7 = 2048.
+        assert_eq!(out.window, 2048);
+        let (tsval, tsecr) = out.opts.timestamps.expect("TS option present");
+        assert_eq!(tsval, 0xaabb_ccdd);
+        assert_eq!(tsecr, 0x1122_3344);
+        assert!(!out.zero_window);
+        assert_eq!(out.sack_blocks_emitted, 0);
+        assert_eq!(out.opts.sack_block_count, 0);
+    }
+
+    #[test]
+    fn build_ack_outcome_ts_disabled_skips_option() {
+        // Mirrors A3 defaults: no TS negotiated ⇒ no TS option.
+        let out = super::build_ack_outcome(0, false, 0, 12345, false, &[], 4096);
+        assert!(out.opts.timestamps.is_none());
+        assert_eq!(out.window, 4096);
+    }
+
+    #[test]
+    fn build_ack_outcome_ws_shift_zero_passes_free_space_through() {
+        // ws_shift=0 ⇒ no scaling; clamp still bounds at u16::MAX.
+        let out = super::build_ack_outcome(0, false, 0, 0, false, &[], 50_000);
+        assert_eq!(out.window, 50_000);
+    }
+
+    #[test]
+    fn build_ack_outcome_window_clamps_to_u16_max() {
+        // Unscaled 2 MiB ⇒ clamp to 65535 (what A3 did).
+        let out = super::build_ack_outcome(0, false, 0, 0, false, &[], 2 * 1024 * 1024);
+        assert_eq!(out.window, u16::MAX);
+    }
+
+    #[test]
+    fn build_ack_outcome_scaled_window_clamps_to_u16_max() {
+        // 512 MiB >> 3 = 64 MiB ⇒ still >> u16::MAX, so clamp.
+        let out = super::build_ack_outcome(3, false, 0, 0, false, &[], 512 * 1024 * 1024);
+        assert_eq!(out.window, u16::MAX);
+    }
+
+    #[test]
+    fn build_ack_outcome_zero_free_space_signals_zero_window_and_window_zero() {
+        let out = super::build_ack_outcome(7, false, 0, 0, false, &[], 0);
+        assert_eq!(out.window, 0);
+        assert!(out.zero_window);
+    }
+
+    #[test]
+    fn build_ack_outcome_sack_blocks_emit_in_reverse_seq_order() {
+        // Reorder queue is sorted ascending — simulate three OOO ranges.
+        // RFC 2018 §4: most-recent (highest-seq) block comes first.
+        let reorder = [(1_000u32, 1_100u32), (2_000, 2_100), (3_000, 3_100)];
+        let out = super::build_ack_outcome(0, false, 0, 0, true, &reorder, 4096);
+        assert_eq!(out.sack_blocks_emitted, 3);
+        assert_eq!(out.opts.sack_block_count, 3);
+        // Reversed: highest seq (3000/3100) first.
+        assert_eq!(
+            out.opts.sack_blocks[0],
+            crate::tcp_options::SackBlock { left: 3_000, right: 3_100 }
+        );
+        assert_eq!(
+            out.opts.sack_blocks[1],
+            crate::tcp_options::SackBlock { left: 2_000, right: 2_100 }
+        );
+        assert_eq!(
+            out.opts.sack_blocks[2],
+            crate::tcp_options::SackBlock { left: 1_000, right: 1_100 }
+        );
+    }
+
+    #[test]
+    fn build_ack_outcome_sack_disabled_skips_blocks_even_with_reorder() {
+        // Peer didn't negotiate SACK-permitted ⇒ no blocks on wire.
+        let reorder = [(100u32, 200u32)];
+        let out = super::build_ack_outcome(0, false, 0, 0, false, &reorder, 4096);
+        assert_eq!(out.sack_blocks_emitted, 0);
+        assert_eq!(out.opts.sack_block_count, 0);
+    }
+
+    #[test]
+    fn build_ack_outcome_sack_caps_at_max_blocks_emit() {
+        // 5 ranges but MAX_SACK_BLOCKS_EMIT=3 ⇒ only top-3 by seq make it.
+        let reorder = [
+            (1_000u32, 1_100u32),
+            (2_000, 2_100),
+            (3_000, 3_100),
+            (4_000, 4_100),
+            (5_000, 5_100),
+        ];
+        let out = super::build_ack_outcome(0, false, 0, 0, true, &reorder, 4096);
+        assert_eq!(out.sack_blocks_emitted, 3);
+        assert_eq!(out.opts.sack_block_count, 3);
+        assert_eq!(
+            out.opts.sack_blocks[0],
+            crate::tcp_options::SackBlock { left: 5_000, right: 5_100 }
+        );
+        assert_eq!(
+            out.opts.sack_blocks[1],
+            crate::tcp_options::SackBlock { left: 4_000, right: 4_100 }
+        );
+        assert_eq!(
+            out.opts.sack_blocks[2],
+            crate::tcp_options::SackBlock { left: 3_000, right: 3_100 }
+        );
+    }
+
+    #[test]
+    fn build_ack_outcome_full_matrix_ts_plus_ws_plus_sack() {
+        // All three options on — verify no interaction breaks any of them.
+        let reorder = [(1_000u32, 1_100u32), (2_000, 2_100)];
+        let out = super::build_ack_outcome(
+            /* ws_shift_out */ 7,
+            /* ts_enabled */ true,
+            /* ts_recent */ 0xdead_beef,
+            /* now_us */ 0x1234_5678,
+            /* sack_enabled */ true,
+            /* reorder */ &reorder,
+            /* free_space */ 256 * 1024,
+        );
+        assert_eq!(out.window, 2048);
+        assert_eq!(out.opts.timestamps, Some((0x1234_5678, 0xdead_beef)));
+        assert_eq!(out.sack_blocks_emitted, 2);
+        assert_eq!(out.opts.sack_block_count, 2);
+        // Most-recent (highest seq) first.
+        assert_eq!(
+            out.opts.sack_blocks[0],
+            crate::tcp_options::SackBlock { left: 2_000, right: 2_100 }
+        );
     }
 }
