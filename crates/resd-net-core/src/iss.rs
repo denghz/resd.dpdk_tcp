@@ -30,7 +30,8 @@ impl IssGen {
     pub fn new(test_seed: u64) -> Self {
         let tsc = clock::now_ns();
         let secret = [
-            tsc.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(test_seed),
+            tsc.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                .wrapping_add(test_seed),
             tsc.wrapping_mul(0xBF58_476D_1CE4_E5B9)
                 .wrapping_add(test_seed)
                 .wrapping_add(0x6A09_E667_F3BC_C908),

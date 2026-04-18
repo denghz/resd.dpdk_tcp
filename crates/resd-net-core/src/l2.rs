@@ -17,9 +17,9 @@ pub struct L2Decoded {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum L2Drop {
-    Short,           // frame shorter than 14 bytes
-    MissMac,         // dst MAC is not us and not broadcast
-    UnknownEthertype,// neither IPv4 nor ARP
+    Short,            // frame shorter than 14 bytes
+    MissMac,          // dst MAC is not us and not broadcast
+    UnknownEthertype, // neither IPv4 nor ARP
 }
 
 /// Decode an Ethernet II frame. Accepts broadcast (ff:ff:ff:ff:ff:ff) for ARP.

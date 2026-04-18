@@ -1,26 +1,26 @@
 //! Pure-Rust internals of the resd.dpdk_tcp stack.
 //! The public `extern "C"` surface lives in the `resd-net` crate.
 
-pub mod tcp_seq;
-pub mod tcp_state;
-pub mod flow_table;
-pub mod tcp_conn;
-pub mod tcp_output;
-pub mod tcp_events;
-pub mod tcp_input;
-pub mod tcp_options;
-pub mod tcp_reassembly;
-pub mod tcp_sack;
-pub mod iss;
 pub mod arp;
 pub mod clock;
 pub mod counters;
 pub mod engine;
 pub mod error;
+pub mod flow_table;
 pub mod icmp;
+pub mod iss;
 pub mod l2;
 pub mod l3_ip;
 pub mod mempool;
+pub mod tcp_conn;
+pub mod tcp_events;
+pub mod tcp_input;
+pub mod tcp_options;
+pub mod tcp_output;
+pub mod tcp_reassembly;
+pub mod tcp_sack;
+pub mod tcp_seq;
+pub mod tcp_state;
 
 pub use error::Error;
 

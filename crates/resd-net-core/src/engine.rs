@@ -6,8 +6,8 @@ use std::sync::Mutex;
 use crate::arp;
 use crate::counters::Counters;
 use crate::flow_table::{ConnHandle, FlowTable, FourTuple};
-use crate::iss::IssGen;
 use crate::icmp::PmtuTable;
+use crate::iss::IssGen;
 use crate::mempool::Mempool;
 use crate::tcp_events::{EventQueue, InternalEvent};
 use crate::tcp_state::TcpState;
@@ -212,20 +212,39 @@ fn apply_tcp_input_counters(
     counters: &crate::counters::TcpCounters,
 ) {
     use crate::counters::{add, inc};
-    if outcome.paws_rejected { inc(&counters.rx_paws_rejected); }
-    if outcome.bad_option { inc(&counters.rx_bad_option); }
-    if outcome.reassembly_queued_bytes > 0 { inc(&counters.rx_reassembly_queued); }
+    if outcome.paws_rejected {
+        inc(&counters.rx_paws_rejected);
+    }
+    if outcome.bad_option {
+        inc(&counters.rx_bad_option);
+    }
+    if outcome.reassembly_queued_bytes > 0 {
+        inc(&counters.rx_reassembly_queued);
+    }
     if outcome.reassembly_hole_filled > 0 {
-        add(&counters.rx_reassembly_hole_filled, outcome.reassembly_hole_filled as u64);
+        add(
+            &counters.rx_reassembly_hole_filled,
+            outcome.reassembly_hole_filled as u64,
+        );
     }
     if outcome.sack_blocks_decoded > 0 {
         add(&counters.rx_sack_blocks, outcome.sack_blocks_decoded as u64);
     }
-    if outcome.bad_seq { inc(&counters.rx_bad_seq); }
-    if outcome.bad_ack { inc(&counters.rx_bad_ack); }
-    if outcome.dup_ack { inc(&counters.rx_dup_ack); }
-    if outcome.urgent_dropped { inc(&counters.rx_urgent_dropped); }
-    if outcome.rx_zero_window { inc(&counters.rx_zero_window); }
+    if outcome.bad_seq {
+        inc(&counters.rx_bad_seq);
+    }
+    if outcome.bad_ack {
+        inc(&counters.rx_bad_ack);
+    }
+    if outcome.dup_ack {
+        inc(&counters.rx_dup_ack);
+    }
+    if outcome.urgent_dropped {
+        inc(&counters.rx_urgent_dropped);
+    }
+    if outcome.rx_zero_window {
+        inc(&counters.rx_zero_window);
+    }
 }
 
 /// EAL is process-global; only initialize once.
@@ -339,7 +358,9 @@ impl Engine {
         let mut mac_addr: sys::rte_ether_addr = unsafe { std::mem::zeroed() };
         let rc = unsafe { sys::resd_rte_eth_macaddr_get(cfg.port_id, &mut mac_addr) };
         if rc != 0 {
-            return Err(Error::MacAddrLookup(cfg.port_id, unsafe { sys::resd_rte_errno() }));
+            return Err(Error::MacAddrLookup(cfg.port_id, unsafe {
+                sys::resd_rte_errno()
+            }));
         }
         // bindgen names the field `addr_bytes` on rte_ether_addr.
         let our_mac = mac_addr.addr_bytes;
@@ -367,11 +388,21 @@ impl Engine {
         &self.counters
     }
 
-    pub fn our_mac(&self) -> [u8; 6] { self.our_mac }
-    pub fn our_ip(&self) -> u32 { self.cfg.local_ip }
-    pub fn gateway_mac(&self) -> [u8; 6] { self.cfg.gateway_mac }
-    pub fn gateway_ip(&self) -> u32 { self.cfg.gateway_ip }
-    pub fn pmtu_for(&self, ip: u32) -> Option<u16> { self.pmtu.borrow().get(ip) }
+    pub fn our_mac(&self) -> [u8; 6] {
+        self.our_mac
+    }
+    pub fn our_ip(&self) -> u32 {
+        self.cfg.local_ip
+    }
+    pub fn gateway_mac(&self) -> [u8; 6] {
+        self.cfg.gateway_mac
+    }
+    pub fn gateway_ip(&self) -> u32 {
+        self.cfg.gateway_ip
+    }
+    pub fn pmtu_for(&self, ip: u32) -> Option<u16> {
+        self.pmtu.borrow().get(ip)
+    }
 
     /// TX a self-contained ≤128-byte frame (ARP reply / gratuitous ARP is 42
     /// bytes). Allocates one mbuf from tx_hdr_mempool, copies `bytes` into its
@@ -410,12 +441,7 @@ impl Engine {
         }
         let mut pkts = [m];
         let sent = unsafe {
-            sys::resd_rte_eth_tx_burst(
-                self.cfg.port_id,
-                self.cfg.tx_queue_id,
-                pkts.as_mut_ptr(),
-                1,
-            )
+            sys::resd_rte_eth_tx_burst(self.cfg.port_id, self.cfg.tx_queue_id, pkts.as_mut_ptr(), 1)
         } as usize;
         if sent == 1 {
             add(&self.counters.eth.tx_bytes, bytes.len() as u64);
@@ -454,12 +480,7 @@ impl Engine {
         }
         let mut pkts = [m];
         let sent = unsafe {
-            sys::resd_rte_eth_tx_burst(
-                self.cfg.port_id,
-                self.cfg.tx_queue_id,
-                pkts.as_mut_ptr(),
-                1,
-            )
+            sys::resd_rte_eth_tx_burst(self.cfg.port_id, self.cfg.tx_queue_id, pkts.as_mut_ptr(), 1)
         } as usize;
         if sent == 1 {
             add(&self.counters.eth.tx_bytes, bytes.len() as u64);
@@ -586,7 +607,9 @@ impl Engine {
             let ft = self.flow_table.borrow();
             ft.iter_handles()
                 .filter(|h| {
-                    let Some(c) = ft.get(*h) else { return false; };
+                    let Some(c) = ft.get(*h) else {
+                        return false;
+                    };
                     c.state == TcpState::TimeWait
                         && c.time_wait_deadline_ns.is_some_and(|d| now >= d)
                 })
@@ -594,7 +617,9 @@ impl Engine {
         };
         for h in candidates {
             self.transition_conn(h, TcpState::Closed);
-            self.events.borrow_mut().push(InternalEvent::Closed { conn: h, err: 0 });
+            self.events
+                .borrow_mut()
+                .push(InternalEvent::Closed { conn: h, err: 0 });
             crate::counters::inc(&self.counters.tcp.conn_close);
             // A4 cross-phase backfill: TIME_WAIT deadline expired.
             crate::counters::inc(&self.counters.tcp.conn_time_wait_reaped);
@@ -608,7 +633,9 @@ impl Engine {
     pub fn drain_events<F: FnMut(&InternalEvent, &Engine)>(&self, max: u32, mut sink: F) -> u32 {
         let mut n = 0u32;
         while n < max {
-            let Some(ev) = self.events.borrow_mut().pop() else { break; };
+            let Some(ev) = self.events.borrow_mut().pop() else {
+                break;
+            };
             sink(&ev, self);
             n += 1;
         }
@@ -759,9 +786,13 @@ impl Engine {
             Err(e) => {
                 match e {
                     crate::tcp_input::TcpParseError::Short => inc(&self.counters.tcp.rx_short),
-                    crate::tcp_input::TcpParseError::BadFlags => inc(&self.counters.tcp.rx_bad_flags),
+                    crate::tcp_input::TcpParseError::BadFlags => {
+                        inc(&self.counters.tcp.rx_bad_flags)
+                    }
                     crate::tcp_input::TcpParseError::Csum => inc(&self.counters.tcp.rx_bad_csum),
-                    crate::tcp_input::TcpParseError::BadDataOffset => inc(&self.counters.tcp.rx_short),
+                    crate::tcp_input::TcpParseError::BadDataOffset => {
+                        inc(&self.counters.tcp.rx_short)
+                    }
                 }
                 return 0;
             }
@@ -781,14 +812,24 @@ impl Engine {
         if (parsed.flags & TCP_SYN) != 0 && (parsed.flags & TCP_ACK) != 0 {
             inc(&self.counters.tcp.rx_syn_ack);
         }
-        if (parsed.flags & TCP_ACK) != 0 { inc(&self.counters.tcp.rx_ack); }
-        if (parsed.flags & TCP_FIN) != 0 { inc(&self.counters.tcp.rx_fin); }
-        if (parsed.flags & TCP_RST) != 0 { inc(&self.counters.tcp.rx_rst); }
-        if !parsed.payload.is_empty() { inc(&self.counters.tcp.rx_data); }
+        if (parsed.flags & TCP_ACK) != 0 {
+            inc(&self.counters.tcp.rx_ack);
+        }
+        if (parsed.flags & TCP_FIN) != 0 {
+            inc(&self.counters.tcp.rx_fin);
+        }
+        if (parsed.flags & TCP_RST) != 0 {
+            inc(&self.counters.tcp.rx_rst);
+        }
+        if !parsed.payload.is_empty() {
+            inc(&self.counters.tcp.rx_data);
+        }
 
         let outcome = {
             let mut ft = self.flow_table.borrow_mut();
-            let Some(conn) = ft.get_mut(handle) else { return 0; };
+            let Some(conn) = ft.get_mut(handle) else {
+                return 0;
+            };
             dispatch(conn, &parsed)
         };
 
@@ -829,7 +870,8 @@ impl Engine {
 
         if outcome.connected {
             self.events.borrow_mut().push(InternalEvent::Connected {
-                conn: handle, rx_hw_ts_ns: 0,
+                conn: handle,
+                rx_hw_ts_ns: 0,
             });
             inc(&self.counters.tcp.conn_open);
         }
@@ -855,7 +897,8 @@ impl Engine {
 
         if outcome.closed {
             self.events.borrow_mut().push(InternalEvent::Closed {
-                conn: handle, err: 0,
+                conn: handle,
+                err: 0,
             });
             inc(&self.counters.tcp.conn_close);
             // Bump conn_rst when the close was caused by RST (either
@@ -863,8 +906,7 @@ impl Engine {
             // bad-ACK / sync-state Rst paths). LastAck-fin_acked closes
             // and TIME_WAIT reaper closes are clean, not counted as RST.
             let rst_close = (parsed.flags & crate::tcp_output::TCP_RST) != 0
-                || matches!(outcome.tx,
-                    TxAction::Rst | TxAction::RstForSynSentBadAck);
+                || matches!(outcome.tx, TxAction::Rst | TxAction::RstForSynSentBadAck);
             if rst_close {
                 inc(&self.counters.tcp.conn_rst);
             }
@@ -889,9 +931,13 @@ impl Engine {
     fn transition_conn(&self, handle: ConnHandle, to: TcpState) {
         use crate::counters::inc;
         let mut ft = self.flow_table.borrow_mut();
-        let Some(conn) = ft.get_mut(handle) else { return; };
+        let Some(conn) = ft.get_mut(handle) else {
+            return;
+        };
         let from = conn.state;
-        if from == to { return; }
+        if from == to {
+            return;
+        }
         conn.state = to;
         // TIME_WAIT entry: arm the reaping deadline.
         if to == TcpState::TimeWait {
@@ -901,7 +947,9 @@ impl Engine {
         drop(ft);
         inc(&self.counters.tcp.state_trans[from as usize][to as usize]);
         self.events.borrow_mut().push(InternalEvent::StateChange {
-            conn: handle, from, to,
+            conn: handle,
+            from,
+            to,
         });
     }
 
@@ -929,7 +977,9 @@ impl Engine {
         use crate::counters::{add, inc};
         use crate::tcp_output::{build_segment, SegmentTx, TCP_ACK};
         let ft = self.flow_table.borrow();
-        let Some(conn) = ft.get(handle) else { return; };
+        let Some(conn) = ft.get(handle) else {
+            return;
+        };
         let t = conn.four_tuple();
         let ws_shift_out = conn.ws_shift_out;
         let ts_enabled = conn.ts_enabled;
@@ -979,7 +1029,9 @@ impl Engine {
         // Sized to cover max TCP-options budget: 14 (eth) + 20 (ip) +
         // 20 (tcp min) + 40 (max tcp opts) = 94; round up to 128.
         let mut buf = [0u8; 128];
-        let Some(n) = build_segment(&seg, &mut buf) else { return; };
+        let Some(n) = build_segment(&seg, &mut buf) else {
+            return;
+        };
         if self.tx_frame(&buf[..n]) {
             inc(&self.counters.tcp.tx_ack);
             if outcome.zero_window {
@@ -1013,14 +1065,18 @@ impl Engine {
         use crate::counters::inc;
         use crate::tcp_output::{build_segment, SegmentTx, TCP_ACK, TCP_RST};
         let ft = self.flow_table.borrow();
-        let Some(conn) = ft.get(handle) else { return; };
+        let Some(conn) = ft.get(handle) else {
+            return;
+        };
         let t = conn.four_tuple();
         let ack = incoming.seq.wrapping_add(incoming.payload.len() as u32);
         let seg = SegmentTx {
             src_mac: self.our_mac,
             dst_mac: self.cfg.gateway_mac,
-            src_ip: t.local_ip, dst_ip: t.peer_ip,
-            src_port: t.local_port, dst_port: t.peer_port,
+            src_ip: t.local_ip,
+            dst_ip: t.peer_ip,
+            src_port: t.local_port,
+            dst_port: t.peer_port,
             seq: conn.snd_nxt,
             ack,
             flags: TCP_RST | TCP_ACK,
@@ -1029,7 +1085,9 @@ impl Engine {
             payload: &[],
         };
         let mut buf = [0u8; 64];
-        let Some(n) = build_segment(&seg, &mut buf) else { return; };
+        let Some(n) = build_segment(&seg, &mut buf) else {
+            return;
+        };
         drop(ft);
         if self.tx_frame(&buf[..n]) {
             inc(&self.counters.tcp.tx_rst);
@@ -1060,7 +1118,9 @@ impl Engine {
             payload: &[],
         };
         let mut buf = [0u8; 64];
-        let Some(n) = build_segment(&seg, &mut buf) else { return; };
+        let Some(n) = build_segment(&seg, &mut buf) else {
+            return;
+        };
         if self.tx_frame(&buf[..n]) {
             inc(&self.counters.tcp.tx_rst);
         }
@@ -1080,7 +1140,8 @@ impl Engine {
         let (seq, ack, flags) = if (incoming.flags & TCP_ACK) != 0 {
             (incoming.ack, 0, TCP_RST)
         } else {
-            let ack = incoming.seq
+            let ack = incoming
+                .seq
                 .wrapping_add(incoming.payload.len() as u32)
                 .wrapping_add(syn_len)
                 .wrapping_add(fin_len);
@@ -1089,13 +1150,21 @@ impl Engine {
         let seg = SegmentTx {
             src_mac: self.our_mac,
             dst_mac: self.cfg.gateway_mac,
-            src_ip: tuple.local_ip, dst_ip: tuple.peer_ip,
-            src_port: tuple.local_port, dst_port: tuple.peer_port,
-            seq, ack, flags, window: 0,
-            options: crate::tcp_options::TcpOpts::default(), payload: &[],
+            src_ip: tuple.local_ip,
+            dst_ip: tuple.peer_ip,
+            src_port: tuple.local_port,
+            dst_port: tuple.peer_port,
+            seq,
+            ack,
+            flags,
+            window: 0,
+            options: crate::tcp_options::TcpOpts::default(),
+            payload: &[],
         };
         let mut buf = [0u8; 64];
-        let Some(n) = build_segment(&seg, &mut buf) else { return; };
+        let Some(n) = build_segment(&seg, &mut buf) else {
+            return;
+        };
         if self.tx_frame(&buf[..n]) {
             inc(&self.counters.tcp.tx_rst);
         }
@@ -1104,7 +1173,9 @@ impl Engine {
     fn deliver_readable(&self, handle: ConnHandle, delivered: u32) {
         use crate::counters::add;
         let mut ft = self.flow_table.borrow_mut();
-        let Some(conn) = ft.get_mut(handle) else { return; };
+        let Some(conn) = ft.get_mut(handle) else {
+            return;
+        };
         // Append delivered bytes to last_read_buf (do NOT clear — the poll
         // entry point clears once per iteration so multiple Readable events
         // within one poll stack contiguously in the buffer).
@@ -1252,15 +1323,22 @@ impl Engine {
         use crate::counters::inc;
         use crate::tcp_output::{build_segment, SegmentTx, TCP_ACK, TCP_PSH};
 
-        let (tuple, seq_start, snd_una, snd_wnd, peer_mss, state, rcv_nxt, rcv_wnd)
-            = {
-                let ft = self.flow_table.borrow();
-                let Some(c) = ft.get(handle) else {
-                    return Err(Error::InvalidConnHandle(handle as u64));
-                };
-                (c.four_tuple(), c.snd_nxt, c.snd_una, c.snd_wnd, c.peer_mss,
-                 c.state, c.rcv_nxt, c.rcv_wnd)
+        let (tuple, seq_start, snd_una, snd_wnd, peer_mss, state, rcv_nxt, rcv_wnd) = {
+            let ft = self.flow_table.borrow();
+            let Some(c) = ft.get(handle) else {
+                return Err(Error::InvalidConnHandle(handle as u64));
             };
+            (
+                c.four_tuple(),
+                c.snd_nxt,
+                c.snd_una,
+                c.snd_wnd,
+                c.peer_mss,
+                c.state,
+                c.rcv_nxt,
+                c.rcv_wnd,
+            )
+        };
         if state != TcpState::Established {
             return Err(Error::InvalidConnHandle(handle as u64));
         }
@@ -1271,7 +1349,10 @@ impl Engine {
         let in_flight = seq_start.wrapping_sub(snd_una);
         let room_in_peer_wnd = snd_wnd.saturating_sub(in_flight);
         let send_buf_room = self.cfg.send_buffer_bytes.saturating_sub(in_flight);
-        let mut remaining = bytes.len().min(room_in_peer_wnd as usize).min(send_buf_room as usize);
+        let mut remaining = bytes
+            .len()
+            .min(room_in_peer_wnd as usize)
+            .min(send_buf_room as usize);
         let mut offset = 0usize;
         let mut accepted = 0u32;
         let mut cur_seq = seq_start;
@@ -1290,8 +1371,10 @@ impl Engine {
             let seg = SegmentTx {
                 src_mac: self.our_mac,
                 dst_mac: self.cfg.gateway_mac,
-                src_ip: tuple.local_ip, dst_ip: tuple.peer_ip,
-                src_port: tuple.local_port, dst_port: tuple.peer_port,
+                src_ip: tuple.local_ip,
+                dst_ip: tuple.peer_ip,
+                src_port: tuple.local_port,
+                dst_port: tuple.peer_port,
                 seq: cur_seq,
                 ack: rcv_nxt,
                 flags: TCP_ACK | TCP_PSH,
@@ -1375,8 +1458,10 @@ impl Engine {
         let seg = SegmentTx {
             src_mac: self.our_mac,
             dst_mac: self.cfg.gateway_mac,
-            src_ip: tuple.local_ip, dst_ip: tuple.peer_ip,
-            src_port: tuple.local_port, dst_port: tuple.peer_port,
+            src_ip: tuple.local_ip,
+            dst_ip: tuple.peer_ip,
+            src_port: tuple.local_port,
+            dst_port: tuple.peer_port,
             seq,
             ack: rcv_nxt,
             flags: TCP_ACK | TCP_FIN,
@@ -1642,15 +1727,24 @@ mod tests {
         // Reversed: highest seq (3000/3100) first.
         assert_eq!(
             out.opts.sack_blocks[0],
-            crate::tcp_options::SackBlock { left: 3_000, right: 3_100 }
+            crate::tcp_options::SackBlock {
+                left: 3_000,
+                right: 3_100
+            }
         );
         assert_eq!(
             out.opts.sack_blocks[1],
-            crate::tcp_options::SackBlock { left: 2_000, right: 2_100 }
+            crate::tcp_options::SackBlock {
+                left: 2_000,
+                right: 2_100
+            }
         );
         assert_eq!(
             out.opts.sack_blocks[2],
-            crate::tcp_options::SackBlock { left: 1_000, right: 1_100 }
+            crate::tcp_options::SackBlock {
+                left: 1_000,
+                right: 1_100
+            }
         );
     }
 
@@ -1678,15 +1772,24 @@ mod tests {
         assert_eq!(out.opts.sack_block_count, 3);
         assert_eq!(
             out.opts.sack_blocks[0],
-            crate::tcp_options::SackBlock { left: 5_000, right: 5_100 }
+            crate::tcp_options::SackBlock {
+                left: 5_000,
+                right: 5_100
+            }
         );
         assert_eq!(
             out.opts.sack_blocks[1],
-            crate::tcp_options::SackBlock { left: 4_000, right: 4_100 }
+            crate::tcp_options::SackBlock {
+                left: 4_000,
+                right: 4_100
+            }
         );
         assert_eq!(
             out.opts.sack_blocks[2],
-            crate::tcp_options::SackBlock { left: 3_000, right: 3_100 }
+            crate::tcp_options::SackBlock {
+                left: 3_000,
+                right: 3_100
+            }
         );
     }
 
@@ -1710,7 +1813,10 @@ mod tests {
         // Most-recent (highest seq) first.
         assert_eq!(
             out.opts.sack_blocks[0],
-            crate::tcp_options::SackBlock { left: 2_000, right: 2_100 }
+            crate::tcp_options::SackBlock {
+                left: 2_000,
+                right: 2_100
+            }
         );
     }
 

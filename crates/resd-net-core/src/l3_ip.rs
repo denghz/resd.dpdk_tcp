@@ -9,8 +9,8 @@ pub const IPPROTO_TCP: u8 = 6;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct L3Decoded {
     pub protocol: u8,
-    pub src_ip: u32,  // host byte order
-    pub dst_ip: u32,  // host byte order
+    pub src_ip: u32, // host byte order
+    pub dst_ip: u32, // host byte order
     pub header_len: usize,
     pub total_len: usize,
     pub ttl: u8,
@@ -18,15 +18,15 @@ pub struct L3Decoded {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum L3Drop {
-    Short,             // fewer than 20 bytes
-    BadVersion,        // version != 4
-    BadHeaderLen,      // IHL < 5 or header extends past slice
-    BadTotalLen,       // total_length < header_len or > slice
-    CsumBad,           // checksum verify failed
-    TtlZero,           // TTL == 0 on ingress (RFC 791; we drop rather than send ICMP)
-    Fragment,          // MF=1 or frag_offset != 0
-    NotOurs,           // dst_ip != our_ip (and our_ip != 0)
-    UnsupportedProto,  // protocol is not TCP and not ICMP
+    Short,            // fewer than 20 bytes
+    BadVersion,       // version != 4
+    BadHeaderLen,     // IHL < 5 or header extends past slice
+    BadTotalLen,      // total_length < header_len or > slice
+    CsumBad,          // checksum verify failed
+    TtlZero,          // TTL == 0 on ingress (RFC 791; we drop rather than send ICMP)
+    Fragment,         // MF=1 or frag_offset != 0
+    NotOurs,          // dst_ip != our_ip (and our_ip != 0)
+    UnsupportedProto, // protocol is not TCP and not ICMP
 }
 
 /// Compute the Internet checksum (RFC 1071) over a byte slice.
@@ -116,24 +116,21 @@ mod tests {
     use super::*;
 
     /// Build a valid IPv4 header with an optional wrong-checksum flag.
-    fn build_ip_hdr(
-        proto: u8,
-        src: u32,
-        dst: u32,
-        payload_len: usize,
-        bad_csum: bool,
-    ) -> Vec<u8> {
+    fn build_ip_hdr(proto: u8, src: u32, dst: u32, payload_len: usize, bad_csum: bool) -> Vec<u8> {
         let total = 20 + payload_len;
         let mut v = vec![
-            0x45,                      // version 4, IHL 5
-            0x00,                      // DSCP/ECN
+            0x45, // version 4, IHL 5
+            0x00, // DSCP/ECN
             (total >> 8) as u8,
-            (total & 0xff) as u8,      // total length
-            0x00, 0x01,                // identification
-            0x40, 0x00,                // flags=DF, fragment offset 0
-            0x40,                      // TTL 64
-            proto,                     // protocol
-            0x00, 0x00,                // checksum placeholder
+            (total & 0xff) as u8, // total length
+            0x00,
+            0x01, // identification
+            0x40,
+            0x00,  // flags=DF, fragment offset 0
+            0x40,  // TTL 64
+            proto, // protocol
+            0x00,
+            0x00, // checksum placeholder
         ];
         v.extend_from_slice(&src.to_be_bytes());
         v.extend_from_slice(&dst.to_be_bytes());

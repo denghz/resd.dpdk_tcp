@@ -44,7 +44,9 @@ pub fn build_segment(seg: &SegmentTx, out: &mut [u8]) -> Option<usize> {
     let opts_len = seg.options.encoded_len();
     let tcp_hdr_len = TCP_HDR_MIN + opts_len;
     let total = ETH_HDR_LEN + IPV4_HDR_MIN + tcp_hdr_len + seg.payload.len();
-    if out.len() < total { return None; }
+    if out.len() < total {
+        return None;
+    }
 
     // Ethernet
     out[0..6].copy_from_slice(&seg.dst_mac);
@@ -92,7 +94,9 @@ pub fn build_segment(seg: &SegmentTx, out: &mut [u8]) -> Option<usize> {
 
     let tcp_seg_len = (tcp_hdr_len + seg.payload.len()) as u32;
     let csum = tcp_checksum(
-        seg.src_ip, seg.dst_ip, tcp_seg_len,
+        seg.src_ip,
+        seg.dst_ip,
+        tcp_seg_len,
         &out[tcp_start..payload_start + seg.payload.len()],
     );
     out[tcp_start + 16] = (csum >> 8) as u8;
@@ -133,7 +137,8 @@ mod tests {
             flags: TCP_SYN,
             window: 65535,
             options: crate::tcp_options::TcpOpts {
-                mss: Some(1460), ..Default::default()
+                mss: Some(1460),
+                ..Default::default()
             },
             payload: &[],
         }

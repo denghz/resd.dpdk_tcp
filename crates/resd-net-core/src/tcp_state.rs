@@ -58,10 +58,17 @@ mod tests {
     #[test]
     fn label_is_stable_for_every_state() {
         for s in [
-            TcpState::Closed, TcpState::Listen, TcpState::SynSent,
-            TcpState::SynReceived, TcpState::Established,
-            TcpState::FinWait1, TcpState::FinWait2, TcpState::CloseWait,
-            TcpState::Closing, TcpState::LastAck, TcpState::TimeWait,
+            TcpState::Closed,
+            TcpState::Listen,
+            TcpState::SynSent,
+            TcpState::SynReceived,
+            TcpState::Established,
+            TcpState::FinWait1,
+            TcpState::FinWait2,
+            TcpState::CloseWait,
+            TcpState::Closing,
+            TcpState::LastAck,
+            TcpState::TimeWait,
         ] {
             assert!(!s.label().is_empty());
         }

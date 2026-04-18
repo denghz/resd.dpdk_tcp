@@ -61,12 +61,32 @@ pub unsafe extern "C" fn resd_net_engine_create(
     let cfg = &*cfg;
     // A3 fields with 0 sentinels fall back to defaults so callers that
     // don't supply them get sensible behavior.
-    let max_conns = if cfg.max_connections == 0 { 16 } else { cfg.max_connections };
-    let recv_buf = if cfg.recv_buffer_bytes == 0 { 256 * 1024 } else { cfg.recv_buffer_bytes };
-    let send_buf = if cfg.send_buffer_bytes == 0 { 256 * 1024 } else { cfg.send_buffer_bytes };
+    let max_conns = if cfg.max_connections == 0 {
+        16
+    } else {
+        cfg.max_connections
+    };
+    let recv_buf = if cfg.recv_buffer_bytes == 0 {
+        256 * 1024
+    } else {
+        cfg.recv_buffer_bytes
+    };
+    let send_buf = if cfg.send_buffer_bytes == 0 {
+        256 * 1024
+    } else {
+        cfg.send_buffer_bytes
+    };
     let mss = if cfg.tcp_mss == 0 { 1460 } else { cfg.tcp_mss };
-    let init_rto = if cfg.tcp_initial_rto_ms == 0 { 50 } else { cfg.tcp_initial_rto_ms };
-    let msl = if cfg.tcp_msl_ms == 0 { 30_000 } else { cfg.tcp_msl_ms };
+    let init_rto = if cfg.tcp_initial_rto_ms == 0 {
+        50
+    } else {
+        cfg.tcp_initial_rto_ms
+    };
+    let msl = if cfg.tcp_msl_ms == 0 {
+        30_000
+    } else {
+        cfg.tcp_msl_ms
+    };
 
     let core_cfg = EngineConfig {
         lcore_id,
@@ -111,7 +131,9 @@ pub unsafe extern "C" fn resd_net_poll(
     max_events: u32,
     _timeout_ns: u64,
 ) -> i32 {
-    let Some(e) = engine_from_raw(p) else { return -libc::EINVAL; };
+    let Some(e) = engine_from_raw(p) else {
+        return -libc::EINVAL;
+    };
     e.poll_once();
     if events_out.is_null() || max_events == 0 {
         return 0;
@@ -131,7 +153,12 @@ pub unsafe extern "C" fn resd_net_poll(
                     u: resd_net_event_payload_t { _pad: [0u8; 16] },
                 }
             }
-            resd_net_core::tcp_events::InternalEvent::Readable { conn, byte_offset, byte_len, rx_hw_ts_ns } => {
+            resd_net_core::tcp_events::InternalEvent::Readable {
+                conn,
+                byte_offset,
+                byte_len,
+                rx_hw_ts_ns,
+            } => {
                 // Build the borrowed-view pointer into the connection's
                 // last_read_buf at the event's byte_offset (Task 19 fix
                 // for multi-segment polls).
@@ -150,21 +177,22 @@ pub unsafe extern "C" fn resd_net_poll(
                     rx_hw_ts_ns: *rx_hw_ts_ns,
                     enqueued_ts_ns: ts,
                     u: resd_net_event_payload_t {
-                        readable: resd_net_event_readable_t { data: data_ptr, data_len },
+                        readable: resd_net_event_readable_t {
+                            data: data_ptr,
+                            data_len,
+                        },
                     },
                 }
             }
-            resd_net_core::tcp_events::InternalEvent::Closed { conn, err } => {
-                resd_net_event_t {
-                    kind: resd_net_event_kind_t::RESD_NET_EVT_CLOSED,
-                    conn: *conn as u64,
-                    rx_hw_ts_ns: 0,
-                    enqueued_ts_ns: ts,
-                    u: resd_net_event_payload_t {
-                        closed: resd_net_event_error_t { err: *err },
-                    },
-                }
-            }
+            resd_net_core::tcp_events::InternalEvent::Closed { conn, err } => resd_net_event_t {
+                kind: resd_net_event_kind_t::RESD_NET_EVT_CLOSED,
+                conn: *conn as u64,
+                rx_hw_ts_ns: 0,
+                enqueued_ts_ns: ts,
+                u: resd_net_event_payload_t {
+                    closed: resd_net_event_error_t { err: *err },
+                },
+            },
             resd_net_core::tcp_events::InternalEvent::StateChange { conn, from, to } => {
                 resd_net_event_t {
                     kind: resd_net_event_kind_t::RESD_NET_EVT_TCP_STATE_CHANGE,
@@ -173,22 +201,21 @@ pub unsafe extern "C" fn resd_net_poll(
                     enqueued_ts_ns: ts,
                     u: resd_net_event_payload_t {
                         tcp_state: resd_net_event_tcp_state_t {
-                            from_state: *from as u8, to_state: *to as u8,
+                            from_state: *from as u8,
+                            to_state: *to as u8,
                         },
                     },
                 }
             }
-            resd_net_core::tcp_events::InternalEvent::Error { conn, err } => {
-                resd_net_event_t {
-                    kind: resd_net_event_kind_t::RESD_NET_EVT_ERROR,
-                    conn: *conn as u64,
-                    rx_hw_ts_ns: 0,
-                    enqueued_ts_ns: ts,
-                    u: resd_net_event_payload_t {
-                        error: resd_net_event_error_t { err: *err },
-                    },
-                }
-            }
+            resd_net_core::tcp_events::InternalEvent::Error { conn, err } => resd_net_event_t {
+                kind: resd_net_event_kind_t::RESD_NET_EVT_ERROR,
+                conn: *conn as u64,
+                rx_hw_ts_ns: 0,
+                enqueued_ts_ns: ts,
+                u: resd_net_event_payload_t {
+                    error: resd_net_event_error_t { err: *err },
+                },
+            },
         };
         unsafe {
             std::ptr::write(events_out.add(filled as usize), event);
@@ -247,7 +274,9 @@ pub unsafe extern "C" fn resd_net_connect(
     if p.is_null() || opts.is_null() || out.is_null() {
         return -libc::EINVAL;
     }
-    let Some(e) = engine_from_raw(p) else { return -libc::EINVAL; };
+    let Some(e) = engine_from_raw(p) else {
+        return -libc::EINVAL;
+    };
     let opts = &*opts;
     // peer_addr comes in network byte order; convert to host order.
     let peer_ip = u32::from_be(opts.peer_addr);
@@ -277,7 +306,9 @@ pub unsafe extern "C" fn resd_net_send(
     if len > 0 && buf.is_null() {
         return -libc::EINVAL;
     }
-    let Some(e) = engine_from_raw(p) else { return -libc::EINVAL; };
+    let Some(e) = engine_from_raw(p) else {
+        return -libc::EINVAL;
+    };
     let slice = if len == 0 {
         &[][..]
     } else {
@@ -301,7 +332,9 @@ pub unsafe extern "C" fn resd_net_close(
     if p.is_null() {
         return -libc::EINVAL;
     }
-    let Some(e) = engine_from_raw(p) else { return -libc::EINVAL; };
+    let Some(e) = engine_from_raw(p) else {
+        return -libc::EINVAL;
+    };
     match e.close_conn(conn as u32) {
         Ok(()) => 0,
         Err(resd_net_core::Error::InvalidConnHandle(_)) => -libc::ENOTCONN,
@@ -401,14 +434,7 @@ mod tests {
 
     #[test]
     fn send_null_engine_returns_einval() {
-        let rc = unsafe {
-            resd_net_send(
-                std::ptr::null_mut(),
-                1u64,
-                b"x".as_ptr(),
-                1,
-            )
-        };
+        let rc = unsafe { resd_net_send(std::ptr::null_mut(), 1u64, b"x".as_ptr(), 1) };
         assert_eq!(rc, -libc::EINVAL);
     }
 

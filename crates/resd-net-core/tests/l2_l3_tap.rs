@@ -34,8 +34,12 @@ fn skip_if_not_tap() -> bool {
 
 fn bring_up_tap(iface: &str, cidr: &str) {
     // These commands require root — the test itself must be run via sudo.
-    let _ = Command::new("ip").args(["link", "set", iface, "up"]).status();
-    let _ = Command::new("ip").args(["addr", "add", cidr, "dev", iface]).status();
+    let _ = Command::new("ip")
+        .args(["link", "set", iface, "up"])
+        .status();
+    let _ = Command::new("ip")
+        .args(["addr", "add", cidr, "dev", iface])
+        .status();
 }
 
 /// Open an AF_PACKET SOCK_RAW socket bound to `iface` for raw frame TX.
@@ -47,7 +51,11 @@ fn open_pkt_socket(iface: &str) -> c_int {
             (libc::ETH_P_ALL as u16).to_be() as i32,
         )
     };
-    assert!(s >= 0, "socket() failed: {}", std::io::Error::last_os_error());
+    assert!(
+        s >= 0,
+        "socket() failed: {}",
+        std::io::Error::last_os_error()
+    );
     let c_name = CString::new(iface).unwrap();
     let ifindex = unsafe { libc::if_nametoindex(c_name.as_ptr()) };
     assert!(ifindex > 0, "if_nametoindex({iface}) failed");
@@ -99,12 +107,18 @@ fn build_eth(dst: [u8; 6], src: [u8; 6], et: u16, body: &[u8]) -> Vec<u8> {
 fn build_ipv4(proto: u8, src: u32, dst: u32, payload: &[u8]) -> Vec<u8> {
     let total = 20 + payload.len();
     let mut v = vec![
-        0x45, 0x00,
-        (total >> 8) as u8, (total & 0xff) as u8,
-        0x00, 0x01,
-        0x40, 0x00,
-        0x40, proto,
-        0x00, 0x00,
+        0x45,
+        0x00,
+        (total >> 8) as u8,
+        (total & 0xff) as u8,
+        0x00,
+        0x01,
+        0x40,
+        0x00,
+        0x40,
+        proto,
+        0x00,
+        0x00,
     ];
     v.extend_from_slice(&src.to_be_bytes());
     v.extend_from_slice(&dst.to_be_bytes());
@@ -144,14 +158,17 @@ fn snapshot(c: &Counters) -> (u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, 
 
 #[test]
 fn crafted_frames_through_tap_pair() {
-    if skip_if_not_tap() { return; }
+    if skip_if_not_tap() {
+        return;
+    }
 
     let args = [
         "resd-net-a2-test",
         "--in-memory",
         "--no-pci",
         "--vdev=net_tap0,iface=resdtap1",
-        "-l", "0-1",
+        "-l",
+        "0-1",
         "--log-level=3",
     ];
     eal_init(&args).expect("EAL init");
@@ -161,7 +178,7 @@ fn crafted_frames_through_tap_pair() {
         local_ip: OUR_IP,
         gateway_ip: PEER_IP,
         gateway_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01], // arbitrary; not actually used in rx path
-        garp_interval_sec: 0, // disabled for this test
+        garp_interval_sec: 0,                              // disabled for this test
         ..Default::default()
     };
     let engine = Engine::new(cfg).expect("engine new");
@@ -175,14 +192,18 @@ fn crafted_frames_through_tap_pair() {
 
     // Drain any startup noise (router advertisements, IPv6 MLD, etc.)
     // so our counter deltas are attributable.
-    for _ in 0..200 { engine.poll_once(); }
+    for _ in 0..200 {
+        engine.poll_once();
+    }
     let _ = snapshot(engine.counters());
 
     // -- Case 1: wrong destination MAC → rx_drop_miss_mac --
     let s0 = snapshot(engine.counters());
     let bad_mac = [0xee, 0xee, 0xee, 0xee, 0xee, 0xee];
     let frame = build_eth(
-        bad_mac, [0xaa; 6], 0x0800,
+        bad_mac,
+        [0xaa; 6],
+        0x0800,
         &build_ipv4(6 /*TCP*/, PEER_IP, OUR_IP, &[0u8; 20]),
     );
     send_frame(sock, TAP_IFACE, &frame);
@@ -201,7 +222,9 @@ fn crafted_frames_through_tap_pair() {
     // -- Case 3: IPv4 TCP to us → rx_tcp bumped --
     let s2 = snapshot(engine.counters());
     let frame = build_eth(
-        our_mac, [0xaa; 6], 0x0800,
+        our_mac,
+        [0xaa; 6],
+        0x0800,
         &build_ipv4(6, PEER_IP, OUR_IP, &[0u8; 20]),
     );
     send_frame(sock, TAP_IFACE, &frame);
@@ -212,7 +235,9 @@ fn crafted_frames_through_tap_pair() {
     // -- Case 4: IPv4 UDP (unsupported proto) → rx_drop_unsupported_proto --
     let s3 = snapshot(engine.counters());
     let frame = build_eth(
-        our_mac, [0xaa; 6], 0x0800,
+        our_mac,
+        [0xaa; 6],
+        0x0800,
         &build_ipv4(17 /*UDP*/, PEER_IP, OUR_IP, &[0u8; 8]),
     );
     send_frame(sock, TAP_IFACE, &frame);
@@ -236,16 +261,40 @@ fn crafted_frames_through_tap_pair() {
     // we supposedly sent traffic to. The stack indexes PMTU by that dst.
     let inner_dst: u32 = 0x0a_63_00_64_u32; // 10.99.0.100
     let mut inner = vec![
-        0x45, 0x00,
-        0x00, 0x14, 0x00, 0x01, 0x40, 0x00, 0x40, 6, 0x00, 0x00,
-        (PEER_IP >> 24) as u8, (PEER_IP >> 16) as u8, (PEER_IP >> 8) as u8, PEER_IP as u8,
+        0x45,
+        0x00,
+        0x00,
+        0x14,
+        0x00,
+        0x01,
+        0x40,
+        0x00,
+        0x40,
+        6,
+        0x00,
+        0x00,
+        (PEER_IP >> 24) as u8,
+        (PEER_IP >> 16) as u8,
+        (PEER_IP >> 8) as u8,
+        PEER_IP as u8,
     ];
     inner.extend_from_slice(&inner_dst.to_be_bytes());
     // Build ICMP body: type=3, code=4, csum=0, unused=0, mtu=1200, then inner IP
-    let mut icmp_body = vec![3u8, 4, 0, 0, 0, 0, (1200u16 >> 8) as u8, (1200u16 & 0xff) as u8];
+    let mut icmp_body = vec![
+        3u8,
+        4,
+        0,
+        0,
+        0,
+        0,
+        (1200u16 >> 8) as u8,
+        (1200u16 & 0xff) as u8,
+    ];
     icmp_body.extend_from_slice(&inner);
     let frame = build_eth(
-        our_mac, [0xaa; 6], 0x0800,
+        our_mac,
+        [0xaa; 6],
+        0x0800,
         &build_ipv4(1 /*ICMP*/, PEER_IP, OUR_IP, &icmp_body),
     );
     send_frame(sock, TAP_IFACE, &frame);
@@ -275,9 +324,15 @@ fn crafted_frames_through_tap_pair() {
     send_frame(sock, TAP_IFACE, &frame);
     poll_until_pkts(&engine, s6.0 + 1, 500);
     // Allow time for the reply to have been pushed by tx_burst.
-    for _ in 0..5 { engine.poll_once(); std::thread::sleep(std::time::Duration::from_millis(2)); }
+    for _ in 0..5 {
+        engine.poll_once();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
     let tx_arp_after = engine.counters().eth.tx_arp.load(Ordering::Relaxed);
-    assert!(tx_arp_after > tx_arp_before, "tx_arp should have incremented (we replied)");
+    assert!(
+        tx_arp_after > tx_arp_before,
+        "tx_arp should have incremented (we replied)"
+    );
 
     drop(engine);
     unsafe { libc::close(sock) };

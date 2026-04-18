@@ -51,7 +51,9 @@ fn read_kernel_tap_mac(iface: &str) -> [u8; 6] {
 }
 
 fn bring_up_tap(iface: &str) {
-    let _ = Command::new("ip").args(["link", "set", iface, "up"]).status();
+    let _ = Command::new("ip")
+        .args(["link", "set", iface, "up"])
+        .status();
     let _ = Command::new("ip")
         .args(["addr", "add", "10.99.4.1/24", "dev", iface])
         .status();
@@ -59,7 +61,17 @@ fn bring_up_tap(iface: &str) {
 
 fn pin_arp(iface: &str, ip: &str, mac: &str) {
     let _ = Command::new("ip")
-        .args(["neigh", "replace", ip, "lladdr", mac, "dev", iface, "nud", "permanent"])
+        .args([
+            "neigh",
+            "replace",
+            ip,
+            "lladdr",
+            mac,
+            "dev",
+            iface,
+            "nud",
+            "permanent",
+        ])
         .status();
 }
 

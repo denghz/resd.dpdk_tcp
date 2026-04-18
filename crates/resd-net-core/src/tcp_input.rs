@@ -192,9 +192,16 @@ impl Outcome {
             closed: false,
         }
     }
-    pub fn none() -> Self { Self::base() }
+    pub fn none() -> Self {
+        Self::base()
+    }
     pub fn rst() -> Self {
-        Self { tx: TxAction::Rst, new_state: Some(TcpState::Closed), closed: true, ..Self::base() }
+        Self {
+            tx: TxAction::Rst,
+            new_state: Some(TcpState::Closed),
+            closed: true,
+            ..Self::base()
+        }
     }
 }
 
@@ -255,9 +262,7 @@ fn handle_syn_sent(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
 
     // ACK must cover exactly iss+1 (our SYN). Accept only when
     // snd_una+1 <= ack <= snd_nxt (RFC 9293 §3.10.7.3).
-    if !seq_le(conn.snd_una.wrapping_add(1), seg.ack)
-        || !seq_le(seg.ack, conn.snd_nxt)
-    {
+    if !seq_le(conn.snd_una.wrapping_add(1), seg.ack) || !seq_le(seg.ack, conn.snd_nxt) {
         return Outcome {
             tx: TxAction::RstForSynSentBadAck,
             new_state: Some(TcpState::Closed),
@@ -290,8 +295,13 @@ fn handle_syn_sent(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
     conn.peer_mss = parsed_opts.mss.unwrap_or(536);
 
     match parsed_opts.wscale {
-        Some(ws_peer) => { conn.ws_shift_in = ws_peer; }
-        None => { conn.ws_shift_in = 0; conn.ws_shift_out = 0; }
+        Some(ws_peer) => {
+            conn.ws_shift_in = ws_peer;
+        }
+        None => {
+            conn.ws_shift_in = 0;
+            conn.ws_shift_out = 0;
+        }
     }
     conn.sack_enabled = parsed_opts.sack_permitted;
     if let Some((tsval, _tsecr)) = parsed_opts.timestamps {
@@ -315,7 +325,11 @@ fn handle_established(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
     // Stage 1 does not support URG. Drop silently and account via
     // `tcp.rx_urgent_dropped` (A4 cross-phase backfill — spec §9.1.1).
     if (seg.flags & TCP_URG) != 0 {
-        return Outcome { tx: TxAction::None, urgent_dropped: true, ..Outcome::base() };
+        return Outcome {
+            tx: TxAction::None,
+            urgent_dropped: true,
+            ..Outcome::base()
+        };
     }
 
     // Observe a zero-window advertisement from the peer before any
@@ -336,15 +350,17 @@ fn handle_established(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
 
     // Segment must carry ACK in ESTABLISHED.
     if (seg.flags & TCP_ACK) == 0 {
-        return Outcome { rx_zero_window, ..Outcome::base() };
+        return Outcome {
+            rx_zero_window,
+            ..Outcome::base()
+        };
     }
 
     // Sequence-window check — RFC 9293 §3.10.7.4. Accept iff either
     // the seg has no payload and seq==rcv_nxt (pure ACK), or its
     // payload's first byte lies within our recv window. Our check is
     // stricter than mTCP's (both edges); see spec §6.1 + plan header.
-    let seg_len = seg.payload.len() as u32
-        + ((seg.flags & TCP_FIN) != 0) as u32; // FIN consumes one
+    let seg_len = seg.payload.len() as u32 + ((seg.flags & TCP_FIN) != 0) as u32; // FIN consumes one
     let in_win = if seg_len == 0 {
         seg.seq == conn.rcv_nxt
     } else {
@@ -502,8 +518,7 @@ fn handle_established(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
 
     // FIN processing: consumes one seq and moves us to CLOSE_WAIT.
     let mut new_state = None;
-    if (seg.flags & TCP_FIN) != 0
-        && seg.seq.wrapping_add(seg.payload.len() as u32) == conn.rcv_nxt
+    if (seg.flags & TCP_FIN) != 0 && seg.seq.wrapping_add(seg.payload.len() as u32) == conn.rcv_nxt
     {
         conn.rcv_nxt = conn.rcv_nxt.wrapping_add(1);
         new_state = Some(TcpState::CloseWait);
@@ -513,10 +528,7 @@ fn handle_established(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
     // in-window payload (in-order → confirms; OOO → dup-ACK signals
     // expected seq per RFC 9293 §3.10.7.4 / RFC 5681 §4.2). Pure-ack
     // segments that only advanced snd_una need no response.
-    let tx = if delivered > 0
-        || new_state == Some(TcpState::CloseWait)
-        || !seg.payload.is_empty()
-    {
+    let tx = if delivered > 0 || new_state == Some(TcpState::CloseWait) || !seg.payload.is_empty() {
         TxAction::Ack
     } else {
         TxAction::None
@@ -552,7 +564,10 @@ fn handle_close_path(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
     // TIME_WAIT: replay-ACK anything the peer sends; reaper will move
     // us to CLOSED via the engine tick (Task 19).
     if conn.state == TcpState::TimeWait {
-        return Outcome { tx: TxAction::Ack, ..Outcome::base() };
+        return Outcome {
+            tx: TxAction::Ack,
+            ..Outcome::base()
+        };
     }
 
     // Segment must have ACK in these states.
@@ -570,7 +585,11 @@ fn handle_close_path(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
             && in_window(conn.rcv_nxt, last, conn.rcv_wnd)
     };
     if !in_win {
-        return Outcome { tx: TxAction::Ack, bad_seq: true, ..Outcome::base() };
+        return Outcome {
+            tx: TxAction::Ack,
+            bad_seq: true,
+            ..Outcome::base()
+        };
     }
 
     // Advance snd_una if ack covers more of our stream.
@@ -602,7 +621,12 @@ fn handle_close_path(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
     };
 
     let closed = new_state == Some(TcpState::Closed);
-    Outcome { tx, new_state, closed, ..Outcome::base() }
+    Outcome {
+        tx,
+        new_state,
+        closed,
+        ..Outcome::base()
+    }
 }
 
 /// Build the 4-tuple from a parsed segment's ports + the IPv4 header's
@@ -637,7 +661,8 @@ mod tests {
             flags,
             window: 65535,
             options: crate::tcp_options::TcpOpts {
-                mss, ..Default::default()
+                mss,
+                ..Default::default()
             },
             payload,
         };
@@ -702,8 +727,12 @@ mod tests {
         use crate::tcp_conn::TcpConn;
         use crate::tcp_options::TcpOpts;
 
-        let t = FourTuple { local_ip: 0x0a_00_00_02, local_port: 40000,
-                            peer_ip: 0x0a_00_00_01, peer_port: 5000 };
+        let t = FourTuple {
+            local_ip: 0x0a_00_00_02,
+            local_port: 40000,
+            peer_ip: 0x0a_00_00_01,
+            peer_port: 5000,
+        };
         let mut c = TcpConn::new_client(t, 1000, 1460, 1024, 2048);
         c.state = TcpState::SynSent;
         c.snd_nxt = c.snd_nxt.wrapping_add(1);
@@ -718,10 +747,14 @@ mod tests {
         let opts_len = peer_opts.encode(&mut opts_buf).unwrap();
 
         let seg = ParsedSegment {
-            src_port: 5000, dst_port: 40000,
-            seq: 5000, ack: 1001,
-            flags: TCP_SYN | TCP_ACK, window: 65535,
-            header_len: 20 + opts_len, payload: &[],
+            src_port: 5000,
+            dst_port: 40000,
+            seq: 5000,
+            ack: 1001,
+            flags: TCP_SYN | TCP_ACK,
+            window: 65535,
+            header_len: 20 + opts_len,
+            payload: &[],
             options: &opts_buf[..opts_len],
         };
         let out = dispatch(&mut c, &seg);
@@ -742,8 +775,12 @@ mod tests {
         use crate::tcp_conn::TcpConn;
         use crate::tcp_options::TcpOpts;
 
-        let t = FourTuple { local_ip: 0x0a_00_00_02, local_port: 40000,
-                            peer_ip: 0x0a_00_00_01, peer_port: 5000 };
+        let t = FourTuple {
+            local_ip: 0x0a_00_00_02,
+            local_port: 40000,
+            peer_ip: 0x0a_00_00_01,
+            peer_port: 5000,
+        };
         let mut c = TcpConn::new_client(t, 1000, 1460, 1024, 2048);
         c.state = TcpState::SynSent;
         c.snd_nxt = c.snd_nxt.wrapping_add(1);
@@ -756,10 +793,14 @@ mod tests {
         let opts_len = peer_opts.encode(&mut opts_buf).unwrap();
 
         let seg = ParsedSegment {
-            src_port: 5000, dst_port: 40000,
-            seq: 5000, ack: 1001,
-            flags: TCP_SYN | TCP_ACK, window: 65535,
-            header_len: 20 + opts_len, payload: &[],
+            src_port: 5000,
+            dst_port: 40000,
+            seq: 5000,
+            ack: 1001,
+            flags: TCP_SYN | TCP_ACK,
+            window: 65535,
+            header_len: 20 + opts_len,
+            payload: &[],
             options: &opts_buf[..opts_len],
         };
         let out = dispatch(&mut c, &seg);
@@ -774,19 +815,26 @@ mod tests {
         use crate::flow_table::FourTuple;
         use crate::tcp_conn::TcpConn;
 
-        let t = FourTuple { local_ip: 0x0a_00_00_02, local_port: 40000,
-                            peer_ip: 0x0a_00_00_01, peer_port: 5000 };
+        let t = FourTuple {
+            local_ip: 0x0a_00_00_02,
+            local_port: 40000,
+            peer_ip: 0x0a_00_00_01,
+            peer_port: 5000,
+        };
         let mut c = TcpConn::new_client(t, 1000, 1460, 1024, 2048);
         c.state = TcpState::SynSent;
         c.snd_nxt = c.snd_nxt.wrapping_add(1);
         // Bogus: ACK-only with an ack that doesn't cover our SYN.
         let seg = ParsedSegment {
-            src_port: 5000, dst_port: 40000,
-            seq: 5000, ack: 999,
+            src_port: 5000,
+            dst_port: 40000,
+            seq: 5000,
+            ack: 999,
             flags: TCP_ACK,
             window: 65535,
             header_len: 20,
-            payload: &[], options: &[],
+            payload: &[],
+            options: &[],
         };
         let out = dispatch(&mut c, &seg);
         assert_eq!(out.tx, TxAction::RstForSynSentBadAck);
@@ -797,18 +845,25 @@ mod tests {
         use crate::flow_table::FourTuple;
         use crate::tcp_conn::TcpConn;
 
-        let t = FourTuple { local_ip: 0x0a_00_00_02, local_port: 40000,
-                            peer_ip: 0x0a_00_00_01, peer_port: 5000 };
+        let t = FourTuple {
+            local_ip: 0x0a_00_00_02,
+            local_port: 40000,
+            peer_ip: 0x0a_00_00_01,
+            peer_port: 5000,
+        };
         let mut c = TcpConn::new_client(t, 1000, 1460, 1024, 2048);
         c.state = TcpState::SynSent;
         c.snd_nxt = c.snd_nxt.wrapping_add(1);
         let seg = ParsedSegment {
-            src_port: 5000, dst_port: 40000,
-            seq: 0, ack: 1001,
+            src_port: 5000,
+            dst_port: 40000,
+            seq: 0,
+            ack: 1001,
             flags: TCP_RST | TCP_ACK,
             window: 0,
             header_len: 20,
-            payload: &[], options: &[],
+            payload: &[],
+            options: &[],
         };
         let out = dispatch(&mut c, &seg);
         assert_eq!(out.new_state, Some(TcpState::Closed));
@@ -818,8 +873,12 @@ mod tests {
 
     fn est_conn(iss: u32, irs: u32, peer_wnd: u16) -> crate::tcp_conn::TcpConn {
         use crate::flow_table::FourTuple;
-        let t = FourTuple { local_ip: 0x0a_00_00_02, local_port: 40000,
-                            peer_ip: 0x0a_00_00_01, peer_port: 5000 };
+        let t = FourTuple {
+            local_ip: 0x0a_00_00_02,
+            local_port: 40000,
+            peer_ip: 0x0a_00_00_01,
+            peer_port: 5000,
+        };
         let mut c = crate::tcp_conn::TcpConn::new_client(t, iss, 1460, 1024, 2048);
         c.state = TcpState::Established;
         c.snd_una = iss.wrapping_add(1);
@@ -835,12 +894,15 @@ mod tests {
         let mut c = est_conn(1000, 5000, 1024);
         let payload = b"abcdef";
         let seg = ParsedSegment {
-            src_port: 5000, dst_port: 40000,
-            seq: 5001, ack: 1001,
+            src_port: 5000,
+            dst_port: 40000,
+            seq: 5001,
+            ack: 1001,
             flags: TCP_ACK | TCP_PSH,
             window: 65535,
             header_len: 20,
-            payload, options: &[],
+            payload,
+            options: &[],
         };
         let out = dispatch(&mut c, &seg);
         assert_eq!(out.tx, TxAction::Ack);
@@ -855,10 +917,15 @@ mod tests {
     fn established_ooo_segment_queues_into_reassembly() {
         let mut c = est_conn(1000, 5000, 1024);
         let seg = ParsedSegment {
-            src_port: 5000, dst_port: 40000,
-            seq: 5100, ack: 1001,
-            flags: TCP_ACK, window: 65535,
-            header_len: 20, payload: b"xyz", options: &[],
+            src_port: 5000,
+            dst_port: 40000,
+            seq: 5100,
+            ack: 1001,
+            flags: TCP_ACK,
+            window: 65535,
+            header_len: 20,
+            payload: b"xyz",
+            options: &[],
         };
         let out = dispatch(&mut c, &seg);
         assert_eq!(out.tx, TxAction::Ack);
@@ -875,20 +942,30 @@ mod tests {
         let mut c = est_conn(1000, 5000, 1024);
         c.rcv_wnd = 4096;
         let ooo = ParsedSegment {
-            src_port: 5000, dst_port: 40000,
-            seq: 5010, ack: 1001,
-            flags: TCP_ACK, window: 65535,
-            header_len: 20, payload: b"world", options: &[],
+            src_port: 5000,
+            dst_port: 40000,
+            seq: 5010,
+            ack: 1001,
+            flags: TCP_ACK,
+            window: 65535,
+            header_len: 20,
+            payload: b"world",
+            options: &[],
         };
         let out_ooo = dispatch(&mut c, &ooo);
         assert_eq!(out_ooo.reassembly_queued_bytes, 5);
         assert_eq!(c.rcv_nxt, 5001);
 
         let inorder = ParsedSegment {
-            src_port: 5000, dst_port: 40000,
-            seq: 5001, ack: 1001,
-            flags: TCP_ACK | TCP_PSH, window: 65535,
-            header_len: 20, payload: b"ninebytes", options: &[],
+            src_port: 5000,
+            dst_port: 40000,
+            seq: 5001,
+            ack: 1001,
+            flags: TCP_ACK | TCP_PSH,
+            window: 65535,
+            header_len: 20,
+            payload: b"ninebytes",
+            options: &[],
         };
         let out_in = dispatch(&mut c, &inorder);
         assert_eq!(out_in.delivered, 9 + 5);
@@ -903,12 +980,15 @@ mod tests {
     fn established_inorder_payload_does_not_flag_ooo() {
         let mut c = est_conn(1000, 5000, 1024);
         let seg = ParsedSegment {
-            src_port: 5000, dst_port: 40000,
-            seq: 5001, ack: 1001,
+            src_port: 5000,
+            dst_port: 40000,
+            seq: 5001,
+            ack: 1001,
             flags: TCP_ACK | TCP_PSH,
             window: 65535,
             header_len: 20,
-            payload: b"abc", options: &[],
+            payload: b"abc",
+            options: &[],
         };
         let out = dispatch(&mut c, &seg);
         assert_eq!(out.delivered, 3);
@@ -925,12 +1005,15 @@ mod tests {
         c.rcv_wnd = 4096;
         let payload = vec![0u8; 2000];
         let seg = ParsedSegment {
-            src_port: 5000, dst_port: 40000,
-            seq: 5001, ack: 1001,
+            src_port: 5000,
+            dst_port: 40000,
+            seq: 5001,
+            ack: 1001,
             flags: TCP_ACK | TCP_PSH,
             window: 65535,
             header_len: 20,
-            payload: &payload, options: &[],
+            payload: &payload,
+            options: &[],
         };
         let out = dispatch(&mut c, &seg);
         // 1024 accepted, 976 dropped — overflow is `buf_full_drop`, not OOO.
@@ -946,12 +1029,15 @@ mod tests {
         c.snd.push(b"hello");
         c.snd_nxt = c.snd_una.wrapping_add(5);
         let seg = ParsedSegment {
-            src_port: 5000, dst_port: 40000,
-            seq: 5001, ack: 1006, // acks 5 bytes
+            src_port: 5000,
+            dst_port: 40000,
+            seq: 5001,
+            ack: 1006, // acks 5 bytes
             flags: TCP_ACK,
             window: 32000,
             header_len: 20,
-            payload: &[], options: &[],
+            payload: &[],
+            options: &[],
         };
         let _ = dispatch(&mut c, &seg);
         assert_eq!(c.snd_una, 1006);
@@ -963,12 +1049,15 @@ mod tests {
     fn established_fin_transitions_to_close_wait() {
         let mut c = est_conn(1000, 5000, 1024);
         let seg = ParsedSegment {
-            src_port: 5000, dst_port: 40000,
-            seq: 5001, ack: 1001,
+            src_port: 5000,
+            dst_port: 40000,
+            seq: 5001,
+            ack: 1001,
             flags: TCP_ACK | TCP_FIN,
             window: 65535,
             header_len: 20,
-            payload: &[], options: &[],
+            payload: &[],
+            options: &[],
         };
         let out = dispatch(&mut c, &seg);
         assert_eq!(out.new_state, Some(TcpState::CloseWait));
@@ -980,12 +1069,15 @@ mod tests {
     fn established_rst_closes_immediately() {
         let mut c = est_conn(1000, 5000, 1024);
         let seg = ParsedSegment {
-            src_port: 5000, dst_port: 40000,
-            seq: 5001, ack: 1001,
+            src_port: 5000,
+            dst_port: 40000,
+            seq: 5001,
+            ack: 1001,
             flags: TCP_RST | TCP_ACK,
             window: 0,
             header_len: 20,
-            payload: &[], options: &[],
+            payload: &[],
+            options: &[],
         };
         let out = dispatch(&mut c, &seg);
         assert_eq!(out.new_state, Some(TcpState::Closed));
@@ -996,12 +1088,15 @@ mod tests {
     fn established_rst_outcome_carries_rst_cause() {
         let mut c = est_conn(1000, 5000, 1024);
         let seg = ParsedSegment {
-            src_port: 5000, dst_port: 40000,
-            seq: 5001, ack: 1001,
+            src_port: 5000,
+            dst_port: 40000,
+            seq: 5001,
+            ack: 1001,
             flags: TCP_RST | TCP_ACK,
             window: 0,
             header_len: 20,
-            payload: &[], options: &[],
+            payload: &[],
+            options: &[],
         };
         let out = dispatch(&mut c, &seg);
         assert_eq!(out.new_state, Some(TcpState::Closed));
@@ -1016,8 +1111,12 @@ mod tests {
     fn fin_wait1_ack_of_our_fin_transitions_to_fin_wait2() {
         use crate::flow_table::FourTuple;
         use crate::tcp_conn::TcpConn;
-        let t = FourTuple { local_ip: 0x0a_00_00_02, local_port: 40000,
-                            peer_ip: 0x0a_00_00_01, peer_port: 5000 };
+        let t = FourTuple {
+            local_ip: 0x0a_00_00_02,
+            local_port: 40000,
+            peer_ip: 0x0a_00_00_01,
+            peer_port: 5000,
+        };
         let mut c = TcpConn::new_client(t, 1000, 1460, 1024, 2048);
         c.state = TcpState::FinWait1;
         c.snd_una = 1001;
@@ -1028,12 +1127,15 @@ mod tests {
         c.rcv_wnd = 1024;
         c.snd_wnd = 1024;
         let seg = ParsedSegment {
-            src_port: 5000, dst_port: 40000,
-            seq: 5001, ack: 1002, // acks our FIN
+            src_port: 5000,
+            dst_port: 40000,
+            seq: 5001,
+            ack: 1002, // acks our FIN
             flags: TCP_ACK,
             window: 65535,
             header_len: 20,
-            payload: &[], options: &[],
+            payload: &[],
+            options: &[],
         };
         let out = dispatch(&mut c, &seg);
         assert_eq!(out.new_state, Some(TcpState::FinWait2));
@@ -1043,8 +1145,12 @@ mod tests {
     fn fin_wait2_peer_fin_transitions_to_time_wait() {
         use crate::flow_table::FourTuple;
         use crate::tcp_conn::TcpConn;
-        let t = FourTuple { local_ip: 0x0a_00_00_02, local_port: 40000,
-                            peer_ip: 0x0a_00_00_01, peer_port: 5000 };
+        let t = FourTuple {
+            local_ip: 0x0a_00_00_02,
+            local_port: 40000,
+            peer_ip: 0x0a_00_00_01,
+            peer_port: 5000,
+        };
         let mut c = TcpConn::new_client(t, 1000, 1460, 1024, 2048);
         c.state = TcpState::FinWait2;
         c.snd_una = 1002;
@@ -1055,12 +1161,15 @@ mod tests {
         c.rcv_wnd = 1024;
         c.snd_wnd = 1024;
         let seg = ParsedSegment {
-            src_port: 5000, dst_port: 40000,
-            seq: 5001, ack: 1002,
+            src_port: 5000,
+            dst_port: 40000,
+            seq: 5001,
+            ack: 1002,
             flags: TCP_ACK | TCP_FIN,
             window: 65535,
             header_len: 20,
-            payload: &[], options: &[],
+            payload: &[],
+            options: &[],
         };
         let out = dispatch(&mut c, &seg);
         assert_eq!(out.new_state, Some(TcpState::TimeWait));
@@ -1072,8 +1181,12 @@ mod tests {
     fn fin_wait1_peer_fin_without_ack_of_our_fin_transitions_to_closing() {
         use crate::flow_table::FourTuple;
         use crate::tcp_conn::TcpConn;
-        let t = FourTuple { local_ip: 0x0a_00_00_02, local_port: 40000,
-                            peer_ip: 0x0a_00_00_01, peer_port: 5000 };
+        let t = FourTuple {
+            local_ip: 0x0a_00_00_02,
+            local_port: 40000,
+            peer_ip: 0x0a_00_00_01,
+            peer_port: 5000,
+        };
         let mut c = TcpConn::new_client(t, 1000, 1460, 1024, 2048);
         c.state = TcpState::FinWait1;
         c.snd_una = 1001;
@@ -1084,12 +1197,15 @@ mod tests {
         c.rcv_wnd = 1024;
         c.snd_wnd = 1024;
         let seg = ParsedSegment {
-            src_port: 5000, dst_port: 40000,
-            seq: 5001, ack: 1001, // does NOT ack our FIN
+            src_port: 5000,
+            dst_port: 40000,
+            seq: 5001,
+            ack: 1001, // does NOT ack our FIN
             flags: TCP_ACK | TCP_FIN,
             window: 65535,
             header_len: 20,
-            payload: &[], options: &[],
+            payload: &[],
+            options: &[],
         };
         let out = dispatch(&mut c, &seg);
         assert_eq!(out.new_state, Some(TcpState::Closing));
@@ -1099,8 +1215,12 @@ mod tests {
     fn closing_ack_of_our_fin_transitions_to_time_wait() {
         use crate::flow_table::FourTuple;
         use crate::tcp_conn::TcpConn;
-        let t = FourTuple { local_ip: 0x0a_00_00_02, local_port: 40000,
-                            peer_ip: 0x0a_00_00_01, peer_port: 5000 };
+        let t = FourTuple {
+            local_ip: 0x0a_00_00_02,
+            local_port: 40000,
+            peer_ip: 0x0a_00_00_01,
+            peer_port: 5000,
+        };
         let mut c = TcpConn::new_client(t, 1000, 1460, 1024, 2048);
         c.state = TcpState::Closing;
         c.snd_una = 1001;
@@ -1111,12 +1231,15 @@ mod tests {
         c.rcv_wnd = 1024;
         c.snd_wnd = 1024;
         let seg = ParsedSegment {
-            src_port: 5000, dst_port: 40000,
-            seq: 5002, ack: 1002,
+            src_port: 5000,
+            dst_port: 40000,
+            seq: 5002,
+            ack: 1002,
             flags: TCP_ACK,
             window: 0,
             header_len: 20,
-            payload: &[], options: &[],
+            payload: &[],
+            options: &[],
         };
         let out = dispatch(&mut c, &seg);
         assert_eq!(out.new_state, Some(TcpState::TimeWait));
@@ -1126,8 +1249,12 @@ mod tests {
     fn last_ack_ack_of_our_fin_closes_connection() {
         use crate::flow_table::FourTuple;
         use crate::tcp_conn::TcpConn;
-        let t = FourTuple { local_ip: 0x0a_00_00_02, local_port: 40000,
-                            peer_ip: 0x0a_00_00_01, peer_port: 5000 };
+        let t = FourTuple {
+            local_ip: 0x0a_00_00_02,
+            local_port: 40000,
+            peer_ip: 0x0a_00_00_01,
+            peer_port: 5000,
+        };
         let mut c = TcpConn::new_client(t, 1000, 1460, 1024, 2048);
         c.state = TcpState::LastAck;
         c.snd_una = 1001;
@@ -1138,12 +1265,15 @@ mod tests {
         c.rcv_wnd = 1024;
         c.snd_wnd = 1024;
         let seg = ParsedSegment {
-            src_port: 5000, dst_port: 40000,
-            seq: 5002, ack: 1002,
+            src_port: 5000,
+            dst_port: 40000,
+            seq: 5002,
+            ack: 1002,
             flags: TCP_ACK,
             window: 0,
             header_len: 20,
-            payload: &[], options: &[],
+            payload: &[],
+            options: &[],
         };
         let out = dispatch(&mut c, &seg);
         assert_eq!(out.new_state, Some(TcpState::Closed));
@@ -1166,10 +1296,14 @@ mod tests {
         let mut buf = [0u8; 40];
         let n = peer_opts.encode(&mut buf).unwrap();
         let seg = ParsedSegment {
-            src_port: 5000, dst_port: 40000,
-            seq: 5001, ack: 1001,
-            flags: TCP_ACK, window: 65535,
-            header_len: 20 + n, payload: b"xxx",
+            src_port: 5000,
+            dst_port: 40000,
+            seq: 5001,
+            ack: 1001,
+            flags: TCP_ACK,
+            window: 65535,
+            header_len: 20 + n,
+            payload: b"xxx",
             options: &buf[..n],
         };
         let out = dispatch(&mut c, &seg);
@@ -1188,10 +1322,14 @@ mod tests {
         let mut buf = [0u8; 40];
         let n = peer_opts.encode(&mut buf).unwrap();
         let seg = ParsedSegment {
-            src_port: 5000, dst_port: 40000,
-            seq: 5001, ack: 1001,
-            flags: TCP_ACK | TCP_PSH, window: 65535,
-            header_len: 20 + n, payload: b"hello",
+            src_port: 5000,
+            dst_port: 40000,
+            seq: 5001,
+            ack: 1001,
+            flags: TCP_ACK | TCP_PSH,
+            window: 65535,
+            header_len: 20 + n,
+            payload: b"hello",
             options: &buf[..n],
         };
         let out = dispatch(&mut c, &seg);
@@ -1204,10 +1342,14 @@ mod tests {
     fn missing_ts_on_ts_enabled_conn_bumps_bad_option_and_drops() {
         let mut c = est_conn_ts(1000, 5000, 1024, 200);
         let seg = ParsedSegment {
-            src_port: 5000, dst_port: 40000,
-            seq: 5001, ack: 1001,
-            flags: TCP_ACK | TCP_PSH, window: 65535,
-            header_len: 20, payload: b"x",
+            src_port: 5000,
+            dst_port: 40000,
+            seq: 5001,
+            ack: 1001,
+            flags: TCP_ACK | TCP_PSH,
+            window: 65535,
+            header_len: 20,
+            payload: b"x",
             options: &[],
         };
         let out = dispatch(&mut c, &seg);
@@ -1224,16 +1366,26 @@ mod tests {
         c.snd_nxt = c.snd_una.wrapping_add(20);
 
         let mut peer_opts = TcpOpts::default();
-        peer_opts.push_sack_block(SackBlock { left: 1005, right: 1010 });
-        peer_opts.push_sack_block(SackBlock { left: 1015, right: 1020 });
+        peer_opts.push_sack_block(SackBlock {
+            left: 1005,
+            right: 1010,
+        });
+        peer_opts.push_sack_block(SackBlock {
+            left: 1015,
+            right: 1020,
+        });
         let mut buf = [0u8; 40];
         let n = peer_opts.encode(&mut buf).unwrap();
 
         let seg = ParsedSegment {
-            src_port: 5000, dst_port: 40000,
-            seq: 5001, ack: 1003,
-            flags: TCP_ACK, window: 65535,
-            header_len: 20 + n, payload: &[],
+            src_port: 5000,
+            dst_port: 40000,
+            seq: 5001,
+            ack: 1003,
+            flags: TCP_ACK,
+            window: 65535,
+            header_len: 20 + n,
+            payload: &[],
             options: &buf[..n],
         };
         let out = dispatch(&mut c, &seg);
@@ -1248,8 +1400,14 @@ mod tests {
         use crate::tcp_options::{SackBlock, TcpOpts};
         let mut c = est_conn(1000, 5000, 1024);
         c.sack_enabled = true;
-        c.sack_scoreboard.insert(SackBlock { left: 1005, right: 1010 });
-        c.sack_scoreboard.insert(SackBlock { left: 1020, right: 1030 });
+        c.sack_scoreboard.insert(SackBlock {
+            left: 1005,
+            right: 1010,
+        });
+        c.sack_scoreboard.insert(SackBlock {
+            left: 1020,
+            right: 1030,
+        });
         c.snd.push(&[0u8; 30]);
         c.snd_nxt = c.snd_una.wrapping_add(30);
 
@@ -1258,10 +1416,14 @@ mod tests {
         let n = peer_opts.encode(&mut buf).unwrap();
 
         let seg = ParsedSegment {
-            src_port: 5000, dst_port: 40000,
-            seq: 5001, ack: 1015,
-            flags: TCP_ACK, window: 65535,
-            header_len: 20 + n, payload: &[],
+            src_port: 5000,
+            dst_port: 40000,
+            seq: 5001,
+            ack: 1015,
+            flags: TCP_ACK,
+            window: 65535,
+            header_len: 20 + n,
+            payload: &[],
             options: &buf[..n],
         };
         let _ = dispatch(&mut c, &seg);
@@ -1274,20 +1436,27 @@ mod tests {
     fn time_wait_replays_ack_on_any_segment() {
         use crate::flow_table::FourTuple;
         use crate::tcp_conn::TcpConn;
-        let t = FourTuple { local_ip: 0x0a_00_00_02, local_port: 40000,
-                            peer_ip: 0x0a_00_00_01, peer_port: 5000 };
+        let t = FourTuple {
+            local_ip: 0x0a_00_00_02,
+            local_port: 40000,
+            peer_ip: 0x0a_00_00_01,
+            peer_port: 5000,
+        };
         let mut c = TcpConn::new_client(t, 1000, 1460, 1024, 2048);
         c.state = TcpState::TimeWait;
         c.our_fin_seq = Some(1001);
         c.rcv_nxt = 5002;
         c.rcv_wnd = 1024;
         let seg = ParsedSegment {
-            src_port: 5000, dst_port: 40000,
-            seq: 5001, ack: 1002,
+            src_port: 5000,
+            dst_port: 40000,
+            seq: 5001,
+            ack: 1002,
             flags: TCP_ACK | TCP_FIN,
             window: 0,
             header_len: 20,
-            payload: &[], options: &[],
+            payload: &[],
+            options: &[],
         };
         let out = dispatch(&mut c, &seg);
         assert_eq!(out.tx, TxAction::Ack);
@@ -1301,10 +1470,15 @@ mod tests {
         use crate::tcp_output::TCP_URG;
         let mut c = est_conn(1000, 5000, 1024);
         let seg = ParsedSegment {
-            src_port: 5000, dst_port: 40000,
-            seq: 5001, ack: 1001,
-            flags: TCP_ACK | TCP_URG, window: 65535,
-            header_len: 20, payload: b"x", options: &[],
+            src_port: 5000,
+            dst_port: 40000,
+            seq: 5001,
+            ack: 1001,
+            flags: TCP_ACK | TCP_URG,
+            window: 65535,
+            header_len: 20,
+            payload: b"x",
+            options: &[],
         };
         let out = dispatch(&mut c, &seg);
         assert!(out.urgent_dropped);
@@ -1319,10 +1493,15 @@ mod tests {
         let mut c = est_conn(1000, 5000, 1024);
         // rcv_nxt=5001, rcv_wnd=1024. seq way past window.
         let seg = ParsedSegment {
-            src_port: 5000, dst_port: 40000,
-            seq: 9999, ack: 1001,
-            flags: TCP_ACK, window: 65535,
-            header_len: 20, payload: b"xxx", options: &[],
+            src_port: 5000,
+            dst_port: 40000,
+            seq: 9999,
+            ack: 1001,
+            flags: TCP_ACK,
+            window: 65535,
+            header_len: 20,
+            payload: b"xxx",
+            options: &[],
         };
         let out = dispatch(&mut c, &seg);
         assert!(out.bad_seq);
@@ -1335,10 +1514,15 @@ mod tests {
         let mut c = est_conn(1000, 5000, 1024);
         // snd_nxt=1001 (1000+1 for SYN). Ack a future byte.
         let seg = ParsedSegment {
-            src_port: 5000, dst_port: 40000,
-            seq: 5001, ack: 9999,
-            flags: TCP_ACK, window: 65535,
-            header_len: 20, payload: &[], options: &[],
+            src_port: 5000,
+            dst_port: 40000,
+            seq: 5001,
+            ack: 9999,
+            flags: TCP_ACK,
+            window: 65535,
+            header_len: 20,
+            payload: &[],
+            options: &[],
         };
         let out = dispatch(&mut c, &seg);
         assert!(out.bad_ack);
@@ -1350,10 +1534,15 @@ mod tests {
         let mut c = est_conn(1000, 5000, 1024);
         // ack == snd_una == 1001 ⇒ duplicate ACK.
         let seg = ParsedSegment {
-            src_port: 5000, dst_port: 40000,
-            seq: 5001, ack: 1001,
-            flags: TCP_ACK, window: 65535,
-            header_len: 20, payload: &[], options: &[],
+            src_port: 5000,
+            dst_port: 40000,
+            seq: 5001,
+            ack: 1001,
+            flags: TCP_ACK,
+            window: 65535,
+            header_len: 20,
+            payload: &[],
+            options: &[],
         };
         let out = dispatch(&mut c, &seg);
         assert!(out.dup_ack);
@@ -1363,10 +1552,15 @@ mod tests {
     fn established_zero_window_segment_sets_rx_zero_window() {
         let mut c = est_conn(1000, 5000, 1024);
         let seg = ParsedSegment {
-            src_port: 5000, dst_port: 40000,
-            seq: 5001, ack: 1001,
-            flags: TCP_ACK, window: 0,
-            header_len: 20, payload: &[], options: &[],
+            src_port: 5000,
+            dst_port: 40000,
+            seq: 5001,
+            ack: 1001,
+            flags: TCP_ACK,
+            window: 0,
+            header_len: 20,
+            payload: &[],
+            options: &[],
         };
         let out = dispatch(&mut c, &seg);
         assert!(out.rx_zero_window);
@@ -1376,10 +1570,15 @@ mod tests {
     fn established_nonzero_window_does_not_set_rx_zero_window() {
         let mut c = est_conn(1000, 5000, 1024);
         let seg = ParsedSegment {
-            src_port: 5000, dst_port: 40000,
-            seq: 5001, ack: 1001,
-            flags: TCP_ACK, window: 1,
-            header_len: 20, payload: &[], options: &[],
+            src_port: 5000,
+            dst_port: 40000,
+            seq: 5001,
+            ack: 1001,
+            flags: TCP_ACK,
+            window: 1,
+            header_len: 20,
+            payload: &[],
+            options: &[],
         };
         let out = dispatch(&mut c, &seg);
         assert!(!out.rx_zero_window);
@@ -1389,8 +1588,12 @@ mod tests {
     fn close_path_out_of_window_sets_bad_seq() {
         use crate::flow_table::FourTuple;
         use crate::tcp_conn::TcpConn;
-        let t = FourTuple { local_ip: 0x0a_00_00_02, local_port: 40000,
-                            peer_ip: 0x0a_00_00_01, peer_port: 5000 };
+        let t = FourTuple {
+            local_ip: 0x0a_00_00_02,
+            local_port: 40000,
+            peer_ip: 0x0a_00_00_01,
+            peer_port: 5000,
+        };
         let mut c = TcpConn::new_client(t, 1000, 1460, 1024, 2048);
         c.state = TcpState::FinWait2;
         c.snd_una = 1001;
@@ -1402,10 +1605,15 @@ mod tests {
         c.snd_wnd = 1024;
         // seq well outside window.
         let seg = ParsedSegment {
-            src_port: 5000, dst_port: 40000,
-            seq: 99999, ack: 1002,
-            flags: TCP_ACK, window: 65535,
-            header_len: 20, payload: b"x", options: &[],
+            src_port: 5000,
+            dst_port: 40000,
+            seq: 99999,
+            ack: 1002,
+            flags: TCP_ACK,
+            window: 65535,
+            header_len: 20,
+            payload: b"x",
+            options: &[],
         };
         let out = dispatch(&mut c, &seg);
         assert!(out.bad_seq);

@@ -45,20 +45,35 @@ pub struct ReorderQueue {
 
 impl ReorderQueue {
     pub fn new(cap: u32) -> Self {
-        Self { segments: Vec::new(), cap, total_bytes: 0 }
+        Self {
+            segments: Vec::new(),
+            cap,
+            total_bytes: 0,
+        }
     }
 
-    pub fn is_empty(&self) -> bool { self.segments.is_empty() }
-    pub fn len(&self) -> usize { self.segments.len() }
-    pub fn total_bytes(&self) -> u32 { self.total_bytes }
-    pub fn segments(&self) -> &[OooSegment] { &self.segments }
+    pub fn is_empty(&self) -> bool {
+        self.segments.is_empty()
+    }
+    pub fn len(&self) -> usize {
+        self.segments.len()
+    }
+    pub fn total_bytes(&self) -> u32 {
+        self.total_bytes
+    }
+    pub fn segments(&self) -> &[OooSegment] {
+        &self.segments
+    }
 
     /// Insert a new OOO segment. Merges with neighbours where ranges
     /// overlap or touch; drops payload past `cap`. Returns an outcome
     /// summary that the caller feeds into counters.
     pub fn insert(&mut self, seq: u32, payload: &[u8]) -> InsertOutcome {
         if payload.is_empty() {
-            return InsertOutcome { newly_buffered: 0, cap_dropped: 0 };
+            return InsertOutcome {
+                newly_buffered: 0,
+                cap_dropped: 0,
+            };
         }
         let incoming_end = seq.wrapping_add(payload.len() as u32);
 
@@ -71,8 +86,12 @@ impl ReorderQueue {
         let mut to_insert: Vec<(u32, Vec<u8>)> = Vec::new();
 
         for existing in &self.segments {
-            if seq_le(incoming_end, existing.seq) { break; }
-            if seq_le(existing.end_seq(), cursor) { continue; }
+            if seq_le(incoming_end, existing.seq) {
+                break;
+            }
+            if seq_le(existing.end_seq(), cursor) {
+                continue;
+            }
             if seq_lt(cursor, existing.seq) {
                 let gap_len = existing.seq.wrapping_sub(cursor) as usize;
                 let off = cursor.wrapping_sub(seq) as usize;
@@ -80,7 +99,7 @@ impl ReorderQueue {
                 let remaining_cap = self.cap.saturating_sub(self.total_bytes + newly_buffered);
                 let take = (take_end - off).min(remaining_cap as usize);
                 if take > 0 {
-                    to_insert.push((cursor, payload[off..off+take].to_vec()));
+                    to_insert.push((cursor, payload[off..off + take].to_vec()));
                     newly_buffered += take as u32;
                 }
                 if take < take_end - off {
@@ -99,7 +118,7 @@ impl ReorderQueue {
             let remaining_cap = self.cap.saturating_sub(self.total_bytes + newly_buffered);
             let take = tail_len.min(remaining_cap as usize);
             if take > 0 {
-                to_insert.push((cursor, payload[off..off+take].to_vec()));
+                to_insert.push((cursor, payload[off..off + take].to_vec()));
                 newly_buffered += take as u32;
             }
             if take < tail_len {
@@ -112,7 +131,10 @@ impl ReorderQueue {
         }
 
         self.total_bytes += newly_buffered;
-        InsertOutcome { newly_buffered, cap_dropped }
+        InsertOutcome {
+            newly_buffered,
+            cap_dropped,
+        }
     }
 
     /// Insert `(seq, payload)` which is guaranteed not to overlap any
@@ -122,7 +144,10 @@ impl ReorderQueue {
 
         let mut idx = self.segments.len();
         for (i, s) in self.segments.iter().enumerate() {
-            if seq_lt(seq, s.seq) { idx = i; break; }
+            if seq_lt(seq, s.seq) {
+                idx = i;
+                break;
+            }
         }
 
         let mut merged_left = false;
@@ -134,7 +159,9 @@ impl ReorderQueue {
         if idx < self.segments.len() && self.segments[idx].seq == end {
             if merged_left {
                 let right = self.segments.remove(idx);
-                self.segments[idx - 1].payload.extend_from_slice(&right.payload);
+                self.segments[idx - 1]
+                    .payload
+                    .extend_from_slice(&right.payload);
             } else {
                 let mut new_payload = payload;
                 new_payload.extend_from_slice(&self.segments[idx].payload);
@@ -156,7 +183,9 @@ impl ReorderQueue {
 
         while !self.segments.is_empty() {
             let seg = &self.segments[0];
-            if seq_lt(rcv_nxt, seg.seq) { break; }
+            if seq_lt(rcv_nxt, seg.seq) {
+                break;
+            }
             let seg_end = seg.end_seq();
             if seq_le(seg_end, rcv_nxt) {
                 // Entire segment behind rcv_nxt — drop.

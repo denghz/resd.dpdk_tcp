@@ -62,14 +62,26 @@ pub fn arp_decode(eth_payload: &[u8]) -> Result<ArpPacket, ArpDrop> {
     let mut sender_mac = [0u8; 6];
     sender_mac.copy_from_slice(&eth_payload[8..14]);
     let sender_ip = u32::from_be_bytes([
-        eth_payload[14], eth_payload[15], eth_payload[16], eth_payload[17],
+        eth_payload[14],
+        eth_payload[15],
+        eth_payload[16],
+        eth_payload[17],
     ]);
     let mut target_mac = [0u8; 6];
     target_mac.copy_from_slice(&eth_payload[18..24]);
     let target_ip = u32::from_be_bytes([
-        eth_payload[24], eth_payload[25], eth_payload[26], eth_payload[27],
+        eth_payload[24],
+        eth_payload[25],
+        eth_payload[26],
+        eth_payload[27],
     ]);
-    Ok(ArpPacket { op, sender_mac, sender_ip, target_mac, target_ip })
+    Ok(ArpPacket {
+        op,
+        sender_mac,
+        sender_ip,
+        target_mac,
+        target_ip,
+    })
 }
 
 /// Build a complete Eth+ARP reply frame answering `request`.
@@ -116,8 +128,8 @@ pub fn build_gratuitous_arp(our_mac: [u8; 6], our_ip: u32, out: &mut [u8]) -> Op
         ARP_OP_REQUEST,
         our_mac,
         our_ip,
-        [0u8; 6],   // target MAC unknown in gratuitous
-        our_ip,     // target IP is us (that's what "gratuitous" means)
+        [0u8; 6], // target MAC unknown in gratuitous
+        our_ip,   // target IP is us (that's what "gratuitous" means)
     );
     // Pad to Ethernet minimum to avoid runt-frame drops at the receiver.
     out[14 + ARP_HDR_LEN..ARP_FRAME_LEN].fill(0);
@@ -248,7 +260,10 @@ mod tests {
         let req = sample_request();
         let mut buf = [0u8; ARP_FRAME_LEN];
         let n = build_arp_reply([1, 2, 3, 4, 5, 6], 0x0a_00_00_02, &req, &mut buf).unwrap();
-        assert_eq!(n, 60, "ARP reply must be Ethernet-min (60 bytes) to avoid runts");
+        assert_eq!(
+            n, 60,
+            "ARP reply must be Ethernet-min (60 bytes) to avoid runts"
+        );
         assert_eq!(ARP_FRAME_LEN, 60);
         // Pad bytes (42..60) must be zero.
         for (i, &b) in buf[42..].iter().enumerate() {

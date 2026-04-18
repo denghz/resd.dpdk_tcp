@@ -49,7 +49,9 @@ pub struct EventQueue {
 
 impl EventQueue {
     pub fn new() -> Self {
-        Self { q: VecDeque::with_capacity(64) }
+        Self {
+            q: VecDeque::with_capacity(64),
+        }
     }
 
     pub fn push(&mut self, ev: InternalEvent) {
@@ -70,7 +72,9 @@ impl EventQueue {
 }
 
 impl Default for EventQueue {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]
@@ -80,7 +84,10 @@ mod tests {
     #[test]
     fn fifo_ordering() {
         let mut q = EventQueue::new();
-        q.push(InternalEvent::Connected { conn: 1, rx_hw_ts_ns: 0 });
+        q.push(InternalEvent::Connected {
+            conn: 1,
+            rx_hw_ts_ns: 0,
+        });
         q.push(InternalEvent::Closed { conn: 1, err: 0 });
         match q.pop() {
             Some(InternalEvent::Connected { conn, .. }) => assert_eq!(conn, 1),

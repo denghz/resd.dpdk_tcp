@@ -37,8 +37,7 @@ fn skip_if_not_tap() -> bool {
 
 fn read_kernel_tap_mac(iface: &str) -> [u8; 6] {
     let path = format!("/sys/class/net/{iface}/address");
-    let s = std::fs::read_to_string(&path)
-        .unwrap_or_else(|_| panic!("read {path}"));
+    let s = std::fs::read_to_string(&path).unwrap_or_else(|_| panic!("read {path}"));
     let mut out = [0u8; 6];
     for (i, part) in s.trim().split(':').enumerate() {
         out[i] = u8::from_str_radix(part, 16).expect("hex mac");
@@ -47,31 +46,50 @@ fn read_kernel_tap_mac(iface: &str) -> [u8; 6] {
 }
 
 fn bring_up_tap(iface: &str) {
-    let _ = Command::new("ip").args(["link", "set", iface, "up"]).status();
-    let _ = Command::new("ip").args(["addr", "add", "10.99.2.1/24", "dev", iface]).status();
+    let _ = Command::new("ip")
+        .args(["link", "set", iface, "up"])
+        .status();
+    let _ = Command::new("ip")
+        .args(["addr", "add", "10.99.2.1/24", "dev", iface])
+        .status();
 }
 
 fn pin_arp(iface: &str, ip: &str, mac: &str) {
     let _ = Command::new("ip")
-        .args(["neigh", "replace", ip, "lladdr", mac, "dev", iface, "nud", "permanent"])
+        .args([
+            "neigh",
+            "replace",
+            ip,
+            "lladdr",
+            mac,
+            "dev",
+            iface,
+            "nud",
+            "permanent",
+        ])
         .status();
 }
 
 fn mac_hex(mac: [u8; 6]) -> String {
-    format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5])
+    format!(
+        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+    )
 }
 
 #[test]
 fn handshake_echo_close_over_tap() {
-    if skip_if_not_tap() { return; }
+    if skip_if_not_tap() {
+        return;
+    }
 
     let args = [
         "resd-net-a3-test",
         "--in-memory",
         "--no-pci",
         "--vdev=net_tap0,iface=resdtap2",
-        "-l", "0-1",
+        "-l",
+        "0-1",
         "--log-level=3",
     ];
     eal_init(&args).expect("EAL init");
@@ -106,7 +124,9 @@ fn handshake_echo_close_over_tap() {
             let mut buf = [0u8; 64];
             loop {
                 let n = s.read(&mut buf).unwrap_or(0);
-                if n == 0 { break; }
+                if n == 0 {
+                    break;
+                }
                 s.write_all(&buf[..n]).unwrap();
             }
             let _ = done_tx.send(());
@@ -141,7 +161,13 @@ fn handshake_echo_close_over_tap() {
         let mut evs = Vec::new();
         engine.drain_events(16, |ev, _| evs.push(ev.clone()));
         for ev in &evs {
-            if let InternalEvent::Readable { conn, byte_offset, byte_len, .. } = ev {
+            if let InternalEvent::Readable {
+                conn,
+                byte_offset,
+                byte_len,
+                ..
+            } = ev
+            {
                 if *conn == handle {
                     let ft = engine.flow_table();
                     if let Some(c) = ft.get(handle) {
@@ -203,7 +229,8 @@ fn handshake_echo_close_over_tap() {
     assert!(
         delivered >= msg.len() as u64,
         "tcp.recv_buf_delivered = {}, want >= {}",
-        delivered, msg.len()
+        delivered,
+        msg.len()
     );
     // --- Clean-path correctness invariants ---
     // 24-byte echo against a 256KB recv buffer → no overflow.
@@ -251,7 +278,9 @@ fn handshake_echo_close_over_tap() {
     assert!(
         fw1_to_fw2 + fw1_to_closing + fw1_to_tw >= 1,
         "state_trans[FinWait1][FinWait2|Closing|TimeWait] = {}+{}+{}, want sum >= 1",
-        fw1_to_fw2, fw1_to_closing, fw1_to_tw
+        fw1_to_fw2,
+        fw1_to_closing,
+        fw1_to_tw
     );
     // TIME_WAIT reaper ran within the test's deadline (MSL=100ms).
     assert!(

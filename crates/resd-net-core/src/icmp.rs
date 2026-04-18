@@ -20,9 +20,13 @@ pub struct PmtuTable {
 }
 
 impl PmtuTable {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
-    pub fn get(&self, ip: u32) -> Option<u16> { self.entries.get(&ip).copied() }
+    pub fn get(&self, ip: u32) -> Option<u16> {
+        self.entries.get(&ip).copied()
+    }
 
     /// Update the PMTU for `ip`. Returns `true` if this updated or
     /// inserted an entry (caller bumps pmtud_updates counter).
@@ -42,10 +46,10 @@ impl PmtuTable {
 /// Result classification for the caller's counter path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IcmpResult {
-    FragNeededPmtuUpdated,   // found, stored; caller bumps ip.rx_icmp_frag_needed + ip.pmtud_updates
-    FragNeededNoShrink,      // found, but no-op (MTU not smaller than existing); caller bumps ip.rx_icmp_frag_needed only
-    OtherDropped,            // not dest-unreach-frag-needed, silently dropped
-    Malformed,               // too short / inner header not recognizable
+    FragNeededPmtuUpdated, // found, stored; caller bumps ip.rx_icmp_frag_needed + ip.pmtud_updates
+    FragNeededNoShrink, // found, but no-op (MTU not smaller than existing); caller bumps ip.rx_icmp_frag_needed only
+    OtherDropped,       // not dest-unreach-frag-needed, silently dropped
+    Malformed,          // too short / inner header not recognizable
 }
 
 /// Parse ICMP starting at the IPv4 payload. `ip_payload` is the slice
@@ -94,12 +98,10 @@ mod tests {
 
     fn build_inner_ip(dst: u32) -> Vec<u8> {
         let mut v = vec![
-            0x45, 0x00,
-            0x00, 0x14, // total_length = 20
-            0, 0,
-            0x40, 0x00, // DF
-            0x40, 6,    // TTL 64, proto TCP
-            0, 0,       // csum
+            0x45, 0x00, 0x00, 0x14, // total_length = 20
+            0, 0, 0x40, 0x00, // DF
+            0x40, 6, // TTL 64, proto TCP
+            0, 0, // csum
             0, 0, 0, 0, // src
             0, 0, 0, 0, // dst
         ];
@@ -111,9 +113,12 @@ mod tests {
         let mut v = vec![
             ICMP_DEST_UNREACH,
             ICMP_CODE_FRAG_NEEDED,
-            0x00, 0x00,      // csum (not verified by icmp_input)
-            0x00, 0x00,      // unused
-            (mtu >> 8) as u8, (mtu & 0xff) as u8,
+            0x00,
+            0x00, // csum (not verified by icmp_input)
+            0x00,
+            0x00, // unused
+            (mtu >> 8) as u8,
+            (mtu & 0xff) as u8,
         ];
         v.extend_from_slice(inner);
         v

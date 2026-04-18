@@ -67,16 +67,26 @@ impl TcpOpts {
     /// next 4-byte word via NOP padding.
     pub fn encoded_len(&self) -> usize {
         let mut n = 0usize;
-        if self.mss.is_some() { n += LEN_MSS as usize; }
-        if self.sack_permitted { n += LEN_SACK_PERMITTED as usize; }
-        if self.timestamps.is_some() { n += LEN_TIMESTAMP as usize; }
-        if self.wscale.is_some() { n += LEN_WSCALE as usize; }
+        if self.mss.is_some() {
+            n += LEN_MSS as usize;
+        }
+        if self.sack_permitted {
+            n += LEN_SACK_PERMITTED as usize;
+        }
+        if self.timestamps.is_some() {
+            n += LEN_TIMESTAMP as usize;
+        }
+        if self.wscale.is_some() {
+            n += LEN_WSCALE as usize;
+        }
         if self.sack_block_count > 0 {
             n += 2 + 8 * (self.sack_block_count as usize);
         }
         // Word-align.
         let rem = n % 4;
-        if rem != 0 { n += 4 - rem; }
+        if rem != 0 {
+            n += 4 - rem;
+        }
         n
     }
 
@@ -86,35 +96,43 @@ impl TcpOpts {
     /// of bytes written, or `None` if `out` is too short.
     pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
         let need = self.encoded_len();
-        if out.len() < need { return None; }
+        if out.len() < need {
+            return None;
+        }
 
         let mut i = 0usize;
         if let Some(mss) = self.mss {
-            out[i] = OPT_MSS; out[i+1] = LEN_MSS;
-            out[i+2..i+4].copy_from_slice(&mss.to_be_bytes());
+            out[i] = OPT_MSS;
+            out[i + 1] = LEN_MSS;
+            out[i + 2..i + 4].copy_from_slice(&mss.to_be_bytes());
             i += LEN_MSS as usize;
         }
         if self.sack_permitted {
-            out[i] = OPT_SACK_PERMITTED; out[i+1] = LEN_SACK_PERMITTED;
+            out[i] = OPT_SACK_PERMITTED;
+            out[i + 1] = LEN_SACK_PERMITTED;
             i += LEN_SACK_PERMITTED as usize;
         }
         if let Some((tsval, tsecr)) = self.timestamps {
-            out[i] = OPT_TIMESTAMP; out[i+1] = LEN_TIMESTAMP;
-            out[i+2..i+6].copy_from_slice(&tsval.to_be_bytes());
-            out[i+6..i+10].copy_from_slice(&tsecr.to_be_bytes());
+            out[i] = OPT_TIMESTAMP;
+            out[i + 1] = LEN_TIMESTAMP;
+            out[i + 2..i + 6].copy_from_slice(&tsval.to_be_bytes());
+            out[i + 6..i + 10].copy_from_slice(&tsecr.to_be_bytes());
             i += LEN_TIMESTAMP as usize;
         }
         if let Some(ws) = self.wscale {
-            out[i] = OPT_WSCALE; out[i+1] = LEN_WSCALE; out[i+2] = ws;
+            out[i] = OPT_WSCALE;
+            out[i + 1] = LEN_WSCALE;
+            out[i + 2] = ws;
             i += LEN_WSCALE as usize;
         }
         if self.sack_block_count > 0 {
             let n = self.sack_block_count as usize;
-            out[i] = OPT_SACK; out[i+1] = (2 + 8 * n) as u8;
+            out[i] = OPT_SACK;
+            out[i + 1] = (2 + 8 * n) as u8;
             i += 2;
             for block in &self.sack_blocks[..n] {
-                out[i..i+4].copy_from_slice(&block.left.to_be_bytes());
-                out[i+4..i+8].copy_from_slice(&block.right.to_be_bytes());
+                out[i..i + 4].copy_from_slice(&block.left.to_be_bytes());
+                out[i + 4..i + 8].copy_from_slice(&block.right.to_be_bytes());
                 i += 8;
             }
         }
@@ -152,7 +170,10 @@ pub fn parse_options(opts: &[u8]) -> Result<TcpOpts, OptionParseError> {
     while i < opts.len() {
         match opts[i] {
             OPT_END => return Ok(out),
-            OPT_NOP => { i += 1; continue; }
+            OPT_NOP => {
+                i += 1;
+                continue;
+            }
             kind => {
                 if i + 1 >= opts.len() {
                     return Err(OptionParseError::Truncated);
@@ -169,13 +190,13 @@ pub fn parse_options(opts: &[u8]) -> Result<TcpOpts, OptionParseError> {
                         if olen != LEN_MSS as usize {
                             return Err(OptionParseError::BadKnownLen);
                         }
-                        out.mss = Some(u16::from_be_bytes([opts[i+2], opts[i+3]]));
+                        out.mss = Some(u16::from_be_bytes([opts[i + 2], opts[i + 3]]));
                     }
                     OPT_WSCALE => {
                         if olen != LEN_WSCALE as usize {
                             return Err(OptionParseError::BadKnownLen);
                         }
-                        out.wscale = Some(opts[i+2]);
+                        out.wscale = Some(opts[i + 2]);
                     }
                     OPT_SACK_PERMITTED => {
                         if olen != LEN_SACK_PERMITTED as usize {
@@ -187,14 +208,25 @@ pub fn parse_options(opts: &[u8]) -> Result<TcpOpts, OptionParseError> {
                         if olen != LEN_TIMESTAMP as usize {
                             return Err(OptionParseError::BadKnownLen);
                         }
-                        let tsval = u32::from_be_bytes([opts[i+2], opts[i+3], opts[i+4], opts[i+5]]);
-                        let tsecr = u32::from_be_bytes([opts[i+6], opts[i+7], opts[i+8], opts[i+9]]);
+                        let tsval = u32::from_be_bytes([
+                            opts[i + 2],
+                            opts[i + 3],
+                            opts[i + 4],
+                            opts[i + 5],
+                        ]);
+                        let tsecr = u32::from_be_bytes([
+                            opts[i + 6],
+                            opts[i + 7],
+                            opts[i + 8],
+                            opts[i + 9],
+                        ]);
                         out.timestamps = Some((tsval, tsecr));
                     }
                     OPT_SACK => {
                         // len = 2 (hdr) + 8 * N, N in 1..=4.
                         let block_bytes = olen.saturating_sub(2);
-                        if block_bytes == 0 || !block_bytes.is_multiple_of(8) || block_bytes / 8 > 4 {
+                        if block_bytes == 0 || !block_bytes.is_multiple_of(8) || block_bytes / 8 > 4
+                        {
                             return Err(OptionParseError::BadSackBlockCount);
                         }
                         // Store as many as fit in our fixed-size array; drop
@@ -202,8 +234,18 @@ pub fn parse_options(opts: &[u8]) -> Result<TcpOpts, OptionParseError> {
                         // are advisory for the sender).
                         let mut bi = i + 2;
                         for _ in 0..(block_bytes / 8) {
-                            let left = u32::from_be_bytes([opts[bi], opts[bi+1], opts[bi+2], opts[bi+3]]);
-                            let right = u32::from_be_bytes([opts[bi+4], opts[bi+5], opts[bi+6], opts[bi+7]]);
+                            let left = u32::from_be_bytes([
+                                opts[bi],
+                                opts[bi + 1],
+                                opts[bi + 2],
+                                opts[bi + 3],
+                            ]);
+                            let right = u32::from_be_bytes([
+                                opts[bi + 4],
+                                opts[bi + 5],
+                                opts[bi + 6],
+                                opts[bi + 7],
+                            ]);
                             out.push_sack_block(SackBlock { left, right });
                             bi += 8;
                         }
@@ -254,8 +296,14 @@ mod tests {
     fn ack_with_timestamp_and_two_sack_blocks_word_aligned() {
         let mut opts = TcpOpts::default();
         opts.timestamps = Some((100, 200));
-        opts.push_sack_block(SackBlock { left: 1000, right: 2000 });
-        opts.push_sack_block(SackBlock { left: 3000, right: 4000 });
+        opts.push_sack_block(SackBlock {
+            left: 1000,
+            right: 2000,
+        });
+        opts.push_sack_block(SackBlock {
+            left: 3000,
+            right: 4000,
+        });
         let mut buf = [0u8; 40];
         let n = opts.encode(&mut buf).unwrap();
         // 10 TS + 2 SACK-hdr + 16 SACK-blocks = 28, already word-aligned.
@@ -338,16 +386,43 @@ mod tests {
     fn parse_sack_blocks_three_roundtrips() {
         let mut built = TcpOpts::default();
         built.timestamps = Some((0, 0));
-        built.push_sack_block(SackBlock { left: 100, right: 200 });
-        built.push_sack_block(SackBlock { left: 300, right: 400 });
-        built.push_sack_block(SackBlock { left: 500, right: 600 });
+        built.push_sack_block(SackBlock {
+            left: 100,
+            right: 200,
+        });
+        built.push_sack_block(SackBlock {
+            left: 300,
+            right: 400,
+        });
+        built.push_sack_block(SackBlock {
+            left: 500,
+            right: 600,
+        });
         let mut buf = [0u8; 40];
         let n = built.encode(&mut buf).unwrap();
         let parsed = parse_options(&buf[..n]).unwrap();
         assert_eq!(parsed.sack_block_count, 3);
-        assert_eq!(parsed.sack_blocks[0], SackBlock { left: 100, right: 200 });
-        assert_eq!(parsed.sack_blocks[1], SackBlock { left: 300, right: 400 });
-        assert_eq!(parsed.sack_blocks[2], SackBlock { left: 500, right: 600 });
+        assert_eq!(
+            parsed.sack_blocks[0],
+            SackBlock {
+                left: 100,
+                right: 200
+            }
+        );
+        assert_eq!(
+            parsed.sack_blocks[1],
+            SackBlock {
+                left: 300,
+                right: 400
+            }
+        );
+        assert_eq!(
+            parsed.sack_blocks[2],
+            SackBlock {
+                left: 500,
+                right: 600
+            }
+        );
     }
 
     #[test]
@@ -375,7 +450,7 @@ mod tests {
 
     #[test]
     fn parse_rejects_wrong_ts_len() {
-        let bytes = [OPT_TIMESTAMP, 8, 0,0,0,0, 0,0];
+        let bytes = [OPT_TIMESTAMP, 8, 0, 0, 0, 0, 0, 0];
         let err = parse_options(&bytes).unwrap_err();
         assert_eq!(err, OptionParseError::BadKnownLen);
     }
@@ -399,7 +474,8 @@ mod tests {
     fn parse_rejects_sack_with_odd_block_bytes() {
         // 2 + 7 = odd block region.
         let mut bytes = [0u8; 9];
-        bytes[0] = OPT_SACK; bytes[1] = 9;
+        bytes[0] = OPT_SACK;
+        bytes[1] = 9;
         let err = parse_options(&bytes).unwrap_err();
         assert_eq!(err, OptionParseError::BadSackBlockCount);
     }
