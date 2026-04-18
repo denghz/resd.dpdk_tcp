@@ -378,23 +378,45 @@ fn handle_established(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
     }
     // Else: duplicate ACK (ack <= snd_una) — no-op for A3 (A5 uses it for fast retx).
 
-    // Data delivery (only in-order).
+    // Data delivery — A4: in-order append + OOO reassembly enqueue +
+    // drain-on-gap-close per spec §7.2.
     let mut delivered = 0u32;
     let mut buf_full_drop = 0u32;
-    let mut ooo_drop = 0u32;
+    let mut reassembly_queued_bytes = 0u32;
+    let mut reassembly_hole_filled = 0u32;
     if !seg.payload.is_empty() {
         if seg.seq == conn.rcv_nxt {
             delivered = conn.recv.append(seg.payload);
             conn.rcv_nxt = conn.rcv_nxt.wrapping_add(delivered);
             buf_full_drop = (seg.payload.len() as u32).saturating_sub(delivered);
-        } else {
-            // In-window but ahead of rcv_nxt: there's a hole. A3 has no
-            // reassembly queue (AD-6), so the payload is dropped and the
-            // challenge ACK emitted below signals the expected seq to the
-            // peer per RFC 9293 §3.10.7.4 / RFC 5681 §4.2. Engine bumps
-            // `tcp.rx_out_of_order` on `ooo_drop > 0`.
-            ooo_drop = seg.payload.len() as u32;
+
+            let (drained_bytes, drained_count) =
+                conn.recv.reorder.drain_contiguous_from(conn.rcv_nxt);
+            if !drained_bytes.is_empty() {
+                let appended = conn.recv.append(&drained_bytes);
+                conn.rcv_nxt = conn.rcv_nxt.wrapping_add(appended);
+                buf_full_drop += (drained_bytes.len() as u32).saturating_sub(appended);
+                delivered += appended;
+            }
+            reassembly_hole_filled = drained_count;
+        } else if seq_lt(conn.rcv_nxt, seg.seq) {
+            let total_cap = conn.recv.free_space_total();
+            if total_cap > 0 {
+                let take = (seg.payload.len() as u32).min(total_cap);
+                let outcome = conn
+                    .recv
+                    .reorder
+                    .insert(seg.seq, &seg.payload[..take as usize]);
+                reassembly_queued_bytes = outcome.newly_buffered;
+                buf_full_drop = outcome.cap_dropped;
+                if (take as usize) < seg.payload.len() {
+                    buf_full_drop += seg.payload.len() as u32 - take;
+                }
+            } else {
+                buf_full_drop = seg.payload.len() as u32;
+            }
         }
+        // else: seg.seq < conn.rcv_nxt — duplicate/old payload; drop silently.
     }
 
     // FIN processing: consumes one seq and moves us to CLOSE_WAIT.
@@ -419,7 +441,16 @@ fn handle_established(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
         TxAction::None
     };
 
-    Outcome { tx, new_state, delivered, buf_full_drop, ooo_drop, ..Outcome::base() }
+    Outcome {
+        tx,
+        new_state,
+        delivered,
+        buf_full_drop,
+        reassembly_queued_bytes,
+        reassembly_hole_filled,
+        // sack_blocks_decoded populated in Task 18
+        ..Outcome::base()
+    }
 }
 
 fn handle_close_path(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
@@ -738,23 +769,51 @@ mod tests {
     }
 
     #[test]
-    fn established_ooo_segment_acked_but_not_delivered() {
+    fn established_ooo_segment_queues_into_reassembly() {
         let mut c = est_conn(1000, 5000, 1024);
         let seg = ParsedSegment {
             src_port: 5000, dst_port: 40000,
-            seq: 5100, ack: 1001, // jumps past rcv_nxt
-            flags: TCP_ACK,
-            window: 65535,
-            header_len: 20,
-            payload: b"xyz", options: &[],
+            seq: 5100, ack: 1001,
+            flags: TCP_ACK, window: 65535,
+            header_len: 20, payload: b"xyz", options: &[],
         };
         let out = dispatch(&mut c, &seg);
         assert_eq!(out.tx, TxAction::Ack);
         assert_eq!(out.delivered, 0);
-        // A3 I-1 fix: OOO in-window payload is dropped and counted.
-        // Engine maps `ooo_drop > 0` to one `tcp.rx_out_of_order` bump.
-        assert_eq!(out.ooo_drop, 3);
-        assert_eq!(c.rcv_nxt, 5001); // unchanged
+        assert_eq!(out.ooo_drop, 0); // A4: legacy, always zero
+        assert_eq!(out.reassembly_queued_bytes, 3);
+        assert_eq!(c.rcv_nxt, 5001);
+        assert_eq!(c.recv.reorder.len(), 1);
+        assert_eq!(&c.recv.reorder.segments()[0].payload, b"xyz");
+    }
+
+    #[test]
+    fn inorder_arrival_closes_hole_and_drains_reassembly() {
+        let mut c = est_conn(1000, 5000, 1024);
+        c.rcv_wnd = 4096;
+        let ooo = ParsedSegment {
+            src_port: 5000, dst_port: 40000,
+            seq: 5010, ack: 1001,
+            flags: TCP_ACK, window: 65535,
+            header_len: 20, payload: b"world", options: &[],
+        };
+        let out_ooo = dispatch(&mut c, &ooo);
+        assert_eq!(out_ooo.reassembly_queued_bytes, 5);
+        assert_eq!(c.rcv_nxt, 5001);
+
+        let inorder = ParsedSegment {
+            src_port: 5000, dst_port: 40000,
+            seq: 5001, ack: 1001,
+            flags: TCP_ACK | TCP_PSH, window: 65535,
+            header_len: 20, payload: b"ninebytes", options: &[],
+        };
+        let out_in = dispatch(&mut c, &inorder);
+        assert_eq!(out_in.delivered, 9 + 5);
+        assert_eq!(out_in.reassembly_hole_filled, 1);
+        assert_eq!(c.rcv_nxt, 5015);
+        assert!(c.recv.reorder.is_empty());
+        let got: Vec<u8> = c.recv.bytes.iter().copied().collect();
+        assert_eq!(&got, b"ninebytesworld");
     }
 
     #[test]
