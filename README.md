@@ -31,3 +31,9 @@ sudo -E RESD_NET_TEST_TAP=1 cargo test -p resd-net-core --test engine_smoke -- -
 ```sh
 sudo -E RESD_NET_TEST_TAP=1 cargo test -p resd-net-core --test l2_l3_tap -- --nocapture
 ```
+
+## TCP handshake + echo integration test (requires DPDK TAP + root)
+
+```sh
+sudo -E RESD_NET_TEST_TAP=1 cargo test -p resd-net-core --test tcp_basic_tap -- --nocapture
+```
