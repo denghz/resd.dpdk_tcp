@@ -521,6 +521,12 @@ impl Engine {
     /// TX a full-size frame via `tx_data_mempool`. Used for TCP data
     /// segments where the frame size exceeds the small-mbuf pool's
     /// data room. Behavior is otherwise identical to `tx_frame`.
+    ///
+    /// A5 task 10: `send_bytes` no longer calls this — it inlines the
+    /// alloc+append+refcnt_bump+tx_burst sequence so it can capture the
+    /// mbuf pointer for `snd_retrans`. The helper is retained for future
+    /// data-frame control paths that don't need in-flight tracking.
+    #[allow(dead_code)]
     pub(crate) fn tx_data_frame(&self, bytes: &[u8]) -> bool {
         use crate::counters::{add, inc};
         if bytes.len() > u16::MAX as usize {
@@ -1552,33 +1558,136 @@ impl Engine {
                 // Shouldn't happen; buf is sized for hdrs+opts+take.
                 break;
             };
-            if !self.tx_data_frame(&frame[..n]) {
+
+            // A5 task 10: inline alloc + append + refcnt_update(+1) +
+            // tx_burst, capturing the mbuf pointer so it can be stashed in
+            // `snd_retrans` for retransmit. `tx_data_frame` is kept for
+            // control frames; `send_bytes` needs the mbuf pointer and the
+            // pre-tx_burst refcount bump, so the steps are inlined here.
+            let m = unsafe { sys::resd_rte_pktmbuf_alloc(self.tx_data_mempool.as_ptr()) };
+            if m.is_null() {
+                inc(&self.counters.eth.tx_drop_nomem);
                 if accepted == 0 {
                     return Err(Error::SendBufferFull);
                 }
                 break;
             }
+            let dst = unsafe { sys::resd_rte_pktmbuf_append(m, n as u16) };
+            if dst.is_null() {
+                unsafe { sys::resd_rte_pktmbuf_free(m) };
+                inc(&self.counters.eth.tx_drop_nomem);
+                if accepted == 0 {
+                    return Err(Error::SendBufferFull);
+                }
+                break;
+            }
+            // Safety: `dst` points to `n` writable bytes inside the freshly
+            // allocated mbuf's data room (see DPDK `rte_pktmbuf_append`).
+            unsafe {
+                std::ptr::copy_nonoverlapping(frame.as_ptr(), dst as *mut u8, n);
+            }
+            // Bump refcount BEFORE tx_burst: after the call, the driver
+            // holds one ref (freed on TX-completion) and we hold one ref
+            // that lives in `snd_retrans` until Task 11's ACK-prune path.
+            // On tx_burst failure neither owner takes the mbuf, so we free
+            // it twice below (each call decrements refcount by 1).
+            unsafe { sys::resd_rte_mbuf_refcnt_update(m, 1) };
+
+            let mut pkts = [m];
+            let sent = unsafe {
+                sys::resd_rte_eth_tx_burst(
+                    self.cfg.port_id,
+                    self.cfg.tx_queue_id,
+                    pkts.as_mut_ptr(),
+                    1,
+                )
+            } as usize;
+            if sent != 1 {
+                // Driver did not take the mbuf — free both refs (2 → 1 → 0).
+                unsafe { sys::resd_rte_pktmbuf_free(m) };
+                unsafe { sys::resd_rte_pktmbuf_free(m) };
+                inc(&self.counters.eth.tx_drop_full_ring);
+                if accepted == 0 {
+                    return Err(Error::SendBufferFull);
+                }
+                break;
+            }
+            crate::counters::add(&self.counters.eth.tx_bytes, n as u64);
+            inc(&self.counters.eth.tx_pkts);
             inc(&self.counters.tcp.tx_data);
             #[cfg(feature = "obs-byte-counters")]
             {
                 tx_bytes_acc += take as u64;
             }
+
+            // Stash the segment in `snd_retrans` with the live mbuf ref.
+            // Also arm the RTO timer exactly once per burst (when the first
+            // segment transitions `snd_retrans` from empty → non-empty and
+            // no RTO timer is currently scheduled). Subsequent segments in
+            // the same burst observe `was_empty == false` and skip the arm.
+            let first_tx_ts_ns = crate::clock::now_ns();
+            let new_entry = crate::tcp_retrans::RetransEntry {
+                seq: cur_seq,
+                len: take as u16,
+                mbuf: crate::mempool::Mbuf::from_ptr(m),
+                first_tx_ts_ns,
+                xmit_count: 1,
+                sacked: false,
+                lost: false,
+                xmit_ts_ns: first_tx_ts_ns,
+            };
+            {
+                let mut ft = self.flow_table.borrow_mut();
+                let arm_rto = if let Some(c) = ft.get_mut(handle) {
+                    let was_empty = c.snd_retrans.is_empty();
+                    c.snd_retrans.push_after_tx(new_entry);
+                    was_empty && c.rto_timer_id.is_none()
+                } else {
+                    false
+                };
+                if arm_rto {
+                    // Release flow_table before borrowing timer_wheel to
+                    // avoid RefCell double-borrow risk.
+                    drop(ft);
+                    let rto_us = {
+                        let ft2 = self.flow_table.borrow();
+                        ft2.get(handle).map(|c| c.rtt_est.rto_us()).unwrap_or(0)
+                    };
+                    if rto_us > 0 {
+                        let fire_at = first_tx_ts_ns + (rto_us as u64 * 1_000);
+                        let id = self.timer_wheel.borrow_mut().add(
+                            first_tx_ts_ns,
+                            crate::tcp_timer_wheel::TimerNode {
+                                fire_at_ns: fire_at,
+                                owner_handle: handle,
+                                kind: crate::tcp_timer_wheel::TimerKind::Rto,
+                                generation: 0,
+                                cancelled: false,
+                            },
+                        );
+                        let mut ft2 = self.flow_table.borrow_mut();
+                        if let Some(c) = ft2.get_mut(handle) {
+                            c.rto_timer_id = Some(id);
+                            c.timer_ids.push(id);
+                        }
+                    }
+                }
+            }
+
             offset += take;
             accepted += take as u32;
             cur_seq = cur_seq.wrapping_add(take as u32);
             remaining -= take;
         }
 
-        // Persist accepted bytes to `snd.pending` (for spec-future retx)
-        // and advance `snd_nxt`.
+        // A5 task 10: advance `snd_nxt`. `snd_retrans` now owns in-flight
+        // tracking via mbuf refs (stashed per-segment above), so the former
+        // A3 `c.snd.push(&bytes[..accepted])` is removed. The `snd: SendQueue`
+        // field is kept for future pre-TX staging use — `send_bytes` takes
+        // bytes directly from its argument and no longer stages via `snd`.
         {
             let mut ft = self.flow_table.borrow_mut();
             if let Some(c) = ft.get_mut(handle) {
-                let stored = c.snd.push(&bytes[..accepted as usize]);
-                // If the send buffer was too small, we may have sent
-                // bytes we can't retx-track. Not an error in A3; noted
-                // for A5.
-                let _ = stored;
                 c.snd_nxt = cur_seq;
             }
         }
