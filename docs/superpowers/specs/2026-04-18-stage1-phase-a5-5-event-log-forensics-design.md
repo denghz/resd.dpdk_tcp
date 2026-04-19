@@ -385,10 +385,13 @@ if conn.syn_retransmit_count == 0 {
 
 **A5.5 behavior:** at the top of `on_rto_fire` Phase 3, before `self.retransmit(handle, 0)`, run the §6.3 `RACK_mark_losses_on_RTO` pass:
 
+**Erratum (A5.5 Task 16): `RACK.rtt` mapping.** RFC 8985 §6.1 defines `RACK.rtt` as the RTT of the most recently delivered segment (data source for `RACK_mark_losses_on_RTO`). Our `RackState` struct (`crates/resd-net-core/src/tcp_rack.rs`) **does not carry a dedicated `rack.rtt_us` field** — we track `min_rtt_us` there and SRTT in the sibling `rtt_est: RttEstimator`. The Task 14 implementation therefore maps `RACK.rtt` → `conn.rtt_est.srtt_us().unwrap_or(conn.rack.min_rtt_us)`: prefer the smoothed RTT when available (post-SRTT-seed from Task 13 this is always available from ESTABLISHED), fall back to `min_rtt_us` for the degenerate pre-sample case, and tolerate 0 in the arithmetic below (the `seq == snd.una` disjunct still fires for the front entry regardless). The pseudocode below writes `rtt_us` as shorthand for this mapping.
+
 ```rust
 // RFC 8985 §6.3 RACK_mark_losses_on_RTO (Stage-2 AD-17 close).
 let now_us = (now_ns / 1_000) as u32;
-let rtt_us = conn.rack.rtt_us;             // 0 until first RACK update — loop below tolerates it
+// Erratum: RackState has no `rtt_us`; map RACK.rtt → SRTT (or min_rtt fallback).
+let rtt_us = conn.rtt_est.srtt_us().unwrap_or(conn.rack.min_rtt_us);
 let reo_wnd_us = conn.rack.reo_wnd_us;
 let snd_una = conn.snd.una;
 let mut rto_lost: Vec<u16> = Vec::new();
@@ -512,7 +515,7 @@ All default to behavior-preserving values so existing callers are unaffected. A5
 
 | Field | Type | Default | Valid range | Notes |
 |---|---|---|---|---|
-| `tlp_pto_min_floor_us` | `u32` | inherit from `tcp_min_rto_us` | 0 .. `tcp_max_rto_us` | `0` = no floor. Can be set above or below the engine-wide `tcp_min_rto_us`. A value >engine `tcp_max_rto_us` is rejected at `resd_net_connect` with `-EINVAL`. |
+| `tlp_pto_min_floor_us` | `u32` | `0` inherits engine `tcp_min_rto_us` | `0` .. `tcp_max_rto_us` OR `u32::MAX` | **Erratum (A5.5 Task 16): zero-init-friendly semantics.** `0` (the zero-init default) inherits the engine-wide `tcp_min_rto_us` — callers that memset the struct get A5-default behavior unchanged. `u32::MAX` is the explicit "no floor" sentinel (e.g. aggressive-preset order-entry sockets that truly want no PTO floor). Any other value must be ≤ `tcp_max_rto_us`; values strictly above (and not equal to `u32::MAX`) are rejected at `resd_net_connect` with `-EINVAL`. Can be set above or below the engine-wide `tcp_min_rto_us` within this bound. |
 | `tlp_pto_srtt_multiplier_x100` | `u16` | `200` | 100 .. 200 | Expressed as integer ×100 (100 = 1.0×, 150 = 1.5×, 200 = 2.0×). Values outside the range rejected with `-EINVAL`. Values above 2.0× rejected — that's RTO territory, not TLP. |
 | `tlp_skip_flight_size_gate` | `bool` | `false` | — | When `true`, the `+max(WCDelAckT, RTT/4)` penalty in the PTO formula is skipped regardless of FlightSize. Trades spurious-probe risk (peer's delayed-ACK fires after our probe) for tighter PTO timing. |
 | `tlp_max_consecutive_probes` | `u8` | `1` | 1 .. 5 | Number of TLP probes to fire consecutively before falling back to RTO-driven retransmit. Reset on any new RTT sample or newly-ACKed data. `0` and `>5` rejected with `-EINVAL`. |
@@ -525,7 +528,7 @@ resd_net_connect_opts_t opts = {
     // ... existing fields ...
     .rack_aggressive = true,
     .rto_no_backoff = true,
-    .tlp_pto_min_floor_us = 0,
+    .tlp_pto_min_floor_us = UINT32_MAX,       // explicit no-floor sentinel (A5.5 Task 16 erratum)
     .tlp_pto_srtt_multiplier_x100 = 100,      // 1.0 × SRTT
     .tlp_skip_flight_size_gate = true,
     .tlp_max_consecutive_probes = 3,
@@ -534,6 +537,8 @@ resd_net_connect_opts_t opts = {
 ```
 
 This configuration fires the first TLP at `SRTT` (not `2·SRTT + max_ack_delay`), up to 3 consecutive probes at `SRTT` cadence each, then falls back to RTO (which itself uses `tcp_initial_rto_us` = 5ms and no-backoff). Monitor `tcp.tx_tlp_spurious / tcp.tx_tlp` on the engine — target < 3–5%. If the ratio climbs, raise `tlp_pto_min_floor_us` incrementally until spurious rate stabilizes.
+
+**Note (A5.5 Task 16 erratum):** the no-floor case uses `UINT32_MAX` as an explicit sentinel rather than `0`. The `0` value is reserved for zero-init callers and means "inherit engine `tcp_min_rto_us`" — this keeps memset-of-struct callers at the A5 safe default instead of accidentally opting them into no-floor behavior. Conservative pre-A5.5 examples that used `.tlp_pto_min_floor_us = 0` to mean "no floor" must migrate to `UINT32_MAX`.
 
 ---
 

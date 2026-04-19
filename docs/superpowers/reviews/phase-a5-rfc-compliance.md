@@ -147,6 +147,7 @@
   - Spec/memory ref: phase-a5 plan "Known Stage-1 simplifications"; RFC 8985 §7.3 steps 4-6.
   - Stage-1 behavior: `engine.rs:940-1005` `on_tlp_fire` checks `fired_id` currency + non-empty `snd_retrans` only; `tlp_timer_id.is_none()` schedule-time gate partially covers the "no other probe armed" invariant.
   - Rationale: Stage 1 implements the PTO + probe-selection + basic fire flow but not the full ACK-coalesce interlocks. Pragmatic impact: occasional redundant probe on overlapping ACK; no correctness issue. Stage 2 will add `tlp_end_seq` / `tlp_is_retrans` fields and full §7.4 `TLP_process_ack` clearing.
+  - **Closed in A5.5 (`phase-a5-5-complete`)** — superseded by A5.5 multi-probe data structures: `tlp_recent_probes` ring (Task 10/11) replaces single-slot `tlp_end_seq`; `tlp_consecutive_probes_fired < tlp_max_consecutive_probes` gate (Task 11) replaces the single-in-flight invariant. RTT-sample-since-last-probe guard now configurable via `tlp_skip_rtt_sample_gate` per-connect knob. See A5.5 design spec §6 `AD-15 retired` and parent-spec §6.4 retirement note.
 
 - **AD-16 (from F-3 promotion)** — RACK Step 2 spurious-retrans guard deferred to Stage 2
   - RFC clause: `docs/rfcs/rfc8985.txt:656-669` — RFC 8985 §6.2 Step 2 TSecr / min_rtt-age guard on retransmitted segments.
@@ -159,12 +160,14 @@
   - Spec/memory ref: design spec §6.3 deferrals table; RFC 8985 §6.3.
   - Stage-1 behavior: `engine.rs:803-922` `on_rto_fire` retransmits only the single front entry and relies on RACK's regular §6.2 Step 5 detect-lost pass on the next ACK to catch up the rest.
   - Rationale: Stage 1 RTO retransmits the front segment; RACK's detect-lost pass on the next ACK covers the rest. Functional equivalence with slightly more retransmit traffic under pathological loss bursts; spec §6.5 deviation acknowledged.
+  - **Closed in A5.5 (`phase-a5-5-complete`)** — `RACK_mark_losses_on_RTO` pass added at the top of `on_rto_fire` Phase 3 in A5.5 plan task 14. A single RTO fire now retransmits the whole §6.3-eligible tail in one burst (one `tcp.tx_rto` increment per fire; `tcp.tx_retrans` one per segment). See A5.5 design spec §6 `AD-A5-5-rack-mark-losses-on-rto` and parent-spec §6.4.
 
 - **AD-18 (from mTCP E-2 promotion, mirrored here for completeness)** — TLP-arm-on-send deferred to Stage 2
   - RFC clause: `docs/rfcs/rfc8985.txt:935-942` — RFC 8985 §7.2 "the sender SHOULD start or restart a loss probe PTO timer after transmitting new data".
   - Spec/memory ref: phase-a5 plan Task 17; RFC 8985 §7.2.
   - Stage-1 behavior: TLP is armed from the ACK handler only (`engine.rs:1549-1584`); the pre-first-ACK window relies on RTO fallback.
   - Rationale: Pre-first-ACK tail-loss window is narrow in trading REST/WS flows (RTT<1ms); RTO falls back correctly. Stage 2 will wire TLP-arm-on-send when profiling shows material recovery-latency regression.
+  - **Closed in A5.5 (`phase-a5-5-complete`)** — `arm_tlp_pto` helper called from `Engine::send_bytes` TX path in A5.5 plan task 15. Combined with A5.5 plan task 13's SRTT-from-SYN seed, the arm site always has a valid PTO basis post-ESTABLISHED, so the first-burst tail-loss window is now covered by TLP rather than RTO. See A5.5 design spec §6 `AD-A5-5-tlp-arm-on-send` and parent-spec §6.4.
 
 ### FYI (informational — no action)
 
@@ -222,12 +225,13 @@ All Must-fix items closed in commit `eb5467b` (F-1) or promoted to explicit Stag
 Gate status:
 - Must-fix open: 0.
   - [x] F-1 — closed in `eb5467b` (`update_min_rtt` wired in both TS-source and Karn's branches).
-  - [x] F-2 — promoted to AD-15 (Stage-2 scope).
+  - [x] F-2 — promoted to AD-15 (Stage-2 scope); **AD-15 closed in A5.5** (superseded by multi-probe data structures).
   - [x] F-3 — promoted to AD-16 (Stage-2 scope).
 - Missing-SHOULD open: 0.
-  - [x] S-1 — promoted to AD-17 (Stage-2 scope).
+  - [x] S-1 — promoted to AD-17 (Stage-2 scope); **AD-17 closed in A5.5** (`RACK_mark_losses_on_RTO` pass implemented).
   - [x] S-2 — closed in `eb5467b` (partial-ACK RTO restart per RFC 6298 §5.3).
 - Accepted-deviation entries: 18 (AD-1…AD-18). AD-15/16/17 are promotions of F-2/F-3/S-1; AD-18 mirrors the mTCP review's AD-8 (TLP-arm-on-send). Each cites either spec §6.4/§6.5 or the A5 plan's pre-declared/Stage-2-simplifications list.
+  - **A5.5 retirements (3):** AD-15 (superseded), AD-17 (`RACK_mark_losses_on_RTO` implemented), AD-18 (TLP-arm-on-send implemented). Retained in this list for historical traceability; retirement notes appended on each AD entry cross-reference the A5.5 plan tasks (13/14/15/16) and the A5.5 design spec §6 new-AD rows (`AD-A5-5-srtt-from-syn`, `AD-A5-5-rack-mark-losses-on-rto`, `AD-A5-5-tlp-arm-on-send`) that supersede them. Remaining open Stage-2 ADs from this list: AD-16 (RACK Step 2 spurious-retrans guard) only.
 - FYI: 13 informational observations (I-1…I-13).
 
 Gate rule: phase may tag `phase-a5-complete` — no open `[ ]` checkboxes remain in Must-fix or Missing-SHOULD.
