@@ -296,19 +296,17 @@ pub struct Engine {
     /// hardware RX timestamp lives. Populated at engine_create via
     /// rte_mbuf_dynfield_lookup("rte_dynfield_timestamp"). `None` when
     /// the PMD does not register the dynfield (expected on ENA — spec §10.5).
-    /// Spec §10.1. `allow(dead_code)` drops when Task 11 wires the
-    /// `hw_rx_ts_ns` accessor into the RX event-emission call sites.
+    /// Spec §10.1. Consumed by `hw_rx_ts_ns` which is called at the RX
+    /// decode boundary in `poll_once` (Task 11).
     #[cfg(feature = "hw-offload-rx-timestamp")]
-    #[allow(dead_code)]
     rx_ts_offset: Option<i32>,
     /// Bitmask in ol_flags that indicates a valid RX timestamp on this
     /// mbuf. Populated via rte_mbuf_dynflag_lookup("rte_dynflag_rx_timestamp")
     /// → the returned bit position translated to (1 << bit_pos). `None` when
     /// the flag isn't registered. Expected `None` on ENA (spec §10.5).
-    /// `allow(dead_code)` drops when Task 11 wires the accessor into the
-    /// RX event-emission call sites.
+    /// Consumed by `hw_rx_ts_ns` which is called at the RX decode boundary
+    /// in `poll_once` (Task 11).
     #[cfg(feature = "hw-offload-rx-timestamp")]
-    #[allow(dead_code)]
     rx_ts_flag_mask: Option<u64>,
     /// Driver name captured at bring-up; used by Task 12's LLQ verification
     /// to short-circuit non-ENA drivers. See spec §5.
@@ -928,7 +926,6 @@ impl Engine {
     /// field read is never reached in Stage 1.
     #[cfg(feature = "hw-offload-rx-timestamp")]
     #[inline(always)]
-    #[allow(dead_code)]
     pub(crate) unsafe fn hw_rx_ts_ns(&self, mbuf: *const sys::rte_mbuf) -> u64 {
         match (self.rx_ts_offset, self.rx_ts_flag_mask) {
             (Some(off), Some(mask)) => {
@@ -957,7 +954,6 @@ impl Engine {
     /// don't need `#[cfg]`-gated call syntax.
     #[cfg(not(feature = "hw-offload-rx-timestamp"))]
     #[inline(always)]
-    #[allow(dead_code)]
     pub(crate) const unsafe fn hw_rx_ts_ns(&self, _mbuf: *const sys::rte_mbuf) -> u64 {
         0
     }
@@ -1373,8 +1369,16 @@ impl Engine {
             let nic_rss_hash = unsafe { sys::resd_rte_mbuf_get_rss_hash(m) };
             #[cfg(not(feature = "hw-offload-rss-hash"))]
             let nic_rss_hash: u32 = 0;
+            // Task 11: read the NIC-provided RX timestamp alongside ol_flags
+            // + nic_rss_hash. `hw_rx_ts_ns` yields 0 when the feature is off,
+            // when either dynfield/dynflag lookup returned negative at
+            // engine_create (expected on ENA — spec §10.5), or when the
+            // mbuf's ol_flags do not indicate a valid timestamp. Threaded
+            // through rx_frame -> handle_ipv4 -> tcp_input to both
+            // RX-origin event emission sites (Connected + Readable).
+            let hw_rx_ts = unsafe { self.hw_rx_ts_ns(m) };
             add(&self.counters.eth.rx_bytes, bytes.len() as u64);
-            let _accepted = self.rx_frame(bytes, ol_flags, nic_rss_hash);
+            let _accepted = self.rx_frame(bytes, ol_flags, nic_rss_hash, hw_rx_ts);
             #[cfg(feature = "obs-byte-counters")]
             {
                 rx_bytes_acc += _accepted as u64;
@@ -2009,7 +2013,13 @@ impl Engine {
     /// through to the IP + TCP decode sites where Task 8's HW checksum
     /// classification gates on them. Test callers that aren't exercising
     /// the offload path pass `0` (UNKNOWN → software verify).
-    fn rx_frame(&self, bytes: &[u8], ol_flags: u64, nic_rss_hash: u32) -> u32 {
+    ///
+    /// `hw_rx_ts` — the NIC-provided RX timestamp (ns) captured at the
+    /// RX decode boundary via `hw_rx_ts_ns`. Threaded through to the
+    /// `Connected` + `Readable` event emission sites in `tcp_input` +
+    /// `deliver_readable` (spec §10.3). `0` when the NIC didn't stamp
+    /// one (expected on ENA — spec §10.5).
+    fn rx_frame(&self, bytes: &[u8], ol_flags: u64, nic_rss_hash: u32, hw_rx_ts: u64) -> u32 {
         use crate::counters::inc;
         match crate::l2::l2_decode(bytes, self.our_mac) {
             Err(crate::l2::L2Drop::Short) => {
@@ -2032,7 +2042,9 @@ impl Engine {
                         self.handle_arp(payload);
                         0
                     }
-                    crate::l2::ETHERTYPE_IPV4 => self.handle_ipv4(payload, ol_flags, nic_rss_hash),
+                    crate::l2::ETHERTYPE_IPV4 => {
+                        self.handle_ipv4(payload, ol_flags, nic_rss_hash, hw_rx_ts)
+                    }
                     _ => unreachable!("l2_decode filters unsupported ethertypes"),
                 }
             }
@@ -2069,7 +2081,7 @@ impl Engine {
     /// `hw-offload-rx-cksum` feature AND the runtime
     /// `rx_cksum_offload_active` latch — if either is false the
     /// offload-aware wrapper degrades to the software path.
-    fn handle_ipv4(&self, payload: &[u8], ol_flags: u64, nic_rss_hash: u32) -> u32 {
+    fn handle_ipv4(&self, payload: &[u8], ol_flags: u64, nic_rss_hash: u32, hw_rx_ts: u64) -> u32 {
         use crate::counters::inc;
         match crate::l3_ip::ip_decode_offload_aware(
             payload,
@@ -2119,7 +2131,7 @@ impl Engine {
                 match ip.protocol {
                     crate::l3_ip::IPPROTO_TCP => {
                         inc(&self.counters.ip.rx_tcp);
-                        self.tcp_input(&ip, inner, ol_flags, nic_rss_hash)
+                        self.tcp_input(&ip, inner, ol_flags, nic_rss_hash, hw_rx_ts)
                     }
                     crate::l3_ip::IPPROTO_ICMP => {
                         inc(&self.counters.ip.rx_icmp);
@@ -2159,6 +2171,7 @@ impl Engine {
         tcp_bytes: &[u8],
         ol_flags: u64,
         nic_rss_hash: u32,
+        hw_rx_ts: u64,
     ) -> u32 {
         use crate::counters::inc;
         use crate::tcp_input::{dispatch, parse_segment, tuple_from_segment, TxAction};
@@ -2502,7 +2515,7 @@ impl Engine {
             self.events.borrow_mut().push(
                 InternalEvent::Connected {
                     conn: handle,
-                    rx_hw_ts_ns: 0,
+                    rx_hw_ts_ns: hw_rx_ts,
                     emitted_ts_ns: crate::clock::now_ns(),
                 },
                 &self.counters,
@@ -2511,7 +2524,7 @@ impl Engine {
         }
 
         if outcome.delivered > 0 {
-            self.deliver_readable(handle, outcome.delivered);
+            self.deliver_readable(handle, outcome.delivered, hw_rx_ts);
         }
 
         if outcome.buf_full_drop > 0 {
@@ -2841,7 +2854,13 @@ impl Engine {
         }
     }
 
-    fn deliver_readable(&self, handle: ConnHandle, delivered: u32) {
+    /// `rx_hw_ts_ns` — NIC-provided RX timestamp captured at the per-mbuf
+    /// decode boundary in `poll_once` and threaded through the RX frame
+    /// path. Stored on the `Readable` event verbatim. Mbuf is no longer
+    /// in scope here (data has already moved from mbuf to `conn.recv.bytes`),
+    /// so this parameter is the only way to surface the NIC timestamp to
+    /// the event consumer. `0` on ENA / feature-off (spec §10.3, §10.5).
+    fn deliver_readable(&self, handle: ConnHandle, delivered: u32, rx_hw_ts_ns: u64) {
         use crate::counters::add;
         let mut ft = self.flow_table.borrow_mut();
         let Some(conn) = ft.get_mut(handle) else {
@@ -2867,7 +2886,7 @@ impl Engine {
                 conn: handle,
                 byte_offset,
                 byte_len: delivered,
-                rx_hw_ts_ns: 0,
+                rx_hw_ts_ns,
                 emitted_ts_ns: crate::clock::now_ns(),
             },
             &self.counters,
