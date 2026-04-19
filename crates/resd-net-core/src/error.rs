@@ -42,6 +42,10 @@ pub enum Error {
     /// Fires only when hw-verify-llq is compile-enabled.
     #[error("log capture init failed: {0}")]
     LogCaptureInit(String),
+    /// A6 (spec §3.8.3): `rtt_histogram_bucket_edges_us` was non-monotonic
+    /// or had an equal-adjacent pair. `engine_create` rejects with null-return.
+    #[error("invalid histogram edges (not strictly monotonic)")]
+    InvalidHistogramEdges,
 }
 
 #[cfg(test)]

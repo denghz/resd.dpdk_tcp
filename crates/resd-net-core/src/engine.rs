@@ -13,6 +13,35 @@ use crate::tcp_events::{EventQueue, InternalEvent};
 use crate::tcp_state::TcpState;
 use crate::Error;
 
+/// A6 (spec §3.8.2): default RTT histogram bucket edges, µs.
+/// Applied when `EngineConfig::rtt_histogram_bucket_edges_us` is all zero.
+pub const DEFAULT_RTT_HISTOGRAM_EDGES_US: [u32; 15] = [
+    50, 100, 200, 300, 500, 750, 1000, 2000, 3000, 5000,
+    10000, 25000, 50000, 100000, 500000,
+];
+
+/// A6 (spec §3.8.3): validate + default-substitute the caller-supplied
+/// histogram bucket edges. Returns the final `[u32; 15]` to store on
+/// `Engine::rtt_histogram_edges`.
+///
+/// - all-zero input → returns `DEFAULT_RTT_HISTOGRAM_EDGES_US`
+/// - strictly monotonic input (each `edges[i] < edges[i+1]`) → passes through
+/// - any non-monotonic or equal-adjacent input → `Err(())`
+pub fn validate_and_default_histogram_edges(
+    edges: &[u32; 15],
+) -> Result<[u32; 15], ()> {
+    let all_zero = edges.iter().all(|&e| e == 0);
+    if all_zero {
+        return Ok(DEFAULT_RTT_HISTOGRAM_EDGES_US);
+    }
+    for i in 0..14 {
+        if edges[i] >= edges[i + 1] {
+            return Err(());
+        }
+    }
+    Ok(*edges)
+}
+
 /// RFC 7323 §2.3: pick the Window Scale shift so that `(u16::MAX << ws)`
 /// covers our full recv buffer. Bounded at 14 per the RFC's cap. Called
 /// once at `Engine::connect` time to advertise WS in our SYN; the same
@@ -216,6 +245,12 @@ pub struct EngineConfig {
     /// A5.5 Task 5: event-queue overflow guard (§3.2 / §5.1).
     /// Default 4096; must be >= 64. Queue drops oldest on overflow.
     pub event_queue_soft_cap: u32,
+
+    /// A6 (spec §3.8): RTT histogram bucket edges in µs. 15 strictly
+    /// monotonically increasing edges define 16 buckets. All-zero
+    /// substitutes `DEFAULT_RTT_HISTOGRAM_EDGES_US`. Non-monotonic
+    /// rejected at `Engine::new` with `Err(Error::InvalidHistogramEdges)`.
+    pub rtt_histogram_bucket_edges_us: [u32; 15],
 }
 
 impl Default for EngineConfig {
@@ -245,6 +280,7 @@ impl Default for EngineConfig {
             tcp_max_retrans_count: 15,
             tcp_per_packet_events: false,
             event_queue_soft_cap: 4096,
+            rtt_histogram_bucket_edges_us: [0; 15],
         }
     }
 }
@@ -253,6 +289,12 @@ impl Default for EngineConfig {
 /// L2/L3 state for that lcore.
 pub struct Engine {
     cfg: EngineConfig,
+    /// A6: post-validation-post-defaults histogram edges; shared across
+    /// all conns on this engine. Not re-validated on every update.
+    /// `allow(dead_code)` lifts once a later task (per-conn histogram
+    /// update on RTT samples) reads this on the slow-path.
+    #[allow(dead_code)]
+    pub(crate) rtt_histogram_edges: [u32; 15],
     counters: Box<Counters>,
     _rx_mempool: Mempool,
     tx_hdr_mempool: Mempool,
@@ -522,6 +564,14 @@ impl Engine {
         // 50ms calibration cost on the hot path.
         crate::clock::init()?;
 
+        // A6 (spec §3.8.3): validate + substitute defaults for caller-
+        // supplied histogram edges. All-zero → spec §3.8.2 defaults;
+        // non-monotonic rejected here so per-conn code never re-validates.
+        let rtt_histogram_edges = validate_and_default_histogram_edges(
+            &cfg.rtt_histogram_bucket_edges_us,
+        )
+        .map_err(|_| Error::InvalidHistogramEdges)?;
+
         // socket_id may be -1 (cast to 0xFFFFFFFF == SOCKET_ID_ANY) when the
         // port isn't bound to a NUMA node (common in VMs / TAP devices).
         // That's the DPDK sentinel and is valid for mempool/queue setup.
@@ -704,6 +754,7 @@ impl Engine {
             #[cfg(feature = "hw-offload-rx-timestamp")]
             rx_ts_flag_mask,
             driver_name: outcome.driver_name,
+            rtt_histogram_edges,
             cfg,
         })
     }
@@ -4493,6 +4544,35 @@ mod tests {
             e.flush_tx_pending_data();
         }
         let _ = _compile_only;
+    }
+
+    #[test]
+    fn rtt_histogram_edges_defaults_applied_on_all_zero() {
+        let validated = crate::engine::validate_and_default_histogram_edges(&[0u32; 15])
+            .expect("all-zero must validate and substitute defaults");
+        let expected: [u32; 15] = [
+            50, 100, 200, 300, 500, 750, 1000, 2000, 3000, 5000,
+            10000, 25000, 50000, 100000, 500000,
+        ];
+        assert_eq!(validated, expected);
+    }
+
+    #[test]
+    fn rtt_histogram_edges_non_monotonic_rejected() {
+        let bad: [u32; 15] = [
+            50, 100, 200, 150, 500, 750, 1000, 2000, 3000, 5000,
+            10000, 25000, 50000, 100000, 500000,
+        ];
+        assert!(crate::engine::validate_and_default_histogram_edges(&bad).is_err());
+    }
+
+    #[test]
+    fn rtt_histogram_edges_monotonic_passes_through() {
+        let good: [u32; 15] = [
+            10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 200, 300, 400, 500, 1000,
+        ];
+        let out = crate::engine::validate_and_default_histogram_edges(&good).unwrap();
+        assert_eq!(out, good);
     }
 }
 

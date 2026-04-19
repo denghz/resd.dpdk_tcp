@@ -132,6 +132,11 @@ pub unsafe extern "C" fn resd_net_engine_create(
         tcp_max_retrans_count: max_retrans,
         tcp_per_packet_events: cfg.tcp_per_packet_events,
         event_queue_soft_cap: cfg.event_queue_soft_cap,
+        // A6 Task 6: core-side plumbing only — all-zero input triggers the
+        // spec §3.8.2 default substitution in `Engine::new`. The ABI-layer
+        // pass-through (`resd_net_engine_config_t::rtt_histogram_bucket_edges_us`)
+        // lands in Task 20.
+        rtt_histogram_bucket_edges_us: [0u32; 15],
     };
     match Engine::new(core_cfg) {
         Ok(e) => box_to_raw(e),
