@@ -269,6 +269,24 @@ pub struct Engine {
 
     // Phase A5 additions
     pub(crate) timer_wheel: RefCell<crate::tcp_timer_wheel::TimerWheel>,
+
+    // A-HW runtime latches — populated by configure_port_offloads.
+    // When a compile-enabled offload was advertised by the PMD the latch
+    // is true; the corresponding hot-path branch uses the offload. When
+    // false, the branch falls back to software. Task 2: all default false
+    // because no offload bits are requested yet. See spec §§6-10.
+    // The `#[allow(dead_code)]` attributes go away as tasks 6/7/9/12 read
+    // these latches on the hot path.
+    #[allow(dead_code)]
+    tx_cksum_offload_active: bool,
+    #[allow(dead_code)]
+    rx_cksum_offload_active: bool,
+    #[allow(dead_code)]
+    rss_hash_offload_active: bool,
+    /// Driver name captured at bring-up; used by Task 12's LLQ verification
+    /// to short-circuit non-ENA drivers. See spec §5.
+    #[allow(dead_code)]
+    driver_name: [u8; 32],
 }
 
 /// A4: map an `Outcome` to per-segment `TcpCounters` bumps. Pure slow-path
@@ -378,6 +396,34 @@ pub struct ConnectOpts {
     pub tlp_skip_rtt_sample_gate: bool,
 }
 
+/// Result of `configure_port_offloads` — the applied offload masks plus
+/// per-engine runtime latches that gate hot-path offload-vs-software
+/// branches. See spec §4 and §§6-10 for how each latch feeds later branches.
+#[derive(Debug, Clone, Copy)]
+struct PortConfigOutcome {
+    /// Bits written to `eth_conf.rxmode.offloads` after AND with
+    /// `dev_info.rx_offload_capa`. Zero in Task 2 (no RX offloads requested yet).
+    #[allow(dead_code)]
+    applied_rx_offloads: u64,
+    /// Bits written to `eth_conf.txmode.offloads` after AND with
+    /// `dev_info.tx_offload_capa`. At Task 2 this contains only MULTI_SEGS
+    /// if the PMD advertises it.
+    #[allow(dead_code)]
+    applied_tx_offloads: u64,
+    /// True iff TX IPv4 + TCP checksum offload bits both applied. Latches
+    /// the TX hot-path offload-vs-software branch. Task 2: always false.
+    tx_cksum_offload_active: bool,
+    /// True iff RX IPv4 + TCP checksum offload bits both applied. Latches
+    /// the RX hot-path offload-vs-software branch. Task 2: always false.
+    rx_cksum_offload_active: bool,
+    /// True iff RSS_HASH bit applied. Latches mbuf.hash.rss consumption
+    /// in flow_table.rs. Task 2: always false.
+    rss_hash_offload_active: bool,
+    /// Driver name captured at bring-up — consumed by the LLQ verification
+    /// path (Task 12) to short-circuit non-ENA drivers.
+    driver_name: [u8; 32],
+}
+
 impl Engine {
     pub fn new(cfg: EngineConfig) -> Result<Self, Error> {
         // Fail fast on non-invariant-TSC hosts (spec §7.5). Also primes
@@ -419,35 +465,17 @@ impl Engine {
             socket_id,
         )?;
 
-        // Configure port: one RX queue + one TX queue for Phase A1.
-        // A5: enable MULTI_SEGS for retransmit mbuf-chain (spec §6.5, §8.2).
-        //
-        // `RTE_ETH_TX_OFFLOAD_MULTI_SEGS` is defined in `rte_ethdev.h` as
-        // `RTE_BIT64(15)`, a function-like macro bindgen does not expand,
-        // so the FFI crate does not expose it as a Rust const. The bit
-        // position is part of DPDK's stable ethdev ABI (DPDK 23.11).
-        const RTE_ETH_TX_OFFLOAD_MULTI_SEGS: u64 = 1u64 << 15;
+        // Counters exist before port config so the helper can bump any
+        // offload-miss counters it needs in later tasks (Task 2: unused).
+        let counters = Box::new(Counters::new());
 
-        let mut eth_conf: sys::rte_eth_conf = unsafe { std::mem::zeroed() };
-        eth_conf.txmode.offloads = RTE_ETH_TX_OFFLOAD_MULTI_SEGS;
-
-        // Warn if the PMD does not advertise support — retransmit will likely fail.
-        let mut dev_info: sys::rte_eth_dev_info = unsafe { std::mem::zeroed() };
-        let info_rc = unsafe { sys::rte_eth_dev_info_get(cfg.port_id, &mut dev_info) };
-        if info_rc == 0 && (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MULTI_SEGS) == 0 {
-            eprintln!(
-                "resd_net: PMD on port {} does not advertise RTE_ETH_TX_OFFLOAD_MULTI_SEGS; \
-                 A5 retransmit chain may fail — check NIC/PMD support",
-                cfg.port_id
-            );
-        }
-
-        let rc = unsafe { sys::rte_eth_dev_configure(cfg.port_id, 1, 1, &eth_conf as *const _) };
-        if rc != 0 {
-            return Err(Error::PortConfigure(cfg.port_id, unsafe {
-                sys::resd_rte_errno()
-            }));
-        }
+        // Port-config: dev_info query, offload AND, runtime-fallback
+        // latches. Extracted into a helper so later A-HW tasks can add
+        // feature-gated offload-bit branches in one place. See
+        // `dpdk_consts.rs` for the `RTE_ETH_TX_OFFLOAD_MULTI_SEGS` bit
+        // position (DPDK stable ethdev ABI) and spec §4 for the outcome
+        // structure.
+        let outcome = Self::configure_port_offloads(&cfg, &counters)?;
 
         let rc = unsafe {
             sys::rte_eth_rx_queue_setup(
@@ -498,8 +526,6 @@ impl Engine {
         // bindgen names the field `addr_bytes` on rte_ether_addr.
         let our_mac = mac_addr.addr_bytes;
 
-        let counters = Box::new(Counters::new());
-
         Ok(Self {
             counters,
             _rx_mempool: rx_mempool,
@@ -516,7 +542,86 @@ impl Engine {
             timer_wheel: RefCell::new(crate::tcp_timer_wheel::TimerWheel::new(
                 (cfg.max_connections as usize).saturating_mul(4),
             )),
+            tx_cksum_offload_active: outcome.tx_cksum_offload_active,
+            rx_cksum_offload_active: outcome.rx_cksum_offload_active,
+            rss_hash_offload_active: outcome.rss_hash_offload_active,
+            driver_name: outcome.driver_name,
             cfg,
+        })
+    }
+
+    /// A-HW Task 2: build `rte_eth_conf` with requested offload bits,
+    /// query `dev_info` to AND the request against what the PMD advertises,
+    /// then call `rte_eth_dev_configure`. Returns the actually-applied
+    /// masks + per-engine runtime latches (all `false` in Task 2, populated
+    /// as each offload is wired in later tasks). See spec §4.
+    ///
+    /// `counters` is kept in the signature ahead of Task 3, which starts
+    /// bumping `eth.offload_missing_*` when a requested bit isn't advertised.
+    fn configure_port_offloads(
+        cfg: &EngineConfig,
+        counters: &Counters,
+    ) -> Result<PortConfigOutcome, Error> {
+        use crate::dpdk_consts::RTE_ETH_TX_OFFLOAD_MULTI_SEGS;
+        let _ = counters; // unused in Task 2; Task 3 starts using it
+
+        let mut eth_conf: sys::rte_eth_conf = unsafe { std::mem::zeroed() };
+
+        // Query the PMD's offload capabilities. A5 behavior: request
+        // MULTI_SEGS (needed for retransmit mbuf-chain per spec §6.5, §8.2),
+        // warn if the PMD does not advertise support, and drop the bit
+        // from the applied mask so rte_eth_dev_configure does not refuse
+        // the unsupported request.
+        let mut dev_info: sys::rte_eth_dev_info = unsafe { std::mem::zeroed() };
+        let info_rc = unsafe { sys::rte_eth_dev_info_get(cfg.port_id, &mut dev_info) };
+
+        let mut applied_tx_offloads = RTE_ETH_TX_OFFLOAD_MULTI_SEGS;
+        if info_rc == 0
+            && (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MULTI_SEGS) == 0
+        {
+            eprintln!(
+                "resd_net: PMD on port {} does not advertise RTE_ETH_TX_OFFLOAD_MULTI_SEGS; \
+                 A5 retransmit chain may fail — check NIC/PMD support",
+                cfg.port_id
+            );
+            applied_tx_offloads &= !RTE_ETH_TX_OFFLOAD_MULTI_SEGS;
+        }
+        eth_conf.txmode.offloads = applied_tx_offloads;
+
+        let rc = unsafe {
+            sys::rte_eth_dev_configure(cfg.port_id, 1, 1, &eth_conf as *const _)
+        };
+        if rc != 0 {
+            return Err(Error::PortConfigure(cfg.port_id, unsafe {
+                sys::resd_rte_errno()
+            }));
+        }
+
+        // Capture driver name for Task 12's LLQ verification — copy up to
+        // 31 bytes + NUL terminator. `rte_eth_dev_info.driver_name` is
+        // `*const c_char` owned by the PMD and stable for the life of the
+        // port.
+        let mut driver_name = [0u8; 32];
+        if !dev_info.driver_name.is_null() {
+            unsafe {
+                let src = dev_info.driver_name as *const u8;
+                for i in 0..31 {
+                    let b = *src.add(i);
+                    if b == 0 {
+                        break;
+                    }
+                    driver_name[i] = b;
+                }
+            }
+        }
+
+        Ok(PortConfigOutcome {
+            applied_rx_offloads: 0,
+            applied_tx_offloads,
+            tx_cksum_offload_active: false,
+            rx_cksum_offload_active: false,
+            rss_hash_offload_active: false,
+            driver_name,
         })
     }
 
