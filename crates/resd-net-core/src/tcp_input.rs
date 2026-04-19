@@ -1028,6 +1028,70 @@ mod tests {
     }
 
     #[test]
+    fn handle_syn_sent_wires_maybe_seed_srtt_from_syn() {
+        // A5.5 Task 13 wiring gate: the 4 unit tests on
+        // `TcpConn::maybe_seed_srtt_from_syn` only exercise the helper in
+        // isolation. This test drives the real `handle_syn_sent` code path
+        // with a valid SYN-ACK and asserts the helper actually got invoked
+        // — catches a future refactor that drops the call site.
+        use crate::flow_table::FourTuple;
+        use crate::tcp_conn::TcpConn;
+        use crate::tcp_options::TcpOpts;
+
+        let t = FourTuple {
+            local_ip: 0x0a_00_00_02,
+            local_port: 40000,
+            peer_ip: 0x0a_00_00_01,
+            peer_port: 5000,
+        };
+        let mut c = TcpConn::new_client(t, 1000, 1460, 1024, 2048, 5000, 5000, 1_000_000);
+        c.state = TcpState::SynSent;
+        c.snd_nxt = c.snd_nxt.wrapping_add(1);
+        // Arrange: pre-stamp `syn_tx_ts_ns` to `now - 10ms` so the RTT
+        // sample computed inside `handle_syn_sent` (via `clock::now_ns()`)
+        // lands squarely inside the `[1µs, 60s)` acceptance window.
+        // `syn_retrans_count == 0` per `new_client` default — Karn's guard
+        // won't block us.
+        let ten_ms_ns: u64 = 10_000_000;
+        c.syn_tx_ts_ns = crate::clock::now_ns().saturating_sub(ten_ms_ns);
+        assert_eq!(c.syn_retrans_count, 0, "pre: Karn's guard must not apply");
+        assert!(c.rtt_est.srtt_us().is_none(), "pre: no RTT sample yet");
+        assert_eq!(c.rack.min_rtt_us, 0, "pre: no min_rtt yet");
+
+        // Build a valid SYN-ACK matching this conn.
+        let mut peer_opts = TcpOpts::default();
+        peer_opts.mss = Some(1400);
+        let mut opts_buf = [0u8; 40];
+        let opts_len = peer_opts.encode(&mut opts_buf).unwrap();
+        let seg = ParsedSegment {
+            src_port: 5000,
+            dst_port: 40000,
+            seq: 5000,
+            ack: 1001,
+            flags: TCP_SYN | TCP_ACK,
+            window: 65535,
+            header_len: 20 + opts_len,
+            payload: &[],
+            options: &opts_buf[..opts_len],
+        };
+
+        // Act: drive the full dispatcher so we exercise the real call
+        // site inside `handle_syn_sent`.
+        let out = dispatch(&mut c, &seg);
+
+        // Assert: SYN-ACK was accepted AND the helper got invoked.
+        assert_eq!(out.new_state, Some(TcpState::Established));
+        assert!(
+            c.rtt_est.srtt_us().is_some(),
+            "handle_syn_sent must call maybe_seed_srtt_from_syn on SYN-ACK"
+        );
+        assert!(
+            c.rack.min_rtt_us > 0,
+            "maybe_seed_srtt_from_syn must bump rack.min_rtt_us"
+        );
+    }
+
+    #[test]
     fn syn_sent_peer_without_wscale_zeroes_both_shifts() {
         use crate::flow_table::FourTuple;
         use crate::tcp_conn::TcpConn;
