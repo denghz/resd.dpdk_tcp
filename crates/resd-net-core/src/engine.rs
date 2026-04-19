@@ -628,6 +628,50 @@ impl Engine {
         let mut dev_info: sys::rte_eth_dev_info = unsafe { std::mem::zeroed() };
         let info_rc = unsafe { sys::rte_eth_dev_info_get(cfg.port_id, &mut dev_info) };
 
+        // Capture driver name for Task 12's LLQ verification — copy up to
+        // 31 bytes + NUL terminator. `rte_eth_dev_info.driver_name` is
+        // `*const c_char` owned by the PMD and stable for the life of the
+        // port. Populated here (pre-`rte_eth_dev_configure`) so the
+        // advertised-caps banner below can print it.
+        let mut driver_name = [0u8; 32];
+        if !dev_info.driver_name.is_null() {
+            let src = dev_info.driver_name as *const u8;
+            for (i, slot) in driver_name.iter_mut().take(31).enumerate() {
+                // SAFETY: src is a non-null NUL-terminated C string from the
+                // PMD; we walk at most 31 bytes and stop on NUL, so we never
+                // read past the end of a well-formed driver name.
+                let b = unsafe { *src.add(i) };
+                if b == 0 {
+                    break;
+                }
+                *slot = b;
+            }
+        }
+
+        // Advertised-caps banner — per spec §8.5, the startup log is the
+        // authoritative record of what the PMD advertises. Printed BEFORE
+        // any offload-branch block ANDs requested bits against the caps.
+        // `dev_info.dev_flags` is a `*const u32` owned by the PMD; deref
+        // through a null-check so a misbehaving PMD cannot crash the banner.
+        let dev_flags_val: u32 = if dev_info.dev_flags.is_null() {
+            0
+        } else {
+            // SAFETY: non-null pointer into a PMD-owned flag word that is
+            // valid for the life of the port.
+            unsafe { *dev_info.dev_flags }
+        };
+        eprintln!(
+            "resd_net: port {} driver={} rx_offload_capa=0x{:016x} \
+             tx_offload_capa=0x{:016x} dev_flags=0x{:08x}",
+            cfg.port_id,
+            std::str::from_utf8(
+                &driver_name[..driver_name.iter().position(|&b| b == 0).unwrap_or(32)]
+            ).unwrap_or("<non-utf8>"),
+            dev_info.rx_offload_capa,
+            dev_info.tx_offload_capa,
+            dev_flags_val,
+        );
+
         let mut applied_tx_offloads = RTE_ETH_TX_OFFLOAD_MULTI_SEGS;
         // `applied_rx_offloads` is mutated when any RX-side offload feature
         // is enabled (rx-cksum, rss-hash). Silence `unused_mut` when no
@@ -779,24 +823,12 @@ impl Engine {
             }));
         }
 
-        // Capture driver name for Task 12's LLQ verification — copy up to
-        // 31 bytes + NUL terminator. `rte_eth_dev_info.driver_name` is
-        // `*const c_char` owned by the PMD and stable for the life of the
-        // port.
-        let mut driver_name = [0u8; 32];
-        if !dev_info.driver_name.is_null() {
-            let src = dev_info.driver_name as *const u8;
-            for (i, slot) in driver_name.iter_mut().take(31).enumerate() {
-                // SAFETY: src is a non-null NUL-terminated C string from the
-                // PMD; we walk at most 31 bytes and stop on NUL, so we never
-                // read past the end of a well-formed driver name.
-                let b = unsafe { *src.add(i) };
-                if b == 0 {
-                    break;
-                }
-                *slot = b;
-            }
-        }
+        // Negotiated-caps banner — per spec §8.5, authoritative record of
+        // which offload bits the PMD actually accepted.
+        eprintln!(
+            "resd_net: port {} configured rx_offloads=0x{:016x} tx_offloads=0x{:016x}",
+            cfg.port_id, applied_rx_offloads, applied_tx_offloads,
+        );
 
         Ok(PortConfigOutcome {
             applied_rx_offloads,
