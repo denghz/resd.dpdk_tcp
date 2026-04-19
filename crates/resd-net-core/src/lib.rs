@@ -15,6 +15,7 @@ pub mod l3_ip;
 #[cfg(feature = "hw-verify-llq")]
 pub mod llq_verify;
 pub mod mempool;
+pub mod rtt_histogram;
 pub mod siphash24;
 pub mod tcp_conn;
 pub mod tcp_events;

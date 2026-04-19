@@ -252,6 +252,19 @@ pub struct TcpConn {
     // emission so `handle_syn_sent` can seed SRTT from the SYN-ACK
     // RTT sample.
     pub syn_tx_ts_ns: u64,
+    /// A6 (spec §3.3): set when a prior `send_bytes` returned
+    /// `accepted < len`. Cleared when `WRITABLE` hysteresis fires
+    /// on `in_flight <= send_buffer_bytes / 2`.
+    pub send_refused_pending: bool,
+    /// A6 (spec §3.4): caller passed `RESD_NET_CLOSE_FORCE_TW_SKIP`
+    /// to `resd_net_close` AND the connection had `ts_enabled=true`
+    /// at close time. `reap_time_wait` short-circuits the 2×MSL wait
+    /// when this is set.
+    pub force_tw_skip: bool,
+    /// A6 (spec §3.8): per-connection RTT histogram — 16 × u32
+    /// buckets on one cacheline. Updated after each `rtt_est.sample()`
+    /// in `tcp_input.rs` (Task 15). Slow-path update (~5–10 ns).
+    pub rtt_histogram: crate::rtt_histogram::RttHistogram,
 }
 
 impl TcpConn {
@@ -339,6 +352,9 @@ impl TcpConn {
             tlp_recent_probes: [None; 5],
             tlp_recent_probes_next_slot: 0,
             syn_tx_ts_ns: 0,
+            send_refused_pending: false,
+            force_tw_skip: false,
+            rtt_histogram: crate::rtt_histogram::RttHistogram::default(),
         }
     }
 
@@ -708,6 +724,24 @@ mod tests {
         c.tlp_pto_srtt_multiplier_x100 = 200;
         let cfg = c.tlp_config(5_000);
         assert_eq!(cfg.floor_us, 0, "u32::MAX sentinel must project to 0");
+    }
+
+    #[test]
+    fn a6_new_fields_zero_init_after_new_client() {
+        let c = TcpConn::new_client(
+            FourTuple {
+                local_ip: 0x0a000002,
+                local_port: 40000,
+                peer_ip: 0x0a000001,
+                peer_port: 5000,
+            },
+            0, 1460, 1024, 2048, 5_000, 5_000, 1_000_000,
+        );
+        assert!(!c.send_refused_pending);
+        assert!(!c.force_tw_skip);
+        for b in c.rtt_histogram.buckets.iter() {
+            assert_eq!(*b, 0);
+        }
     }
 }
 
