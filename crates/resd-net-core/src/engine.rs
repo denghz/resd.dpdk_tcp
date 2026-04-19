@@ -1782,56 +1782,16 @@ impl Engine {
             }
         }
 
-        // A5 Task 17 / A5.5 Task 11: TLP schedule (RFC 8985 §7.2 + spec
-        // §3.4). Arm a probe timer at `now + PTO` when `tlp_arm_gate_passes`
-        // — i.e. snd_retrans non-empty, no TLP already pending, under the
-        // per-conn consecutive-probe budget, and an RTT sample has been
-        // absorbed since the last TLP (unless opted-out). PTO is computed
-        // from the per-connect TlpConfig; falls back to the configured
-        // floor when the RTT estimator has no sample yet. Runs after the
-        // Task 11 prune so we don't arm a probe on a queue that just
-        // emptied.
-        let tlp_arm = {
-            let ft = self.flow_table.borrow();
-            ft.get(handle)
-                .map(|c| c.tlp_arm_gate_passes())
-                .unwrap_or(false)
-        };
-        if tlp_arm {
-            let (srtt, flight_size, now_ns, tlp_cfg) = {
-                let ft = self.flow_table.borrow();
-                let srtt = ft.get(handle).and_then(|c| c.rtt_est.srtt_us());
-                let flight_size = ft
-                    .get(handle)
-                    .map(|c| c.snd_retrans.flight_size() as u32)
-                    .unwrap_or(0);
-                // A5.5 Task 10: project the per-connect TLP tuning.
-                let tlp_cfg = ft
-                    .get(handle)
-                    .map(|c| c.tlp_config(self.cfg.tcp_min_rto_us))
-                    .unwrap_or_else(|| {
-                        crate::tcp_tlp::TlpConfig::a5_compat(self.cfg.tcp_min_rto_us)
-                    });
-                (srtt, flight_size, crate::clock::now_ns(), tlp_cfg)
-            };
-            let pto_us = crate::tcp_tlp::pto_us(srtt, &tlp_cfg, flight_size);
-            let fire_at_ns = now_ns + (pto_us as u64 * 1_000);
-            let id = self.timer_wheel.borrow_mut().add(
-                now_ns,
-                crate::tcp_timer_wheel::TimerNode {
-                    fire_at_ns,
-                    owner_handle: handle,
-                    kind: crate::tcp_timer_wheel::TimerKind::Tlp,
-                    generation: 0,
-                    cancelled: false,
-                },
-            );
-            let mut ft = self.flow_table.borrow_mut();
-            if let Some(c) = ft.get_mut(handle) {
-                c.tlp_timer_id = Some(id);
-                c.timer_ids.push(id);
-            }
-        }
+        // A5 Task 17 / A5.5 Task 11 / A5.5 Task 15: TLP schedule (RFC
+        // 8985 §7.2 + spec §3.4). Arm a probe timer at `now + PTO` when
+        // `tlp_arm_gate_passes` — snd_retrans non-empty, no TLP already
+        // pending, under the per-conn consecutive-probe budget, an RTT
+        // sample has been absorbed since the last TLP (unless opted-out),
+        // and SRTT is available. Runs after the Task 11 prune so we
+        // don't arm a probe on a queue that just emptied. Delegates to
+        // the shared `arm_tlp_pto` helper so the arm-on-ACK and
+        // arm-on-send (Task 15) sites stay bit-identical.
+        self.arm_tlp_pto(handle);
 
         // A5 Task 18: cancel the SYN-retransmit timer on SYN-ACK.
         // `handle_syn_sent` `.take()`s the conn's `syn_retrans_timer_id`
@@ -2697,7 +2657,61 @@ impl Engine {
             }
         }
 
+        // A5.5 Task 15: RFC 8985 §7.2 SHOULD — arm TLP PTO after
+        // transmitting new data. `arm_tlp_pto` is a no-op when the gate
+        // rejects (already-armed, no SRTT, budget exhausted, etc.) so
+        // calling it on every non-empty send is safe. Gating on
+        // `accepted > 0` skips the call when nothing left the wire.
+        if accepted > 0 {
+            self.arm_tlp_pto(handle);
+        }
+
         Ok(accepted)
+    }
+
+    /// A5.5 Task 15: AD-18 close — arm the TLP PTO timer per RFC 8985
+    /// §7.2 after new data is transmitted. Mirrors the A5 arm-on-ACK
+    /// block in the segment-processing path and is safe to call on
+    /// every send: `tlp_arm_gate_passes` rejects when nothing is in
+    /// flight, a TLP is already armed, the per-conn probe budget is
+    /// exhausted, the RTT-sample-seen gate is closed, or SRTT is
+    /// still unavailable (Karn's-rule skip pre-first-data-ACK).
+    fn arm_tlp_pto(&self, handle: ConnHandle) {
+        let arm_decision = {
+            let ft = self.flow_table.borrow();
+            let Some(c) = ft.get(handle) else {
+                return;
+            };
+            if !c.tlp_arm_gate_passes() {
+                return;
+            }
+            // Gate asserts `srtt_us().is_some()` — safe to unwrap.
+            let srtt_us = c.rtt_est.srtt_us().unwrap();
+            let tlp_cfg = c.tlp_config(self.cfg.tcp_min_rto_us);
+            let flight_size = c.snd_retrans.flight_size() as u32;
+            Some((srtt_us, tlp_cfg, flight_size))
+        };
+        let Some((srtt_us, tlp_cfg, flight_size)) = arm_decision else {
+            return;
+        };
+        let pto_us = crate::tcp_tlp::pto_us(Some(srtt_us), &tlp_cfg, flight_size);
+        let now_ns = crate::clock::now_ns();
+        let fire_at_ns = now_ns + (pto_us as u64 * 1_000);
+        let id = self.timer_wheel.borrow_mut().add(
+            now_ns,
+            crate::tcp_timer_wheel::TimerNode {
+                fire_at_ns,
+                owner_handle: handle,
+                kind: crate::tcp_timer_wheel::TimerKind::Tlp,
+                generation: 0,
+                cancelled: false,
+            },
+        );
+        let mut ft = self.flow_table.borrow_mut();
+        if let Some(c) = ft.get_mut(handle) {
+            c.tlp_timer_id = Some(id);
+            c.timer_ids.push(id);
+        }
     }
 
     pub fn close_conn(&self, handle: ConnHandle) -> Result<(), Error> {
@@ -3197,6 +3211,19 @@ mod tests {
             id: crate::tcp_timer_wheel::TimerId,
         ) {
             e.on_syn_retrans_fire(h, id);
+        }
+    }
+
+    // A5.5 Task 15: `arm_tlp_pto` signature compile-check. The helper
+    // is a gate-guarded slow-path call from `send_bytes` (AD-18 close).
+    // Body coverage lives in Task 28 TAP integration (first-burst TLP
+    // observed when SRTT < RTO). The per-conn gate — including the
+    // SRTT-present check added in Task 15 — is unit-tested in
+    // `tcp_conn::a5_5_tlp_hook_tests`.
+    #[test]
+    fn arm_tlp_pto_signature_exists() {
+        fn _check(e: &Engine, h: crate::flow_table::ConnHandle) {
+            e.arm_tlp_pto(h);
         }
     }
 

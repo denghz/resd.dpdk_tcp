@@ -364,6 +364,12 @@ impl TcpConn {
     /// true iff a TLP probe should be armed now given per-conn state +
     /// knobs. Called by both arm-on-ACK (Task 11) and arm-on-send
     /// (Task 15).
+    ///
+    /// A5.5 Task 15: added SRTT-present gate. PTO computation needs a
+    /// valid SRTT — post Task 13 SYN-seed this holds from ESTABLISHED
+    /// onward; the gate then only rejects in pathological pre-sample
+    /// states (Karn's-rule skip on SYN retransmit) where RTO covers
+    /// the first burst until the next data-ACK seeds SRTT.
     #[inline]
     pub fn tlp_arm_gate_passes(&self) -> bool {
         if self.snd_retrans.is_empty() {
@@ -376,6 +382,9 @@ impl TcpConn {
             return false;
         }
         if !self.tlp_skip_rtt_sample_gate && !self.tlp_rtt_sample_seen_since_last_tlp {
+            return false;
+        }
+        if self.rtt_est.srtt_us().is_none() {
             return false;
         }
         true
@@ -807,6 +816,8 @@ mod a5_5_tlp_hook_tests {
         c.tlp_max_consecutive_probes = 3;
         c.tlp_consecutive_probes_fired = 1;
         c.tlp_rtt_sample_seen_since_last_tlp = true;
+        // A5.5 Task 15: gate now requires SRTT to be present.
+        c.rtt_est.sample(5_000);
         assert!(c.tlp_arm_gate_passes());
     }
 
@@ -829,7 +840,26 @@ mod a5_5_tlp_hook_tests {
         c.tlp_rtt_sample_seen_since_last_tlp = false;
         c.tlp_max_consecutive_probes = 3;
         c.tlp_consecutive_probes_fired = 0;
+        // A5.5 Task 15: gate now also requires SRTT regardless of the
+        // RTT-sample-seen skip flag (PTO math still needs SRTT).
+        c.rtt_est.sample(5_000);
         assert!(c.tlp_arm_gate_passes());
+    }
+
+    #[test]
+    fn tlp_arm_gate_rejects_when_srtt_absent() {
+        // A5.5 Task 15: gate rejects when SRTT is unavailable. Post
+        // Task 13 SYN-seed this only fires in pathological states
+        // (Karn's-rule skip on SYN retransmit); RTO covers the first
+        // burst until the next data-ACK seeds SRTT.
+        let mut c = make_test_conn();
+        prime_retrans(&mut c, 1000, 512);
+        c.tlp_max_consecutive_probes = 3;
+        c.tlp_consecutive_probes_fired = 0;
+        c.tlp_rtt_sample_seen_since_last_tlp = true;
+        // rtt_est holds no sample → srtt_us() is None.
+        assert!(c.rtt_est.srtt_us().is_none());
+        assert!(!c.tlp_arm_gate_passes());
     }
 
     #[test]
