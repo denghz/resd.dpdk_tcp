@@ -168,7 +168,9 @@ fn build_event_from_internal(
         | InternalEvent::StateChange { emitted_ts_ns, .. }
         | InternalEvent::Error { emitted_ts_ns, .. }
         | InternalEvent::TcpRetrans { emitted_ts_ns, .. }
-        | InternalEvent::TcpLossDetected { emitted_ts_ns, .. } => *emitted_ts_ns,
+        | InternalEvent::TcpLossDetected { emitted_ts_ns, .. }
+        | InternalEvent::ApiTimer { emitted_ts_ns, .. }
+        | InternalEvent::Writable { emitted_ts_ns, .. } => *emitted_ts_ns,
     };
     match ev {
         InternalEvent::Connected {
@@ -269,6 +271,17 @@ fn build_event_from_internal(
                     },
                 },
             }
+        }
+        InternalEvent::ApiTimer { .. } => {
+            // Wired in Task 17 (resd_net_timer_add extern). Keeping this
+            // unreachable for now lets the workspace compile; no call site
+            // pushes an ApiTimer variant until Task 8 + Task 17 both land.
+            unreachable!("ApiTimer translation wired in Task 17; no upstream emit until Task 8")
+        }
+        InternalEvent::Writable { .. } => {
+            // Wired in Task 16 (WRITABLE hysteresis) + Task 17. Same
+            // invariant as ApiTimer.
+            unreachable!("Writable translation wired in Task 17; no upstream emit until Task 16")
         }
     }
 }
