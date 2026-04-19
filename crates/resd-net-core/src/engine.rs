@@ -396,6 +396,39 @@ pub struct ConnectOpts {
     pub tlp_skip_rtt_sample_gate: bool,
 }
 
+/// Bump `counter` when `requested_bit` is set but `advertised_mask` does
+/// not include it. Returns the bit ANDed in — i.e., the bit itself if
+/// advertised, else 0. Slow-path; called once per offload at bring-up.
+///
+/// Spec §4 step 5 + §9.1.1 counter-addition policy.
+///
+/// `allow(dead_code)` covers `--no-default-features` builds where all
+/// `hw-offload-*` features are off and no call site references this
+/// helper; the test module always exercises it.
+#[allow(dead_code)]
+fn and_offload_with_miss_counter(
+    requested_bit: u64,
+    advertised_mask: u64,
+    counter: &std::sync::atomic::AtomicU64,
+    name: &str,
+    port_id: u16,
+) -> u64 {
+    if requested_bit == 0 {
+        return 0;
+    }
+    if (requested_bit & advertised_mask) == 0 {
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        eprintln!(
+            "resd_net: PMD on port {} does not advertise {} (0x{:016x}); \
+             degrading to software path for this offload",
+            port_id, name, requested_bit
+        );
+        0
+    } else {
+        requested_bit
+    }
+}
+
 /// Result of `configure_port_offloads` — the applied offload masks plus
 /// per-engine runtime latches that gate hot-path offload-vs-software
 /// branches. See spec §4 and §§6-10 for how each latch feeds later branches.
@@ -563,7 +596,18 @@ impl Engine {
         counters: &Counters,
     ) -> Result<PortConfigOutcome, Error> {
         use crate::dpdk_consts::RTE_ETH_TX_OFFLOAD_MULTI_SEGS;
-        let _ = counters; // unused in Task 2; Task 3 starts using it
+
+        // `counters` is unused when every `hw-offload-*` counter-bumping
+        // feature is compiled out. The signature stays stable because the
+        // latches are C-ABI-stable and future tasks (4, 7, 8) reintroduce
+        // consumers. Keep the binding alive for `-D warnings` on
+        // `--no-default-features`.
+        #[cfg(not(any(
+            feature = "hw-offload-mbuf-fast-free",
+            feature = "hw-offload-tx-cksum",
+            feature = "hw-offload-rx-cksum",
+        )))]
+        let _ = counters;
 
         let mut eth_conf: sys::rte_eth_conf = unsafe { std::mem::zeroed() };
 
@@ -576,6 +620,11 @@ impl Engine {
         let info_rc = unsafe { sys::rte_eth_dev_info_get(cfg.port_id, &mut dev_info) };
 
         let mut applied_tx_offloads = RTE_ETH_TX_OFFLOAD_MULTI_SEGS;
+        // `applied_rx_offloads` is mutated only when the rx-cksum feature
+        // is enabled (Task 4 will also mutate it when rss-hash is on).
+        // Silence `unused_mut` when no rx-side offload feature is active.
+        #[cfg_attr(not(feature = "hw-offload-rx-cksum"), allow(unused_mut))]
+        let mut applied_rx_offloads: u64 = 0;
         if info_rc == 0
             && (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MULTI_SEGS) == 0
         {
@@ -586,7 +635,92 @@ impl Engine {
             );
             applied_tx_offloads &= !RTE_ETH_TX_OFFLOAD_MULTI_SEGS;
         }
+
+        // --- MBUF_FAST_FREE (hw-offload-mbuf-fast-free) ---------------
+        #[cfg(feature = "hw-offload-mbuf-fast-free")]
+        {
+            use crate::dpdk_consts::RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE;
+            applied_tx_offloads |= and_offload_with_miss_counter(
+                RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE,
+                dev_info.tx_offload_capa,
+                &counters.eth.offload_missing_mbuf_fast_free,
+                "RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE",
+                cfg.port_id,
+            );
+        }
+
+        // --- TX checksum (hw-offload-tx-cksum) ------------------------
+        #[cfg(feature = "hw-offload-tx-cksum")]
+        let tx_cksum_offload_active = {
+            use crate::dpdk_consts::{
+                RTE_ETH_TX_OFFLOAD_IPV4_CKSUM, RTE_ETH_TX_OFFLOAD_TCP_CKSUM,
+                RTE_ETH_TX_OFFLOAD_UDP_CKSUM,
+            };
+            let ipv4 = and_offload_with_miss_counter(
+                RTE_ETH_TX_OFFLOAD_IPV4_CKSUM,
+                dev_info.tx_offload_capa,
+                &counters.eth.offload_missing_tx_cksum_ipv4,
+                "RTE_ETH_TX_OFFLOAD_IPV4_CKSUM",
+                cfg.port_id,
+            );
+            let tcp = and_offload_with_miss_counter(
+                RTE_ETH_TX_OFFLOAD_TCP_CKSUM,
+                dev_info.tx_offload_capa,
+                &counters.eth.offload_missing_tx_cksum_tcp,
+                "RTE_ETH_TX_OFFLOAD_TCP_CKSUM",
+                cfg.port_id,
+            );
+            let udp = and_offload_with_miss_counter(
+                RTE_ETH_TX_OFFLOAD_UDP_CKSUM,
+                dev_info.tx_offload_capa,
+                &counters.eth.offload_missing_tx_cksum_udp,
+                "RTE_ETH_TX_OFFLOAD_UDP_CKSUM",
+                cfg.port_id,
+            );
+            applied_tx_offloads |= ipv4 | tcp | udp;
+            // Latch the runtime flag only if IPv4 + TCP both applied.
+            // UDP is optional — Stage 1 has no UDP TX path.
+            ipv4 != 0 && tcp != 0
+        };
+        #[cfg(not(feature = "hw-offload-tx-cksum"))]
+        let tx_cksum_offload_active = false;
+
+        // --- RX checksum (hw-offload-rx-cksum) ------------------------
+        #[cfg(feature = "hw-offload-rx-cksum")]
+        let rx_cksum_offload_active = {
+            use crate::dpdk_consts::{
+                RTE_ETH_RX_OFFLOAD_IPV4_CKSUM, RTE_ETH_RX_OFFLOAD_TCP_CKSUM,
+                RTE_ETH_RX_OFFLOAD_UDP_CKSUM,
+            };
+            let ipv4 = and_offload_with_miss_counter(
+                RTE_ETH_RX_OFFLOAD_IPV4_CKSUM,
+                dev_info.rx_offload_capa,
+                &counters.eth.offload_missing_rx_cksum_ipv4,
+                "RTE_ETH_RX_OFFLOAD_IPV4_CKSUM",
+                cfg.port_id,
+            );
+            let tcp = and_offload_with_miss_counter(
+                RTE_ETH_RX_OFFLOAD_TCP_CKSUM,
+                dev_info.rx_offload_capa,
+                &counters.eth.offload_missing_rx_cksum_tcp,
+                "RTE_ETH_RX_OFFLOAD_TCP_CKSUM",
+                cfg.port_id,
+            );
+            let udp = and_offload_with_miss_counter(
+                RTE_ETH_RX_OFFLOAD_UDP_CKSUM,
+                dev_info.rx_offload_capa,
+                &counters.eth.offload_missing_rx_cksum_udp,
+                "RTE_ETH_RX_OFFLOAD_UDP_CKSUM",
+                cfg.port_id,
+            );
+            applied_rx_offloads |= ipv4 | tcp | udp;
+            ipv4 != 0 && tcp != 0
+        };
+        #[cfg(not(feature = "hw-offload-rx-cksum"))]
+        let rx_cksum_offload_active = false;
+
         eth_conf.txmode.offloads = applied_tx_offloads;
+        eth_conf.rxmode.offloads = applied_rx_offloads;
 
         let rc = unsafe {
             sys::rte_eth_dev_configure(cfg.port_id, 1, 1, &eth_conf as *const _)
@@ -617,11 +751,11 @@ impl Engine {
         }
 
         Ok(PortConfigOutcome {
-            applied_rx_offloads: 0,
+            applied_rx_offloads,
             applied_tx_offloads,
-            tx_cksum_offload_active: false,
-            rx_cksum_offload_active: false,
-            rss_hash_offload_active: false,
+            tx_cksum_offload_active,
+            rx_cksum_offload_active,
+            rss_hash_offload_active: false, // Task 4 fills this.
             driver_name,
         })
     }
@@ -3763,5 +3897,40 @@ mod tests {
         assert_eq!(c.rx_dsack.load(Ordering::Relaxed), 0);
         assert_eq!(c.rx_ws_shift_clamped.load(Ordering::Relaxed), 0);
         assert_eq!(c.rtt_samples.load(Ordering::Relaxed), 0);
+    }
+}
+
+#[cfg(test)]
+mod a_hw_port_config_tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::and_offload_with_miss_counter;
+
+    #[test]
+    fn offload_miss_bumps_counter_returns_zero() {
+        let ctr = AtomicU64::new(0);
+        let bit: u64 = 1 << 3;
+        let advertised = 0u64;
+        let applied = and_offload_with_miss_counter(bit, advertised, &ctr, "tx-tcp-cksum", 0);
+        assert_eq!(applied, 0);
+        assert_eq!(ctr.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn offload_present_no_bump_returns_bit() {
+        let ctr = AtomicU64::new(0);
+        let bit: u64 = 1 << 3;
+        let advertised = bit;
+        let applied = and_offload_with_miss_counter(bit, advertised, &ctr, "tx-tcp-cksum", 0);
+        assert_eq!(applied, bit);
+        assert_eq!(ctr.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn offload_not_requested_noop() {
+        let ctr = AtomicU64::new(0);
+        let applied = and_offload_with_miss_counter(0, u64::MAX, &ctr, "ignored", 0);
+        assert_eq!(applied, 0);
+        assert_eq!(ctr.load(Ordering::Relaxed), 0);
     }
 }
