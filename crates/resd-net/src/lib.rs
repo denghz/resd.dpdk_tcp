@@ -9,6 +9,39 @@ use resd_net_core::engine::{self, Engine, EngineConfig};
 use std::ffi::CStr;
 use std::ptr;
 
+/// A6 (spec §3.5): latency preset — all existing config fields honored
+/// as-written (post zero-sentinel substitution).
+pub const PRESET_LATENCY: u8 = 0;
+/// A6 (spec §3.5): RFC-compliance preset — overrides five fields per
+/// parent spec §4: `tcp_nagle`, `tcp_delayed_ack`, `cc_mode`,
+/// `tcp_min_rto_us`, `tcp_initial_rto_us`.
+pub const PRESET_RFC_COMPLIANCE: u8 = 1;
+
+/// A6 (spec §3.5): apply a preset to a core `EngineConfig` after the
+/// zero-sentinel substitution pass. The preset override is stronger
+/// than defaults — any explicit caller values for the five preset
+/// fields are overwritten when `preset == PRESET_RFC_COMPLIANCE`.
+///
+/// Returns `Err(())` for unknown presets (>= 2); `resd_net_engine_create`
+/// surfaces that as a null-pointer return to the C caller.
+pub fn apply_preset(
+    preset: u8,
+    core_cfg: &mut resd_net_core::engine::EngineConfig,
+) -> Result<(), ()> {
+    match preset {
+        PRESET_LATENCY => Ok(()),
+        PRESET_RFC_COMPLIANCE => {
+            core_cfg.tcp_nagle = true;
+            core_cfg.tcp_delayed_ack = true;
+            core_cfg.cc_mode = 1; // Reno
+            core_cfg.tcp_min_rto_us = 200_000;
+            core_cfg.tcp_initial_rto_us = 1_000_000;
+            Ok(())
+        }
+        _ => Err(()),
+    }
+}
+
 /// Opaque handle — actually a Box<Engine> reinterpreted as *mut resd_net_engine.
 struct OpaqueEngine(Engine);
 
@@ -107,7 +140,7 @@ pub unsafe extern "C" fn resd_net_engine_create(
         cfg.tcp_msl_ms
     };
 
-    let core_cfg = EngineConfig {
+    let mut core_cfg = EngineConfig {
         lcore_id,
         port_id: cfg.port_id,
         rx_queue_id: cfg.rx_queue_id,
@@ -126,6 +159,14 @@ pub unsafe extern "C" fn resd_net_engine_create(
         tcp_mss: mss,
         tcp_msl_ms: msl,
         tcp_nagle: cfg.tcp_nagle,
+        // A6 Task 9 (spec §3.5): ABI-to-core pass-through. Pre-preset
+        // value honored when `preset == PRESET_LATENCY`; `apply_preset`
+        // below overwrites to `true` when `preset == PRESET_RFC_COMPLIANCE`.
+        tcp_delayed_ack: cfg.tcp_delayed_ack,
+        // A6 Task 9 (spec §3.5): ABI-to-core pass-through. Pre-preset
+        // value honored when `preset == PRESET_LATENCY`; `apply_preset`
+        // overwrites to `1` (Reno) when `preset == PRESET_RFC_COMPLIANCE`.
+        cc_mode: cfg.cc_mode,
         tcp_min_rto_us: min_rto_us,
         tcp_initial_rto_us: initial_rto_us,
         tcp_max_rto_us: max_rto_us,
@@ -138,6 +179,12 @@ pub unsafe extern "C" fn resd_net_engine_create(
         // lands in Task 20.
         rtt_histogram_bucket_edges_us: [0u32; 15],
     };
+    // A6 Task 9 (spec §3.5): apply preset override AFTER zero-sentinel
+    // substitution so the preset values are never clobbered by the
+    // substitution pass. Unknown presets (>= 2) null-return.
+    if apply_preset(cfg.preset, &mut core_cfg).is_err() {
+        return ptr::null_mut();
+    }
     match Engine::new(core_cfg) {
         Ok(e) => box_to_raw(e),
         Err(_) => ptr::null_mut(),
@@ -801,6 +848,55 @@ mod tests {
         let fake_engine = std::ptr::dangling_mut::<resd_net_engine>();
         let rc = unsafe { resd_net_conn_stats(fake_engine, 0, std::ptr::null_mut()) };
         assert_eq!(rc, -libc::EINVAL);
+    }
+
+    // A6 Task 9: `preset` (spec §3.5) must be honored in
+    // `resd_net_engine_create`. Pinning the constants + validator here
+    // lets us exercise the preset path without an EAL-backed Engine.
+    #[test]
+    fn preset_rfc_compliance_is_known_constant() {
+        assert_eq!(PRESET_LATENCY, 0);
+        assert_eq!(PRESET_RFC_COMPLIANCE, 1);
+    }
+
+    #[test]
+    fn apply_preset_rfc_compliance_overrides_five_fields() {
+        let mut core_cfg = resd_net_core::engine::EngineConfig {
+            tcp_nagle: false,
+            cc_mode: 0,
+            tcp_min_rto_us: 5_000,
+            tcp_initial_rto_us: 5_000,
+            ..resd_net_core::engine::EngineConfig::default()
+        };
+        apply_preset(1, &mut core_cfg).expect("preset=1 must apply");
+        assert!(core_cfg.tcp_nagle);
+        assert!(core_cfg.tcp_delayed_ack);
+        assert_eq!(core_cfg.cc_mode, 1);
+        assert_eq!(core_cfg.tcp_min_rto_us, 200_000);
+        assert_eq!(core_cfg.tcp_initial_rto_us, 1_000_000);
+    }
+
+    #[test]
+    fn apply_preset_latency_leaves_fields_intact() {
+        let mut core_cfg = resd_net_core::engine::EngineConfig {
+            tcp_nagle: false,
+            cc_mode: 0,
+            tcp_min_rto_us: 5_000,
+            tcp_initial_rto_us: 5_000,
+            ..resd_net_core::engine::EngineConfig::default()
+        };
+        apply_preset(0, &mut core_cfg).expect("preset=0 must be noop");
+        assert!(!core_cfg.tcp_nagle);
+        assert_eq!(core_cfg.cc_mode, 0);
+        assert_eq!(core_cfg.tcp_min_rto_us, 5_000);
+        assert_eq!(core_cfg.tcp_initial_rto_us, 5_000);
+    }
+
+    #[test]
+    fn apply_preset_unknown_rejected() {
+        let mut core_cfg = resd_net_core::engine::EngineConfig::default();
+        assert!(apply_preset(2, &mut core_cfg).is_err());
+        assert!(apply_preset(255, &mut core_cfg).is_err());
     }
 }
 

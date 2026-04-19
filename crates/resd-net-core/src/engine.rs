@@ -249,6 +249,17 @@ pub struct EngineConfig {
     pub tcp_msl_ms: u32,
     pub tcp_nagle: bool,
 
+    /// A6 (spec §3.5): delayed-ACK on/off. Default false (trading
+    /// per-segment ACK). `preset=rfc_compliance` forces true.
+    /// A3–A5.5 per-poll coalesce behavior is unchanged; this field
+    /// gates the future burst-scope coalescing decision in tcp_output.
+    pub tcp_delayed_ack: bool,
+
+    /// A6 (spec §3.5): congestion-control mode selector. `0` = latency
+    /// (A3–A5.5 behavior preserved); `1` = Reno (RFC 5681). Default 0.
+    /// `preset=rfc_compliance` forces 1.
+    pub cc_mode: u8,
+
     // Phase A5 additions
     /// A5 Task 21: RFC 6298 RTO floor (µs). Spec §6.4 default 5ms
     /// (trading-latency policy; RFC recommends 1s floor).
@@ -302,6 +313,11 @@ impl Default for EngineConfig {
             tcp_mss: 1460,
             tcp_msl_ms: 30_000,
             tcp_nagle: false,
+            // A6 (spec §3.5): trading-latency default is false (ACK every
+            // accepted segment). `preset=rfc_compliance` forces true.
+            tcp_delayed_ack: false,
+            // A6 (spec §3.5): 0 = latency (A3–A5.5 behavior preserved).
+            cc_mode: 0,
             tcp_min_rto_us: 5_000,
             tcp_initial_rto_us: 5_000,
             tcp_max_rto_us: 1_000_000,
