@@ -3394,8 +3394,12 @@ impl Engine {
     /// Enqueue `bytes` on the connection's send path. Returns the number
     /// of bytes accepted (could be < bytes.len() under send-buffer or
     /// peer-window backpressure). On `tx_data_mempool` exhaustion mid-send,
-    /// returns a negative errno (Err(Error::SendBufferFull) mapped to
-    /// `-ENOMEM` at the public-API layer).
+    /// returns `Err(Error::SendBufferFull)` (mapped to `-ENOMEM` at the
+    /// public-API layer). After A6 Task 12, NIC TX-ring saturation no
+    /// longer surfaces as `SendBufferFull` — `send_bytes` pushes segments
+    /// onto the engine-scope `tx_pending_data` batch ring and the
+    /// end-of-poll drain retries via `rte_eth_tx_burst`, so only
+    /// `tx_data_mempool` alloc failure produces this error now.
     pub fn send_bytes(&self, handle: ConnHandle, bytes: &[u8]) -> Result<u32, Error> {
         use crate::counters::inc;
         use crate::tcp_output::{build_segment, SegmentTx, TCP_ACK, TCP_PSH};
@@ -3611,6 +3615,8 @@ impl Engine {
             };
             {
                 let mut ft = self.flow_table.borrow_mut();
+                // A6 Task 12: RTO arms on ring-push success (not wire-TX).
+                // Sub-µs drift vs. drain at end-of-poll.
                 let arm_rto = if let Some(c) = ft.get_mut(handle) {
                     let was_empty = c.snd_retrans.is_empty();
                     c.snd_retrans.push_after_tx(new_entry);
@@ -3690,6 +3696,8 @@ impl Engine {
         // rejects (already-armed, no SRTT, budget exhausted, etc.) so
         // calling it on every non-empty send is safe. Gating on
         // `accepted > 0` skips the call when nothing left the wire.
+        // A6 Task 12: TLP PTO arms on ring-push success, not wire-TX
+        // (sub-µs drift).
         if accepted > 0 {
             self.arm_tlp_pto(handle);
         }
