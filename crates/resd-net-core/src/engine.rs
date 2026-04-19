@@ -2234,12 +2234,12 @@ impl Engine {
         // `ConnectOpts::default()`, we apply the same substitution
         // locally so the TcpConn always sees post-substitution values.
         let tlp_multiplier = if opts.tlp_pto_srtt_multiplier_x100 == 0 {
-            200
+            crate::tcp_tlp::DEFAULT_MULTIPLIER_X100
         } else {
             opts.tlp_pto_srtt_multiplier_x100
         };
         let tlp_max_probes = if opts.tlp_max_consecutive_probes == 0 {
-            1
+            crate::tcp_tlp::DEFAULT_MAX_CONSECUTIVE_PROBES
         } else {
             opts.tlp_max_consecutive_probes
         };

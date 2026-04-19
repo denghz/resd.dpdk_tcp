@@ -11,6 +11,14 @@
 /// ACK beyond the probe deadline. 200ms matches the RFC default.
 pub const WCDELACK_US: u32 = 200_000;
 
+/// Default SRTT multiplier (× 100) for TLP PTO when the caller
+/// zero-inits `resd_net_connect_opts_t`. 2.0× matches RFC 8985 §7.2.
+pub const DEFAULT_MULTIPLIER_X100: u16 = 200;
+
+/// Default maximum consecutive TLP probes. 1 matches RFC 8985 §7
+/// (single probe before falling back to RTO).
+pub const DEFAULT_MAX_CONSECUTIVE_PROBES: u8 = 1;
+
 /// Tunable PTO pieces extracted from the A5 formula (`max(2·SRTT, min_rto)`).
 ///
 /// `a5_compat(min_rto)` and `default()` preserve A5 behavior exactly so pre-A5.5

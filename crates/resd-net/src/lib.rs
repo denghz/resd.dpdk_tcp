@@ -425,10 +425,10 @@ fn validate_and_defaults_tlp_opts(
 ) -> Result<resd_net_connect_opts_t, i32> {
     let mut o_opts = *o;
     if o_opts.tlp_pto_srtt_multiplier_x100 == 0 {
-        o_opts.tlp_pto_srtt_multiplier_x100 = 200;
+        o_opts.tlp_pto_srtt_multiplier_x100 = resd_net_core::tcp_tlp::DEFAULT_MULTIPLIER_X100;
     }
     if o_opts.tlp_max_consecutive_probes == 0 {
-        o_opts.tlp_max_consecutive_probes = 1;
+        o_opts.tlp_max_consecutive_probes = resd_net_core::tcp_tlp::DEFAULT_MAX_CONSECUTIVE_PROBES;
     }
     if o_opts.tlp_pto_min_floor_us == 0 {
         o_opts.tlp_pto_min_floor_us = cfg.tcp_min_rto_us;
@@ -822,8 +822,14 @@ mod a5_5_tlp_opts_tests {
         let cfg = base_cfg();
         let out = validate_and_defaults_tlp_opts(&opts, &cfg)
             .expect("zero-init must substitute to valid A5 defaults");
-        assert_eq!(out.tlp_pto_srtt_multiplier_x100, 200);
-        assert_eq!(out.tlp_max_consecutive_probes, 1);
+        assert_eq!(
+            out.tlp_pto_srtt_multiplier_x100,
+            resd_net_core::tcp_tlp::DEFAULT_MULTIPLIER_X100
+        );
+        assert_eq!(
+            out.tlp_max_consecutive_probes,
+            resd_net_core::tcp_tlp::DEFAULT_MAX_CONSECUTIVE_PROBES
+        );
         assert_eq!(out.tlp_pto_min_floor_us, cfg.tcp_min_rto_us);
     }
 
