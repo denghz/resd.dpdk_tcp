@@ -18,6 +18,7 @@
 | A4 | TCP options + PAWS + reassembly + SACK scoreboard | **Complete** ✓ | `2026-04-18-stage1-phase-a4-options-paws-reassembly-sack.md` |
 | A5 | RACK-TLP + RTO + retransmit + ISS | **Complete** ✓ | `2026-04-18-stage1-phase-a5-rack-rto-retransmit.md` |
 | A5.5 | Event-log forensics + in-flight introspection + TLP tuning (emission-time ts, queue overflow counter, stats getter, per-conn TLP knobs) | Not started | — |
+| A5.6 | Per-connection RTT histogram (16 log-spaced u32 buckets, runtime-configurable edges, wraparound-on-delta) | Not started | — |
 | A-HW | ENA hardware offload enablement (LLQ verify + TX/RX checksum + MBUF_FAST_FREE + RSS-hash plumbing) | Not started | — |
 | A6 | Public API surface completeness | Not started | — |
 | A7 | Loopback test server + packetdrill-shim | Not started | — |
@@ -219,6 +220,37 @@
 **Ship gate:** `phase-a5-5-complete` tag requires (a) all integration tests green, (b) mTCP review report landed (expected no ADs for observability; TLP knobs flagged as scope-difference since mTCP does not implement TLP), (c) RFC compliance review landed (expected PASS-WITH-DEVIATIONS since the TLP knobs open 5 new §6.4 rows — all per-connect opt-in with defaults matching RFC 8985).
 
 **Rough scale:** ~10–12 tasks. See `docs/superpowers/specs/2026-04-18-stage1-phase-a5-5-event-log-forensics-design.md` §9.
+
+---
+
+## A5.6 — Per-connection RTT histogram
+
+**Numbering note:** Sibling of A5.5 — observability-only addition that captures RTT distribution shape over app-chosen time windows, complementing A5.5's scalar `stats()` getter. Carved as A5.6 (not folded into A5.5) because A5.5 is already executing and this is a clean additive feature. Can run immediately after A5.5 or in parallel with A-HW.
+
+**Goal:** Give applications a bounded-cost way to observe RTT distribution shape across time windows (e.g., 1-minute session-health monitoring, per-order forensic zoom). Complements A5.5's scalar SRTT/RTTVAR/min_RTT getter, which captures trend but loses distribution tail shape. Full per-sample event streaming was rejected as too expensive; raw-samples ring was rejected as either too small at high sample rates or too big at long windows. The 64-byte histogram counter is sample-rate-independent (one update per sample regardless of rate) and window-size-independent (one 64 B snapshot regardless of window).
+
+**Spec:** `docs/superpowers/specs/2026-04-19-stage1-phase-a5-6-rtt-histogram-design.md`.
+
+**Deliverables:**
+
+- **Per-conn histogram field** — `TcpConn.rtt_histogram: [u32; 16]` (exactly 64 B, one cacheline). Updated inside `rtt_est.sample()` via a 15-comparison bucket-selection ladder + `wrapping_add(1)`. Cost: ~5–10 ns per RTT sample; no atomic (single-lcore RTC model).
+- **Runtime-configurable bucket edges** — `resd_net_engine_config_t::rtt_histogram_bucket_edges_us[15]` (15 × `uint32_t` = 60 B, strictly monotonically increasing). All-zero = stack applies trading-tuned defaults `{50, 100, 200, 300, 500, 750, 1000, 2000, 3000, 5000, 10000, 25000, 50000, 100000, 500000}` µs (dense resolution in the 50µs–1ms colo/same-region range, coarser beyond). Non-monotonic edges rejected at `engine_create` with `-EINVAL`.
+- **New extern "C" getter** — `resd_net_conn_rtt_histogram(engine, conn, out) → i32` returning a 64-byte `resd_net_tcp_rtt_histogram_t { uint32_t bucket[16] }`. Slow-path, per-order or per-minute cadence.
+- **Wraparound semantics** — per-bucket `u32` overflows silently; application takes deltas via unsigned wraparound subtraction. Correctness bound: no single bucket accumulates > 2³² samples between polls. At 1M samples/sec that's ~71 minutes; at 10k samples/sec typical for order-entry it's ~5 days. Documented in the cbindgen header's struct doc-comment.
+- **A8 audit integration** — sibling per-conn-histogram coverage audit in `tests/per-conn-histogram-coverage.rs` (engine-wide counter audit doesn't reach per-conn state); scenario sweeps RTT across all 16 buckets. Knob-coverage audit picks up `rtt_histogram_bucket_edges_us` with a non-default-edges scenario.
+
+**Does NOT include:**
+
+- Per-sample `RESD_NET_EVT_RTT_SAMPLE` events — deferred; histogram covers the stated minute-to-hour use case more cheaply. Revisit if a sub-second forensic-zoom requirement surfaces.
+- Raw-samples ring — deferred for the same reason.
+- Engine-wide histogram (sum across conns) — derive from per-conn on demand if needed; no dedicated machinery in A5.6.
+- Mid-session edge changes — edges are fixed at `engine_create`; changing them would invalidate accumulated counts.
+
+**Dependencies:** A5.5 (A5.6 lands after A5.5 ships; depends on A5's `rtt_est.sample()` call site being the hook point). **Independent of A-HW** — no shared files; can run in parallel.
+
+**Ship gate:** `phase-a5-6-complete` tag requires (a) all integration tests green (bucket selection + wraparound + cross-conn isolation + unknown-handle + null-out), (b) mTCP review (expected brief, no ADs — mTCP has no analog), (c) RFC compliance review (expected trivial — no wire behavior).
+
+**Rough scale:** ~3 tasks. See the A5.6 spec §9.
 
 ---
 
