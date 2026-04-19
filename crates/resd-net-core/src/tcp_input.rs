@@ -367,6 +367,10 @@ fn handle_syn_sent(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
         );
     }
 
+    // A5.5 Task 13: seed SRTT from the SYN handshake round-trip
+    // (RFC 6298 §3.3 MAY). Karn's rule + bounds are inside the helper.
+    conn.maybe_seed_srtt_from_syn(crate::clock::now_ns());
+
     // A5 Task 18: SYN-ACK accepted — hand the engine the SYN-retransmit
     // timer id so it can cancel the pending fire (we can't touch the
     // engine's timer wheel from here). `take()` zeros the field so a

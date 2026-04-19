@@ -685,7 +685,21 @@ impl Engine {
         let Some(n) = build_segment(&seg, &mut buf) else {
             return false;
         };
-        self.tx_frame(&buf[..n])
+        let tx_ok = self.tx_frame(&buf[..n]);
+        // A5.5 Task 13: stash SYN TX timestamp on the ORIGINAL SYN only
+        // (Karn's rule — the retransmit path increments `syn_retrans_count`
+        // before re-entering `emit_syn`, so this guard fires exclusively on
+        // the initial connect). `handle_syn_sent` consumes the field to
+        // seed SRTT from the SYN handshake round-trip (RFC 6298 §3.3 MAY).
+        if tx_ok {
+            let mut ft = self.flow_table.borrow_mut();
+            if let Some(c) = ft.get_mut(handle) {
+                if c.syn_retrans_count == 0 {
+                    c.syn_tx_ts_ns = now_ns;
+                }
+            }
+        }
+        tx_ok
     }
 
     /// Pick the next ephemeral source port in the IANA range [49152, 65535].

@@ -416,6 +416,31 @@ impl TcpConn {
         self.tlp_consecutive_probes_fired = 0;
     }
 
+    /// A5.5 Task 13: seed SRTT from the SYN handshake round-trip per
+    /// RFC 6298 §3.3 MAY ("The RTT of the SYN segment MAY be used as
+    /// the first SRTT"). Karn's rule: skip when `syn_retrans_count != 0`
+    /// — the SYN-ACK could be for the original OR a retransmit, and the
+    /// ambiguity breaks the sample. Also skip when `syn_tx_ts_ns == 0`
+    /// (accept-side paths never set it). Bounds `(1..60_000_000)` match
+    /// A5's data-ACK sampler so clock anomalies are rejected uniformly.
+    /// Returns `true` iff the sample was absorbed.
+    #[inline]
+    pub fn maybe_seed_srtt_from_syn(&mut self, now_ns: u64) -> bool {
+        if self.syn_retrans_count != 0 {
+            return false;
+        }
+        if self.syn_tx_ts_ns == 0 {
+            return false;
+        }
+        let rtt_us = ((now_ns / 1_000) as u32).wrapping_sub((self.syn_tx_ts_ns / 1_000) as u32);
+        if !(1..60_000_000).contains(&rtt_us) {
+            return false;
+        }
+        self.rtt_est.sample(rtt_us);
+        self.rack.update_min_rtt(rtt_us);
+        true
+    }
+
     /// A5.5 Task 12: attribute a DSACK block `[left, right)` to a recent
     /// TLP probe. Returns `true` iff a previously-unattributed probe was
     /// matched; caller increments `tcp.tx_tlp_spurious` on a `true` return.
@@ -953,5 +978,59 @@ mod a5_5_dsack_attribution {
 
         let attributed = c.attribute_dsack_to_recent_tlp_probe(1000, 1100, now_ns);
         assert!(!attributed);
+    }
+}
+
+#[cfg(test)]
+mod a5_5_syn_srtt_seed {
+    use super::a5_5_stats_tests::make_test_conn;
+
+    #[test]
+    fn syn_rtt_seed_absorbs_first_sample() {
+        let mut c = make_test_conn();
+        c.syn_tx_ts_ns = 1_000_000_000; // 1s in ns
+        c.syn_retrans_count = 0;
+        let now_ns = 1_000_000_000 + 50_000_000; // 50ms later
+
+        assert!(c.maybe_seed_srtt_from_syn(now_ns));
+        assert!(c.rtt_est.srtt_us().is_some());
+        assert!(c.rack.min_rtt_us > 0);
+    }
+
+    #[test]
+    fn syn_rtt_seed_karns_rule_skips_retransmits() {
+        let mut c = make_test_conn();
+        c.syn_tx_ts_ns = 1_000_000_000;
+        c.syn_retrans_count = 1; // SYN was retransmitted
+        let now_ns = 1_000_000_000 + 50_000_000;
+
+        assert!(!c.maybe_seed_srtt_from_syn(now_ns));
+        assert!(c.rtt_est.srtt_us().is_none());
+        assert_eq!(c.rack.min_rtt_us, 0);
+    }
+
+    #[test]
+    fn syn_rtt_seed_rejects_zero_syn_tx_ts() {
+        let mut c = make_test_conn();
+        c.syn_tx_ts_ns = 0; // never set (accept-side path, for instance)
+        c.syn_retrans_count = 0;
+        let now_ns = 1_000_000_000;
+
+        assert!(!c.maybe_seed_srtt_from_syn(now_ns));
+        assert!(c.rtt_est.srtt_us().is_none());
+        assert_eq!(c.rack.min_rtt_us, 0);
+    }
+
+    #[test]
+    fn syn_rtt_seed_rejects_out_of_bounds_rtt() {
+        let mut c = make_test_conn();
+        c.syn_tx_ts_ns = 1_000_000_000;
+        c.syn_retrans_count = 0;
+        // 61s later — above 60s upper bound.
+        let now_ns = 1_000_000_000 + 61_000_000_000;
+
+        assert!(!c.maybe_seed_srtt_from_syn(now_ns));
+        assert!(c.rtt_est.srtt_us().is_none());
+        assert_eq!(c.rack.min_rtt_us, 0);
     }
 }
