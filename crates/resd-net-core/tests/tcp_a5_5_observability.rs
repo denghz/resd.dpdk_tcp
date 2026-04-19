@@ -43,7 +43,15 @@ fn internal_event_carries_emitted_ts_ns_on_every_variant() {
         cause: LossCause::Rack,
         emitted_ts_ns: 42,
     };
-    for e in [ev_connected, ev_readable, ev_closed, ev_state, ev_error, ev_retrans, ev_loss] {
+    for e in [
+        ev_connected,
+        ev_readable,
+        ev_closed,
+        ev_state,
+        ev_error,
+        ev_retrans,
+        ev_loss,
+    ] {
         assert_eq!(emitted_ts_ns_of(&e), 42);
     }
     let _ = EventQueue::new();

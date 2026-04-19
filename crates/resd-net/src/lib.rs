@@ -202,9 +202,7 @@ fn build_event_from_internal(
                 closed: resd_net_event_error_t { err: *err },
             },
         },
-        InternalEvent::StateChange {
-            conn, from, to, ..
-        } => resd_net_event_t {
+        InternalEvent::StateChange { conn, from, to, .. } => resd_net_event_t {
             kind: resd_net_event_kind_t::RESD_NET_EVT_TCP_STATE_CHANGE,
             conn: *conn as u64,
             rx_hw_ts_ns: 0,
@@ -292,7 +290,10 @@ pub unsafe extern "C" fn resd_net_poll(
         // Non-Readable variants ignore the tuple.
         let readable_view: (*const u8, u32) = match ev {
             resd_net_core::tcp_events::InternalEvent::Readable {
-                conn, byte_offset, byte_len, ..
+                conn,
+                byte_offset,
+                byte_len,
+                ..
             } => {
                 let ft = engine.flow_table();
                 match ft.get(*conn) {
