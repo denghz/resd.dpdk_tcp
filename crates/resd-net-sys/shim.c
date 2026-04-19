@@ -80,3 +80,36 @@ void resd_rte_mbuf_refcnt_update(struct rte_mbuf *m, int16_t v) {
 uint16_t resd_rte_pktmbuf_nb_segs(const struct rte_mbuf *m) {
     return m->nb_segs;
 }
+
+/* A-HW Task 7: TX offload metadata setters/getters.
+ *
+ * `struct rte_mbuf` is opaque in the Rust bindings (packed anonymous
+ * unions defeat bindgen's layout engine), so the Rust-side finalizer
+ * OR-s ol_flags and sets the l2/l3/l4_len triple through these shims.
+ * The getters back unit-test assertions; production callers only need
+ * the setters. */
+void resd_rte_mbuf_or_ol_flags(struct rte_mbuf *m, uint64_t flags) {
+    m->ol_flags |= flags;
+}
+
+void resd_rte_mbuf_set_tx_lens(struct rte_mbuf *m, uint16_t l2, uint16_t l3, uint16_t l4) {
+    m->l2_len = l2;
+    m->l3_len = l3;
+    m->l4_len = l4;
+}
+
+uint64_t resd_rte_mbuf_get_ol_flags(const struct rte_mbuf *m) {
+    return m->ol_flags;
+}
+
+uint16_t resd_rte_mbuf_get_l2_len(const struct rte_mbuf *m) {
+    return (uint16_t)m->l2_len;
+}
+
+uint16_t resd_rte_mbuf_get_l3_len(const struct rte_mbuf *m) {
+    return (uint16_t)m->l3_len;
+}
+
+uint16_t resd_rte_mbuf_get_l4_len(const struct rte_mbuf *m) {
+    return (uint16_t)m->l4_len;
+}

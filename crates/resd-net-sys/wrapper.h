@@ -42,3 +42,14 @@ uint16_t resd_rte_pktmbuf_data_len(const struct rte_mbuf *m);
 int resd_rte_pktmbuf_chain(struct rte_mbuf *head, struct rte_mbuf *tail);
 void resd_rte_mbuf_refcnt_update(struct rte_mbuf *m, int16_t v);
 uint16_t resd_rte_pktmbuf_nb_segs(const struct rte_mbuf *m);
+
+/* A-HW Task 7: TX offload metadata setters. `struct rte_mbuf` is opaque
+ * to bindgen (packed anonymous unions), so we can't touch ol_flags /
+ * l2_len / l3_len / l4_len directly from Rust — expose OR + set via
+ * shim functions. Read back for unit tests uses the paired getters. */
+void resd_rte_mbuf_or_ol_flags(struct rte_mbuf *m, uint64_t flags);
+void resd_rte_mbuf_set_tx_lens(struct rte_mbuf *m, uint16_t l2, uint16_t l3, uint16_t l4);
+uint64_t resd_rte_mbuf_get_ol_flags(const struct rte_mbuf *m);
+uint16_t resd_rte_mbuf_get_l2_len(const struct rte_mbuf *m);
+uint16_t resd_rte_mbuf_get_l3_len(const struct rte_mbuf *m);
+uint16_t resd_rte_mbuf_get_l4_len(const struct rte_mbuf *m);

@@ -273,11 +273,13 @@ pub struct Engine {
     // A-HW runtime latches — populated by configure_port_offloads.
     // When a compile-enabled offload was advertised by the PMD the latch
     // is true; the corresponding hot-path branch uses the offload. When
-    // false, the branch falls back to software. Task 2: all default false
-    // because no offload bits are requested yet. See spec §§6-10.
-    // The `#[allow(dead_code)]` attributes go away as tasks 6/7/9/12 read
-    // these latches on the hot path.
-    #[allow(dead_code)]
+    // false, the branch falls back to software. See spec §§6-10.
+    // The `#[allow(dead_code)]` attributes go away as tasks 7/9/12 wire
+    // these latches into hot-path branches.
+    //
+    // Task 7 consumer: `tx_tcp_frame` + the inline send_bytes mbuf fill
+    // + the retransmit path all read this latch to decide whether to
+    // invoke `tx_offload_finalize` on the freshly-built mbuf.
     tx_cksum_offload_active: bool,
     #[allow(dead_code)]
     rx_cksum_offload_active: bool,
@@ -929,6 +931,10 @@ impl Engine {
     /// Bumps `eth.tx_pkts` / `eth.tx_bytes` / `eth.tx_drop_nomem` /
     /// `eth.tx_drop_full_ring` as appropriate. Returns true if the packet
     /// was accepted by the driver.
+    ///
+    /// This path carries non-TCP frames (ARP) only; TCP control frames use
+    /// [`Engine::tx_tcp_frame`] so the A-HW `tx_offload_finalize` hook can
+    /// run between mbuf-fill and tx_burst.
     pub(crate) fn tx_frame(&self, bytes: &[u8]) -> bool {
         use crate::counters::{add, inc};
         // Guard against bytes.len() > u16::MAX silently truncating on the
@@ -967,6 +973,71 @@ impl Engine {
             true
         } else {
             // TX ring full; driver did not take the mbuf. Free it ourselves.
+            unsafe { sys::resd_rte_pktmbuf_free(m) };
+            inc(&self.counters.eth.tx_drop_full_ring);
+            false
+        }
+    }
+
+    /// TX a self-contained TCP control frame (SYN / ACK / RST / FIN). Same
+    /// allocation + append + tx_burst sequence as [`Engine::tx_frame`], with
+    /// a `tcp_output::tx_offload_finalize` call spliced between the mbuf
+    /// fill and `rte_eth_tx_burst`.
+    ///
+    /// When `hw-offload-tx-cksum` is compile-enabled and
+    /// `tx_cksum_offload_active == true`, the finalizer flips `ol_flags`,
+    /// sets the `l2/l3/l4_len` triple, and rewrites the TCP/IPv4 cksum
+    /// fields to their offload form (pseudo-header-only TCP cksum, zero
+    /// IPv4 cksum). Otherwise the finalizer is a no-op and the software
+    /// full-fold cksums from `build_segment` ship unchanged.
+    /// Spec §6.2/§6.4.
+    pub(crate) fn tx_tcp_frame(
+        &self,
+        bytes: &[u8],
+        seg: &crate::tcp_output::SegmentTx,
+    ) -> bool {
+        use crate::counters::{add, inc};
+        if bytes.len() > u16::MAX as usize {
+            inc(&self.counters.eth.tx_drop_nomem);
+            return false;
+        }
+        // Safety: tx_hdr_mempool was created in Engine::new and is alive.
+        let m = unsafe { sys::resd_rte_pktmbuf_alloc(self.tx_hdr_mempool.as_ptr()) };
+        if m.is_null() {
+            inc(&self.counters.eth.tx_drop_nomem);
+            return false;
+        }
+        let dst = unsafe { sys::resd_rte_pktmbuf_append(m, bytes.len() as u16) };
+        if dst.is_null() {
+            unsafe { sys::resd_rte_pktmbuf_free(m) };
+            inc(&self.counters.eth.tx_drop_nomem);
+            return false;
+        }
+        // Safety: dst points to `bytes.len()` writable bytes inside the mbuf.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst as *mut u8, bytes.len());
+        }
+        // Safety: `m` is freshly-allocated, exclusive to us until the
+        // tx_burst below; build_segment wrote a full Ethernet+IPv4+TCP
+        // frame into the mbuf's data room via copy_nonoverlapping above,
+        // so the finalizer's data-buffer preconditions hold.
+        unsafe {
+            crate::tcp_output::tx_offload_finalize(
+                m,
+                seg,
+                seg.payload.len() as u32,
+                self.tx_cksum_offload_active,
+            );
+        }
+        let mut pkts = [m];
+        let sent = unsafe {
+            sys::resd_rte_eth_tx_burst(self.cfg.port_id, self.cfg.tx_queue_id, pkts.as_mut_ptr(), 1)
+        } as usize;
+        if sent == 1 {
+            add(&self.counters.eth.tx_bytes, bytes.len() as u64);
+            inc(&self.counters.eth.tx_pkts);
+            true
+        } else {
             unsafe { sys::resd_rte_pktmbuf_free(m) };
             inc(&self.counters.eth.tx_drop_full_ring);
             false
@@ -1060,7 +1131,7 @@ impl Engine {
         let Some(n) = build_segment(&seg, &mut buf) else {
             return false;
         };
-        let tx_ok = self.tx_frame(&buf[..n]);
+        let tx_ok = self.tx_tcp_frame(&buf[..n], &seg);
         // A5.5 Task 13: stash SYN TX timestamp on the ORIGINAL SYN only
         // (Karn's rule — the retransmit path increments `syn_retrans_count`
         // before re-entering `emit_syn`, so this guard fires exclusively on
@@ -2413,7 +2484,7 @@ impl Engine {
         let Some(n) = build_segment(&seg, &mut buf) else {
             return;
         };
-        if self.tx_frame(&buf[..n]) {
+        if self.tx_tcp_frame(&buf[..n], &seg) {
             inc(&self.counters.tcp.tx_ack);
             if outcome.zero_window {
                 inc(&self.counters.tcp.tx_zero_window);
@@ -2474,7 +2545,7 @@ impl Engine {
             return;
         };
         drop(ft);
-        if self.tx_frame(&buf[..n]) {
+        if self.tx_tcp_frame(&buf[..n], &seg) {
             inc(&self.counters.tcp.tx_rst);
         }
     }
@@ -2506,7 +2577,7 @@ impl Engine {
         let Some(n) = build_segment(&seg, &mut buf) else {
             return;
         };
-        if self.tx_frame(&buf[..n]) {
+        if self.tx_tcp_frame(&buf[..n], &seg) {
             inc(&self.counters.tcp.tx_rst);
         }
     }
@@ -2550,7 +2621,7 @@ impl Engine {
         let Some(n) = build_segment(&seg, &mut buf) else {
             return;
         };
-        if self.tx_frame(&buf[..n]) {
+        if self.tx_tcp_frame(&buf[..n], &seg) {
             inc(&self.counters.tcp.tx_rst);
         }
     }
@@ -2914,6 +2985,20 @@ impl Engine {
             unsafe {
                 std::ptr::copy_nonoverlapping(frame.as_ptr(), dst as *mut u8, n);
             }
+            // A-HW Task 7: apply TX offload metadata + pseudo-header-only
+            // TCP cksum rewrite to the mbuf when offload is active.
+            // Safety: `m` is freshly-allocated, exclusive to us until
+            // tx_burst; the data buffer was fully populated by the
+            // copy_nonoverlapping above (n bytes = full L2+L3+TCP+payload),
+            // so the finalizer's data-buffer preconditions hold.
+            unsafe {
+                crate::tcp_output::tx_offload_finalize(
+                    m,
+                    &seg,
+                    seg.payload.len() as u32,
+                    self.tx_cksum_offload_active,
+                );
+            }
             // Bump refcount BEFORE tx_burst: after the call, the driver
             // holds one ref (freed on TX-completion) and we hold one ref
             // that lives in `snd_retrans` until Task 11's ACK-prune path.
@@ -3156,7 +3241,7 @@ impl Engine {
         let Some(n) = build_segment(&seg, &mut buf) else {
             return Err(Error::PeerUnreachable(tuple.peer_ip));
         };
-        if !self.tx_frame(&buf[..n]) {
+        if !self.tx_tcp_frame(&buf[..n], &seg) {
             return Err(Error::PeerUnreachable(tuple.peer_ip));
         }
         inc(&self.counters.tcp.tx_fin);
@@ -3326,6 +3411,26 @@ impl Engine {
         // Safety: `dst` points to `hdr_n` writable bytes inside hdr_mbuf.
         unsafe {
             std::ptr::copy_nonoverlapping(hdr_scratch.as_ptr(), dst as *mut u8, hdr_n);
+        }
+        // A-HW Task 7: apply TX offload metadata + pseudo-header-only
+        // TCP cksum rewrite to the hdr mbuf when offload is active.
+        // payload_for_csum_len is the CHAINED data mbuf's bytes count —
+        // the NIC computes the fold over the header + chained payload,
+        // so the pseudo-header length field must declare the full wire
+        // segment size, not just the hdr mbuf's data_len.
+        //
+        // Safety: `hdr_mbuf` is freshly-allocated, exclusive to us until
+        // chain/tx_burst; the header mbuf's data buffer holds a full
+        // Ethernet+IPv4+TCP header populated by build_retrans_header via
+        // the copy_nonoverlapping above, so the finalizer's data-buffer
+        // preconditions hold.
+        unsafe {
+            crate::tcp_output::tx_offload_finalize(
+                hdr_mbuf,
+                &seg,
+                entry_len as u32,
+                self.tx_cksum_offload_active,
+            );
         }
 
         // Phase 4: bump data mbuf's refcount and chain. The refcnt_update
