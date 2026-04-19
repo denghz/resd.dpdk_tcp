@@ -320,6 +320,13 @@ pub struct Engine {
     /// `tx_data_frame` inline paths.
     pub(crate) tx_pending_data: RefCell<Vec<std::ptr::NonNull<sys::rte_mbuf>>>,
 
+    /// A6 (spec §3.6 Site 3): snapshot of `counters.eth.rx_drop_nomem`
+    /// at the top of `poll_once`; compared against the post-RX value at
+    /// end-of-poll to emit exactly one `Error{err=-ENOMEM}` per iteration
+    /// where RX mempool drops occurred. Cell because `poll_once` borrows
+    /// `&self` like every other engine method.
+    pub(crate) rx_drop_nomem_prev: std::cell::Cell<u64>,
+
     // A-HW runtime latches — populated by configure_port_offloads.
     // When a compile-enabled offload was advertised by the PMD the latch
     // is true; the corresponding hot-path branch uses the offload. When
@@ -746,6 +753,7 @@ impl Engine {
                 (cfg.max_connections as usize).saturating_mul(4),
             )),
             tx_pending_data: RefCell::new(Vec::with_capacity(cfg.tx_ring_size as usize)),
+            rx_drop_nomem_prev: std::cell::Cell::new(0),
             tx_cksum_offload_active: outcome.tx_cksum_offload_active,
             rx_cksum_offload_active: outcome.rx_cksum_offload_active,
             rss_hash_offload_active: outcome.rss_hash_offload_active,
@@ -1398,7 +1406,14 @@ impl Engine {
     /// pipeline, then reaps any TIME_WAIT flows past their 2×MSL deadline.
     pub fn poll_once(&self) -> usize {
         use crate::counters::{add, inc};
+        use std::sync::atomic::Ordering;
         inc(&self.counters.poll.iters);
+
+        // A6 (spec §3.6 Site 3): snapshot RX-mempool-drop counter at top
+        // of poll so `check_and_emit_rx_enomem` at each exit path can
+        // edge-trigger a single Error{err=-ENOMEM} per iteration.
+        self.rx_drop_nomem_prev
+            .set(self.counters.eth.rx_drop_nomem.load(Ordering::Relaxed));
 
         // Clear per-conn last_read_buf so prior borrowed views are
         // invalidated per spec §4.2, before any rx_frame dispatches
@@ -1432,6 +1447,10 @@ impl Engine {
             // A6 (spec §3.2): drain any data-segment TX batched by
             // timer-driven retransmit paths. No-op on empty ring.
             self.drain_tx_pending_data();
+            // A6 (spec §3.6 Site 3): edge-triggered RX-mempool-drop
+            // Error event. Sited after the drain so it runs on every
+            // exit path.
+            self.check_and_emit_rx_enomem();
             return 0;
         }
 
@@ -1503,7 +1522,47 @@ impl Engine {
         // after all emit sites so the burst coalesces everything.
         // No-op on empty ring.
         self.drain_tx_pending_data();
+        // A6 (spec §3.6 Site 3): edge-triggered RX-mempool-drop Error
+        // event. Sited after the drain so it runs on every exit path.
+        self.check_and_emit_rx_enomem();
         n
+    }
+
+    /// A6 (spec §3.6 Site 3): accessor for the RX-mempool-drop snapshot
+    /// taken at the top of `poll_once`. Exposed at `pub(crate)` so tests
+    /// and future observability surfaces can read the prior-iteration
+    /// checkpoint without re-snapshotting. `allow(dead_code)` lifts once
+    /// Task 21's driver harness exercises the accessor directly.
+    #[allow(dead_code)]
+    pub(crate) fn rx_drop_nomem_prev(&self) -> u64 {
+        self.rx_drop_nomem_prev.get()
+    }
+
+    /// Edge-triggered RX-mempool-drop Error emission. Called at end of
+    /// `poll_once` (after the drain). Snapshot taken at top of
+    /// `poll_once`; if the counter advanced, one Error event for the
+    /// whole iteration.
+    ///
+    /// Spec §3.6 Site 3: edge-triggered so an extended mempool-starvation
+    /// window emits at most one event per poll, preventing a flood into
+    /// the `EventQueue` under sustained pressure. `conn = 0` is the
+    /// engine-level sentinel (handle 0 is reserved, never a live conn).
+    pub(crate) fn check_and_emit_rx_enomem(&self) {
+        use std::sync::atomic::Ordering;
+        let now = self.counters.eth.rx_drop_nomem.load(Ordering::Relaxed);
+        let prev = self.rx_drop_nomem_prev.get();
+        if now > prev {
+            let mut ev = self.events.borrow_mut();
+            ev.push(
+                InternalEvent::Error {
+                    conn: 0, // engine-level; not bound to a conn.
+                    err: -libc::ENOMEM,
+                    emitted_ts_ns: crate::clock::now_ns(),
+                },
+                &self.counters,
+            );
+            self.rx_drop_nomem_prev.set(now);
+        }
     }
 
     /// Drain pending data-segment mbufs via one `rte_eth_tx_burst`.
@@ -4573,6 +4632,15 @@ mod tests {
         ];
         let out = crate::engine::validate_and_default_histogram_edges(&good).unwrap();
         assert_eq!(out, good);
+    }
+
+    #[test]
+    fn rx_enomem_edge_trigger_signature_exists() {
+        fn _compile_only(e: &Engine) {
+            let _: u64 = e.rx_drop_nomem_prev();
+            e.check_and_emit_rx_enomem();
+        }
+        let _ = _compile_only;
     }
 }
 
