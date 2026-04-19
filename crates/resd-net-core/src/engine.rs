@@ -548,6 +548,14 @@ impl Engine {
             }));
         }
 
+        // A-HW: RSS reta program. No-op when feature off OR when
+        // the latch is false OR when dev_info.reta_size == 0.
+        if outcome.rss_hash_offload_active {
+            let mut dev_info_post: sys::rte_eth_dev_info = unsafe { std::mem::zeroed() };
+            let _ = unsafe { sys::rte_eth_dev_info_get(cfg.port_id, &mut dev_info_post) };
+            Self::program_rss_reta_single_queue(cfg.port_id, &dev_info_post)?;
+        }
+
         // Read NIC MAC via the shim. `rte_ether_addr` is a 6-byte packed struct.
         let mut mac_addr: sys::rte_ether_addr = unsafe { std::mem::zeroed() };
         let rc = unsafe { sys::resd_rte_eth_macaddr_get(cfg.port_id, &mut mac_addr) };
@@ -599,13 +607,14 @@ impl Engine {
 
         // `counters` is unused when every `hw-offload-*` counter-bumping
         // feature is compiled out. The signature stays stable because the
-        // latches are C-ABI-stable and future tasks (4, 7, 8) reintroduce
+        // latches are C-ABI-stable and future tasks (7, 8) reintroduce
         // consumers. Keep the binding alive for `-D warnings` on
         // `--no-default-features`.
         #[cfg(not(any(
             feature = "hw-offload-mbuf-fast-free",
             feature = "hw-offload-tx-cksum",
             feature = "hw-offload-rx-cksum",
+            feature = "hw-offload-rss-hash",
         )))]
         let _ = counters;
 
@@ -620,10 +629,16 @@ impl Engine {
         let info_rc = unsafe { sys::rte_eth_dev_info_get(cfg.port_id, &mut dev_info) };
 
         let mut applied_tx_offloads = RTE_ETH_TX_OFFLOAD_MULTI_SEGS;
-        // `applied_rx_offloads` is mutated only when the rx-cksum feature
-        // is enabled (Task 4 will also mutate it when rss-hash is on).
-        // Silence `unused_mut` when no rx-side offload feature is active.
-        #[cfg_attr(not(feature = "hw-offload-rx-cksum"), allow(unused_mut))]
+        // `applied_rx_offloads` is mutated when any RX-side offload feature
+        // is enabled (rx-cksum, rss-hash). Silence `unused_mut` when no
+        // rx-side offload feature is active.
+        #[cfg_attr(
+            not(any(
+                feature = "hw-offload-rx-cksum",
+                feature = "hw-offload-rss-hash",
+            )),
+            allow(unused_mut)
+        )]
         let mut applied_rx_offloads: u64 = 0;
         if info_rc == 0
             && (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MULTI_SEGS) == 0
@@ -719,6 +734,32 @@ impl Engine {
         #[cfg(not(feature = "hw-offload-rx-cksum"))]
         let rx_cksum_offload_active = false;
 
+        // --- RSS hash (hw-offload-rss-hash) ---------------------------
+        #[cfg(feature = "hw-offload-rss-hash")]
+        let rss_hash_offload_active = {
+            use crate::dpdk_consts::{
+                RTE_ETH_RSS_NONFRAG_IPV4_TCP, RTE_ETH_RSS_NONFRAG_IPV6_TCP,
+                RTE_ETH_RX_OFFLOAD_RSS_HASH,
+            };
+            let bit = and_offload_with_miss_counter(
+                RTE_ETH_RX_OFFLOAD_RSS_HASH,
+                dev_info.rx_offload_capa,
+                &counters.eth.offload_missing_rss_hash,
+                "RTE_ETH_RX_OFFLOAD_RSS_HASH",
+                cfg.port_id,
+            );
+            applied_rx_offloads |= bit;
+            if bit != 0 {
+                eth_conf.rx_adv_conf.rss_conf.rss_hf =
+                    RTE_ETH_RSS_NONFRAG_IPV4_TCP | RTE_ETH_RSS_NONFRAG_IPV6_TCP;
+                eth_conf.rx_adv_conf.rss_conf.rss_key = std::ptr::null_mut();
+                eth_conf.rx_adv_conf.rss_conf.rss_key_len = 0;
+            }
+            bit != 0
+        };
+        #[cfg(not(feature = "hw-offload-rss-hash"))]
+        let rss_hash_offload_active = false;
+
         eth_conf.txmode.offloads = applied_tx_offloads;
         eth_conf.rxmode.offloads = applied_rx_offloads;
 
@@ -755,9 +796,64 @@ impl Engine {
             applied_tx_offloads,
             tx_cksum_offload_active,
             rx_cksum_offload_active,
-            rss_hash_offload_active: false, // Task 4 fills this.
+            rss_hash_offload_active,
             driver_name,
         })
+    }
+
+    /// After `rte_eth_dev_start`, program the RSS indirection table so
+    /// every bucket points at queue 0. Single-queue no-op at steering
+    /// time, but required so `mbuf.hash.rss` is populated on ingress and
+    /// so multi-queue bring-up (Stage 2) is a config change, not a code
+    /// rewrite. See spec §8.
+    #[cfg(feature = "hw-offload-rss-hash")]
+    fn program_rss_reta_single_queue(
+        port_id: u16,
+        dev_info: &sys::rte_eth_dev_info,
+    ) -> Result<(), Error> {
+        let reta_size = dev_info.reta_size as usize;
+        if reta_size == 0 {
+            // PMD doesn't expose a reprogrammable reta (e.g. net_tap).
+            // Single-queue steering is implicit; skip silently.
+            return Ok(());
+        }
+        // `rte_eth_rss_reta_entry64` covers 64 slots per struct. Allocate
+        // reta_size / 64 entries (rounded up), each with `mask = u64::MAX`
+        // so the update writes every slot, and `reta[*] = 0` so every
+        // slot points at queue 0.
+        let num_entries = reta_size.div_ceil(64);
+        let mut reta: Vec<sys::rte_eth_rss_reta_entry64> =
+            vec![unsafe { std::mem::zeroed() }; num_entries];
+        for entry in reta.iter_mut() {
+            entry.mask = u64::MAX;
+            // `reta` array on the struct is `[u16; 64]` already zeroed.
+        }
+        let rc = unsafe {
+            sys::rte_eth_dev_rss_reta_update(
+                port_id,
+                reta.as_mut_ptr(),
+                reta_size as u16,
+            )
+        };
+        if rc != 0 {
+            // Not fatal — reta update failing on a non-steering single-queue
+            // deployment is not a correctness error. Warn and continue; the
+            // flow_table's SipHash fallback keeps the data path correct.
+            eprintln!(
+                "resd_net: port {} RSS reta program failed rc={}; \
+                 flow_table falls back to SipHash.",
+                port_id, rc
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(not(feature = "hw-offload-rss-hash"))]
+    fn program_rss_reta_single_queue(
+        _port_id: u16,
+        _dev_info: &sys::rte_eth_dev_info,
+    ) -> Result<(), Error> {
+        Ok(())
     }
 
     pub fn counters(&self) -> &Counters {
