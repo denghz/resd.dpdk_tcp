@@ -252,10 +252,18 @@ impl Outcome {
 
 /// Per-state dispatcher. Stubs for now; concrete handlers land in
 /// Tasks 11–13.
-pub fn dispatch(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
+///
+/// A6 Task 15 (spec §3.8): `rtt_histogram_edges` threads the engine-wide
+/// histogram edges down to each RTT-sample-taking handler so the per-conn
+/// `TcpConn::rtt_histogram` is updated on the same site as `rtt_est.sample`.
+pub fn dispatch(
+    conn: &mut TcpConn,
+    seg: &ParsedSegment,
+    rtt_histogram_edges: &[u32; 15],
+) -> Outcome {
     match conn.state {
-        TcpState::SynSent => handle_syn_sent(conn, seg),
-        TcpState::Established => handle_established(conn, seg),
+        TcpState::SynSent => handle_syn_sent(conn, seg, rtt_histogram_edges),
+        TcpState::Established => handle_established(conn, seg, rtt_histogram_edges),
         TcpState::FinWait1
         | TcpState::FinWait2
         | TcpState::Closing
@@ -267,7 +275,11 @@ pub fn dispatch(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
 }
 
 // Stubs filled in by subsequent tasks.
-fn handle_syn_sent(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
+fn handle_syn_sent(
+    conn: &mut TcpConn,
+    seg: &ParsedSegment,
+    rtt_histogram_edges: &[u32; 15],
+) -> Outcome {
     use crate::tcp_seq::seq_le;
 
     // RFC 9293 §3.10.7.3 — SYN_SENT processing.
@@ -384,7 +396,9 @@ fn handle_syn_sent(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
 
     // A5.5 Task 13: seed SRTT from the SYN handshake round-trip
     // (RFC 6298 §3.3 MAY). Karn's rule + bounds are inside the helper.
-    conn.maybe_seed_srtt_from_syn(crate::clock::now_ns());
+    // A6 Task 15 (spec §3.8): on absorption the helper updates the
+    // per-conn RTT histogram under the engine-wide edges.
+    conn.maybe_seed_srtt_from_syn(crate::clock::now_ns(), rtt_histogram_edges);
 
     // A5 Task 18: SYN-ACK accepted — hand the engine the SYN-retransmit
     // timer id so it can cancel the pending fire (we can't touch the
@@ -424,7 +438,11 @@ pub(crate) fn is_dsack(
     })
 }
 
-fn handle_established(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
+fn handle_established(
+    conn: &mut TcpConn,
+    seg: &ParsedSegment,
+    rtt_histogram_edges: &[u32; 15],
+) -> Outcome {
     use crate::tcp_seq::{in_window, seq_le, seq_lt};
 
     // Stage 1 does not support URG. Drop silently and account via
@@ -629,6 +647,10 @@ fn handle_established(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
             // A5.5 Task 11: RTT sample absorbed → reset TLP budget + set
             // sample-seen (satisfies RFC 8985 §7.4 gate).
             conn.on_rtt_sample_tlp_hook();
+            // A6 Task 15 (spec §3.8): per-conn RTT histogram update. Slow-path
+            // at sample cadence (not per-segment). 15-comparison ladder
+            // + one wrapping_add on cache-resident state.
+            conn.rtt_histogram.update(rtt, rtt_histogram_edges);
         } else if let Some(front) = conn.snd_retrans.front() {
             let front_end = front.seq.wrapping_add(front.len as u32);
             if front.xmit_count == 1 && seq_le(front_end, conn.snd_una) {
@@ -639,6 +661,9 @@ fn handle_established(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
                     rtt_sample_taken = true;
                     // A5.5 Task 11: same hook on the Karn's-fallback branch.
                     conn.on_rtt_sample_tlp_hook();
+                    // A6 Task 15 (spec §3.8): per-conn RTT histogram update.
+                    // Same cost + rationale as the timestamp-path branch above.
+                    conn.rtt_histogram.update(rtt, rtt_histogram_edges);
                 }
             }
         }
@@ -942,6 +967,11 @@ mod tests {
     use super::*;
     use crate::tcp_output::{build_segment, SegmentTx, TCP_PSH};
 
+    // A6 Task 15: default RTT histogram edges for tests that drive
+    // `dispatch` directly. Matches the engine-side defaults so tests
+    // exercise the same bucketing the runtime uses.
+    const TEST_EDGES: [u32; 15] = crate::engine::DEFAULT_RTT_HISTOGRAM_EDGES_US;
+
     fn build_test_segment(flags: u8, mss: Option<u16>, payload: &[u8]) -> Vec<u8> {
         let seg = SegmentTx {
             src_mac: [0x02, 0, 0, 0, 0, 1],
@@ -1051,7 +1081,7 @@ mod tests {
             payload: &[],
             options: &opts_buf[..opts_len],
         };
-        let out = dispatch(&mut c, &seg);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES);
         assert_eq!(out.new_state, Some(TcpState::Established));
         assert_eq!(out.tx, TxAction::Ack);
         assert!(out.connected);
@@ -1113,7 +1143,7 @@ mod tests {
 
         // Act: drive the full dispatcher so we exercise the real call
         // site inside `handle_syn_sent`.
-        let out = dispatch(&mut c, &seg);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES);
 
         // Assert: SYN-ACK was accepted AND the helper got invoked.
         assert_eq!(out.new_state, Some(TcpState::Established));
@@ -1161,7 +1191,7 @@ mod tests {
             payload: &[],
             options: &opts_buf[..opts_len],
         };
-        let out = dispatch(&mut c, &seg);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES);
         assert_eq!(out.new_state, Some(TcpState::Established));
         // RFC 7323 §1.3: WS only active if both sides advertise.
         assert_eq!(c.ws_shift_in, 0);
@@ -1205,7 +1235,7 @@ mod tests {
             payload: &[],
             options: &opts_buf[..opts_len],
         };
-        let _out = dispatch(&mut c, &seg);
+        let _out = dispatch(&mut c, &seg, &TEST_EDGES);
         assert_eq!(c.snd_wnd, 65535, "SYN-ACK window must be unscaled");
         assert_eq!(c.ws_shift_in, 7, "peer's WS is recorded for post-handshake");
     }
@@ -1243,7 +1273,7 @@ mod tests {
             payload: &[],
             options: &opts_buf[..opts_len],
         };
-        let _out = dispatch(&mut c, &seg);
+        let _out = dispatch(&mut c, &seg, &TEST_EDGES);
         assert_eq!(
             c.ws_shift_in, 14,
             "peer's WS shift MUST be clamped at 14 per RFC 7323 §2.3"
@@ -1270,7 +1300,7 @@ mod tests {
             payload: &[],
             options: &[],
         };
-        let _ = dispatch(&mut c, &seg);
+        let _ = dispatch(&mut c, &seg, &TEST_EDGES);
         assert_eq!(
             c.snd_wnd,
             512u32 << 7,
@@ -1304,7 +1334,7 @@ mod tests {
             payload: &[],
             options: &[],
         };
-        let out = dispatch(&mut c, &seg);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES);
         assert_eq!(out.tx, TxAction::RstForSynSentBadAck);
     }
 
@@ -1333,7 +1363,7 @@ mod tests {
             payload: &[],
             options: &[],
         };
-        let out = dispatch(&mut c, &seg);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES);
         assert_eq!(out.new_state, Some(TcpState::Closed));
         assert!(out.closed);
         assert_eq!(out.tx, TxAction::None);
@@ -1373,7 +1403,7 @@ mod tests {
             payload,
             options: &[],
         };
-        let out = dispatch(&mut c, &seg);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES);
         assert_eq!(out.tx, TxAction::Ack);
         assert_eq!(out.delivered, 6);
         assert_eq!(c.rcv_nxt, 5001 + 6);
@@ -1396,7 +1426,7 @@ mod tests {
             payload: b"xyz",
             options: &[],
         };
-        let out = dispatch(&mut c, &seg);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES);
         assert_eq!(out.tx, TxAction::Ack);
         assert_eq!(out.delivered, 0);
         assert_eq!(out.reassembly_queued_bytes, 3);
@@ -1423,7 +1453,7 @@ mod tests {
             payload: b"world",
             options: &[],
         };
-        let out_ooo = dispatch(&mut c, &ooo);
+        let out_ooo = dispatch(&mut c, &ooo, &TEST_EDGES);
         assert_eq!(out_ooo.reassembly_queued_bytes, 5);
         assert_eq!(c.rcv_nxt, 5001);
 
@@ -1438,7 +1468,7 @@ mod tests {
             payload: b"ninebytes",
             options: &[],
         };
-        let out_in = dispatch(&mut c, &inorder);
+        let out_in = dispatch(&mut c, &inorder, &TEST_EDGES);
         assert_eq!(out_in.delivered, 9 + 5);
         assert_eq!(out_in.reassembly_hole_filled, 1);
         assert_eq!(c.rcv_nxt, 5015);
@@ -1461,7 +1491,7 @@ mod tests {
             payload: b"abc",
             options: &[],
         };
-        let out = dispatch(&mut c, &seg);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES);
         assert_eq!(out.delivered, 3);
         assert_eq!(out.buf_full_drop, 0);
     }
@@ -1485,7 +1515,7 @@ mod tests {
             payload: &payload,
             options: &[],
         };
-        let out = dispatch(&mut c, &seg);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES);
         // 1024 accepted, 976 dropped — overflow is `buf_full_drop`, not OOO.
         assert_eq!(out.delivered, 1024);
         assert_eq!(out.buf_full_drop, 2000 - 1024);
@@ -1508,7 +1538,7 @@ mod tests {
             payload: &[],
             options: &[],
         };
-        let _ = dispatch(&mut c, &seg);
+        let _ = dispatch(&mut c, &seg, &TEST_EDGES);
         assert_eq!(c.snd_una, 1006);
         assert_eq!(c.snd_wnd, 32000);
         assert_eq!(c.snd.pending.len(), 0);
@@ -1528,7 +1558,7 @@ mod tests {
             payload: &[],
             options: &[],
         };
-        let out = dispatch(&mut c, &seg);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES);
         assert_eq!(out.new_state, Some(TcpState::CloseWait));
         assert_eq!(out.tx, TxAction::Ack);
         assert_eq!(c.rcv_nxt, 5002); // FIN consumes one seq
@@ -1548,7 +1578,7 @@ mod tests {
             payload: &[],
             options: &[],
         };
-        let out = dispatch(&mut c, &seg);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES);
         assert_eq!(out.new_state, Some(TcpState::Closed));
         assert!(out.closed);
     }
@@ -1567,7 +1597,7 @@ mod tests {
             payload: &[],
             options: &[],
         };
-        let out = dispatch(&mut c, &seg);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES);
         assert_eq!(out.new_state, Some(TcpState::Closed));
         assert!(out.closed);
         // seg.flags & TCP_RST is what engine.rs uses to decide conn_rst bump;
@@ -1606,7 +1636,7 @@ mod tests {
             payload: &[],
             options: &[],
         };
-        let out = dispatch(&mut c, &seg);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES);
         assert_eq!(out.new_state, Some(TcpState::FinWait2));
     }
 
@@ -1640,7 +1670,7 @@ mod tests {
             payload: &[],
             options: &[],
         };
-        let out = dispatch(&mut c, &seg);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES);
         assert_eq!(out.new_state, Some(TcpState::TimeWait));
         assert_eq!(out.tx, TxAction::Ack);
         assert_eq!(c.rcv_nxt, 5002);
@@ -1676,7 +1706,7 @@ mod tests {
             payload: &[],
             options: &[],
         };
-        let out = dispatch(&mut c, &seg);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES);
         assert_eq!(out.new_state, Some(TcpState::Closing));
     }
 
@@ -1710,7 +1740,7 @@ mod tests {
             payload: &[],
             options: &[],
         };
-        let out = dispatch(&mut c, &seg);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES);
         assert_eq!(out.new_state, Some(TcpState::TimeWait));
     }
 
@@ -1744,7 +1774,7 @@ mod tests {
             payload: &[],
             options: &[],
         };
-        let out = dispatch(&mut c, &seg);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES);
         assert_eq!(out.new_state, Some(TcpState::Closed));
         assert!(out.closed);
     }
@@ -1775,7 +1805,7 @@ mod tests {
             payload: b"xxx",
             options: &buf[..n],
         };
-        let out = dispatch(&mut c, &seg);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES);
         assert!(out.paws_rejected);
         assert_eq!(out.tx, TxAction::Ack);
         assert_eq!(out.delivered, 0);
@@ -1801,7 +1831,7 @@ mod tests {
             payload: b"hello",
             options: &buf[..n],
         };
-        let out = dispatch(&mut c, &seg);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES);
         assert!(!out.paws_rejected);
         assert_eq!(out.delivered, 5);
         assert_eq!(c.ts_recent, 300);
@@ -1821,7 +1851,7 @@ mod tests {
             payload: b"x",
             options: &[],
         };
-        let out = dispatch(&mut c, &seg);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES);
         assert!(out.bad_option);
         assert_eq!(out.delivered, 0);
     }
@@ -1857,7 +1887,7 @@ mod tests {
             payload: &[],
             options: &buf[..n],
         };
-        let out = dispatch(&mut c, &seg);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES);
         assert_eq!(out.sack_blocks_decoded, 2);
         assert!(c.sack_scoreboard.is_sacked(1005));
         assert!(c.sack_scoreboard.is_sacked(1018));
@@ -1895,7 +1925,7 @@ mod tests {
             payload: &[],
             options: &buf[..n],
         };
-        let _ = dispatch(&mut c, &seg);
+        let _ = dispatch(&mut c, &seg, &TEST_EDGES);
         assert_eq!(c.snd_una, 1015);
         assert_eq!(c.sack_scoreboard.len(), 1);
         assert_eq!(c.sack_scoreboard.blocks()[0].left, 1020);
@@ -2021,7 +2051,7 @@ mod tests {
             payload: &[],
             options: &buf[..n],
         };
-        let out = dispatch(&mut c, &seg);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES);
         assert_eq!(out.rx_dsack_count, 1);
         assert_eq!(out.sack_blocks_decoded, 1);
         // DSACK block was skipped — scoreboard remains empty, no
@@ -2062,7 +2092,7 @@ mod tests {
             payload: &[],
             options: &buf[..n],
         };
-        let out = dispatch(&mut c, &seg);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES);
         assert_eq!(out.rx_dsack_count, 1);
         assert!(c.rack.dsack_seen);
         // Scoreboard unchanged — the DSACK block was skipped, original
@@ -2105,7 +2135,7 @@ mod tests {
             payload: &[],
             options: &buf[..n],
         };
-        let out = dispatch(&mut c, &seg);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES);
         assert_eq!(out.rx_dsack_count, 1);
         assert_eq!(out.sack_blocks_decoded, 2);
         assert!(c.rack.dsack_seen);
@@ -2140,7 +2170,7 @@ mod tests {
             payload: &[],
             options: &[],
         };
-        let out = dispatch(&mut c, &seg);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES);
         assert_eq!(out.tx, TxAction::Ack);
         assert_eq!(out.new_state, None); // stay in TIME_WAIT until reaper
     }
@@ -2162,7 +2192,7 @@ mod tests {
             payload: b"x",
             options: &[],
         };
-        let out = dispatch(&mut c, &seg);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES);
         assert!(out.urgent_dropped);
         assert_eq!(out.tx, TxAction::None);
         assert_eq!(out.delivered, 0);
@@ -2185,7 +2215,7 @@ mod tests {
             payload: b"xxx",
             options: &[],
         };
-        let out = dispatch(&mut c, &seg);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES);
         assert!(out.bad_seq);
         assert_eq!(out.tx, TxAction::Ack); // challenge ACK
         assert_eq!(out.delivered, 0);
@@ -2206,7 +2236,7 @@ mod tests {
             payload: &[],
             options: &[],
         };
-        let out = dispatch(&mut c, &seg);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES);
         assert!(out.bad_ack);
         assert_eq!(out.tx, TxAction::Ack); // challenge ACK
     }
@@ -2233,7 +2263,7 @@ mod tests {
             payload: &[],
             options: &[],
         };
-        let out = dispatch(&mut c, &seg);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES);
         assert!(out.dup_ack);
     }
 
@@ -2255,7 +2285,7 @@ mod tests {
             payload: b"xxx",
             options: &[],
         };
-        let out = dispatch(&mut c, &seg);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES);
         assert!(!out.dup_ack);
     }
 
@@ -2277,7 +2307,7 @@ mod tests {
             payload: &[],
             options: &[],
         };
-        let out = dispatch(&mut c, &seg);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES);
         assert!(!out.dup_ack);
     }
 
@@ -2299,7 +2329,7 @@ mod tests {
             payload: &[],
             options: &[],
         };
-        let out = dispatch(&mut c, &seg);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES);
         assert!(!out.dup_ack);
     }
 
@@ -2324,7 +2354,7 @@ mod tests {
             payload: &[],
             options: &[],
         };
-        let out = dispatch(&mut c, &seg);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES);
         assert!(out.dup_ack);
     }
 
@@ -2348,7 +2378,7 @@ mod tests {
             payload: &[],
             options: &[],
         };
-        let out = dispatch(&mut c, &seg);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES);
         assert!(!out.dup_ack);
     }
 
@@ -2371,7 +2401,7 @@ mod tests {
             payload: &[],
             options: &[],
         };
-        let out = dispatch(&mut c, &seg);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES);
         assert!(!out.dup_ack);
     }
 
@@ -2389,7 +2419,7 @@ mod tests {
             payload: &[],
             options: &[],
         };
-        let out = dispatch(&mut c, &seg);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES);
         assert!(out.rx_zero_window);
     }
 
@@ -2407,7 +2437,7 @@ mod tests {
             payload: &[],
             options: &[],
         };
-        let out = dispatch(&mut c, &seg);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES);
         assert!(!out.rx_zero_window);
     }
 
@@ -2442,7 +2472,7 @@ mod tests {
             payload: b"x",
             options: &[],
         };
-        let out = dispatch(&mut c, &seg);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES);
         assert!(out.bad_seq);
         assert_eq!(out.tx, TxAction::Ack);
     }
@@ -2529,7 +2559,7 @@ mod tests {
             payload: &[],
             options: &opts,
         };
-        let out = dispatch(&mut c, &seg);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES);
         // A (index 0) should be marked lost; B (index 1) is SACKed.
         assert!(
             out.rack_lost_indexes.contains(&0),
@@ -2555,7 +2585,7 @@ mod tests {
             payload: &[],
             options: &[],
         };
-        let out = dispatch(&mut c, &seg);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES);
         assert!(out.rack_lost_indexes.is_empty());
     }
 }

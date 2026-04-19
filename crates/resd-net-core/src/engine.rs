@@ -338,10 +338,9 @@ impl Default for EngineConfig {
 pub struct Engine {
     cfg: EngineConfig,
     /// A6: post-validation-post-defaults histogram edges; shared across
-    /// all conns on this engine. Not re-validated on every update.
-    /// `allow(dead_code)` lifts once a later task (per-conn histogram
-    /// update on RTT samples) reads this on the slow-path.
-    #[allow(dead_code)]
+    /// all conns on this engine. Not re-validated on every update. Read
+    /// on the slow-path from `tcp_input::dispatch` (A6 Task 15) — the
+    /// per-conn `TcpConn::rtt_histogram` update is passed this slice.
     pub(crate) rtt_histogram_edges: [u32; 15],
     counters: Box<Counters>,
     _rx_mempool: Mempool,
@@ -2600,7 +2599,11 @@ impl Engine {
             let Some(conn) = ft.get_mut(handle) else {
                 return 0;
             };
-            dispatch(conn, &parsed)
+            // A6 Task 15 (spec §3.8): pass the engine-wide RTT histogram
+            // edges through to sample-taking handlers. The actual per-conn
+            // histogram update lives at each `rtt_est.sample` site inside
+            // `tcp_input.rs` / `TcpConn::maybe_seed_srtt_from_syn`.
+            dispatch(conn, &parsed, &self.rtt_histogram_edges)
         };
 
         // A4: map Outcome fields → TcpCounters slow-path bumps. Groups
