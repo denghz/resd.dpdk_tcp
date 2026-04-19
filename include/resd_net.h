@@ -259,6 +259,8 @@ struct resd_net_counters_t {
   struct resd_net_ip_counters_t ip;
   struct resd_net_tcp_counters_t tcp;
   struct resd_net_poll_counters_t poll;
+  uint64_t obs_events_dropped;
+  uint64_t obs_events_queue_high_water;
 };
 
 struct resd_net_connect_opts_t {

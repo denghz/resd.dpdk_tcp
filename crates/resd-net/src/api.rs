@@ -275,6 +275,11 @@ pub struct resd_net_counters_t {
     pub ip: resd_net_ip_counters_t,
     pub tcp: resd_net_tcp_counters_t,
     pub poll: resd_net_poll_counters_t,
+    // A5.5 obs group (slow-path). Appended — no mid-struct insertion.
+    // Mirrors `resd_net_core::counters::ObsCounters`; field docs live on
+    // the core struct (see counters.rs).
+    pub obs_events_dropped: u64,
+    pub obs_events_queue_high_water: u64,
 }
 
 // Compile-time checks: the public counters struct must have the same

@@ -155,12 +155,28 @@ pub struct PollCounters {
     _pad: [u64; 11],
 }
 
+/// Engine-internal observability counters (A5.5).
+///
+/// All slow-path per §9.1.1 — fires only when observability pressure exists
+/// (event-queue overflow). No RX/TX hot-path increments.
+#[repr(C)]
+pub struct ObsCounters {
+    /// Count of events dropped from `EventQueue` due to soft-cap overflow.
+    /// Nonzero = app poll cadence cannot keep up + some events were lost.
+    pub events_dropped: AtomicU64,
+    /// Latched max observed queue depth since engine start.
+    /// High value with events_dropped == 0 = close call;
+    /// high value with nonzero events_dropped = actual loss.
+    pub events_queue_high_water: AtomicU64,
+}
+
 #[repr(C)]
 pub struct Counters {
     pub eth: EthCounters,
     pub ip: IpCounters,
     pub tcp: TcpCounters,
     pub poll: PollCounters,
+    pub obs: ObsCounters,
 }
 
 impl Counters {
@@ -171,6 +187,7 @@ impl Counters {
             ip: IpCounters::default(),
             tcp: TcpCounters::default(),
             poll: PollCounters::default(),
+            obs: ObsCounters::default(),
         }
     }
 }
@@ -197,6 +214,11 @@ impl Default for TcpCounters {
     }
 }
 impl Default for PollCounters {
+    fn default() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
+}
+impl Default for ObsCounters {
     fn default() -> Self {
         unsafe { std::mem::zeroed() }
     }
@@ -418,5 +440,18 @@ mod tests {
         assert_eq!(c.tcp.rto_no_backoff_active.load(Ordering::Relaxed), 0);
         assert_eq!(c.tcp.rx_ws_shift_clamped.load(Ordering::Relaxed), 0);
         assert_eq!(c.tcp.rx_dsack.load(Ordering::Relaxed), 0);
+    }
+}
+
+#[cfg(test)]
+mod a5_5_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn engine_counters_has_obs_group_zero_initialized() {
+        let c = Counters::new();
+        assert_eq!(c.obs.events_dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(c.obs.events_queue_high_water.load(Ordering::Relaxed), 0);
     }
 }
