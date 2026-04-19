@@ -236,6 +236,7 @@ Software verify always (current path). No `ol_flags` read. `rx_cksum_offload_act
 
 ### 8.1 Port-config (Section 4 step 7 + step 14)
 
+- `eth_conf.rxmode.mq_mode = RTE_ETH_MQ_RX_RSS`. **Required prerequisite** — DPDK's `rte_eth_dev_rss_reta_update` returns `-ENOTSUP` and ENA's `ena_rss_configure()` silently ignores `rss_hf` unless this bit is set on `mq_mode`. See `lib/ethdev/rte_ethdev.c:4657` and `drivers/net/ena/ena_ethdev.c:2410`.
 - `rx_adv_conf.rss_conf.rss_hf = RTE_ETH_RSS_NONFRAG_IPV4_TCP | RTE_ETH_RSS_NONFRAG_IPV6_TCP`.
 - `rx_adv_conf.rss_conf.rss_key = NULL` (PMD default Toeplitz).
 - `rx_adv_conf.rss_conf.rss_key_len = 0`.

@@ -958,6 +958,10 @@ Append after the RX-checksum branch (Task 3 Step 7):
             );
             applied_rx_offloads |= bit;
             if bit != 0 {
+                // Required prerequisite — see spec §8.1. Without this,
+                // rte_eth_dev_rss_reta_update fails with -ENOTSUP and ENA's
+                // ena_rss_configure() silently ignores rss_hf.
+                eth_conf.rxmode.mq_mode = sys::rte_eth_rx_mq_mode_RTE_ETH_MQ_RX_RSS;
                 eth_conf.rx_adv_conf.rss_conf.rss_hf =
                     RTE_ETH_RSS_NONFRAG_IPV4_TCP | RTE_ETH_RSS_NONFRAG_IPV6_TCP;
                 eth_conf.rx_adv_conf.rss_conf.rss_key = std::ptr::null_mut();

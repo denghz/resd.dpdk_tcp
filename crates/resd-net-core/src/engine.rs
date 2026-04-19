@@ -750,6 +750,13 @@ impl Engine {
             );
             applied_rx_offloads |= bit;
             if bit != 0 {
+                // DPDK ethdev rejects rte_eth_dev_rss_reta_update and ENA's
+                // ena_rss_configure() ignores rss_hf unless mq_mode & RSS_FLAG
+                // is set. Parent dpdk-tcp-design.md §8.1 / A-HW spec §8 both
+                // imply RSS is active; this assignment is what actually
+                // enables it. See drivers/net/ena/ena_ethdev.c:2410 and
+                // lib/ethdev/rte_ethdev.c:4657.
+                eth_conf.rxmode.mq_mode = sys::rte_eth_rx_mq_mode_RTE_ETH_MQ_RX_RSS;
                 eth_conf.rx_adv_conf.rss_conf.rss_hf =
                     RTE_ETH_RSS_NONFRAG_IPV4_TCP | RTE_ETH_RSS_NONFRAG_IPV6_TCP;
                 eth_conf.rx_adv_conf.rss_conf.rss_key = std::ptr::null_mut();
