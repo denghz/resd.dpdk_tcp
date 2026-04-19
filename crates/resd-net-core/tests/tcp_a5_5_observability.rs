@@ -110,3 +110,18 @@ fn event_queue_with_cap_rejects_below_64() {
     let result = std::panic::catch_unwind(|| EventQueue::with_cap(32));
     assert!(result.is_err(), "with_cap(<64) should panic or return Err");
 }
+
+// A5.5 Task 7: `flow_table::get_stats` is the projection layer wrapped by
+// `resd_net_conn_stats`. The C ABI maps `None` → -ENOENT; exercising the
+// `None` branch here pins the projection contract that the ABI relies on
+// without needing a live DPDK/EAL engine. Happy-path + `-ENOENT` via the
+// extern are TAP-gated follow-ups (see Task 8 + Task 7 plan §5.3).
+#[test]
+fn flow_table_get_stats_returns_none_for_invalid_handle() {
+    use resd_net_core::flow_table::{FlowTable, INVALID_HANDLE};
+
+    let ft = FlowTable::new(4);
+    assert!(ft.get_stats(INVALID_HANDLE, 262_144).is_none());
+    // Any handle past `capacity` is also unknown.
+    assert!(ft.get_stats(999, 262_144).is_none());
+}

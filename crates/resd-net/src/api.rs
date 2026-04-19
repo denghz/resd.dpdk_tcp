@@ -154,6 +154,27 @@ pub struct resd_net_event_t {
 /// Close flags — bitmask for resd_net_close.
 pub const RESD_NET_CLOSE_FORCE_TW_SKIP: u32 = 1 << 0;
 
+/// A5.5 per-connection observable state snapshot (spec §5.3, §7.2.3–7.2.6).
+/// Slow-path projection mirroring `resd_net_core::tcp_conn::ConnStats`; all
+/// values are in application-useful units — bytes for the send-buffer
+/// fields, microseconds (`_us`) for the RTT estimator fields. Before the
+/// first RTT sample has been absorbed, `srtt_us`, `rttvar_us`, and
+/// `min_rtt_us` all report 0 and `rto_us` reports the engine's configured
+/// `tcp_initial_rto_us`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct resd_net_conn_stats_t {
+    pub snd_una: u32,
+    pub snd_nxt: u32,
+    pub snd_wnd: u32,
+    pub send_buf_bytes_pending: u32,
+    pub send_buf_bytes_free: u32,
+    pub srtt_us: u32,
+    pub rttvar_us: u32,
+    pub min_rtt_us: u32,
+    pub rto_us: u32,
+}
+
 /// Counters struct — exposed to application via resd_net_counters().
 /// Fields are plain u64 on the C ABI for clean cbindgen emission, but
 /// internally the stack writes them as AtomicU64 (Relaxed). AtomicU64
@@ -304,4 +325,16 @@ const _: () = {
     assert!(size_of::<resd_net_ip_counters_t>() == size_of::<CoreIp>());
     assert!(size_of::<resd_net_tcp_counters_t>() == size_of::<CoreTcp>());
     assert!(size_of::<resd_net_poll_counters_t>() == size_of::<CorePoll>());
+};
+
+// A5.5 Task 7: `resd_net_conn_stats_t` is a field-for-field ABI mirror of
+// `resd_net_core::tcp_conn::ConnStats` (both are `#[repr(C)]` with the
+// same 9 `u32` fields in the same order). If either side changes, the
+// field-copy in `resd_net_conn_stats` silently goes wrong; guard the
+// shape at compile time.
+const _: () = {
+    use resd_net_core::tcp_conn::ConnStats as CoreConnStats;
+    use std::mem::{align_of, size_of};
+    assert!(size_of::<resd_net_conn_stats_t>() == size_of::<CoreConnStats>());
+    assert!(align_of::<resd_net_conn_stats_t>() == align_of::<CoreConnStats>());
 };

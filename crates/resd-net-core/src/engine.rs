@@ -680,6 +680,12 @@ impl Engine {
     pub fn flow_table(&self) -> std::cell::RefMut<'_, FlowTable> {
         self.flow_table.borrow_mut()
     }
+    /// A5.5 Task 7: exposed so the C ABI `resd_net_conn_stats` can feed
+    /// the configured buffer size into `ConnStats::send_buf_bytes_free`
+    /// without re-plumbing the whole `EngineConfig`.
+    pub fn send_buffer_bytes(&self) -> u32 {
+        self.cfg.send_buffer_bytes
+    }
     pub fn events(&self) -> std::cell::RefMut<'_, EventQueue> {
         self.events.borrow_mut()
     }

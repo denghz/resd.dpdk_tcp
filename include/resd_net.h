@@ -268,6 +268,27 @@ struct resd_net_counters_t {
   uint64_t obs_events_queue_high_water;
 };
 
+/**
+ * A5.5 per-connection observable state snapshot (spec §5.3, §7.2.3–7.2.6).
+ * Slow-path projection mirroring `resd_net_core::tcp_conn::ConnStats`; all
+ * values are in application-useful units — bytes for the send-buffer
+ * fields, microseconds (`_us`) for the RTT estimator fields. Before the
+ * first RTT sample has been absorbed, `srtt_us`, `rttvar_us`, and
+ * `min_rtt_us` all report 0 and `rto_us` reports the engine's configured
+ * `tcp_initial_rto_us`.
+ */
+struct resd_net_conn_stats_t {
+  uint32_t snd_una;
+  uint32_t snd_nxt;
+  uint32_t snd_wnd;
+  uint32_t send_buf_bytes_pending;
+  uint32_t send_buf_bytes_free;
+  uint32_t srtt_us;
+  uint32_t rttvar_us;
+  uint32_t min_rtt_us;
+  uint32_t rto_us;
+};
+
 struct resd_net_connect_opts_t {
   uint32_t peer_addr;
   uint16_t peer_port;
@@ -307,6 +328,21 @@ void resd_net_flush(struct resd_net_engine *_p);
 uint64_t resd_net_now_ns(struct resd_net_engine *_p);
 
 const struct resd_net_counters_t *resd_net_counters(struct resd_net_engine *p);
+
+/**
+ * Slow-path snapshot of a connection's send-path + RTT estimator state,
+ * for per-order forensics tagging (spec §5.3, §7.2.3–7.2.6). Safe to call
+ * at order-emit time; not meant for hot-loop polling.
+ *
+ * Returns:
+ *   0       on success; `out` is populated.
+ *   -EINVAL engine or out is NULL.
+ *   -ENOENT conn is not a live handle in the engine's flow table
+ *           (never-allocated, stale post-close, or reserved `0`).
+ */
+int32_t resd_net_conn_stats(struct resd_net_engine *engine,
+                            resd_net_conn_t conn,
+                            struct resd_net_conn_stats_t *out);
 
 /**
  * Resolve the MAC address for `gateway_ip_host_order` by reading

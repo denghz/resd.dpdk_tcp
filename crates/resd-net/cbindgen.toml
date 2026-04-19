@@ -40,6 +40,7 @@ include = [
     "resd_net_tcp_counters_t",
     "resd_net_poll_counters_t",
     "resd_net_counters_t",
+    "resd_net_conn_stats_t",
 ]
 
 [parse]

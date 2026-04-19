@@ -100,6 +100,17 @@ int main() {
     std::printf("tcp.conn_close: %llu\n",
         (unsigned long long)__atomic_load_n(&c->tcp.conn_close, __ATOMIC_RELAXED));
 
+    // Phase A5.5 Task 7: resd_net_conn_stats C ABI linkage demo.
+    // No real peer exists on the TAP vdev, so we can't walk a live
+    // handle here; prove linkage by exercising the ENOENT branch on
+    // a never-allocated handle. Real deployments call this after a
+    // successful connect to tag orders with snd_nxt/srtt_us/rto_us.
+    resd_net_conn_stats_t stats{};
+    int stats_rc = resd_net_conn_stats(eng, /*conn=*/0xdeadbeef, &stats);
+    std::printf("resd_net_conn_stats (unknown handle) rc=%d\n", stats_rc);
+    std::printf("stats: snd_nxt=%u srtt_us=%u rto_us=%u\n",
+        stats.snd_nxt, stats.srtt_us, stats.rto_us);
+
     resd_net_engine_destroy(eng);
     return 0;
 }

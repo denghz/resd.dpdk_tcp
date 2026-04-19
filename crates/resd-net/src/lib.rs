@@ -340,6 +340,47 @@ pub unsafe extern "C" fn resd_net_counters(p: *mut resd_net_engine) -> *const re
     }
 }
 
+/// Slow-path snapshot of a connection's send-path + RTT estimator state,
+/// for per-order forensics tagging (spec §5.3, §7.2.3–7.2.6). Safe to call
+/// at order-emit time; not meant for hot-loop polling.
+///
+/// Returns:
+///   0       on success; `out` is populated.
+///   -EINVAL engine or out is NULL.
+///   -ENOENT conn is not a live handle in the engine's flow table
+///           (never-allocated, stale post-close, or reserved `0`).
+#[no_mangle]
+pub unsafe extern "C" fn resd_net_conn_stats(
+    engine: *mut resd_net_engine,
+    conn: resd_net_conn_t,
+    out: *mut resd_net_conn_stats_t,
+) -> i32 {
+    if engine.is_null() || out.is_null() {
+        return -libc::EINVAL;
+    }
+    let Some(e) = engine_from_raw(engine) else {
+        return -libc::EINVAL;
+    };
+    let handle = conn as resd_net_core::flow_table::ConnHandle;
+    let send_buffer_bytes = e.send_buffer_bytes();
+    let ft = e.flow_table();
+    match ft.get_stats(handle, send_buffer_bytes) {
+        Some(s) => {
+            (*out).snd_una = s.snd_una;
+            (*out).snd_nxt = s.snd_nxt;
+            (*out).snd_wnd = s.snd_wnd;
+            (*out).send_buf_bytes_pending = s.send_buf_bytes_pending;
+            (*out).send_buf_bytes_free = s.send_buf_bytes_free;
+            (*out).srtt_us = s.srtt_us;
+            (*out).rttvar_us = s.rttvar_us;
+            (*out).min_rtt_us = s.min_rtt_us;
+            (*out).rto_us = s.rto_us;
+            0
+        }
+        None => -libc::ENOENT,
+    }
+}
+
 /// Resolve the MAC address for `gateway_ip_host_order` by reading
 /// `/proc/net/arp`. Writes 6 bytes into `out_mac`.
 /// Returns 0 on success, -ENOENT if no entry, -EIO on /proc/net/arp read error,
@@ -654,5 +695,27 @@ mod tests {
                 ev
             );
         }
+    }
+
+    // A5.5 Task 7: C ABI null-argument rejection. Full happy-path and
+    // ENOENT behavior needs a live Engine (DPDK/EAL + TAP); those paths
+    // are covered by resd-net-core's flow_table::get_stats test at the
+    // projection layer. Here we pin the null-guard contract so null
+    // engine or null out cannot dereference into the engine box.
+    #[test]
+    fn conn_stats_null_engine_returns_einval() {
+        let mut out = resd_net_conn_stats_t::default();
+        let rc = unsafe { resd_net_conn_stats(std::ptr::null_mut(), 0, &mut out) };
+        assert_eq!(rc, -libc::EINVAL);
+    }
+
+    #[test]
+    fn conn_stats_null_out_returns_einval_before_engine_deref() {
+        // The null-out check must fire BEFORE any engine dereference, so
+        // a bogus (non-null) engine pointer paired with a null `out` must
+        // still return -EINVAL without segfaulting.
+        let fake_engine = std::ptr::dangling_mut::<resd_net_engine>();
+        let rc = unsafe { resd_net_conn_stats(fake_engine, 0, std::ptr::null_mut()) };
+        assert_eq!(rc, -libc::EINVAL);
     }
 }
