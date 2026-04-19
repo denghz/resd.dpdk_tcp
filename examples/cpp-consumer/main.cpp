@@ -34,6 +34,7 @@ int main() {
     cfg.gateway_ip = 0;
     memset(cfg.gateway_mac, 0, sizeof(cfg.gateway_mac));
     cfg.garp_interval_sec = 0;
+    cfg.event_queue_soft_cap = 4096;
 
     // Initialize EAL first. Uses DPDK TAP vdev so no real NIC is required.
     const char* eal_args[] = {

@@ -59,6 +59,9 @@ pub unsafe extern "C" fn resd_net_engine_create(
         return ptr::null_mut();
     }
     let cfg = &*cfg;
+    if cfg.event_queue_soft_cap < 64 {
+        return ptr::null_mut();
+    }
     // A3 fields with 0 sentinels fall back to defaults so callers that
     // don't supply them get sensible behavior.
     let max_conns = if cfg.max_connections == 0 {
@@ -128,6 +131,7 @@ pub unsafe extern "C" fn resd_net_engine_create(
         tcp_max_rto_us: max_rto_us,
         tcp_max_retrans_count: max_retrans,
         tcp_per_packet_events: cfg.tcp_per_packet_events,
+        event_queue_soft_cap: cfg.event_queue_soft_cap,
     };
     match Engine::new(core_cfg) {
         Ok(e) => box_to_raw(e),
@@ -498,10 +502,50 @@ mod tests {
             gateway_ip: 0x0a_00_00_01,
             gateway_mac: [0xde, 0xad, 0xbe, 0xef, 0x00, 0x01],
             garp_interval_sec: 5,
+            event_queue_soft_cap: 4096,
         };
         assert_eq!(cfg.local_ip, 0x0a_00_00_02);
         assert_eq!(cfg.gateway_mac[2], 0xbe);
         assert_eq!(cfg.garp_interval_sec, 5);
+    }
+
+    // A5.5 Task 5: `resd_net_engine_create` must reject
+    // `event_queue_soft_cap < 64` before any DPDK/EAL touching, so we can
+    // validate the early-return path from a pure unit test. The function
+    // returns a pointer type, so validation failure surfaces as a null
+    // pointer (same convention as the existing null-cfg guard).
+    #[test]
+    fn engine_create_rejects_event_queue_soft_cap_below_64() {
+        let cfg = resd_net_engine_config_t {
+            port_id: 0,
+            rx_queue_id: 0,
+            tx_queue_id: 0,
+            max_connections: 0,
+            recv_buffer_bytes: 0,
+            send_buffer_bytes: 0,
+            tcp_mss: 0,
+            tcp_timestamps: false,
+            tcp_sack: false,
+            tcp_ecn: false,
+            tcp_nagle: false,
+            tcp_delayed_ack: false,
+            cc_mode: 0,
+            tcp_min_rto_ms: 0,
+            tcp_min_rto_us: 0,
+            tcp_initial_rto_us: 0,
+            tcp_max_rto_us: 0,
+            tcp_max_retrans_count: 0,
+            tcp_msl_ms: 0,
+            tcp_per_packet_events: false,
+            preset: 0,
+            local_ip: 0,
+            gateway_ip: 0,
+            gateway_mac: [0u8; 6],
+            garp_interval_sec: 0,
+            event_queue_soft_cap: 32,
+        };
+        let p = unsafe { resd_net_engine_create(0, &cfg) };
+        assert!(p.is_null());
     }
 
     #[test]

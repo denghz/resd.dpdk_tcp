@@ -212,6 +212,10 @@ pub struct EngineConfig {
     /// observability contract; this flag is for forensic sessions where
     /// per-packet event logging is desired.
     pub tcp_per_packet_events: bool,
+
+    /// A5.5 Task 5: event-queue overflow guard (§3.2 / §5.1).
+    /// Default 4096; must be >= 64. Queue drops oldest on overflow.
+    pub event_queue_soft_cap: u32,
 }
 
 impl Default for EngineConfig {
@@ -240,6 +244,7 @@ impl Default for EngineConfig {
             tcp_max_rto_us: 1_000_000,
             tcp_max_retrans_count: 15,
             tcp_per_packet_events: false,
+            event_queue_soft_cap: 4096,
         }
     }
 }
@@ -487,7 +492,7 @@ impl Engine {
             pmtu: RefCell::new(PmtuTable::new()),
             last_garp_ns: RefCell::new(0),
             flow_table: RefCell::new(FlowTable::new(cfg.max_connections)),
-            events: RefCell::new(EventQueue::with_cap(EventQueue::DEFAULT_SOFT_CAP)),
+            events: RefCell::new(EventQueue::with_cap(cfg.event_queue_soft_cap as usize)),
             iss_gen: IssGen::new(),
             // RFC 6056 ephemeral port hint range: start at 49152.
             last_ephemeral_port: Cell::new(49151),
@@ -2877,6 +2882,12 @@ mod tests {
         assert_eq!(cfg.tcp_max_rto_us, 1_000_000);
         assert_eq!(cfg.tcp_max_retrans_count, 15);
         assert!(!cfg.tcp_per_packet_events);
+    }
+
+    #[test]
+    fn engine_config_default_event_queue_soft_cap_matches_spec() {
+        let cfg = EngineConfig::default();
+        assert_eq!(cfg.event_queue_soft_cap, 4096);
     }
 
     #[test]

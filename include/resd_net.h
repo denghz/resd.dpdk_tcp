@@ -71,6 +71,11 @@ struct resd_net_engine_config_t {
   uint32_t gateway_ip;
   uint8_t gateway_mac[6];
   uint32_t garp_interval_sec;
+  /**
+   * A5.5 event-queue overflow guard (§3.2 / §5.1). Default 4096;
+   * must be >= 64. Queue drops oldest on overflow.
+   */
+  uint32_t event_queue_soft_cap;
 };
 
 typedef uint64_t resd_net_conn_t;

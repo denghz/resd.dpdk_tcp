@@ -48,6 +48,9 @@ pub struct resd_net_engine_config_t {
     pub gateway_ip: u32,
     pub gateway_mac: [u8; 6],
     pub garp_interval_sec: u32,
+    /// A5.5 event-queue overflow guard (§3.2 / §5.1). Default 4096;
+    /// must be >= 64. Queue drops oldest on overflow.
+    pub event_queue_soft_cap: u32,
 }
 
 #[repr(C)]
