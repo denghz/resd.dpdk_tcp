@@ -173,11 +173,11 @@ pub unsafe extern "C" fn resd_net_engine_create(
         tcp_max_retrans_count: max_retrans,
         tcp_per_packet_events: cfg.tcp_per_packet_events,
         event_queue_soft_cap: cfg.event_queue_soft_cap,
-        // A6 Task 6: core-side plumbing only — all-zero input triggers the
-        // spec §3.8.2 default substitution in `Engine::new`. The ABI-layer
-        // pass-through (`resd_net_engine_config_t::rtt_histogram_bucket_edges_us`)
-        // lands in Task 20.
-        rtt_histogram_bucket_edges_us: [0u32; 15],
+        // A6 Task 20: ABI-layer pass-through of the caller-supplied
+        // bucket edges. All-zero input triggers the spec §3.8.2 default
+        // substitution in `Engine::new`; non-monotonic input causes
+        // `Engine::new` to reject and is surfaced here as a null-return.
+        rtt_histogram_bucket_edges_us: cfg.rtt_histogram_bucket_edges_us,
     };
     // A6 Task 9 (spec §3.5): apply preset override AFTER zero-sentinel
     // substitution so the preset values are never clobbered by the
@@ -799,6 +799,7 @@ mod tests {
             gateway_mac: [0xde, 0xad, 0xbe, 0xef, 0x00, 0x01],
             garp_interval_sec: 5,
             event_queue_soft_cap: 4096,
+            rtt_histogram_bucket_edges_us: [0u32; 15],
         };
         assert_eq!(cfg.local_ip, 0x0a_00_00_02);
         assert_eq!(cfg.gateway_mac[2], 0xbe);
@@ -839,6 +840,7 @@ mod tests {
             gateway_mac: [0u8; 6],
             garp_interval_sec: 0,
             event_queue_soft_cap: 32,
+            rtt_histogram_bucket_edges_us: [0u32; 15],
         };
         let p = unsafe { resd_net_engine_create(0, &cfg) };
         assert!(p.is_null());

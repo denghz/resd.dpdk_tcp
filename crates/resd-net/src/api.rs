@@ -51,6 +51,11 @@ pub struct resd_net_engine_config_t {
     /// A5.5 event-queue overflow guard (§3.2 / §5.1). Default 4096;
     /// must be >= 64. Queue drops oldest on overflow.
     pub event_queue_soft_cap: u32,
+    /// A6 (spec §5.1, §3.8): RTT histogram bucket edges, µs. 15 strictly
+    /// monotonically increasing edges define 16 buckets. All-zero input
+    /// means "use the stack's trading-tuned defaults" (see spec §3.8.2).
+    /// Non-monotonic rejected at `resd_net_engine_create` with null-return.
+    pub rtt_histogram_bucket_edges_us: [u32; 15],
 }
 
 #[repr(C)]

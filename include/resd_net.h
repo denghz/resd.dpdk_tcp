@@ -89,6 +89,13 @@ struct resd_net_engine_config_t {
    * must be >= 64. Queue drops oldest on overflow.
    */
   uint32_t event_queue_soft_cap;
+  /**
+   * A6 (spec §5.1, §3.8): RTT histogram bucket edges, µs. 15 strictly
+   * monotonically increasing edges define 16 buckets. All-zero input
+   * means "use the stack's trading-tuned defaults" (see spec §3.8.2).
+   * Non-monotonic rejected at `resd_net_engine_create` with null-return.
+   */
+  uint32_t rtt_histogram_bucket_edges_us[15];
 };
 
 typedef uint64_t resd_net_conn_t;
