@@ -54,6 +54,7 @@ pub struct resd_net_engine_config_t {
 }
 
 #[repr(C)]
+#[derive(Copy, Clone)]
 pub struct resd_net_connect_opts_t {
     pub peer_addr: u32, // network byte order IPv4
     pub peer_port: u16,
@@ -66,6 +67,33 @@ pub struct resd_net_connect_opts_t {
     // `resd_net_core::engine::ConnectOpts` for field semantics.
     pub rack_aggressive: bool,
     pub rto_no_backoff: bool,
+    /// A5.5 Task 10: per-connect RFC 8985 §7.2 PTO floor (µs).
+    /// `0` (default) inherits engine `tcp_min_rto_us`; `u32::MAX`
+    /// is the explicit "no-floor" sentinel (yields `floor_us = 0`
+    /// in the projected `TlpConfig`). Any other value must be
+    /// `<= tcp_max_rto_us`, else `resd_net_connect` returns `-EINVAL`.
+    pub tlp_pto_min_floor_us: u32,
+    /// A5.5 Task 10: per-connect SRTT multiplier (×100) for PTO base.
+    /// Default (`0` → `200` at `resd_net_connect` entry) matches RFC
+    /// 8985 `2·SRTT`. Valid range post-substitution: `[100, 200]`.
+    /// Values outside that range cause `resd_net_connect` to return
+    /// `-EINVAL`.
+    pub tlp_pto_srtt_multiplier_x100: u16,
+    /// A5.5 Task 10: when `true`, suppresses the RFC 8985 §7.2
+    /// FlightSize==1 `+max(WCDelAckT, SRTT/4)` penalty (trading-
+    /// latency opt-out; accepts a small spurious-TLP risk on
+    /// delayed-ACK receivers).
+    pub tlp_skip_flight_size_gate: bool,
+    /// A5.5 Task 10: per-connect cap on consecutive TLP probes before
+    /// falling through to RTO. Default (`0` → `1` at `resd_net_connect`
+    /// entry) matches A5 / RFC 8985 §7.1 single-probe behavior. Valid
+    /// range post-substitution: `[1, 5]`. Out-of-range causes `-EINVAL`.
+    pub tlp_max_consecutive_probes: u8,
+    /// A5.5 Task 10: when `true`, suppresses the "require an RTT sample
+    /// since last TLP" gate in TLP scheduling (trading-latency opt-out;
+    /// permits back-to-back TLPs even if no peer ACK has produced a
+    /// fresh RTT sample).
+    pub tlp_skip_rtt_sample_gate: bool,
 }
 
 #[repr(u32)]

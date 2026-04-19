@@ -298,6 +298,43 @@ struct resd_net_connect_opts_t {
   uint32_t idle_keepalive_sec;
   bool rack_aggressive;
   bool rto_no_backoff;
+  /**
+   * A5.5 Task 10: per-connect RFC 8985 §7.2 PTO floor (µs).
+   * `0` (default) inherits engine `tcp_min_rto_us`; `u32::MAX`
+   * is the explicit "no-floor" sentinel (yields `floor_us = 0`
+   * in the projected `TlpConfig`). Any other value must be
+   * `<= tcp_max_rto_us`, else `resd_net_connect` returns `-EINVAL`.
+   */
+  uint32_t tlp_pto_min_floor_us;
+  /**
+   * A5.5 Task 10: per-connect SRTT multiplier (×100) for PTO base.
+   * Default (`0` → `200` at `resd_net_connect` entry) matches RFC
+   * 8985 `2·SRTT`. Valid range post-substitution: `[100, 200]`.
+   * Values outside that range cause `resd_net_connect` to return
+   * `-EINVAL`.
+   */
+  uint16_t tlp_pto_srtt_multiplier_x100;
+  /**
+   * A5.5 Task 10: when `true`, suppresses the RFC 8985 §7.2
+   * FlightSize==1 `+max(WCDelAckT, SRTT/4)` penalty (trading-
+   * latency opt-out; accepts a small spurious-TLP risk on
+   * delayed-ACK receivers).
+   */
+  bool tlp_skip_flight_size_gate;
+  /**
+   * A5.5 Task 10: per-connect cap on consecutive TLP probes before
+   * falling through to RTO. Default (`0` → `1` at `resd_net_connect`
+   * entry) matches A5 / RFC 8985 §7.1 single-probe behavior. Valid
+   * range post-substitution: `[1, 5]`. Out-of-range causes `-EINVAL`.
+   */
+  uint8_t tlp_max_consecutive_probes;
+  /**
+   * A5.5 Task 10: when `true`, suppresses the "require an RTT sample
+   * since last TLP" gate in TLP scheduling (trading-latency opt-out;
+   * permits back-to-back TLPs even if no peer ACK has produced a
+   * fresh RTT sample).
+   */
+  bool tlp_skip_rtt_sample_gate;
 };
 
 #ifdef __cplusplus

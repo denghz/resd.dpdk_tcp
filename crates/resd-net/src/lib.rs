@@ -403,6 +403,48 @@ pub unsafe extern "C" fn resd_net_resolve_gateway_mac(
     }
 }
 
+/// A5.5 Task 10: pure default-substitution + range validation for the
+/// five TLP tuning knobs on `resd_net_connect_opts_t`. Factored out so
+/// rejection paths are unit-testable without standing up a live engine.
+///
+/// Substitution (zero-init-friendly):
+/// * `tlp_pto_srtt_multiplier_x100 == 0` → `200` (RFC 8985 2·SRTT).
+/// * `tlp_max_consecutive_probes == 0` → `1` (A5 / RFC 8985 §7.1).
+/// * `tlp_pto_min_floor_us == 0` → engine `tcp_min_rto_us`.
+///
+/// Validation (post-substitution):
+/// * `tlp_pto_srtt_multiplier_x100 ∈ [100, 200]`.
+/// * `tlp_max_consecutive_probes ∈ [1, 5]`.
+/// * `tlp_pto_min_floor_us == u32::MAX` (explicit no-floor sentinel)
+///   OR `tlp_pto_min_floor_us <= tcp_max_rto_us`.
+///
+/// Returns `Ok(opts_with_substitutions_applied)` or `Err(-libc::EINVAL)`.
+fn validate_and_defaults_tlp_opts(
+    o: &resd_net_connect_opts_t,
+    cfg: &resd_net_core::engine::EngineConfig,
+) -> Result<resd_net_connect_opts_t, i32> {
+    let mut o_opts = *o;
+    if o_opts.tlp_pto_srtt_multiplier_x100 == 0 {
+        o_opts.tlp_pto_srtt_multiplier_x100 = 200;
+    }
+    if o_opts.tlp_max_consecutive_probes == 0 {
+        o_opts.tlp_max_consecutive_probes = 1;
+    }
+    if o_opts.tlp_pto_min_floor_us == 0 {
+        o_opts.tlp_pto_min_floor_us = cfg.tcp_min_rto_us;
+    }
+    if !(100..=200).contains(&o_opts.tlp_pto_srtt_multiplier_x100) {
+        return Err(-libc::EINVAL);
+    }
+    if !(1..=5).contains(&o_opts.tlp_max_consecutive_probes) {
+        return Err(-libc::EINVAL);
+    }
+    if o_opts.tlp_pto_min_floor_us != u32::MAX && o_opts.tlp_pto_min_floor_us > cfg.tcp_max_rto_us {
+        return Err(-libc::EINVAL);
+    }
+    Ok(o_opts)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn resd_net_connect(
     p: *mut resd_net_engine,
@@ -416,14 +458,27 @@ pub unsafe extern "C" fn resd_net_connect(
         return -libc::EINVAL;
     };
     let opts = &*opts;
+    // A5.5 Task 10: validate + default-substitute the TLP tuning fields
+    // before engine construction. Rejects out-of-range values with
+    // -EINVAL; zero-init callers land in the A5-default happy path.
+    let o_opts = match validate_and_defaults_tlp_opts(opts, e.config()) {
+        Ok(v) => v,
+        Err(rc) => return rc,
+    };
     // peer_addr comes in network byte order; convert to host order.
-    let peer_ip = u32::from_be(opts.peer_addr);
-    let peer_port = u16::from_be(opts.peer_port);
-    let local_port = u16::from_be(opts.local_port);
-    // A5 Task 19: plumb per-connect opt-ins into engine::ConnectOpts.
+    let peer_ip = u32::from_be(o_opts.peer_addr);
+    let peer_port = u16::from_be(o_opts.peer_port);
+    let local_port = u16::from_be(o_opts.local_port);
+    // A5 Task 19 / A5.5 Task 10: plumb per-connect opt-ins into
+    // engine::ConnectOpts (post-substitution values).
     let connect_opts = resd_net_core::engine::ConnectOpts {
-        rack_aggressive: opts.rack_aggressive,
-        rto_no_backoff: opts.rto_no_backoff,
+        rack_aggressive: o_opts.rack_aggressive,
+        rto_no_backoff: o_opts.rto_no_backoff,
+        tlp_pto_min_floor_us: o_opts.tlp_pto_min_floor_us,
+        tlp_pto_srtt_multiplier_x100: o_opts.tlp_pto_srtt_multiplier_x100,
+        tlp_skip_flight_size_gate: o_opts.tlp_skip_flight_size_gate,
+        tlp_max_consecutive_probes: o_opts.tlp_max_consecutive_probes,
+        tlp_skip_rtt_sample_gate: o_opts.tlp_skip_rtt_sample_gate,
     };
     match e.connect_with_opts(peer_ip, peer_port, local_port, connect_opts) {
         Ok(h) => {
@@ -614,6 +669,11 @@ mod tests {
             idle_keepalive_sec: 0,
             rack_aggressive: false,
             rto_no_backoff: false,
+            tlp_pto_min_floor_us: 0,
+            tlp_pto_srtt_multiplier_x100: 0,
+            tlp_skip_flight_size_gate: false,
+            tlp_max_consecutive_probes: 0,
+            tlp_skip_rtt_sample_gate: false,
         };
         let mut out: u64 = 0;
         let rc = unsafe { resd_net_connect(std::ptr::null_mut(), &opts, &mut out) };
@@ -717,5 +777,165 @@ mod tests {
         let fake_engine = std::ptr::dangling_mut::<resd_net_engine>();
         let rc = unsafe { resd_net_conn_stats(fake_engine, 0, std::ptr::null_mut()) };
         assert_eq!(rc, -libc::EINVAL);
+    }
+}
+
+#[cfg(test)]
+mod a5_5_tlp_opts_tests {
+    //! A5.5 Task 10: pure-Rust unit tests for
+    //! `validate_and_defaults_tlp_opts`. Exercising the ABI entrypoint
+    //! itself would need a live Engine (DPDK/EAL + TAP); factoring the
+    //! validator out lets us pin every rejection + substitution path
+    //! here without any DPDK dependency.
+    use super::*;
+    use resd_net_core::engine::EngineConfig;
+
+    fn base_cfg() -> EngineConfig {
+        EngineConfig {
+            tcp_min_rto_us: 5_000,
+            tcp_max_rto_us: 1_000_000,
+            ..EngineConfig::default()
+        }
+    }
+
+    fn zero_opts() -> resd_net_connect_opts_t {
+        resd_net_connect_opts_t {
+            peer_addr: 0,
+            peer_port: 0,
+            local_addr: 0,
+            local_port: 0,
+            connect_timeout_ms: 0,
+            idle_keepalive_sec: 0,
+            rack_aggressive: false,
+            rto_no_backoff: false,
+            tlp_pto_min_floor_us: 0,
+            tlp_pto_srtt_multiplier_x100: 0,
+            tlp_skip_flight_size_gate: false,
+            tlp_max_consecutive_probes: 0,
+            tlp_skip_rtt_sample_gate: false,
+        }
+    }
+
+    #[test]
+    fn zero_init_applies_a5_defaults() {
+        let opts = zero_opts();
+        let cfg = base_cfg();
+        let out = validate_and_defaults_tlp_opts(&opts, &cfg)
+            .expect("zero-init must substitute to valid A5 defaults");
+        assert_eq!(out.tlp_pto_srtt_multiplier_x100, 200);
+        assert_eq!(out.tlp_max_consecutive_probes, 1);
+        assert_eq!(out.tlp_pto_min_floor_us, cfg.tcp_min_rto_us);
+    }
+
+    fn expect_err(r: Result<resd_net_connect_opts_t, i32>) -> i32 {
+        match r {
+            Ok(_) => panic!("expected validator to reject, got Ok"),
+            Err(rc) => rc,
+        }
+    }
+
+    #[test]
+    fn multiplier_below_100_rejected() {
+        let mut opts = zero_opts();
+        opts.tlp_pto_srtt_multiplier_x100 = 99;
+        let rc = expect_err(validate_and_defaults_tlp_opts(&opts, &base_cfg()));
+        assert_eq!(rc, -libc::EINVAL);
+    }
+
+    #[test]
+    fn multiplier_above_200_rejected() {
+        let mut opts = zero_opts();
+        opts.tlp_pto_srtt_multiplier_x100 = 201;
+        let rc = expect_err(validate_and_defaults_tlp_opts(&opts, &base_cfg()));
+        assert_eq!(rc, -libc::EINVAL);
+    }
+
+    #[test]
+    fn multiplier_boundary_values_accepted() {
+        let mut opts = zero_opts();
+        opts.tlp_pto_srtt_multiplier_x100 = 100;
+        let out = validate_and_defaults_tlp_opts(&opts, &base_cfg()).unwrap();
+        assert_eq!(out.tlp_pto_srtt_multiplier_x100, 100);
+
+        opts.tlp_pto_srtt_multiplier_x100 = 200;
+        let out = validate_and_defaults_tlp_opts(&opts, &base_cfg()).unwrap();
+        assert_eq!(out.tlp_pto_srtt_multiplier_x100, 200);
+    }
+
+    #[test]
+    fn max_consecutive_probes_above_5_rejected() {
+        let mut opts = zero_opts();
+        opts.tlp_max_consecutive_probes = 6;
+        let rc = expect_err(validate_and_defaults_tlp_opts(&opts, &base_cfg()));
+        assert_eq!(rc, -libc::EINVAL);
+    }
+
+    #[test]
+    fn max_consecutive_probes_boundary_values_accepted() {
+        for n in 1u8..=5 {
+            let mut opts = zero_opts();
+            opts.tlp_max_consecutive_probes = n;
+            let out = validate_and_defaults_tlp_opts(&opts, &base_cfg()).unwrap();
+            assert_eq!(out.tlp_max_consecutive_probes, n);
+        }
+    }
+
+    #[test]
+    fn floor_u32_max_is_explicit_no_floor() {
+        let mut opts = zero_opts();
+        opts.tlp_pto_min_floor_us = u32::MAX;
+        let out = validate_and_defaults_tlp_opts(&opts, &base_cfg()).unwrap();
+        // The sentinel passes through — the `tlp_config()` projection
+        // turns it into `floor_us = 0` at PTO-compute time.
+        assert_eq!(out.tlp_pto_min_floor_us, u32::MAX);
+    }
+
+    #[test]
+    fn floor_above_max_rto_rejected() {
+        let cfg = base_cfg();
+        let mut opts = zero_opts();
+        opts.tlp_pto_min_floor_us = cfg.tcp_max_rto_us + 1;
+        let rc = expect_err(validate_and_defaults_tlp_opts(&opts, &cfg));
+        assert_eq!(rc, -libc::EINVAL);
+    }
+
+    #[test]
+    fn floor_equal_to_max_rto_accepted() {
+        let cfg = base_cfg();
+        let mut opts = zero_opts();
+        opts.tlp_pto_min_floor_us = cfg.tcp_max_rto_us;
+        let out = validate_and_defaults_tlp_opts(&opts, &cfg).unwrap();
+        assert_eq!(out.tlp_pto_min_floor_us, cfg.tcp_max_rto_us);
+    }
+
+    #[test]
+    fn explicit_nonzero_floor_passes_through() {
+        let cfg = base_cfg();
+        let mut opts = zero_opts();
+        opts.tlp_pto_min_floor_us = 10_000; // 10ms, within range
+        let out = validate_and_defaults_tlp_opts(&opts, &cfg).unwrap();
+        assert_eq!(out.tlp_pto_min_floor_us, 10_000);
+    }
+
+    #[test]
+    fn floor_zero_inherits_engine_min_rto() {
+        let cfg = EngineConfig {
+            tcp_min_rto_us: 12_345,
+            tcp_max_rto_us: 1_000_000,
+            ..EngineConfig::default()
+        };
+        let opts = zero_opts();
+        let out = validate_and_defaults_tlp_opts(&opts, &cfg).unwrap();
+        assert_eq!(out.tlp_pto_min_floor_us, 12_345);
+    }
+
+    #[test]
+    fn skip_flags_pass_through_unchanged() {
+        let mut opts = zero_opts();
+        opts.tlp_skip_flight_size_gate = true;
+        opts.tlp_skip_rtt_sample_gate = true;
+        let out = validate_and_defaults_tlp_opts(&opts, &base_cfg()).unwrap();
+        assert!(out.tlp_skip_flight_size_gate);
+        assert!(out.tlp_skip_rtt_sample_gate);
     }
 }

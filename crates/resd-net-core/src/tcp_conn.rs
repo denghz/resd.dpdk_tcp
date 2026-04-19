@@ -102,6 +102,18 @@ pub struct ConnStats {
     pub rto_us: u32,
 }
 
+/// A5.5 Task 10: recent-TLP-probe record, consumed by Task 12's DSACK
+/// spurious-TLP attribution path. Five slots per conn (`tlp_recent_probes`
+/// on `TcpConn`) form a ring; the most-recent-probe-wins overwrite
+/// policy keeps attribution bounded even under a burst of probes.
+#[derive(Debug, Clone, Copy)]
+pub struct RecentProbe {
+    pub seq: u32,
+    pub len: u16,
+    pub tx_ts_ns: u64,
+    pub attributed: bool,
+}
+
 pub struct TcpConn {
     four_tuple: FourTuple,
     pub state: TcpState,
@@ -206,6 +218,40 @@ pub struct TcpConn {
     pub rto_no_backoff: bool,
     /// A5: RFC 8985 RACK state.
     pub rack: crate::tcp_rack::RackState,
+
+    // A5.5 Task 10: per-connect TLP tuning (ABI mirror of the five
+    // `resd_net_connect_opts_t::tlp_*` fields). Zero-init substitution
+    // is applied at `resd_net_connect` entry (multiplier 0 → 200,
+    // max_probes 0 → 1, floor 0 → engine `tcp_min_rto_us`) so these
+    // fields hold post-substitution values by the time they land here.
+    pub tlp_pto_min_floor_us: u32,
+    pub tlp_pto_srtt_multiplier_x100: u16,
+    pub tlp_skip_flight_size_gate: bool,
+    pub tlp_max_consecutive_probes: u8,
+    pub tlp_skip_rtt_sample_gate: bool,
+
+    // A5.5 Task 10: runtime TLP state (NOT in the ABI; private to the
+    // core crate). Task 11 reads/mutates these when arming / firing /
+    // resetting the TLP multi-probe budget.
+    /// Count of consecutive TLPs fired without an intervening RTT
+    /// sample or new-data ACK. Reset by the ACK path; compared against
+    /// `tlp_max_consecutive_probes` before arming the next probe.
+    pub tlp_consecutive_probes_fired: u8,
+    /// Set by the ACK path whenever a fresh RTT sample or new-data ACK
+    /// is absorbed; cleared on TLP fire. Gate for TLP scheduling when
+    /// `tlp_skip_rtt_sample_gate == false`.
+    pub tlp_rtt_sample_seen_since_last_tlp: bool,
+    /// Five-slot ring of recently-transmitted TLP probes, consumed by
+    /// Task 12's DSACK spurious-TLP attribution path.
+    pub tlp_recent_probes: [Option<RecentProbe>; 5],
+    /// Next-slot index into `tlp_recent_probes` (wraps mod 5).
+    pub tlp_recent_probes_next_slot: u8,
+
+    // A5.5 Task 13 pre-announce: our SYN TX timestamp (ns, engine
+    // monotonic clock). Zero-init here; Task 13 populates it at SYN
+    // emission so `handle_syn_sent` can seed SRTT from the SYN-ACK
+    // RTT sample.
+    pub syn_tx_ts_ns: u64,
 }
 
 impl TcpConn {
@@ -268,6 +314,38 @@ impl TcpConn {
             rack_aggressive: false,
             rto_no_backoff: false,
             rack: crate::tcp_rack::RackState::new(),
+            // A5.5 Task 10: TLP tuning fields + runtime state zero-init.
+            // `resd_net_connect` (or `connect_with_opts`) overrides the five
+            // ABI-mirror fields with post-substitution values right after
+            // inserting the conn into the flow table.
+            tlp_pto_min_floor_us: 0,
+            tlp_pto_srtt_multiplier_x100: 0,
+            tlp_skip_flight_size_gate: false,
+            tlp_max_consecutive_probes: 0,
+            tlp_skip_rtt_sample_gate: false,
+            tlp_consecutive_probes_fired: 0,
+            tlp_rtt_sample_seen_since_last_tlp: false,
+            tlp_recent_probes: [None; 5],
+            tlp_recent_probes_next_slot: 0,
+            syn_tx_ts_ns: 0,
+        }
+    }
+
+    /// A5.5 Task 10: project the per-connect TLP tuning into the
+    /// pure-function `TlpConfig` consumed by `pto_us`. By the time we
+    /// reach here, `tlp_pto_min_floor_us` has already been substituted
+    /// from `0` → engine `tcp_min_rto_us` at `resd_net_connect` entry;
+    /// the `u32::MAX` check handles only the explicit no-floor case.
+    pub fn tlp_config(&self, _engine_min_rto_us: u32) -> crate::tcp_tlp::TlpConfig {
+        let floor = if self.tlp_pto_min_floor_us == u32::MAX {
+            0
+        } else {
+            self.tlp_pto_min_floor_us
+        };
+        crate::tcp_tlp::TlpConfig {
+            floor_us: floor,
+            multiplier_x100: self.tlp_pto_srtt_multiplier_x100,
+            skip_flight_size_gate: self.tlp_skip_flight_size_gate,
         }
     }
 
@@ -434,6 +512,43 @@ mod tests {
         assert_eq!(c.rack.end_seq, 0);
         assert_eq!(c.rack.min_rtt_us, 0);
         assert!(!c.rack.dsack_seen);
+    }
+
+    // A5.5 Task 10: per-connect TLP tuning + runtime state + syn_tx_ts_ns.
+    #[test]
+    fn a5_5_tlp_tuning_fields_zero_init_on_new_client() {
+        let c = TcpConn::new_client(tuple(), 1, 1460, 1024, 2048, 5000, 5000, 1_000_000);
+        assert_eq!(c.tlp_pto_min_floor_us, 0);
+        assert_eq!(c.tlp_pto_srtt_multiplier_x100, 0);
+        assert!(!c.tlp_skip_flight_size_gate);
+        assert_eq!(c.tlp_max_consecutive_probes, 0);
+        assert!(!c.tlp_skip_rtt_sample_gate);
+        assert_eq!(c.tlp_consecutive_probes_fired, 0);
+        assert!(!c.tlp_rtt_sample_seen_since_last_tlp);
+        assert!(c.tlp_recent_probes.iter().all(|s| s.is_none()));
+        assert_eq!(c.tlp_recent_probes_next_slot, 0);
+        assert_eq!(c.syn_tx_ts_ns, 0);
+    }
+
+    #[test]
+    fn a5_5_tlp_config_projects_fields() {
+        let mut c = TcpConn::new_client(tuple(), 1, 1460, 1024, 2048, 5000, 5000, 1_000_000);
+        c.tlp_pto_min_floor_us = 7_500;
+        c.tlp_pto_srtt_multiplier_x100 = 150;
+        c.tlp_skip_flight_size_gate = true;
+        let cfg = c.tlp_config(5_000);
+        assert_eq!(cfg.floor_us, 7_500);
+        assert_eq!(cfg.multiplier_x100, 150);
+        assert!(cfg.skip_flight_size_gate);
+    }
+
+    #[test]
+    fn a5_5_tlp_config_u32_max_means_no_floor() {
+        let mut c = TcpConn::new_client(tuple(), 1, 1460, 1024, 2048, 5000, 5000, 1_000_000);
+        c.tlp_pto_min_floor_us = u32::MAX;
+        c.tlp_pto_srtt_multiplier_x100 = 200;
+        let cfg = c.tlp_config(5_000);
+        assert_eq!(cfg.floor_us, 0, "u32::MAX sentinel must project to 0");
     }
 }
 

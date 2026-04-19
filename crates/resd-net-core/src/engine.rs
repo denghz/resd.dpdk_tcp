@@ -355,10 +355,21 @@ pub fn eal_init(args: &[&str]) -> Result<(), Error> {
 ///   at its current value across consecutive retransmits instead of
 ///   doubling — intended for latency-sensitive trading paths where the
 ///   operator prefers faster reprobe over AIMD-style congestion backoff).
+///
+/// A5.5 Task 10: five TLP tuning fields mirror the C ABI
+/// `resd_net_connect_opts_t::tlp_*` set. Zero-init substitution (from
+/// the ABI helper `validate_and_defaults_tlp_opts`) fires before this
+/// struct is built, so `multiplier_x100` / `max_consecutive_probes` /
+/// `pto_min_floor_us` carry post-substitution values here.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ConnectOpts {
     pub rack_aggressive: bool,
     pub rto_no_backoff: bool,
+    pub tlp_pto_min_floor_us: u32,
+    pub tlp_pto_srtt_multiplier_x100: u16,
+    pub tlp_skip_flight_size_gate: bool,
+    pub tlp_max_consecutive_probes: u8,
+    pub tlp_skip_rtt_sample_gate: bool,
 }
 
 impl Engine {
@@ -505,6 +516,13 @@ impl Engine {
 
     pub fn counters(&self) -> &Counters {
         &self.counters
+    }
+
+    /// A5.5 Task 10: expose `EngineConfig` for the ABI crate's TLP
+    /// validation helper (`tcp_min_rto_us` / `tcp_max_rto_us` substitution
+    /// + range checks).
+    pub fn config(&self) -> &EngineConfig {
+        &self.cfg
     }
 
     pub fn our_mac(&self) -> [u8; 6] {
@@ -1670,16 +1688,22 @@ impl Engine {
                 .unwrap_or(false)
         };
         if tlp_arm {
-            let (srtt, flight_size, now_ns) = {
+            let (srtt, flight_size, now_ns, tlp_cfg) = {
                 let ft = self.flow_table.borrow();
                 let srtt = ft.get(handle).and_then(|c| c.rtt_est.srtt_us());
                 let flight_size = ft
                     .get(handle)
                     .map(|c| c.snd_retrans.flight_size() as u32)
                     .unwrap_or(0);
-                (srtt, flight_size, crate::clock::now_ns())
+                // A5.5 Task 10: project the per-connect TLP tuning.
+                let tlp_cfg = ft
+                    .get(handle)
+                    .map(|c| c.tlp_config(self.cfg.tcp_min_rto_us))
+                    .unwrap_or_else(|| {
+                        crate::tcp_tlp::TlpConfig::a5_compat(self.cfg.tcp_min_rto_us)
+                    });
+                (srtt, flight_size, crate::clock::now_ns(), tlp_cfg)
             };
-            let tlp_cfg = crate::tcp_tlp::TlpConfig::a5_compat(self.cfg.tcp_min_rto_us);
             let pto_us = crate::tcp_tlp::pto_us(srtt, &tlp_cfg, flight_size);
             let fire_at_ns = now_ns + (pto_us as u64 * 1_000);
             let id = self.timer_wheel.borrow_mut().add(
@@ -2201,11 +2225,39 @@ impl Engine {
         // BEFORE emit_syn / SYN retrans timer arm so the fields are already
         // in effect if emit_syn (or a later RTO/RACK path after SYN-ACK)
         // consults them.
+        //
+        // A5.5 Task 10: mirror TLP tuning fields onto the conn. The ABI
+        // helper `validate_and_defaults_tlp_opts` handles zero-init
+        // substitution + range validation before this site is reached
+        // from `resd_net_connect`; for core-level callers (internal
+        // tests, engine-direct `connect()` wrapper) that pass
+        // `ConnectOpts::default()`, we apply the same substitution
+        // locally so the TcpConn always sees post-substitution values.
+        let tlp_multiplier = if opts.tlp_pto_srtt_multiplier_x100 == 0 {
+            200
+        } else {
+            opts.tlp_pto_srtt_multiplier_x100
+        };
+        let tlp_max_probes = if opts.tlp_max_consecutive_probes == 0 {
+            1
+        } else {
+            opts.tlp_max_consecutive_probes
+        };
+        let tlp_floor = if opts.tlp_pto_min_floor_us == 0 {
+            self.cfg.tcp_min_rto_us
+        } else {
+            opts.tlp_pto_min_floor_us
+        };
         {
             let mut ft = self.flow_table.borrow_mut();
             if let Some(c) = ft.get_mut(handle) {
                 c.rack_aggressive = opts.rack_aggressive;
                 c.rto_no_backoff = opts.rto_no_backoff;
+                c.tlp_pto_min_floor_us = tlp_floor;
+                c.tlp_pto_srtt_multiplier_x100 = tlp_multiplier;
+                c.tlp_skip_flight_size_gate = opts.tlp_skip_flight_size_gate;
+                c.tlp_max_consecutive_probes = tlp_max_probes;
+                c.tlp_skip_rtt_sample_gate = opts.tlp_skip_rtt_sample_gate;
             }
         }
         if opts.rack_aggressive {
