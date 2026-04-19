@@ -203,6 +203,21 @@ pub struct resd_net_conn_stats_t {
     pub rto_us: u32,
 }
 
+/// A6 (spec §3.8, §5.2): per-connection RTT histogram snapshot POD.
+/// Exactly 64 B — one cacheline. The cbindgen header emits the
+/// wraparound-semantics doc-comment from the core `rtt_histogram.rs`
+/// alongside this struct; see that module for the full contract.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct resd_net_tcp_rtt_histogram_t {
+    pub bucket: [u32; 16],
+}
+
+const _: () = {
+    use std::mem::size_of;
+    assert!(size_of::<resd_net_tcp_rtt_histogram_t>() == 64);
+};
+
 /// Counters struct — exposed to application via resd_net_counters().
 /// Fields are plain u64 on the C ABI for clean cbindgen emission, but
 /// internally the stack writes them as AtomicU64 (Relaxed). AtomicU64

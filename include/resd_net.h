@@ -320,6 +320,16 @@ struct resd_net_conn_stats_t {
   uint32_t rto_us;
 };
 
+/**
+ * A6 (spec §3.8, §5.2): per-connection RTT histogram snapshot POD.
+ * Exactly 64 B — one cacheline. The cbindgen header emits the
+ * wraparound-semantics doc-comment from the core `rtt_histogram.rs`
+ * alongside this struct; see that module for the full contract.
+ */
+struct resd_net_tcp_rtt_histogram_t {
+  uint32_t bucket[16];
+};
+
 struct resd_net_connect_opts_t {
   uint32_t peer_addr;
   uint16_t peer_port;
@@ -418,6 +428,28 @@ const struct resd_net_counters_t *resd_net_counters(struct resd_net_engine *p);
 int32_t resd_net_conn_stats(struct resd_net_engine *engine,
                             resd_net_conn_t conn,
                             struct resd_net_conn_stats_t *out);
+
+/**
+ * A6 (spec §3.8, §5.3): per-connection RTT histogram snapshot.
+ *
+ * Each bucket counts RTT samples whose value is <= the corresponding
+ * edge in `rtt_histogram_bucket_edges_us[]` (bucket 15 is the catch-
+ * all for values greater than the last edge). Counters are u32 per-
+ * connection lifetime; applications take deltas across two snapshots
+ * using unsigned wraparound subtraction. See the core `rtt_histogram.rs`
+ * module doc-comment for the full wraparound contract.
+ *
+ * Slow-path: safe per-order for forensics tagging, safe per-minute for
+ * session-health polling. Do not call in a per-segment loop.
+ *
+ * Returns:
+ *   0       on success; `out` is populated with 64 bytes.
+ *   -EINVAL engine or out is NULL.
+ *   -ENOENT conn is not a live handle in the engine's flow table.
+ */
+int32_t resd_net_conn_rtt_histogram(struct resd_net_engine *engine,
+                                    resd_net_conn_t conn,
+                                    struct resd_net_tcp_rtt_histogram_t *out);
 
 /**
  * Resolve the MAC address for `gateway_ip_host_order` by reading

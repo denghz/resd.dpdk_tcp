@@ -471,6 +471,46 @@ pub unsafe extern "C" fn resd_net_conn_stats(
     }
 }
 
+/// A6 (spec §3.8, §5.3): per-connection RTT histogram snapshot.
+///
+/// Each bucket counts RTT samples whose value is <= the corresponding
+/// edge in `rtt_histogram_bucket_edges_us[]` (bucket 15 is the catch-
+/// all for values greater than the last edge). Counters are u32 per-
+/// connection lifetime; applications take deltas across two snapshots
+/// using unsigned wraparound subtraction. See the core `rtt_histogram.rs`
+/// module doc-comment for the full wraparound contract.
+///
+/// Slow-path: safe per-order for forensics tagging, safe per-minute for
+/// session-health polling. Do not call in a per-segment loop.
+///
+/// Returns:
+///   0       on success; `out` is populated with 64 bytes.
+///   -EINVAL engine or out is NULL.
+///   -ENOENT conn is not a live handle in the engine's flow table.
+#[no_mangle]
+pub unsafe extern "C" fn resd_net_conn_rtt_histogram(
+    engine: *mut resd_net_engine,
+    conn: resd_net_conn_t,
+    out: *mut resd_net_tcp_rtt_histogram_t,
+) -> i32 {
+    if engine.is_null() || out.is_null() {
+        return -libc::EINVAL;
+    }
+    let Some(e) = engine_from_raw(engine) else {
+        return -libc::EINVAL;
+    };
+    let handle = conn as resd_net_core::flow_table::ConnHandle;
+    let ft = e.flow_table();
+    match ft.get(handle) {
+        Some(c) => {
+            let snap = c.rtt_histogram.snapshot();
+            (*out).bucket = snap;
+            0
+        }
+        None => -libc::ENOENT,
+    }
+}
+
 /// Resolve the MAC address for `gateway_ip_host_order` by reading
 /// `/proc/net/arp`. Writes 6 bytes into `out_mac`.
 /// Returns 0 on success, -ENOENT if no entry, -EIO on /proc/net/arp read error,
@@ -918,6 +958,30 @@ mod tests {
         // still return -EINVAL without segfaulting.
         let fake_engine = std::ptr::dangling_mut::<resd_net_engine>();
         let rc = unsafe { resd_net_conn_stats(fake_engine, 0, std::ptr::null_mut()) };
+        assert_eq!(rc, -libc::EINVAL);
+    }
+
+    // A6 Task 18: C ABI null-argument rejection for the RTT histogram
+    // snapshot extern. Happy-path + ENOENT-on-unknown-handle need a live
+    // Engine (DPDK/EAL + TAP); the bucket-update contract is covered by
+    // `resd-net-core::rtt_histogram` unit tests at the ladder layer. Here
+    // we pin the null-guard contracts so malformed C callers cannot
+    // dereference into the engine box.
+    #[test]
+    fn rtt_histogram_null_engine_returns_einval() {
+        let mut out = resd_net_tcp_rtt_histogram_t::default();
+        let rc = unsafe {
+            resd_net_conn_rtt_histogram(std::ptr::null_mut(), 0, &mut out)
+        };
+        assert_eq!(rc, -libc::EINVAL);
+    }
+
+    #[test]
+    fn rtt_histogram_null_out_returns_einval() {
+        let fake_engine = std::ptr::dangling_mut::<resd_net_engine>();
+        let rc = unsafe {
+            resd_net_conn_rtt_histogram(fake_engine, 0, std::ptr::null_mut())
+        };
         assert_eq!(rc, -libc::EINVAL);
     }
 
