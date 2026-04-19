@@ -162,7 +162,23 @@ pub struct TcpCounters {
     /// A5.5 Task 11/12: TLP probe retroactively classified as spurious via
     /// DSACK (RFC 8985 §7.4 / spec §3.4). Declared here; wired in Task 12.
     pub tx_tlp_spurious: AtomicU64,
-    _pad: [u64; 1],
+    // --- A6 additions (all slow-path per §9.1.1 rule 1) ---
+    /// A6: public-timer-API fire. Incremented once per `ApiPublic`
+    /// wheel node firing through `advance_timer_wheel` — a slow-path
+    /// boundary (not per-segment / per-burst / per-poll).
+    pub tx_api_timers_fired: AtomicU64,
+    /// A6: RFC 7323 §5.5 24-day `TS.Recent` expiration fired on an
+    /// inbound segment's PAWS gate. Effectively zero on healthy
+    /// trading traffic; nonzero is operationally interesting.
+    pub ts_recent_expired: AtomicU64,
+    /// A6: `drain_tx_pending_data` called `rte_eth_tx_burst`. One
+    /// fetch_add per drain (per end-of-poll + per `resd_net_flush`).
+    pub tx_flush_bursts: AtomicU64,
+    /// A6: aggregate `sent` count summed across every `tx_flush_bursts`
+    /// call. Useful to compute mean-batch-size = tx_flush_batched_pkts
+    /// / tx_flush_bursts; values near 1 mean the data path isn't
+    /// actually batching.
+    pub tx_flush_batched_pkts: AtomicU64,
 }
 
 #[repr(C, align(64))]
@@ -484,5 +500,14 @@ mod a5_5_tests {
     fn tlp_counters_tx_tlp_spurious_exists_and_zero_initialized() {
         let c = Counters::new();
         assert_eq!(c.tcp.tx_tlp_spurious.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn a6_new_tcp_counters_exist_and_zero() {
+        let c = Counters::new();
+        assert_eq!(c.tcp.tx_api_timers_fired.load(Ordering::Relaxed), 0);
+        assert_eq!(c.tcp.ts_recent_expired.load(Ordering::Relaxed), 0);
+        assert_eq!(c.tcp.tx_flush_bursts.load(Ordering::Relaxed), 0);
+        assert_eq!(c.tcp.tx_flush_batched_pkts.load(Ordering::Relaxed), 0);
     }
 }

@@ -258,7 +258,10 @@ struct RESD_NET_ALIGNED(64) resd_net_tcp_counters_t {
    * A5.5 Task 11/12 — see core counters.rs for the full field doc.
    */
   uint64_t tx_tlp_spurious;
-  uint64_t _pad[1];
+  uint64_t tx_api_timers_fired;
+  uint64_t ts_recent_expired;
+  uint64_t tx_flush_bursts;
+  uint64_t tx_flush_batched_pkts;
 };
 
 struct RESD_NET_ALIGNED(64) resd_net_poll_counters_t {

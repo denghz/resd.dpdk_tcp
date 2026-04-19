@@ -323,7 +323,12 @@ pub struct resd_net_tcp_counters_t {
     pub rx_dsack: u64,
     /// A5.5 Task 11/12 — see core counters.rs for the full field doc.
     pub tx_tlp_spurious: u64,
-    pub _pad: [u64; 1],
+    // A6 additions — see core counters.rs for field docs. Declaration
+    // order must match `resd_net_core::counters::TcpCounters` exactly.
+    pub tx_api_timers_fired: u64,
+    pub ts_recent_expired: u64,
+    pub tx_flush_bursts: u64,
+    pub tx_flush_batched_pkts: u64,
 }
 #[repr(C, align(64))]
 pub struct resd_net_poll_counters_t {
