@@ -281,7 +281,11 @@ pub struct Engine {
     // + the retransmit path all read this latch to decide whether to
     // invoke `tx_offload_finalize` on the freshly-built mbuf.
     tx_cksum_offload_active: bool,
-    #[allow(dead_code)]
+    // Task 8 consumer: `handle_ipv4` threads this latch into
+    // `ip_decode_offload_aware` (IP cksum) and `tcp_input` threads it
+    // into the L4 cksum classification. Both pre-checks gate on
+    // `rx_cksum_offload_active AND hw-offload-rx-cksum feature` —
+    // false-either short-circuits to software verify (spec §7.2).
     rx_cksum_offload_active: bool,
     #[allow(dead_code)]
     rss_hash_offload_active: bool,
@@ -1239,8 +1243,14 @@ impl Engine {
 
         for &m in &mbufs[..n] {
             let bytes = unsafe { crate::mbuf_data_slice(m) };
+            // Task 8: read ol_flags once per mbuf at the RX boundary;
+            // threaded through rx_frame -> handle_ipv4 -> tcp_input so
+            // the IP + L4 offload classifications can gate on the bits
+            // the NIC stamped on this frame. Feature-off / latch-false
+            // callees ignore it.
+            let ol_flags = unsafe { sys::resd_rte_mbuf_get_ol_flags(m) };
             add(&self.counters.eth.rx_bytes, bytes.len() as u64);
-            let _accepted = self.rx_frame(bytes);
+            let _accepted = self.rx_frame(bytes, ol_flags);
             #[cfg(feature = "obs-byte-counters")]
             {
                 rx_bytes_acc += _accepted as u64;
@@ -1870,7 +1880,12 @@ impl Engine {
     /// computed; only consumed by the `obs-byte-counters` accumulator
     /// in `poll_once`. LLVM elides the dead-store path when the feature
     /// is off.
-    fn rx_frame(&self, bytes: &[u8]) -> u32 {
+    ///
+    /// `ol_flags` — mbuf offload flags as stamped by the PMD. Threaded
+    /// through to the IP + TCP decode sites where Task 8's HW checksum
+    /// classification gates on them. Test callers that aren't exercising
+    /// the offload path pass `0` (UNKNOWN → software verify).
+    fn rx_frame(&self, bytes: &[u8], ol_flags: u64) -> u32 {
         use crate::counters::inc;
         match crate::l2::l2_decode(bytes, self.our_mac) {
             Err(crate::l2::L2Drop::Short) => {
@@ -1893,7 +1908,7 @@ impl Engine {
                         self.handle_arp(payload);
                         0
                     }
-                    crate::l2::ETHERTYPE_IPV4 => self.handle_ipv4(payload),
+                    crate::l2::ETHERTYPE_IPV4 => self.handle_ipv4(payload, ol_flags),
                     _ => unreachable!("l2_decode filters unsupported ethertypes"),
                 }
             }
@@ -1922,9 +1937,23 @@ impl Engine {
     /// Returns TCP payload bytes accepted by the inner `tcp_input` (or 0
     /// for non-TCP / decode-error paths). Used by `poll_once`'s
     /// `obs-byte-counters` accumulator.
-    fn handle_ipv4(&self, payload: &[u8]) -> u32 {
+    ///
+    /// `ol_flags` — the RX mbuf offload flags. Dispatches to
+    /// `ip_decode_offload_aware`, which routes GOOD → skip IP software
+    /// verify, BAD → drop + bump `eth.rx_drop_cksum_bad` + `ip.rx_csum_bad`,
+    /// NONE/UNKNOWN → software verify. Gated on the compile-time
+    /// `hw-offload-rx-cksum` feature AND the runtime
+    /// `rx_cksum_offload_active` latch — if either is false the
+    /// offload-aware wrapper degrades to the software path.
+    fn handle_ipv4(&self, payload: &[u8], ol_flags: u64) -> u32 {
         use crate::counters::inc;
-        match crate::l3_ip::ip_decode(payload, self.cfg.local_ip, /*nic_csum_ok=*/ false) {
+        match crate::l3_ip::ip_decode_offload_aware(
+            payload,
+            self.cfg.local_ip,
+            ol_flags,
+            self.rx_cksum_offload_active,
+            &self.counters,
+        ) {
             Err(crate::l3_ip::L3Drop::Short) => {
                 inc(&self.counters.ip.rx_drop_short);
                 0
@@ -1966,7 +1995,7 @@ impl Engine {
                 match ip.protocol {
                     crate::l3_ip::IPPROTO_TCP => {
                         inc(&self.counters.ip.rx_tcp);
-                        self.tcp_input(&ip, inner)
+                        self.tcp_input(&ip, inner, ol_flags)
                     }
                     crate::l3_ip::IPPROTO_ICMP => {
                         inc(&self.counters.ip.rx_icmp);
@@ -2000,11 +2029,55 @@ impl Engine {
     /// (`outcome.delivered + outcome.reassembly_queued_bytes`). Drops,
     /// errors, and pure-ACK / control segments return 0. Used by the
     /// `obs-byte-counters` accumulator in `poll_once`.
-    fn tcp_input(&self, ip: &crate::l3_ip::L3Decoded, tcp_bytes: &[u8]) -> u32 {
+    fn tcp_input(&self, ip: &crate::l3_ip::L3Decoded, tcp_bytes: &[u8], ol_flags: u64) -> u32 {
         use crate::counters::inc;
         use crate::tcp_input::{dispatch, parse_segment, tuple_from_segment, TxAction};
 
-        let parsed = match parse_segment(tcp_bytes, ip.src_ip, ip.dst_ip, false) {
+        // Task 8: classify the NIC-reported L4 checksum outcome before
+        // dispatching the software fold inside `parse_segment`. Gated
+        // on both the compile-time `hw-offload-rx-cksum` feature AND
+        // the runtime `rx_cksum_offload_active` latch (spec §7.2).
+        //
+        // GOOD → tell parse_segment to skip the software fold.
+        // BAD  → drop + bump eth.rx_drop_cksum_bad + tcp.rx_bad_csum.
+        // NONE / UNKNOWN → fall through to software verify (existing path).
+        //
+        // Feature-off / latch-false builds always take the software
+        // verify path, same as before A-HW.
+        #[allow(unused_mut)]
+        let mut nic_csum_ok = false;
+        #[cfg(feature = "hw-offload-rx-cksum")]
+        {
+            if self.rx_cksum_offload_active {
+                use crate::l3_ip::{classify_l4_rx_cksum, IpCksumOutcome};
+                use std::sync::atomic::Ordering;
+                match classify_l4_rx_cksum(ol_flags) {
+                    IpCksumOutcome::Good => {
+                        nic_csum_ok = true;
+                    }
+                    IpCksumOutcome::Bad => {
+                        self.counters
+                            .eth
+                            .rx_drop_cksum_bad
+                            .fetch_add(1, Ordering::Relaxed);
+                        self.counters
+                            .tcp
+                            .rx_bad_csum
+                            .fetch_add(1, Ordering::Relaxed);
+                        return 0;
+                    }
+                    _ => {
+                        // NONE / UNKNOWN — software verify via parse_segment.
+                    }
+                }
+            }
+        }
+        #[cfg(not(feature = "hw-offload-rx-cksum"))]
+        {
+            let _ = ol_flags;
+        }
+
+        let parsed = match parse_segment(tcp_bytes, ip.src_ip, ip.dst_ip, nic_csum_ok) {
             Ok(p) => p,
             Err(e) => {
                 match e {
