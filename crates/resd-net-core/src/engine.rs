@@ -2603,13 +2603,45 @@ impl Engine {
             // edges through to sample-taking handlers. The actual per-conn
             // histogram update lives at each `rtt_est.sample` site inside
             // `tcp_input.rs` / `TcpConn::maybe_seed_srtt_from_syn`.
-            dispatch(conn, &parsed, &self.rtt_histogram_edges)
+            //
+            // A6 Task 16 (spec §3.3): pass `send_buffer_bytes` so the
+            // ACK-prune site can evaluate the WRITABLE hysteresis gate
+            // (`in_flight ≤ send_buffer_bytes/2`) and surface a one-shot
+            // Outcome flag; the engine translator below pushes
+            // `InternalEvent::Writable` when set.
+            dispatch(
+                conn,
+                &parsed,
+                &self.rtt_histogram_edges,
+                self.cfg.send_buffer_bytes,
+            )
         };
 
         // A4: map Outcome fields → TcpCounters slow-path bumps. Groups
         // all per-segment counter wiring in one place so the dispatch
         // hot-path stays straight-line.
         apply_tcp_input_counters(&outcome, &self.counters.tcp);
+
+        // A6 Task 16 (spec §3.3): WRITABLE hysteresis emission. The
+        // ACK-prune site inside `handle_established` flipped
+        // `writable_hysteresis_fired` (and cleared
+        // `conn.send_refused_pending`) when this ACK drained
+        // `in_flight` to ≤ `send_buffer_bytes/2` following a prior
+        // short-accept from `send_bytes`. Level-triggered and single-
+        // edge-per-refusal-cycle — a subsequent refusal restarts the
+        // cycle. No payload on WRITABLE (ABI translator zeroes the
+        // union); `emitted_ts_ns` sampled at push time per A5.5 §3.1.
+        if outcome.writable_hysteresis_fired {
+            let emitted_ts_ns = crate::clock::now_ns();
+            let mut ev = self.events.borrow_mut();
+            ev.push(
+                InternalEvent::Writable {
+                    conn: handle,
+                    emitted_ts_ns,
+                },
+                &self.counters,
+            );
+        }
 
         // A5 Task 15: RACK-detected lost segments — retransmit each +
         // bump `tcp.tx_rack_loss`. Runs BEFORE the Task-11 prune below

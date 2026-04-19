@@ -330,11 +330,18 @@ fn build_event_from_internal(
             // pushes an ApiTimer variant until Task 8 + Task 17 both land.
             unreachable!("ApiTimer translation wired in Task 17; no upstream emit until Task 8")
         }
-        InternalEvent::Writable { .. } => {
-            // Wired in Task 16 (WRITABLE hysteresis) + Task 17. Same
-            // invariant as ApiTimer.
-            unreachable!("Writable translation wired in Task 17; no upstream emit until Task 16")
-        }
+        // A6 Task 16 (spec §3.3): level-triggered WRITABLE hysteresis.
+        // Upstream emit lives in `Engine::tcp_input` after
+        // `apply_tcp_input_counters` when `outcome.writable_hysteresis_fired`
+        // latches (in-flight drained to ≤ send_buffer_bytes/2 after a
+        // prior send_bytes refusal). No payload — union zeroed.
+        InternalEvent::Writable { conn, .. } => resd_net_event_t {
+            kind: resd_net_event_kind_t::RESD_NET_EVT_WRITABLE,
+            conn: *conn as u64,
+            rx_hw_ts_ns: 0,
+            enqueued_ts_ns: emitted,
+            u: resd_net_event_payload_t { _pad: [0u8; 16] },
+        },
     }
 }
 
