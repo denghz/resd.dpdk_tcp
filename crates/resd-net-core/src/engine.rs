@@ -13,6 +13,10 @@ use crate::tcp_events::{EventQueue, InternalEvent};
 use crate::tcp_state::TcpState;
 use crate::Error;
 
+/// A6 (spec §3.4): close-flag bit, mirror of `RESD_NET_CLOSE_FORCE_TW_SKIP`.
+/// Defined core-side so engine logic doesn't depend on the ABI crate.
+pub const CLOSE_FLAG_FORCE_TW_SKIP: u32 = 1 << 0;
+
 /// A6 (spec §3.8.2): default RTT histogram bucket edges, µs.
 /// Applied when `EngineConfig::rtt_histogram_bucket_edges_us` is all zero.
 pub const DEFAULT_RTT_HISTOGRAM_EDGES_US: [u32; 15] = [
@@ -3797,6 +3801,49 @@ impl Engine {
         Ok(())
     }
 
+    /// A6 (spec §3.4): close a connection, honoring the `flags` bitmask.
+    /// Currently only `CLOSE_FLAG_FORCE_TW_SKIP` is defined; other bits
+    /// are reserved for future extension and silently ignored.
+    ///
+    /// Semantics for `FORCE_TW_SKIP`:
+    /// - If `c.ts_enabled == false`, emit one `Error{err=-EPERM}` event
+    ///   (the "EPERM_TW_REQUIRED" condition per parent spec §9.3) and
+    ///   drop the flag; normal FIN + 2×MSL TIME_WAIT proceeds.
+    /// - If `c.ts_enabled == true`, set `c.force_tw_skip = true`;
+    ///   `reap_time_wait` (Task 11) short-circuits the 2×MSL wait.
+    ///
+    /// In both cases the existing `close_conn` body runs to emit the FIN.
+    pub fn close_conn_with_flags(
+        &self,
+        handle: ConnHandle,
+        flags: u32,
+    ) -> Result<(), Error> {
+        if (flags & CLOSE_FLAG_FORCE_TW_SKIP) != 0 {
+            let ts_enabled = {
+                let ft = self.flow_table.borrow();
+                ft.get(handle).map(|c| c.ts_enabled).unwrap_or(false)
+            };
+            if !ts_enabled {
+                let emitted_ts_ns = crate::clock::now_ns();
+                let mut ev = self.events.borrow_mut();
+                ev.push(
+                    InternalEvent::Error {
+                        conn: handle,
+                        err: -libc::EPERM,
+                        emitted_ts_ns,
+                    },
+                    &self.counters,
+                );
+            } else {
+                let mut ft = self.flow_table.borrow_mut();
+                if let Some(c) = ft.get_mut(handle) {
+                    c.force_tw_skip = true;
+                }
+            }
+        }
+        self.close_conn(handle)
+    }
+
     /// Retransmit the entry at `entry_index` in `conn.snd_retrans`. Allocates
     /// a fresh header mbuf from `tx_hdr_mempool`, writes L2+L3+TCP headers via
     /// `build_retrans_header`, bumps the held data mbuf's refcount, chains
@@ -4155,6 +4202,15 @@ mod tests {
         fn _check(e: &Engine, h: crate::flow_table::ConnHandle) {
             let _: Result<(), crate::Error> = e.close_conn(h);
         }
+    }
+
+    #[test]
+    fn close_conn_with_flags_signature_exists() {
+        fn _compile_only(e: &Engine) {
+            let _: Result<(), crate::Error> = e.close_conn_with_flags(0, 0);
+            let _: Result<(), crate::Error> = e.close_conn_with_flags(0, 1 << 0);
+        }
+        let _ = _compile_only;
     }
 
     #[test]
