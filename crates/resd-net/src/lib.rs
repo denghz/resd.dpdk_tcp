@@ -324,11 +324,23 @@ fn build_event_from_internal(
                 },
             }
         }
-        InternalEvent::ApiTimer { .. } => {
-            // Wired in Task 17 (resd_net_timer_add extern). Keeping this
-            // unreachable for now lets the workspace compile; no call site
-            // pushes an ApiTimer variant until Task 8 + Task 17 both land.
-            unreachable!("ApiTimer translation wired in Task 17; no upstream emit until Task 8")
+        // A6 Task 17 (spec §5.3): public-timer fire translator. The
+        // wheel's `TimerId{slot, generation}` re-packs to the same u64
+        // the caller originally received from `resd_net_timer_add`; the
+        // opaque `user_data` round-trips through unchanged.
+        InternalEvent::ApiTimer { timer_id, user_data, .. } => {
+            resd_net_event_t {
+                kind: resd_net_event_kind_t::RESD_NET_EVT_TIMER,
+                conn: 0,
+                rx_hw_ts_ns: 0,
+                enqueued_ts_ns: emitted,
+                u: resd_net_event_payload_t {
+                    timer: resd_net_event_timer_t {
+                        timer_id: resd_net_core::engine::pack_timer_id(*timer_id),
+                        user_data: *user_data,
+                    },
+                },
+            }
         }
         // A6 Task 16 (spec §3.3): level-triggered WRITABLE hysteresis.
         // Upstream emit lives in `Engine::tcp_input` after
@@ -618,6 +630,58 @@ pub unsafe extern "C" fn resd_net_close(
     }
 }
 
+/// A6 (spec §5.3): schedule a one-shot timer. `deadline_ns` is in the
+/// engine's monotonic clock domain (see `resd_net_now_ns`). Rounded up
+/// to the next 10 µs wheel tick; past deadlines fire on the next poll.
+/// On fire, emits `RESD_NET_EVT_TIMER` with the returned `timer_id`
+/// and the caller-supplied `user_data` echoed back.
+///
+/// Returns 0 on success (populates `*timer_id_out`); -EINVAL on
+/// null engine/out. The populated `*timer_id_out` is a packed
+/// `TimerId{slot, generation}` opaque handle — callers treat as
+/// opaque but may observe the high 32 bits change on slot reuse.
+#[no_mangle]
+pub unsafe extern "C" fn resd_net_timer_add(
+    engine: *mut resd_net_engine,
+    deadline_ns: u64,
+    user_data: u64,
+    timer_id_out: *mut u64,
+) -> i32 {
+    if engine.is_null() || timer_id_out.is_null() {
+        return -libc::EINVAL;
+    }
+    let Some(e) = engine_from_raw(engine) else {
+        return -libc::EINVAL;
+    };
+    let id = e.public_timer_add(deadline_ns, user_data);
+    *timer_id_out = resd_net_core::engine::pack_timer_id(id);
+    0
+}
+
+/// A6 (spec §5.3): cancel a previously-added timer. Returns 0 if
+/// cancelled before fire, -ENOENT otherwise (collapses: never existed /
+/// already fired and drained / already fired but not yet drained).
+/// Callers must always drain any queued TIMER events regardless of
+/// this return — the event queue is authoritative.
+#[no_mangle]
+pub unsafe extern "C" fn resd_net_timer_cancel(
+    engine: *mut resd_net_engine,
+    timer_id: u64,
+) -> i32 {
+    if engine.is_null() {
+        return -libc::EINVAL;
+    }
+    let Some(e) = engine_from_raw(engine) else {
+        return -libc::EINVAL;
+    };
+    let id = resd_net_core::engine::unpack_timer_id(timer_id);
+    if e.public_timer_cancel(id) {
+        0
+    } else {
+        -libc::ENOENT
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -904,6 +968,36 @@ mod tests {
         let mut core_cfg = resd_net_core::engine::EngineConfig::default();
         assert!(apply_preset(2, &mut core_cfg).is_err());
         assert!(apply_preset(255, &mut core_cfg).is_err());
+    }
+
+    // A6 Task 17: null-argument rejection contracts for the public
+    // timer extern "C" wrappers. Happy-path + ENOENT-on-stale-id
+    // require a live Engine (DPDK/EAL) and are covered by
+    // resd-net-core's wheel tests at the engine layer; here we pin
+    // the null-guard contracts so malformed C callers can't
+    // dereference into the engine box.
+    #[test]
+    fn timer_add_null_engine_returns_einval() {
+        let mut out: u64 = 0;
+        let rc = unsafe {
+            resd_net_timer_add(std::ptr::null_mut(), 0, 0, &mut out)
+        };
+        assert_eq!(rc, -libc::EINVAL);
+    }
+
+    #[test]
+    fn timer_add_null_out_returns_einval() {
+        let fake_engine = std::ptr::dangling_mut::<resd_net_engine>();
+        let rc = unsafe {
+            resd_net_timer_add(fake_engine, 0, 0, std::ptr::null_mut())
+        };
+        assert_eq!(rc, -libc::EINVAL);
+    }
+
+    #[test]
+    fn timer_cancel_null_engine_returns_einval() {
+        let rc = unsafe { resd_net_timer_cancel(std::ptr::null_mut(), 0) };
+        assert_eq!(rc, -libc::EINVAL);
     }
 }
 

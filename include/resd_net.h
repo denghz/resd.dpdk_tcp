@@ -438,6 +438,32 @@ int32_t resd_net_send(struct resd_net_engine *p,
 
 int32_t resd_net_close(struct resd_net_engine *p, resd_net_conn_t conn, uint32_t _flags);
 
+/**
+ * A6 (spec §5.3): schedule a one-shot timer. `deadline_ns` is in the
+ * engine's monotonic clock domain (see `resd_net_now_ns`). Rounded up
+ * to the next 10 µs wheel tick; past deadlines fire on the next poll.
+ * On fire, emits `RESD_NET_EVT_TIMER` with the returned `timer_id`
+ * and the caller-supplied `user_data` echoed back.
+ *
+ * Returns 0 on success (populates `*timer_id_out`); -EINVAL on
+ * null engine/out. The populated `*timer_id_out` is a packed
+ * `TimerId{slot, generation}` opaque handle — callers treat as
+ * opaque but may observe the high 32 bits change on slot reuse.
+ */
+int32_t resd_net_timer_add(struct resd_net_engine *engine,
+                           uint64_t deadline_ns,
+                           uint64_t user_data,
+                           uint64_t *timer_id_out);
+
+/**
+ * A6 (spec §5.3): cancel a previously-added timer. Returns 0 if
+ * cancelled before fire, -ENOENT otherwise (collapses: never existed /
+ * already fired and drained / already fired but not yet drained).
+ * Callers must always drain any queued TIMER events regardless of
+ * this return — the event queue is authoritative.
+ */
+int32_t resd_net_timer_cancel(struct resd_net_engine *engine, uint64_t timer_id);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif // __cplusplus
