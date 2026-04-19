@@ -335,9 +335,15 @@ pub unsafe extern "C" fn resd_net_poll(
     filled as i32
 }
 
+/// A6 (spec §4.2): drains the pending data-segment TX batch via one
+/// `rte_eth_tx_burst`. No-op when ring empty. Idempotent.
+/// Control frames (ACK, SYN, FIN, RST) are emitted inline at their
+/// emit site and do not participate in the flush batch — flushing
+/// never blocks or reorders control-frame emission.
 #[no_mangle]
-pub unsafe extern "C" fn resd_net_flush(_p: *mut resd_net_engine) {
-    // Phase A1: no-op; TX burst handled inline in poll_once.
+pub unsafe extern "C" fn resd_net_flush(p: *mut resd_net_engine) {
+    let Some(e) = engine_from_raw(p) else { return };
+    e.flush_tx_pending_data();
 }
 
 #[no_mangle]

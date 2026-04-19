@@ -270,6 +270,14 @@ pub struct Engine {
     // Phase A5 additions
     pub(crate) timer_wheel: RefCell<crate::tcp_timer_wheel::TimerWheel>,
 
+    /// A6 (spec §3.2): pending outbound data-segment mbufs for batched TX.
+    /// Populated by `send_bytes` / `retransmit`; drained at end-of-poll
+    /// and from `resd_net_flush` via `drain_tx_pending_data`. Control
+    /// frames (ACK / FIN / SYN / RST) are emitted inline and do NOT
+    /// queue here — they stay on their existing `tx_frame` /
+    /// `tx_data_frame` inline paths.
+    pub(crate) tx_pending_data: RefCell<Vec<std::ptr::NonNull<sys::rte_mbuf>>>,
+
     // A-HW runtime latches — populated by configure_port_offloads.
     // When a compile-enabled offload was advertised by the PMD the latch
     // is true; the corresponding hot-path branch uses the offload. When
@@ -687,6 +695,7 @@ impl Engine {
             timer_wheel: RefCell::new(crate::tcp_timer_wheel::TimerWheel::new(
                 (cfg.max_connections as usize).saturating_mul(4),
             )),
+            tx_pending_data: RefCell::new(Vec::with_capacity(cfg.tx_ring_size as usize)),
             tx_cksum_offload_active: outcome.tx_cksum_offload_active,
             rx_cksum_offload_active: outcome.rx_cksum_offload_active,
             rss_hash_offload_active: outcome.rss_hash_offload_active,
@@ -1369,6 +1378,9 @@ impl Engine {
             self.advance_timer_wheel();
             self.reap_time_wait();
             self.maybe_emit_gratuitous_arp();
+            // A6 (spec §3.2): drain any data-segment TX batched by
+            // timer-driven retransmit paths. No-op on empty ring.
+            self.drain_tx_pending_data();
             return 0;
         }
 
@@ -1435,7 +1447,62 @@ impl Engine {
         self.advance_timer_wheel();
         self.reap_time_wait();
         self.maybe_emit_gratuitous_arp();
+        // A6 (spec §3.2): drain any data-segment TX batched this iter
+        // (RX-triggered send_bytes, timer-driven retransmit). Runs
+        // after all emit sites so the burst coalesces everything.
+        // No-op on empty ring.
+        self.drain_tx_pending_data();
         n
+    }
+
+    /// Drain pending data-segment mbufs via one `rte_eth_tx_burst`.
+    /// On partial send (driver accepted fewer than pushed), the unsent
+    /// tail mbufs are freed to mempool and bump `eth.tx_drop_full_ring`.
+    /// The ring clears unconditionally after drain — a send_bytes
+    /// caller observes the drop via the counter, not by inspecting
+    /// the ring state. Slow-path: fires once per poll end + once per
+    /// `resd_net_flush` call; no hot-path cost.
+    ///
+    /// Spec §3.2 / §4.2. Consumed by Task 12 (send_bytes push) and
+    /// Task 13 (retransmit push); at this task the ring is never
+    /// populated so the helper early-returns on empty.
+    pub(crate) fn drain_tx_pending_data(&self) {
+        use crate::counters::{add, inc};
+        let mut ring = self.tx_pending_data.borrow_mut();
+        if ring.is_empty() {
+            return;
+        }
+        let n = ring.len() as u16;
+        // Safety: `ring` holds `NonNull<sys::rte_mbuf>`. `NonNull<T>` has
+        // the same size/alignment as `*mut T` (std guarantee), so the
+        // slice-reinterpret cast to `*mut *mut rte_mbuf` is sound and
+        // matches `rte_eth_tx_burst`'s expected tx-pkts array layout.
+        let sent = unsafe {
+            sys::resd_rte_eth_tx_burst(
+                self.cfg.port_id,
+                self.cfg.tx_queue_id,
+                ring.as_mut_ptr() as *mut *mut sys::rte_mbuf,
+                n,
+            )
+        } as usize;
+        // Free tail mbufs (DPDK partial-fill: driver took the prefix, we own the rest).
+        for i in sent..ring.len() {
+            unsafe { sys::resd_rte_pktmbuf_free(ring[i].as_ptr()); }
+            inc(&self.counters.eth.tx_drop_full_ring);
+        }
+        ring.clear();
+        inc(&self.counters.tcp.tx_flush_bursts);
+        add(&self.counters.tcp.tx_flush_batched_pkts, sent as u64);
+        if sent > 0 {
+            add(&self.counters.eth.tx_pkts, sent as u64);
+        }
+    }
+
+    /// Public entrypoint for `resd_net_flush`. Wrapper so the ABI layer
+    /// doesn't need to know about RefCell or the ring type.
+    /// Spec §4.2: idempotent; no-op on empty ring.
+    pub fn flush_tx_pending_data(&self) {
+        self.drain_tx_pending_data();
     }
 
     /// A5 Task 12: advance the timer wheel to `now_ns` and dispatch fired
@@ -4416,6 +4483,16 @@ mod tests {
         assert_eq!(c.rx_dsack.load(Ordering::Relaxed), 0);
         assert_eq!(c.rx_ws_shift_clamped.load(Ordering::Relaxed), 0);
         assert_eq!(c.rtt_samples.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn flush_tx_pending_data_signature_exists() {
+        // Signature-only check; empty-ring drain and full drain are exercised
+        // end-to-end in tcp_a6_public_api_tap.rs (Task 21).
+        fn _compile_only(e: &Engine) {
+            e.flush_tx_pending_data();
+        }
+        let _ = _compile_only;
     }
 }
 

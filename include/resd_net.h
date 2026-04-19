@@ -378,7 +378,14 @@ int32_t resd_net_poll(struct resd_net_engine *p,
                       uint32_t max_events,
                       uint64_t _timeout_ns);
 
-void resd_net_flush(struct resd_net_engine *_p);
+/**
+ * A6 (spec §4.2): drains the pending data-segment TX batch via one
+ * `rte_eth_tx_burst`. No-op when ring empty. Idempotent.
+ * Control frames (ACK, SYN, FIN, RST) are emitted inline at their
+ * emit site and do not participate in the flush batch — flushing
+ * never blocks or reorders control-frame emission.
+ */
+void resd_net_flush(struct resd_net_engine *p);
 
 uint64_t resd_net_now_ns(struct resd_net_engine *_p);
 
