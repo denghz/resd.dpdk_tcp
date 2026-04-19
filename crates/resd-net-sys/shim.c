@@ -113,3 +113,12 @@ uint16_t resd_rte_mbuf_get_l3_len(const struct rte_mbuf *m) {
 uint16_t resd_rte_mbuf_get_l4_len(const struct rte_mbuf *m) {
     return (uint16_t)m->l4_len;
 }
+
+/* A-HW Task 9: RSS hash accessor. `mbuf.hash` is a nested anonymous
+ * union in rte_mbuf.h which bindgen does not expose cleanly, so the
+ * Rust RX hot path reads `hash.rss` via this shim. Paired with the
+ * flow_table::hash_bucket_for_lookup selector — only called when the
+ * `hw-offload-rss-hash` feature is compiled in. */
+uint32_t resd_rte_mbuf_get_rss_hash(const struct rte_mbuf *m) {
+    return m->hash.rss;
+}

@@ -53,3 +53,9 @@ uint64_t resd_rte_mbuf_get_ol_flags(const struct rte_mbuf *m);
 uint16_t resd_rte_mbuf_get_l2_len(const struct rte_mbuf *m);
 uint16_t resd_rte_mbuf_get_l3_len(const struct rte_mbuf *m);
 uint16_t resd_rte_mbuf_get_l4_len(const struct rte_mbuf *m);
+
+/* A-HW Task 9: RSS hash accessor. `mbuf.hash.rss` lives in a nested
+ * anonymous union that bindgen elides; the Rust RX path reads the NIC
+ * Toeplitz hash through this shim and passes it to the flow_table
+ * bucket selector. */
+uint32_t resd_rte_mbuf_get_rss_hash(const struct rte_mbuf *m);

@@ -287,7 +287,10 @@ pub struct Engine {
     // `rx_cksum_offload_active AND hw-offload-rx-cksum feature` —
     // false-either short-circuits to software verify (spec §7.2).
     rx_cksum_offload_active: bool,
-    #[allow(dead_code)]
+    // Task 9 consumer: threaded into `flow_table::hash_bucket_for_lookup`
+    // by `tcp_input` — when true (and the `hw-offload-rss-hash` feature
+    // is compiled), the NIC-provided Toeplitz hash replaces the software
+    // SipHash for the RX flow-table bucket pick. See spec §8.2.
     rss_hash_offload_active: bool,
     /// Driver name captured at bring-up; used by Task 12's LLQ verification
     /// to short-circuit non-ENA drivers. See spec §5.
@@ -1249,8 +1252,16 @@ impl Engine {
             // the NIC stamped on this frame. Feature-off / latch-false
             // callees ignore it.
             let ol_flags = unsafe { sys::resd_rte_mbuf_get_ol_flags(m) };
+            // Task 9: read the NIC-provided RSS Toeplitz hash alongside
+            // ol_flags. Threaded through to flow_table::hash_bucket_for_lookup
+            // in tcp_input. When the feature is off, we compile the read
+            // away entirely (no bindgen call) and pass 0.
+            #[cfg(feature = "hw-offload-rss-hash")]
+            let nic_rss_hash = unsafe { sys::resd_rte_mbuf_get_rss_hash(m) };
+            #[cfg(not(feature = "hw-offload-rss-hash"))]
+            let nic_rss_hash: u32 = 0;
             add(&self.counters.eth.rx_bytes, bytes.len() as u64);
-            let _accepted = self.rx_frame(bytes, ol_flags);
+            let _accepted = self.rx_frame(bytes, ol_flags, nic_rss_hash);
             #[cfg(feature = "obs-byte-counters")]
             {
                 rx_bytes_acc += _accepted as u64;
@@ -1885,7 +1896,7 @@ impl Engine {
     /// through to the IP + TCP decode sites where Task 8's HW checksum
     /// classification gates on them. Test callers that aren't exercising
     /// the offload path pass `0` (UNKNOWN → software verify).
-    fn rx_frame(&self, bytes: &[u8], ol_flags: u64) -> u32 {
+    fn rx_frame(&self, bytes: &[u8], ol_flags: u64, nic_rss_hash: u32) -> u32 {
         use crate::counters::inc;
         match crate::l2::l2_decode(bytes, self.our_mac) {
             Err(crate::l2::L2Drop::Short) => {
@@ -1908,7 +1919,7 @@ impl Engine {
                         self.handle_arp(payload);
                         0
                     }
-                    crate::l2::ETHERTYPE_IPV4 => self.handle_ipv4(payload, ol_flags),
+                    crate::l2::ETHERTYPE_IPV4 => self.handle_ipv4(payload, ol_flags, nic_rss_hash),
                     _ => unreachable!("l2_decode filters unsupported ethertypes"),
                 }
             }
@@ -1945,7 +1956,7 @@ impl Engine {
     /// `hw-offload-rx-cksum` feature AND the runtime
     /// `rx_cksum_offload_active` latch — if either is false the
     /// offload-aware wrapper degrades to the software path.
-    fn handle_ipv4(&self, payload: &[u8], ol_flags: u64) -> u32 {
+    fn handle_ipv4(&self, payload: &[u8], ol_flags: u64, nic_rss_hash: u32) -> u32 {
         use crate::counters::inc;
         match crate::l3_ip::ip_decode_offload_aware(
             payload,
@@ -1995,7 +2006,7 @@ impl Engine {
                 match ip.protocol {
                     crate::l3_ip::IPPROTO_TCP => {
                         inc(&self.counters.ip.rx_tcp);
-                        self.tcp_input(&ip, inner, ol_flags)
+                        self.tcp_input(&ip, inner, ol_flags, nic_rss_hash)
                     }
                     crate::l3_ip::IPPROTO_ICMP => {
                         inc(&self.counters.ip.rx_icmp);
@@ -2029,7 +2040,13 @@ impl Engine {
     /// (`outcome.delivered + outcome.reassembly_queued_bytes`). Drops,
     /// errors, and pure-ACK / control segments return 0. Used by the
     /// `obs-byte-counters` accumulator in `poll_once`.
-    fn tcp_input(&self, ip: &crate::l3_ip::L3Decoded, tcp_bytes: &[u8], ol_flags: u64) -> u32 {
+    fn tcp_input(
+        &self,
+        ip: &crate::l3_ip::L3Decoded,
+        tcp_bytes: &[u8],
+        ol_flags: u64,
+        nic_rss_hash: u32,
+    ) -> u32 {
         use crate::counters::inc;
         use crate::tcp_input::{dispatch, parse_segment, tuple_from_segment, TxAction};
 
@@ -2095,7 +2112,19 @@ impl Engine {
         };
 
         let tuple = tuple_from_segment(ip.src_ip, ip.dst_ip, &parsed);
-        let handle = { self.flow_table.borrow().lookup_by_tuple(&tuple) };
+        // Task 9: pick the initial bucket hash via the RSS-aware selector.
+        // Feature-off / latch-off / flag-off all fall back to siphash_4tuple.
+        let bucket_hash = crate::flow_table::hash_bucket_for_lookup(
+            &tuple,
+            ol_flags,
+            nic_rss_hash,
+            self.rss_hash_offload_active,
+        );
+        let handle = {
+            self.flow_table
+                .borrow()
+                .lookup_by_hash(&tuple, bucket_hash)
+        };
         let Some(handle) = handle else {
             // Unmatched: reply RST per spec §5.1 `reply_rst`.
             inc(&self.counters.tcp.rx_unmatched);
