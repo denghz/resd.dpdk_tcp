@@ -85,6 +85,23 @@ impl RecvQueue {
     }
 }
 
+/// Per-connection observable state snapshot (A5.5). Pure projection.
+/// All values in application-useful units (bytes or µs); no engine-
+/// internal tickers exposed.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ConnStats {
+    pub snd_una: u32,
+    pub snd_nxt: u32,
+    pub snd_wnd: u32,
+    pub send_buf_bytes_pending: u32,
+    pub send_buf_bytes_free: u32,
+    pub srtt_us: u32,
+    pub rttvar_us: u32,
+    pub min_rtt_us: u32,
+    pub rto_us: u32,
+}
+
 pub struct TcpConn {
     four_tuple: FourTuple,
     pub state: TcpState,
@@ -258,6 +275,23 @@ impl TcpConn {
         self.four_tuple
     }
 
+    /// Slow-path snapshot for forensics / per-order tagging. Called
+    /// from the app via `resd_net_conn_stats`; not on any hot path.
+    pub fn stats(&self, send_buffer_bytes: u32) -> ConnStats {
+        let pending = self.snd.pending.len() as u32;
+        ConnStats {
+            snd_una: self.snd_una,
+            snd_nxt: self.snd_nxt,
+            snd_wnd: self.snd_wnd,
+            send_buf_bytes_pending: pending,
+            send_buf_bytes_free: send_buffer_bytes.saturating_sub(pending),
+            srtt_us: self.rtt_est.srtt_us().unwrap_or(0),
+            rttvar_us: self.rtt_est.rttvar_us(),
+            min_rtt_us: self.rack.min_rtt_us,
+            rto_us: self.rtt_est.rto_us(),
+        }
+    }
+
     /// True iff our FIN has been sent and ACKed (i.e. ACK covers
     /// `our_fin_seq + 1`). Implementations use this to decide FIN_WAIT_1
     /// → FIN_WAIT_2 and CLOSING → TIME_WAIT transitions.
@@ -400,5 +434,54 @@ mod tests {
         assert_eq!(c.rack.end_seq, 0);
         assert_eq!(c.rack.min_rtt_us, 0);
         assert!(!c.rack.dsack_seen);
+    }
+}
+
+#[cfg(test)]
+mod a5_5_stats_tests {
+    use super::*;
+
+    fn tuple() -> FourTuple {
+        FourTuple {
+            local_ip: 0x0a_00_00_02,
+            local_port: 40000,
+            peer_ip: 0x0a_00_00_01,
+            peer_port: 5000,
+        }
+    }
+
+    fn make_test_conn() -> TcpConn {
+        TcpConn::new_client(tuple(), 0, 1460, 1024, 2048, 5000, 5000, 1_000_000)
+    }
+
+    #[test]
+    fn stats_projects_send_path_fields() {
+        let mut c = make_test_conn();
+        c.snd_una = 100;
+        c.snd_nxt = 200;
+        c.snd_wnd = 65535;
+        let s = c.stats(1_048_576);
+        assert_eq!(s.snd_una, 100);
+        assert_eq!(s.snd_nxt, 200);
+        assert_eq!(s.snd_wnd, 65535);
+    }
+
+    #[test]
+    fn stats_before_any_rtt_sample_returns_zero_except_rto() {
+        let c = make_test_conn();
+        let s = c.stats(1_048_576);
+        assert_eq!(s.srtt_us, 0);
+        assert_eq!(s.rttvar_us, 0);
+        assert_eq!(s.min_rtt_us, 0);
+        assert_eq!(s.rto_us, c.rtt_est.rto_us());
+    }
+
+    #[test]
+    fn stats_send_buf_bytes_free_saturates_at_zero() {
+        let mut c = make_test_conn();
+        c.snd.pending.extend(std::iter::repeat_n(0u8, 128));
+        let s = c.stats(64);
+        assert_eq!(s.send_buf_bytes_pending, 128);
+        assert_eq!(s.send_buf_bytes_free, 0);
     }
 }

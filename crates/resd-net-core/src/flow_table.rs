@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 
-use crate::tcp_conn::TcpConn;
+use crate::tcp_conn::{ConnStats, TcpConn};
 
 /// 4-tuple in HOST byte order for all integer fields. All hash / compare
 /// operations use this representation. Network-byte-order conversion
@@ -81,6 +81,11 @@ impl FlowTable {
 
     pub fn lookup_by_tuple(&self, tuple: &FourTuple) -> Option<ConnHandle> {
         self.by_tuple.get(tuple).copied().map(|i| i + 1)
+    }
+
+    /// Slow-path stats snapshot; see `TcpConn::stats`.
+    pub fn get_stats(&self, handle: ConnHandle, send_buffer_bytes: u32) -> Option<ConnStats> {
+        self.get(handle).map(|c| c.stats(send_buffer_bytes))
     }
 
     /// Remove the connection for `handle`. Returns the removed `TcpConn` if
