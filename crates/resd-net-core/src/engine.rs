@@ -301,6 +301,12 @@ fn apply_tcp_input_counters(
     if outcome.rx_dsack_count > 0 {
         add(&counters.rx_dsack, outcome.rx_dsack_count as u64);
     }
+    if outcome.tx_tlp_spurious_count > 0 {
+        add(
+            &counters.tx_tlp_spurious,
+            outcome.tx_tlp_spurious_count as u64,
+        );
+    }
     if outcome.bad_seq {
         inc(&counters.rx_bad_seq);
     }

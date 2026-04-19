@@ -184,6 +184,10 @@ pub struct Outcome {
     /// bumps `tcp.rx_dsack` by this count. Visibility only — A5 does
     /// not adapt reo_wnd or scoreboard prune based on DSACK.
     pub rx_dsack_count: u32,
+    /// A5.5 Task 12: count of recent TLP probes retroactively classified
+    /// as spurious by DSACK blocks on this ACK (RFC 8985 §7.4 / spec
+    /// §3.4). Engine bumps `tcp.tx_tlp_spurious` by this count.
+    pub tx_tlp_spurious_count: u32,
     /// A5 Task 18: the SYN-retransmit timer id to cancel on the engine's
     /// side. Set by `handle_syn_sent` when a valid SYN-ACK lands — the
     /// conn's `syn_retrans_timer_id` field is `.take()`n here so the
@@ -216,6 +220,7 @@ impl Outcome {
             rtt_sample_taken: false,
             rack_lost_indexes: Vec::new(),
             rx_dsack_count: 0,
+            tx_tlp_spurious_count: 0,
             syn_retrans_timer_to_cancel: None,
             connected: false,
             closed: false,
@@ -525,11 +530,19 @@ fn handle_established(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
     // would falsely match the block we just inserted.
     let mut sack_blocks_decoded = 0u32;
     let mut rx_dsack_count = 0u32;
+    let mut tx_tlp_spurious_count = 0u32;
     if conn.sack_enabled && parsed_opts.sack_block_count > 0 {
         for block in &parsed_opts.sack_blocks[..parsed_opts.sack_block_count as usize] {
             if is_dsack(block, conn.snd_una, &conn.sack_scoreboard) {
                 rx_dsack_count += 1;
                 conn.rack.dsack_seen = true;
+                // A5.5 Task 12: attribute this DSACK block to a recent
+                // TLP probe if one falls wholly inside the block's seq
+                // range and within the 4·SRTT plausibility window.
+                let now_ns = crate::clock::now_ns();
+                if conn.attribute_dsack_to_recent_tlp_probe(block.left, block.right, now_ns) {
+                    tx_tlp_spurious_count += 1;
+                }
                 continue;
             }
             conn.sack_scoreboard.insert(*block);
@@ -784,6 +797,7 @@ fn handle_established(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
         rtt_sample_taken,
         rack_lost_indexes,
         rx_dsack_count,
+        tx_tlp_spurious_count,
         ..Outcome::base()
     }
 }

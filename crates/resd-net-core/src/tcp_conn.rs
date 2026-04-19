@@ -416,6 +416,51 @@ impl TcpConn {
         self.tlp_consecutive_probes_fired = 0;
     }
 
+    /// A5.5 Task 12: attribute a DSACK block `[left, right)` to a recent
+    /// TLP probe. Returns `true` iff a previously-unattributed probe was
+    /// matched; caller increments `tcp.tx_tlp_spurious` on a `true` return.
+    ///
+    /// The 4·SRTT plausibility window prevents wrap-around mis-attribution
+    /// across the 32-bit seq space. Before any RTT sample exists, we fall
+    /// through to a defensive 1s window (DSACK can fire on the very first
+    /// dup-ACK of a flow, so a zero-sample guard would drop legitimate
+    /// attributions on cold conns).
+    #[inline]
+    pub fn attribute_dsack_to_recent_tlp_probe(
+        &mut self,
+        block_left: u32,
+        block_right: u32,
+        now_ns: u64,
+    ) -> bool {
+        let srtt_us = self.rtt_est.srtt_us().unwrap_or(self.rack.min_rtt_us);
+        let effective_srtt_us = if srtt_us == 0 { 1_000_000 } else { srtt_us };
+        let window_ns = (effective_srtt_us as u64)
+            .saturating_mul(1_000)
+            .saturating_mul(4);
+
+        for probe_slot in self.tlp_recent_probes.iter_mut() {
+            let Some(probe) = probe_slot.as_mut() else {
+                continue;
+            };
+            if probe.attributed {
+                continue;
+            }
+            let probe_end = probe.seq.wrapping_add(probe.len as u32);
+            if !crate::tcp_seq::seq_le(block_left, probe.seq) {
+                continue;
+            }
+            if !crate::tcp_seq::seq_le(probe_end, block_right) {
+                continue;
+            }
+            if now_ns.saturating_sub(probe.tx_ts_ns) >= window_ns {
+                continue;
+            }
+            probe.attributed = true;
+            return true;
+        }
+        false
+    }
+
     pub fn four_tuple(&self) -> FourTuple {
         self.four_tuple
     }
@@ -822,5 +867,91 @@ mod a5_5_tlp_hook_tests {
 
         assert_eq!(c.tlp_consecutive_probes_fired, 0);
         assert!(!c.tlp_rtt_sample_seen_since_last_tlp);
+    }
+}
+
+#[cfg(test)]
+mod a5_5_dsack_attribution {
+    use super::a5_5_stats_tests::make_test_conn;
+    use super::RecentProbe;
+
+    #[test]
+    fn attribute_dsack_matches_recent_probe_within_window() {
+        let mut c = make_test_conn();
+        c.tlp_recent_probes[0] = Some(RecentProbe {
+            seq: 1000,
+            len: 100,
+            tx_ts_ns: 1_000_000,
+            attributed: false,
+        });
+        c.tlp_recent_probes_next_slot = 1;
+        c.rtt_est.sample(100_000); // 100ms; window = 400ms
+        let now_ns = 1_000_000 + 50_000_000; // 50ms later; within window
+
+        let attributed = c.attribute_dsack_to_recent_tlp_probe(1000, 1100, now_ns);
+        assert!(attributed);
+        assert!(c.tlp_recent_probes[0].as_ref().unwrap().attributed);
+    }
+
+    #[test]
+    fn attribute_dsack_outside_window_skips_probe() {
+        let mut c = make_test_conn();
+        c.tlp_recent_probes[0] = Some(RecentProbe {
+            seq: 1000,
+            len: 100,
+            tx_ts_ns: 1_000_000,
+            attributed: false,
+        });
+        c.rtt_est.sample(100_000); // 100ms → window 400ms
+        let now_ns = 1_000_000 + 500_000_000; // 500ms later; outside window
+
+        let attributed = c.attribute_dsack_to_recent_tlp_probe(1000, 1100, now_ns);
+        assert!(!attributed);
+        assert!(!c.tlp_recent_probes[0].as_ref().unwrap().attributed);
+    }
+
+    #[test]
+    fn attribute_dsack_does_not_double_count_same_probe() {
+        let mut c = make_test_conn();
+        c.tlp_recent_probes[0] = Some(RecentProbe {
+            seq: 1000,
+            len: 100,
+            tx_ts_ns: 1_000_000,
+            attributed: false,
+        });
+        c.rtt_est.sample(100_000);
+        let now_ns = 1_000_000 + 50_000_000;
+
+        let first = c.attribute_dsack_to_recent_tlp_probe(1000, 1100, now_ns);
+        let second = c.attribute_dsack_to_recent_tlp_probe(1000, 1100, now_ns);
+        assert!(first);
+        assert!(!second); // already attributed
+    }
+
+    #[test]
+    fn attribute_dsack_partial_block_coverage_skips_probe() {
+        let mut c = make_test_conn();
+        c.tlp_recent_probes[0] = Some(RecentProbe {
+            seq: 1000,
+            len: 100,
+            tx_ts_ns: 1_000_000,
+            attributed: false,
+        });
+        c.rtt_est.sample(100_000);
+        let now_ns = 1_000_000 + 50_000_000;
+
+        // Block only covers [1050, 1100) — partial overlap; spec requires full coverage.
+        let attributed = c.attribute_dsack_to_recent_tlp_probe(1050, 1100, now_ns);
+        assert!(!attributed);
+    }
+
+    #[test]
+    fn attribute_dsack_with_no_probes_in_ring_returns_false() {
+        let mut c = make_test_conn();
+        c.rtt_est.sample(100_000);
+        let now_ns = 1_000_000;
+
+        let attributed = c.attribute_dsack_to_recent_tlp_probe(1000, 1100, now_ns);
+        assert!(!attributed);
     }
 }
