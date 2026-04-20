@@ -7,6 +7,8 @@
 //! `rcv_nxt` or transitions state triggers an ACK on the same poll
 //! iteration (wired in the handlers via `TxAction::Ack`).
 
+use smallvec::SmallVec;
+
 use crate::flow_table::FourTuple;
 use crate::tcp_conn::TcpConn;
 use crate::tcp_output::{TCP_ACK, TCP_FIN, TCP_RST, TCP_SYN, TCP_URG};
@@ -187,12 +189,10 @@ pub struct Outcome {
     pub rtt_sample_taken: bool,
     /// A5 Task 15: indexes into `conn.snd_retrans.entries` that RACK
     /// marked lost this ACK. Engine retransmits each and bumps
-    /// `tcp.tx_rack_loss`. Vec<u16> chosen to allow ≥4 simultaneous
-    /// losses while keeping the Outcome small (a fresh Vec is allocated
-    /// per ACK — at typical rates ≤1k ACKs/sec per conn, this is
-    /// acceptable; a Stage-2 optimization could use an inline
-    /// fixed-size array).
-    pub rack_lost_indexes: Vec<u16>,
+    /// `tcp.tx_rack_loss`. A6.5 Task 4: inline N=16 (see spec §2.3) —
+    /// steady-state losses fit in the stack buffer so no per-ACK heap
+    /// alloc; rare reorder storms beyond 16 spill to the heap.
+    pub rack_lost_indexes: SmallVec<[u16; 16]>,
     /// A5 Task 16: RFC 2883 DSACK blocks detected this ACK. Engine
     /// bumps `tcp.rx_dsack` by this count. Visibility only — A5 does
     /// not adapt reo_wnd or scoreboard prune based on DSACK.
@@ -239,7 +239,7 @@ impl Outcome {
             ws_shift_clamped: false,
             snd_una_advanced_to: None,
             rtt_sample_taken: false,
-            rack_lost_indexes: Vec::new(),
+            rack_lost_indexes: SmallVec::new(),
             rx_dsack_count: 0,
             tx_tlp_spurious_count: 0,
             syn_retrans_timer_to_cancel: None,
@@ -775,7 +775,7 @@ fn handle_established(
     //
     // Runs regardless of whether this ACK advanced `snd_una` — a
     // SACK-only ACK with no cumulative advance can still trigger RACK.
-    let mut rack_lost_indexes: Vec<u16> = Vec::new();
+    let mut rack_lost_indexes: SmallVec<[u16; 16]> = SmallVec::new();
     if !conn.snd_retrans.is_empty() {
         let now_ns = crate::clock::now_ns();
         // Update RACK state from newly-acked-or-sacked entries.

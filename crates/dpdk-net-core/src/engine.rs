@@ -1,4 +1,5 @@
 use dpdk_net_sys as sys;
+use smallvec::{smallvec, SmallVec};
 use std::cell::{Cell, RefCell};
 use std::ffi::CString;
 use std::sync::Mutex;
@@ -1827,9 +1828,10 @@ impl Engine {
     }
 
     /// A5 Task 12: advance the timer wheel to `now_ns` and dispatch fired
-    /// timers by kind. `advance()` returns an owned `Vec`, so the
-    /// `timer_wheel` borrow ends at the semicolon — per-timer handlers are
-    /// free to re-borrow the wheel (e.g. `on_rto_fire` re-arms).
+    /// timers by kind. `advance()` returns an owned `SmallVec<[_; 8]>`
+    /// (A6.5 Task 4; typical per-tick fire count ≤ 8 stays on the stack),
+    /// so the `timer_wheel` borrow ends at the semicolon — per-timer
+    /// handlers are free to re-borrow the wheel (e.g. `on_rto_fire` re-arms).
     fn advance_timer_wheel(&self) {
         let fired = self
             .timer_wheel
@@ -1965,7 +1967,10 @@ impl Engine {
         // phases.
         if self.cfg.tcp_per_packet_events {
             let emitted_ts_ns = crate::clock::now_ns();
-            let retrans_snapshots: Vec<(u32, u32)> = {
+            // A6.5 Task 4: SmallVec<[_; 4]> inline — the empty-lost_indexes
+            // branch emits at most one snapshot; the RACK branch rarely
+            // exceeds a handful of losses in steady state (see spec §2.3).
+            let retrans_snapshots: SmallVec<[(u32, u32); 4]> = {
                 let ft = self.flow_table.borrow();
                 let c = match ft.get(handle) {
                     Some(c) => c,
@@ -1974,7 +1979,7 @@ impl Engine {
                 if lost_indexes.is_empty() {
                     c.snd_retrans
                         .front()
-                        .map(|e| vec![(e.seq, e.xmit_count as u32)])
+                        .map(|e| smallvec![(e.seq, e.xmit_count as u32)])
                         .unwrap_or_default()
                 } else {
                     lost_indexes
@@ -2841,7 +2846,7 @@ impl Engine {
                 if let Some(c) = ft.get_mut(handle) {
                     c.snd_retrans.prune_below(new_snd_una)
                 } else {
-                    Vec::new()
+                    smallvec::SmallVec::new()
                 }
             };
             for entry in dropped {

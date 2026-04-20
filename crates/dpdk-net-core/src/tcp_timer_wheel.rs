@@ -7,6 +7,8 @@
 //! fields `owner_handle`, `kind` are read by those later tasks.
 #![allow(dead_code)]
 
+use smallvec::SmallVec;
+
 pub const TICK_NS: u64 = 10_000;
 pub const LEVELS: usize = 8;
 pub const BUCKETS: usize = 256;
@@ -98,12 +100,12 @@ impl TimerWheel {
         }
     }
 
-    pub fn advance(&mut self, now_ns: u64) -> Vec<(TimerId, TimerNode)> {
+    pub fn advance(&mut self, now_ns: u64) -> SmallVec<[(TimerId, TimerNode); 8]> {
         let now_tick = now_ns / TICK_NS;
         if now_tick <= self.last_tick {
-            return Vec::new();
+            return SmallVec::new();
         }
-        let mut fired = Vec::new();
+        let mut fired: SmallVec<[(TimerId, TimerNode); 8]> = SmallVec::new();
         let target_delta = now_tick - self.last_tick;
         for _ in 0..target_delta.min((BUCKETS * LEVELS) as u64) {
             self.cursors[0] = (self.cursors[0] + 1) % BUCKETS as u16;
