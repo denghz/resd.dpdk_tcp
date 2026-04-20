@@ -442,7 +442,8 @@ mod tests {
         assert_eq!(select_bucket(150, &edges), 2);
         assert_eq!(select_bucket(1000, &edges), 6);
         assert_eq!(select_bucket(2000, &edges), 7);
-        assert_eq!(select_bucket(30000, &edges), 11);
+        // edges[11]=25000 < 30000 ≤ edges[12]=50000 → bucket 12.
+        assert_eq!(select_bucket(30000, &edges), 12);
         assert_eq!(select_bucket(600000, &edges), 15);
     }
 

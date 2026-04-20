@@ -30,17 +30,17 @@ pub const DEFAULT_RTT_HISTOGRAM_EDGES_US: [u32; 15] = [
 ///
 /// - all-zero input → returns `DEFAULT_RTT_HISTOGRAM_EDGES_US`
 /// - strictly monotonic input (each `edges[i] < edges[i+1]`) → passes through
-/// - any non-monotonic or equal-adjacent input → `Err(())`
+/// - any non-monotonic or equal-adjacent input → `Err(Error::InvalidHistogramEdges)`
 pub fn validate_and_default_histogram_edges(
     edges: &[u32; 15],
-) -> Result<[u32; 15], ()> {
+) -> Result<[u32; 15], Error> {
     let all_zero = edges.iter().all(|&e| e == 0);
     if all_zero {
         return Ok(DEFAULT_RTT_HISTOGRAM_EDGES_US);
     }
     for i in 0..14 {
         if edges[i] >= edges[i + 1] {
-            return Err(());
+            return Err(Error::InvalidHistogramEdges);
         }
     }
     Ok(*edges)
@@ -627,10 +627,11 @@ impl Engine {
         // A6 (spec §3.8.3): validate + substitute defaults for caller-
         // supplied histogram edges. All-zero → spec §3.8.2 defaults;
         // non-monotonic rejected here so per-conn code never re-validates.
+        // Function returns `Err(Error::InvalidHistogramEdges)` directly
+        // on rejection — `?` propagates without a `.map_err`.
         let rtt_histogram_edges = validate_and_default_histogram_edges(
             &cfg.rtt_histogram_bucket_edges_us,
-        )
-        .map_err(|_| Error::InvalidHistogramEdges)?;
+        )?;
 
         // socket_id may be -1 (cast to 0xFFFFFFFF == SOCKET_ID_ANY) when the
         // port isn't bound to a NUMA node (common in VMs / TAP devices).

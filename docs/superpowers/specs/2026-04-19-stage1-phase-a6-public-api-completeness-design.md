@@ -518,7 +518,7 @@ No new hot-path counters, no wire-format changes, no RFC MUST divergences.
 - Cancel tombstone + stale-generation no-op (wheel unit tests already cover; add one for `ApiPublic` kind).
 
 **Histogram:**
-- `select_bucket` across default edges: `{ 10, 50, 75, 150, 1000, 2000, 30000, 600000 }` → `{ 0, 0, 1, 2, 6, 7, 11, 15 }`.
+- `select_bucket` across default edges: `{ 10, 50, 75, 150, 1000, 2000, 30000, 600000 }` → `{ 0, 0, 1, 2, 6, 7, 12, 15 }`. (Under `DEFAULT_RTT_HISTOGRAM_EDGES_US`, `edges[11]=25000 < 30000 ≤ edges[12]=50000` puts 30000 µs in bucket 12, not 11.)
 - `rtt_histogram_update` called 2³² + 5 times with the same RTT returns bucket value = 5 (wraparound).
 - Monotonic-edges validation at `engine_create`: `[100, 200, 150, ...]` → null-return; `[100, 200, 300, ...]` accepted; all-zero accepted (defaults).
 - `size_of::<RttHistogram>() == 64`, `align_of::<RttHistogram>() == 64`.
