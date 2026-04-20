@@ -387,6 +387,12 @@ pub struct Engine {
     /// `tx_data_frame` inline paths.
     pub(crate) tx_pending_data: RefCell<Vec<std::ptr::NonNull<sys::rte_mbuf>>>,
 
+    /// Reusable scratch buffer for per-segment TX frame staging. Sized
+    /// at `engine_create` to fit MSS + 40-byte option budget + FRAME_HDRS_MIN.
+    /// Borrow semantics mirror `tx_pending_data`: borrow_mut + clear + resize.
+    /// §7.6 scratch-reuse policy.
+    pub(crate) tx_frame_scratch: RefCell<Vec<u8>>,
+
     /// A6 (spec §3.6 Site 3): snapshot of `counters.eth.rx_drop_nomem`
     /// at the top of `poll_once`; compared against the post-RX value at
     /// end-of-poll to emit exactly one `Error{err=-ENOMEM}` per iteration
@@ -857,6 +863,11 @@ impl Engine {
                 (cfg.max_connections as usize).saturating_mul(4),
             )),
             tx_pending_data: RefCell::new(Vec::with_capacity(cfg.tx_ring_size as usize)),
+            tx_frame_scratch: RefCell::new(Vec::with_capacity(
+                cfg.tcp_mss as usize
+                    + crate::tcp_output::FRAME_HDRS_MIN
+                    + 40,
+            )),
             rx_drop_nomem_prev: std::cell::Cell::new(0),
             tx_cksum_offload_active: outcome.tx_cksum_offload_active,
             rx_cksum_offload_active: outcome.rx_cksum_offload_active,
@@ -3626,7 +3637,14 @@ impl Engine {
         #[cfg(feature = "obs-byte-counters")]
         let mut tx_bytes_acc: u64 = 0;
 
-        let mut frame = vec![0u8; 1600];
+        let mut frame = self.tx_frame_scratch.borrow_mut();
+        // Pre-size to cover the first segment's needed bytes. Inner loop
+        // grows on demand for atypical sizes.
+        let initial_cap_needed = crate::tcp_output::FRAME_HDRS_MIN + 40 + mss_cap as usize;
+        let current_cap = frame.capacity();
+        if current_cap < initial_cap_needed {
+            frame.reserve(initial_cap_needed - current_cap);
+        }
         while remaining > 0 {
             let take = remaining.min(mss_cap as usize);
             let payload = &bytes[offset..offset + take];
@@ -3661,10 +3679,13 @@ impl Engine {
             // payloads the frame grows by 12 bytes. Keep a 40-byte
             // cushion for any future option additions under A5+.
             let needed = crate::tcp_output::FRAME_HDRS_MIN + 40 + take;
-            if frame.len() < needed {
-                frame.resize(needed, 0);
-            }
-            let Some(n) = build_segment(&seg, &mut frame) else {
+            // A6.5 Task 1: reuse the engine-owned scratch buffer across
+            // segments. `clear()` drops the logical length to 0 without
+            // shrinking capacity; `resize()` zero-fills the range
+            // build_segment will overwrite.
+            frame.clear();
+            frame.resize(needed, 0);
+            let Some(n) = build_segment(&seg, frame.as_mut_slice()) else {
                 // Shouldn't happen; buf is sized for hdrs+opts+take.
                 break;
             };
