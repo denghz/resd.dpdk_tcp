@@ -11,6 +11,7 @@
 //! copy-based `(seq, Vec<u8>)` entries.
 
 use resd_net_sys as sys;
+use smallvec::SmallVec;
 
 use crate::tcp_seq::{seq_le, seq_lt};
 
@@ -303,18 +304,28 @@ impl ReorderQueue {
         let mut cursor = seq;
         let mut newly_buffered = 0u32;
         let mut cap_dropped = 0u32;
-        let mut stored_count = 0u32;
 
-        let n = self.segments.len();
-        let mut i = 0;
-        while i < n {
-            let existing_seq = self.segments[i].seq();
-            let existing_end = self.segments[i].end_seq();
+        // A6.5 Task 7 fix (C1): deferred-insert pattern. Collect pending
+        // `(cursor_seq, sub_offset, take_len)` triples while scanning the
+        // existing segments with an immutable borrow; apply the actual
+        // `insert_merged_mbuf_ref` mutations in a second pass after the
+        // scan completes. This mirrors the proven pattern in the legacy
+        // `insert` path (see `to_insert: Vec<(u32, Vec<u8>)>` above) and
+        // avoids the index-shift bug where mid-iteration inserts caused
+        // later existing segments to be skipped. A `SmallVec` keeps the
+        // zero-alloc steady state: multi-segment-span reorder is rare and
+        // almost always fits within 4 gap-slices; anything larger falls
+        // back to one heap alloc on this slow path (gap-filling), which
+        // is acceptable.
+        let mut to_insert: SmallVec<[(u32, u16, u16); 4]> = SmallVec::new();
+
+        for existing in &self.segments {
+            let existing_seq = existing.seq();
+            let existing_end = existing.end_seq();
             if seq_le(incoming_end, existing_seq) {
                 break;
             }
             if seq_le(existing_end, cursor) {
-                i += 1;
                 continue;
             }
             if seq_lt(cursor, existing_seq) {
@@ -325,9 +336,8 @@ impl ReorderQueue {
                 let take = (take_end - off).min(remaining_cap as usize);
                 if take > 0 {
                     let sub_offset = mbuf_payload_offset + off as u16;
-                    self.insert_merged_mbuf_ref(cursor, mbuf, sub_offset, take as u16);
+                    to_insert.push((cursor, sub_offset, take as u16));
                     newly_buffered += take as u32;
-                    stored_count += 1;
                 }
                 if take < take_end - off {
                     cap_dropped += (take_end - off - take) as u32;
@@ -337,7 +347,6 @@ impl ReorderQueue {
             if seq_lt(cursor, existing_end) {
                 cursor = existing_end;
             }
-            i += 1;
         }
         if seq_lt(cursor, incoming_end) {
             let off = cursor.wrapping_sub(seq) as usize;
@@ -346,14 +355,24 @@ impl ReorderQueue {
             let take = tail_len.min(remaining_cap as usize);
             if take > 0 {
                 let sub_offset = mbuf_payload_offset + off as u16;
-                self.insert_merged_mbuf_ref(cursor, mbuf, sub_offset, take as u16);
+                to_insert.push((cursor, sub_offset, take as u16));
                 newly_buffered += take as u32;
-                stored_count += 1;
             }
             if take < tail_len {
                 cap_dropped += (tail_len - take) as u32;
             }
         }
+
+        // Second phase: apply the collected inserts. Each push shifts
+        // following indices, but we no longer iterate over `self.segments`
+        // so the shift is inconsequential — `insert_merged_mbuf_ref`
+        // positions each new entry by seq order within the current state
+        // of `self.segments`.
+        let stored_count = to_insert.len() as u32;
+        for (cursor_seq, sub_offset, take_len) in to_insert {
+            self.insert_merged_mbuf_ref(cursor_seq, mbuf, sub_offset, take_len);
+        }
+
         self.total_bytes += newly_buffered;
         // Caller bumped the refcount by +1 pre-call. The queue needs one
         // ref per stored segment. If the carve produced >1 stored entries,
@@ -484,6 +503,18 @@ impl ReorderQueue {
             drained_segments += 1;
         }
         (out, drained_segments)
+    }
+}
+
+impl Drop for ReorderQueue {
+    /// A6.5 Task 7 fix (C3): decrement mbuf refcount on every stored
+    /// `OooMbufRef` segment when the queue is dropped. Prevents refcount
+    /// leaks when a `TcpConn` is dropped mid-reassembly (RST, reaper,
+    /// force-close) with OOO segments still queued.
+    fn drop(&mut self) {
+        for seg in &self.segments {
+            Self::drop_segment_mbuf_ref(seg);
+        }
     }
 }
 
@@ -654,11 +685,12 @@ mod tests {
     // A6.5 Task 4b (Task 7): insert_mbuf unit tests. These tests exercise
     // insert logic only — they do NOT call drain (which would deref the
     // dangling pointer). The TAP integration tests + ahw_smoke exercise
-    // the full real-mbuf lifecycle. SAFETY: ReorderQueue has no custom
-    // Drop impl, so dropping a queue containing MbufRef entries does not
-    // deref the pointer — OooMbufRef's Drop is the auto-derived one
-    // (no-op on NonNull<rte_mbuf>). Refcount bookkeeping is only run
-    // inside drain_contiguous_from, which these tests never call.
+    // the full real-mbuf lifecycle. SAFETY: A6.5 Task 7's Drop impl on
+    // ReorderQueue would deref MbufRef pointers at queue drop, so every
+    // test below that stores an MbufRef entry backed by
+    // `NonNull::dangling()` calls `std::mem::forget(q)` at the end to
+    // bypass the Drop impl. Refcount-decrement bookkeeping is exercised
+    // via the TAP integration tests with real mbufs.
 
     #[test]
     fn insert_mbuf_produces_mbuf_ref_variant() {
@@ -680,6 +712,8 @@ mod tests {
             }
             _ => panic!("expected MbufRef variant"),
         }
+        // Skip Drop to avoid UB deref on the fake mbuf pointer.
+        std::mem::forget(q);
     }
 
     #[test]
@@ -697,6 +731,11 @@ mod tests {
         assert_eq!(out2.newly_buffered, 0);
         assert_eq!(out2.cap_dropped, 5);
         assert!(!out2.mbuf_ref_retained);
+        // q stored 1 MbufRef entry; skip Drop to avoid UB deref.
+        std::mem::forget(q);
+        // q2 stored nothing (cap=0 dropped it), but forget anyway for
+        // consistency.
+        std::mem::forget(q2);
     }
 
     #[test]
@@ -708,6 +747,10 @@ mod tests {
         assert_eq!(out.cap_dropped, 0);
         assert!(!out.mbuf_ref_retained);
         assert_eq!(q.len(), 0);
+        // No MbufRef entries stored, Drop would be a no-op. forget() is
+        // not strictly required but is kept for consistency across
+        // dangling-pointer tests.
+        std::mem::forget(q);
     }
 
     #[test]
@@ -725,5 +768,76 @@ mod tests {
         assert_eq!(q.segments()[0].seq(), 100);
         assert_eq!(q.segments()[1].seq(), 103);
         assert_eq!(q.segments()[2].seq(), 200);
+        // Skip Drop: queue holds 3 MbufRef entries backed by a fake ptr.
+        std::mem::forget(q);
+    }
+
+    #[test]
+    fn insert_mbuf_spanning_multiple_existing_segments_produces_three_gap_slices() {
+        // Bug repro for A6.5 Task 7 C1: insert_mbuf with payload spanning
+        // two existing Bytes segments used to skip the tail due to
+        // mid-iteration index shifts.
+        //
+        // This test calls insert_mbuf with stored_count == 3, which
+        // triggers the `(stored_count - 1)` internal refcount bump AND
+        // the ReorderQueue Drop impl's per-segment decrement. Both paths
+        // deref the mbuf pointer, so we can't use `NonNull::dangling()`
+        // here — we back the fake mbuf with a boxed byte buffer that
+        // lives longer than `q`. rte_mbuf's refcnt field lives at a
+        // small offset (<32 bytes) inside its first cacheline, so 256
+        // aligned bytes is plenty for the refcnt_update path. We must
+        // declare `fake_mbuf_storage` BEFORE `q` so that `q` drops first
+        // and its Drop impl reads from still-live storage.
+        let mut fake_mbuf_storage: Box<[u8; 256]> = Box::new([0u8; 256]);
+        let fake_mbuf: std::ptr::NonNull<sys::rte_mbuf> = unsafe {
+            std::ptr::NonNull::new_unchecked(
+                fake_mbuf_storage.as_mut_ptr() as *mut sys::rte_mbuf,
+            )
+        };
+
+        let mut q = ReorderQueue::new(10_000);
+        // Seed with two disjoint Bytes segments at seqs 150 and 200.
+        q.insert(150, &[0xaa; 10]);
+        q.insert(200, &[0xbb; 10]);
+        assert_eq!(q.len(), 2);
+
+        // Insert an mbuf-backed payload that covers [100..300), i.e., wraps
+        // both existing segments and has tail beyond them.
+        let payload = vec![0xcc; 200]; // 100..300
+        let out = q.insert_mbuf(100, &payload, fake_mbuf, 0);
+        // Expected carve: [100..150), [160..200), [210..300) — three
+        // gap-slices, each stored as a separate MbufRef.
+        // Total new bytes: 50 + 40 + 90 = 180.
+        assert_eq!(out.newly_buffered, 180);
+        assert_eq!(out.cap_dropped, 0);
+        assert!(out.mbuf_ref_retained);
+        // 2 seed Bytes + 3 new MbufRef = 5 segments.
+        assert_eq!(q.len(), 5);
+        // Verify interleaved order by seq.
+        let seqs: Vec<u32> = q.segments().iter().map(|s| s.seq()).collect();
+        assert_eq!(seqs, vec![100, 150, 160, 200, 210]);
+        // Verify MbufRef lens.
+        assert_eq!(q.segments()[0].len(), 50);
+        assert_eq!(q.segments()[2].len(), 40);
+        assert_eq!(q.segments()[4].len(), 90);
+        // `q` drops here before `fake_mbuf_storage`, so the Drop impl's
+        // refcnt decrements land in valid backing storage.
+        drop(q);
+        // Suppress unused-mut warning on fake_mbuf_storage; it was
+        // written to via the refcnt path.
+        let _ = &mut fake_mbuf_storage;
+    }
+
+    #[test]
+    fn insert_mbuf_fully_covered_by_existing_returns_not_retained() {
+        let mut q = ReorderQueue::new(1024);
+        q.insert(100, &[0u8; 200]);  // covers [100..300)
+        let fake_mbuf: std::ptr::NonNull<sys::rte_mbuf> = std::ptr::NonNull::dangling();
+        // Payload fully covered by existing segment.
+        let payload = vec![0xcc; 50]; // [150..200)
+        let out = q.insert_mbuf(150, &payload, fake_mbuf, 0);
+        assert_eq!(out.newly_buffered, 0);
+        assert!(!out.mbuf_ref_retained);
+        std::mem::forget(q);
     }
 }
