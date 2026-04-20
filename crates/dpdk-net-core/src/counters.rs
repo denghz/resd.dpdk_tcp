@@ -282,7 +282,8 @@ pub struct ObsCounters {
 // cacheline-multiple size with cacheline alignment so the C-ABI mirror
 // in dpdk-net/src/api.rs can hold byte-identical layout. Future
 // additions MUST adjust `_pad` to keep this assertion true. Paired with
-// the mirror-equality assertion at crates/dpdk-net/src/api.rs:381-396.
+// the `size_of::<dpdk_net_eth_counters_t>() == size_of::<CoreEth>()`
+// mirror-equality assertion in `crates/dpdk-net/src/api.rs`.
 const _: () = {
     use std::mem::{align_of, size_of};
     assert!(align_of::<EthCounters>() == 64);
