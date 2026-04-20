@@ -19,6 +19,7 @@
 | A5 | RACK-TLP + RTO + retransmit + ISS | **Complete** ✓ | `2026-04-18-stage1-phase-a5-rack-rto-retransmit.md` |
 | A5.5 | Event-log forensics + in-flight introspection + TLP tuning (emission-time ts, queue overflow counter, stats getter, per-conn TLP knobs) | **Complete** ✓ | `2026-04-19-stage1-phase-a5-5-event-log-forensics-tlp-tuning.md` |
 | A-HW | ENA hardware offload enablement (LLQ verify + TX/RX checksum + MBUF_FAST_FREE + RSS-hash plumbing) | **Complete** ✓ | `2026-04-19-stage1-phase-a-hw-ena-offload.md` |
+| A-HW+ | ENA observability + tuning knobs (WC verify + ENI xstats + per-queue xstats + large_llq_hdr / miss_txc_to knobs) | **In progress** | `2026-04-20-stage1-phase-a-hw-plus-ena-obs-knobs.md` |
 | A6 | Public API surface completeness **+ per-connection RTT histogram** (merged from former A5.6) | Not started | — |
 | A6.5 | Hot-path allocation elimination (reusable scratch, streaming csum, SmallVec, zero-copy reassembly) | Not started | — |
 | A6.6 | RX zero-copy (scatter-gather iovec API, in-order delivery-path mbuf-ref rework, LRO-compatible multi-segment, `rx_mempool_size` knob) | Not started | — |
@@ -298,6 +299,34 @@
 **Rough scale:** ~14 tasks (port-config upgrade, LLQ verify, TX checksum feature gate + branch, RX checksum feature gate + branch, RSS-hash feature gate + flow-table read, MBUF_FAST_FREE feature gate, LLQ feature gate, RX-timestamp feature gate + dynfield/dynflag lookup at `engine_create`, RX-timestamp inline accessor + threading through A3/A4 event-emission sites, capability-gated runtime fallback paths, software-fallback smoke × 2 build configs, hardware-path smoke, counter additions + coverage entries, startup-banner format + CI feature-matrix build).
 
 **Status:** **Complete.** Plan: `docs/superpowers/plans/2026-04-19-stage1-phase-a-hw-ena-offload.md`. Tag: `phase-a-hw-complete` (set after Task 20's mTCP + RFC review gates).
+
+---
+
+## A-HW+ — ENA observability + tuning knobs
+
+**Goal:** Close 5 gaps identified in `docs/references/ena-dpdk-review-2026-04-20.md` against the upstream ENA DPDK README — H1 WC verification, H2 ENI allowance xstats, M1 large_llq_hdr knob, M2 miss_txc_to knob, M3 per-queue xstats — without touching the wire path. All slow-path; 15 new always-allocated counter fields; 2 new EngineConfig knobs; 2 new extern "C" entry points (`dpdk_net_scrape_xstats`, `dpdk_net_recommended_ena_devargs`); no new feature flags.
+
+**Spec refs:** `docs/references/ena-dpdk-readme.md` §5.1 (devargs), §6.1 + §6.2.3 (WC), §8.2.2–4 (xstats); parent spec §9.1.1 (counter policy); user memory `feedback_observability_primitives_only.md`.
+
+**Deliverables:** see plan file `docs/superpowers/plans/2026-04-20-stage1-phase-a-hw-plus-ena-obs-knobs.md`.
+
+**Does NOT include:**
+- Device-reset / AENQ keepalive recovery (parent gap H3 — Stage 2 reliability phase).
+- `RTE_ETHDEV_QUEUE_STAT_CNTRS` bump (Stage 2 multi-queue gap M4).
+- MTU / jumbo frames (out of Stage 1 scope per A-HW).
+- RSS symmetric key (AD-2 from A-HW review — Stage 2 multi-queue).
+
+**Dependencies:** A-HW (sits on the `EthCounters` + offload-AND infrastructure).
+
+**Ship gate:** `phase-a-hw-plus-complete` tag requires:
+- `cargo test --workspace` green.
+- `ena_obs_smoke` green (pure-unit cross-crate check).
+- Real-ENA smoke green (`ahw_smoke_ena_hw.rs` `--ignored`).
+- `knob-coverage` extended + green.
+- mTCP review report `docs/superpowers/reviews/phase-a-hw-plus-mtcp-compare.md` with zero open `[ ]` in blocking sections.
+- RFC review report `docs/superpowers/reviews/phase-a-hw-plus-rfc-compliance.md` with zero open `[ ]` in blocking sections.
+
+**Status:** In progress — branch `phase-a-hw-ena-followups` off master (commit eb01e79).
 
 ---
 
