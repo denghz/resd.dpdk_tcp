@@ -348,6 +348,9 @@ struct DPDK_NET_ALIGNED(64) dpdk_net_tcp_counters_t {
   uint64_t ts_recent_expired;
   uint64_t tx_flush_bursts;
   uint64_t tx_flush_batched_pkts;
+  uint64_t rx_iovec_segs_total;
+  uint64_t rx_multi_seg_events;
+  uint64_t rx_partial_read_splits;
 };
 
 struct DPDK_NET_ALIGNED(64) dpdk_net_poll_counters_t {

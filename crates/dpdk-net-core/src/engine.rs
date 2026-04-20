@@ -237,7 +237,6 @@ pub struct EngineConfig {
     pub tx_queue_id: u16,
     pub rx_ring_size: u16,
     pub tx_ring_size: u16,
-    pub rx_mempool_elems: u32,
     pub mbuf_data_room: u16,
 
     /// A6.6-7 Task 10: RX mempool capacity in mbufs. `0` = compute default
@@ -343,7 +342,6 @@ impl Default for EngineConfig {
             tx_queue_id: 0,
             rx_ring_size: 1024,
             tx_ring_size: 1024,
-            rx_mempool_elems: 8192,
             mbuf_data_room: 2048,
             // A6.6-7 Task 10: 0 = compute formula-based default in
             // `Engine::new`. Keeping it here avoids callers of
@@ -3714,6 +3712,7 @@ impl Engine {
         rx_hw_ts_ns: u64,
     ) {
         use crate::counters::add;
+        use std::sync::atomic::Ordering;
         let mut ft = self.flow_table.borrow_mut();
         let Some(conn) = ft.get_mut(handle) else {
             // Rare race — conn gone between dispatch and event-emit.
@@ -3762,6 +3761,16 @@ impl Engine {
                         offset: delivered_offset,
                         len: split_off,
                     });
+                    // A6.6-7 Task 11: exactly one bump per READABLE that
+                    // required a split. The split branch sets `remaining
+                    // = 0` and exits the pop loop, so this site fires at
+                    // most once per `deliver_readable` invocation —
+                    // consistent with the slow-path counter policy
+                    // (§9.1.1: not per-byte, not per-seg).
+                    self.counters
+                        .tcp
+                        .rx_partial_read_splits
+                        .fetch_add(1, Ordering::Relaxed);
                     remaining = 0;
                 }
             }
@@ -3789,6 +3798,23 @@ impl Engine {
         // invocation.
         let mut events = self.events.borrow_mut();
         if seg_count > 0 {
+            // A6.6-7 Task 11: slow-path per-event counters. Batched
+            // `fetch_add(n_segs, Relaxed)` for the cumulative segs
+            // total — a single RMW even when N segments were
+            // emitted. `rx_multi_seg_events` is a conditional
+            // single-increment; both only fire when we actually push
+            // a READABLE event.
+            let n_segs = seg_count as u64;
+            self.counters
+                .tcp
+                .rx_iovec_segs_total
+                .fetch_add(n_segs, Ordering::Relaxed);
+            if n_segs > 1 {
+                self.counters
+                    .tcp
+                    .rx_multi_seg_events
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             events.push(
                 InternalEvent::Readable {
                     conn: handle,

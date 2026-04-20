@@ -423,6 +423,12 @@ pub struct dpdk_net_tcp_counters_t {
     pub ts_recent_expired: u64,
     pub tx_flush_bursts: u64,
     pub tx_flush_batched_pkts: u64,
+    // A6.6-7 Task 11 — slow-path RX zero-copy event-shape counters.
+    // Declaration order must match `dpdk_net_core::counters::TcpCounters`
+    // exactly. Field docs live on the core struct (see counters.rs).
+    pub rx_iovec_segs_total: u64,
+    pub rx_multi_seg_events: u64,
+    pub rx_partial_read_splits: u64,
 }
 #[repr(C, align(64))]
 pub struct dpdk_net_poll_counters_t {

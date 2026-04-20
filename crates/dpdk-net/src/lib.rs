@@ -147,7 +147,6 @@ pub unsafe extern "C" fn dpdk_net_engine_create(
         tx_queue_id: cfg.tx_queue_id,
         rx_ring_size: 1024,
         tx_ring_size: 1024,
-        rx_mempool_elems: 8192,
         mbuf_data_room: 2048,
         // A6.6-7 Task 10: pass through caller knob as-is. `0` (the common
         // case from a zero-initialized `dpdk_net_engine_config_t`) signals
@@ -969,6 +968,8 @@ mod tests {
             rtt_histogram_bucket_edges_us: [0u32; 15],
             ena_large_llq_hdr: 0,
             ena_miss_txc_to_sec: 0,
+            // A6.6-7 T10: zero means "use formula default" at engine_create.
+            rx_mempool_size: 0,
         };
         assert_eq!(cfg.local_ip, 0x0a_00_00_02);
         assert_eq!(cfg.gateway_mac[2], 0xbe);
@@ -1012,6 +1013,9 @@ mod tests {
             rtt_histogram_bucket_edges_us: [0u32; 15],
             ena_large_llq_hdr: 0,
             ena_miss_txc_to_sec: 0,
+            // A6.6-7 T10: zero = formula default; validation-rejection test
+            // doesn't reach the mempool-create path so the value is inert.
+            rx_mempool_size: 0,
         };
         let p = unsafe { dpdk_net_engine_create(0, &cfg) };
         assert!(p.is_null());
