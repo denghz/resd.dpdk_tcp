@@ -459,6 +459,65 @@ pub unsafe extern "C" fn dpdk_net_scrape_xstats(p: *mut dpdk_net_engine) -> i32 
     }
 }
 
+/// M1+M2 helper: build an ENA `-a <bdf>,...=` devarg string the
+/// application splices into its EAL args before calling
+/// `dpdk_net_eal_init`. Writes a NUL-terminated string into `out`;
+/// returns the number of bytes written EXCLUDING the trailing NUL on
+/// success, or a negative errno on failure:
+///   `-EINVAL` — `bdf` or `out` is null.
+///   `-ERANGE` — `miss_txc_to_sec > 60` (see ENA README §5.1).
+///   `-ENOSPC` — `out_cap` is smaller than the required length + NUL.
+///
+/// Emits `large_llq_hdr=1` only when the argument is non-zero; emits
+/// `miss_txc_to=N` only when the argument is non-zero (0 = use PMD
+/// default 5 s). Do NOT set 0 with the intent of disabling the Tx
+/// watchdog — see ENA README §5.1 caution.
+///
+/// Slow-path; called once during EAL-args construction at process
+/// startup.
+///
+/// # Safety
+/// `bdf` must point to a NUL-terminated PCI BDF string (e.g.
+/// "00:06.0"). `out` must be a writable buffer of at least `out_cap`
+/// bytes.
+#[no_mangle]
+pub unsafe extern "C" fn dpdk_net_recommended_ena_devargs(
+    bdf: *const libc::c_char,
+    large_llq_hdr: u8,
+    miss_txc_to_sec: u8,
+    out: *mut libc::c_char,
+    out_cap: usize,
+) -> i32 {
+    if bdf.is_null() || out.is_null() {
+        return -libc::EINVAL;
+    }
+    if miss_txc_to_sec > 60 {
+        return -libc::ERANGE;
+    }
+    let bdf_str = match std::ffi::CStr::from_ptr(bdf).to_str() {
+        Ok(s) => s,
+        Err(_) => return -libc::EINVAL,
+    };
+    let mut s = bdf_str.to_string();
+    if large_llq_hdr != 0 {
+        s.push_str(",large_llq_hdr=1");
+    }
+    if miss_txc_to_sec != 0 {
+        s.push_str(&format!(",miss_txc_to={}", miss_txc_to_sec));
+    }
+    let bytes = s.as_bytes();
+    if bytes.len() + 1 > out_cap {
+        return -libc::ENOSPC;
+    }
+    std::ptr::copy_nonoverlapping(
+        bytes.as_ptr() as *const libc::c_char,
+        out,
+        bytes.len(),
+    );
+    *out.add(bytes.len()) = 0;
+    bytes.len() as i32
+}
+
 /// Slow-path snapshot of a connection's send-path + RTT estimator state,
 /// for per-order forensics tagging (spec §5.3, §7.2.3–7.2.6). Safe to call
 /// at order-emit time; not meant for hot-loop polling.
@@ -1281,5 +1340,85 @@ mod a5_5_tlp_opts_tests {
         let out = validate_and_defaults_tlp_opts(&opts, &base_cfg()).unwrap();
         assert!(out.tlp_skip_flight_size_gate);
         assert!(out.tlp_skip_rtt_sample_gate);
+    }
+}
+
+#[cfg(test)]
+mod a_hw_plus_devargs_tests {
+    use super::*;
+
+    fn call(bdf: &str, large: u8, miss: u8, cap: usize) -> (i32, String) {
+        let bdf_c = std::ffi::CString::new(bdf).unwrap();
+        let mut buf = vec![0u8; cap];
+        let n = unsafe {
+            dpdk_net_recommended_ena_devargs(
+                bdf_c.as_ptr(),
+                large,
+                miss,
+                buf.as_mut_ptr() as *mut _,
+                cap,
+            )
+        };
+        let s = if n > 0 {
+            String::from_utf8_lossy(&buf[..n as usize]).into_owned()
+        } else {
+            String::new()
+        };
+        (n, s)
+    }
+
+    #[test]
+    fn defaults_emit_bdf_only() {
+        let (n, s) = call("00:06.0", 0, 0, 64);
+        assert_eq!(n, 7);
+        assert_eq!(s, "00:06.0");
+    }
+
+    #[test]
+    fn large_llq_hdr_appended() {
+        let (n, s) = call("00:06.0", 1, 0, 64);
+        assert!(n > 0);
+        assert_eq!(s, "00:06.0,large_llq_hdr=1");
+    }
+
+    #[test]
+    fn miss_txc_to_appended() {
+        let (n, s) = call("00:06.0", 0, 3, 64);
+        assert!(n > 0);
+        assert_eq!(s, "00:06.0,miss_txc_to=3");
+    }
+
+    #[test]
+    fn both_appended() {
+        let (n, s) = call("00:06.0", 1, 2, 64);
+        assert!(n > 0);
+        assert_eq!(s, "00:06.0,large_llq_hdr=1,miss_txc_to=2");
+    }
+
+    #[test]
+    fn out_too_small_returns_enospc() {
+        let (n, _) = call("00:06.0", 1, 1, 4);
+        assert_eq!(n, -libc::ENOSPC);
+    }
+
+    #[test]
+    fn miss_out_of_range_returns_erange() {
+        let (n, _) = call("00:06.0", 0, 61, 64);
+        assert_eq!(n, -libc::ERANGE);
+    }
+
+    #[test]
+    fn null_bdf_returns_einval() {
+        let mut buf = [0u8; 64];
+        let n = unsafe {
+            dpdk_net_recommended_ena_devargs(
+                std::ptr::null(),
+                0,
+                0,
+                buf.as_mut_ptr() as *mut _,
+                64,
+            )
+        };
+        assert_eq!(n, -libc::EINVAL);
     }
 }

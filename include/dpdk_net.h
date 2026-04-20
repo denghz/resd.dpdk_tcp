@@ -102,7 +102,10 @@ struct dpdk_net_engine_config_t {
   uint8_t ena_large_llq_hdr;
   /**
    * M2 — see core `EngineConfig.ena_miss_txc_to_sec`. Default 0
-   * (PMD default 5 s). Recommended 2 or 3 for trading.
+   * (PMD default 5 s). Recommended 2 or 3 for trading. Do NOT set
+   * 0 with the intent of disabling the Tx-completion watchdog —
+   * disabling causes severe performance degradation (ENA README
+   * §5.1 caution). 0 here specifically means "use PMD default".
    */
   uint8_t ena_miss_txc_to_sec;
 };
@@ -461,6 +464,35 @@ const struct dpdk_net_counters_t *dpdk_net_counters(struct dpdk_net_engine *p);
  * `dpdk_net_engine_create`.
  */
 int32_t dpdk_net_scrape_xstats(struct dpdk_net_engine *p);
+
+/**
+ * M1+M2 helper: build an ENA `-a <bdf>,...=` devarg string the
+ * application splices into its EAL args before calling
+ * `dpdk_net_eal_init`. Writes a NUL-terminated string into `out`;
+ * returns the number of bytes written EXCLUDING the trailing NUL on
+ * success, or a negative errno on failure:
+ *   `-EINVAL` — `bdf` or `out` is null.
+ *   `-ERANGE` — `miss_txc_to_sec > 60` (see ENA README §5.1).
+ *   `-ENOSPC` — `out_cap` is smaller than the required length + NUL.
+ *
+ * Emits `large_llq_hdr=1` only when the argument is non-zero; emits
+ * `miss_txc_to=N` only when the argument is non-zero (0 = use PMD
+ * default 5 s). Do NOT set 0 with the intent of disabling the Tx
+ * watchdog — see ENA README §5.1 caution.
+ *
+ * Slow-path; called once during EAL-args construction at process
+ * startup.
+ *
+ * # Safety
+ * `bdf` must point to a NUL-terminated PCI BDF string (e.g.
+ * "00:06.0"). `out` must be a writable buffer of at least `out_cap`
+ * bytes.
+ */
+int32_t dpdk_net_recommended_ena_devargs(const char *bdf,
+                                         uint8_t large_llq_hdr,
+                                         uint8_t miss_txc_to_sec,
+                                         char *out,
+                                         uintptr_t out_cap);
 
 /**
  * Slow-path snapshot of a connection's send-path + RTT estimator state,
