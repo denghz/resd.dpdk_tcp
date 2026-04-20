@@ -268,7 +268,7 @@
 
   | Feature flag | Default | Gates |
   |---|---|---|
-  | `hw-offload-llq` | ON | Passes `enable_llq=1` to the ENA PMD devargs; with the feature off, passes `enable_llq=0` so LLQ is explicitly disabled |
+  | `hw-verify-llq` | ON | Engine verifies LLQ activation at EAL init via PMD log-scrape + `dev_info.default_rxportconf` / `default_txportconf` inspection; fails hard if ENA advertised LLQ capability but LLQ did not activate. The `enable_llq=X` devarg stays **application-owned** (ENA PMD default is `enable_llq=1`) — this flag controls the engine's verification discipline, not activation. With feature off, verification is skipped. See A-HW spec §5 |
   | `hw-offload-tx-cksum` | ON | TX IPv4+TCP+UDP checksum offload bits + pseudo-header-only checksum in `tcp_output.rs` / `l3_ip.rs`; with feature off, software full-fold stays on the TX path |
   | `hw-offload-rx-cksum` | ON | RX IPv4+TCP+UDP checksum offload bits + `mbuf.ol_flags` inspection in `tcp_input.rs` / `l3_ip.rs`; with feature off, software verify runs on the RX path |
   | `hw-offload-mbuf-fast-free` | ON | `RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE` bit in `txmode.offloads` |
@@ -284,7 +284,7 @@
   - For each offload that is compile-time enabled, AND the requested bit against `dev_info.*_offload_capa`; WARN + one-shot counter per requested-but-unadvertised capability (`eth.offload_missing_<name>`); software path stays reachable (runtime capability gate per §8.5).
   - Populate `rte_eth_conf.rxmode.offloads` / `txmode.offloads` with bits that are both compile-time enabled AND runtime advertised.
   - When `hw-offload-rss-hash` is on: populate `rte_eth_conf.rx_adv_conf.rss_conf = { rss_hf: RTE_ETH_RSS_NONFRAG_IPV4_TCP | RTE_ETH_RSS_NONFRAG_IPV6_TCP, rss_key: NULL }` (NULL key → PMD default Toeplitz key); on single queue, program the RSS indirection table so every hash lands on queue 0.
-- LLQ verification (when `hw-offload-llq` on): parse PMD startup log + read `dev_info.default_rxportconf` / `default_txportconf` signals; fail-hard if the device advertises LLQ capability but LLQ did not activate at bring-up.
+- LLQ verification (when `hw-verify-llq` on): parse PMD startup log + read `dev_info.default_rxportconf` / `default_txportconf` signals; fail-hard if the device advertises LLQ capability but LLQ did not activate at bring-up.
 - `tcp_output.rs` / `l3_ip.rs` TX checksum split, compile-gated by `hw-offload-tx-cksum`:
   - Feature ON: set `mbuf.ol_flags |= RTE_MBUF_F_TX_IPV4 | RTE_MBUF_F_TX_IP_CKSUM | RTE_MBUF_F_TX_TCP_CKSUM` (and UDP analog); set `mbuf.l2_len = 14`, `mbuf.l3_len = 20`, `mbuf.l4_len = tcp_hdr_len`; write **only** the TCP / UDP pseudo-header checksum per RFC 9293 §3.1. Runtime-fallback branch (if the PMD didn't advertise the capability) reverts to full-fold for that engine instance only.
   - Feature OFF: software full-fold on the TX path; no offload bits set.
@@ -434,7 +434,7 @@
 - `tools/bench-e2e/` — request/response RTT harness with HW-timestamp attribution buckets and per-measurement sum-identity assertion.
 - `tools/bench-stress/` — netem + FaultInjector scenario runner for §11.4 matrix.
 - `tools/bench-vs-linux/` — dual-stack comparison vs Linux TCP with tap-jitter baseline subtraction.
-- `tools/bench-offload-ab/` — per-offload A/B harness that consumes A-HW's `hw-offload-*` cargo feature flags (`hw-offload-llq`, `hw-offload-tx-cksum`, `hw-offload-rx-cksum`, `hw-offload-mbuf-fast-free`, `hw-offload-rss-hash`) by rebuilding the engine once per feature-combination and running a 128 B / 128 B request-response micro-workload on the ENA target host.
+- `tools/bench-offload-ab/` — per-offload A/B harness that consumes A-HW's feature flags (`hw-verify-llq`, `hw-offload-tx-cksum`, `hw-offload-rx-cksum`, `hw-offload-mbuf-fast-free`, `hw-offload-rss-hash`) by rebuilding the engine once per feature-combination and running a 128 B / 128 B request-response micro-workload on the ENA target host. Note `hw-verify-llq` is a verification-discipline gate, not an offload-enable gate — its A/B toggles whether the engine enforces LLQ-active at bring-up, not whether LLQ is configured (the ENA PMD's `enable_llq=X` devarg stays application-owned).
   - Config matrix: `baseline` (no features), per-offload-only (one feature each), `full` (all default features). Additional compositions optional if any single-offload result is ambiguous.
   - Workload: ≥ 10 000 round-trips per config post-warmup (drop first 1 000); fresh engine bring-up between configs with `rte_eal_cleanup`; same RNG seed across runs.
   - Measurement discipline: same preconditions as §11.1 (isolcpus, governor, C-states, TSC invariant, no thermal throttle during the run). Harness fails-fast on any precondition miss.
