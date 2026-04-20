@@ -20,9 +20,12 @@
 ///
 /// `allow(dead_code)` covers Task 2 — the engine bring-up wiring that
 /// will call this function lands in Task 3, mirroring the same gating
-/// pattern used by `llq_verify::verify_llq_activation`.
+/// pattern used by `llq_verify::verify_llq_activation`. Visibility is
+/// `pub` (not `pub(crate)`) so the Task 12 pure-unit smoke at
+/// `tests/ena_obs_smoke.rs` can exercise the parser across the
+/// integration-test crate boundary.
 #[allow(dead_code)]
-pub(crate) fn parse_pat_memtype_list(
+pub fn parse_pat_memtype_list(
     pat_contents: &str,
     bar_phys_addr: u64,
 ) -> WcVerdict {
@@ -50,7 +53,7 @@ pub(crate) fn parse_pat_memtype_list(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
-pub(crate) enum WcVerdict {
+pub enum WcVerdict {
     WriteCombining,
     OtherMapping,
     NotFound,
