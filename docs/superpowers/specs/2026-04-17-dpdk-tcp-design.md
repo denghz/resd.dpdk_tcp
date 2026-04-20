@@ -534,22 +534,30 @@ Stage 1 design defaults (single RX / single TX queue, RTC loop, one-engine-per-l
 
 ### 8.2 ENA offload capabilities (what the NIC can do for us)
 
-Advertised by the DPDK ENA PMD (`drivers/net/ena/ena_ethdev.c:2471–2503`):
+**Observed at runtime on AWS AMD EPYC Milan + ENA PMD (DPDK 23.11), verified by A-HW Task 18 bring-up**: `rx_offload_capa=0x200e`, `tx_offload_capa=0x1800e`. The ENA PMD advertises:
 
 | Direction | Capability | DPDK flag |
 |---|---|---|
-| RX | IPv4 header checksum verify | `RTE_ETH_RX_OFFLOAD_IPV4_CKSUM` |
-| RX | TCP checksum verify | `RTE_ETH_RX_OFFLOAD_TCP_CKSUM` |
-| RX | UDP checksum verify | `RTE_ETH_RX_OFFLOAD_UDP_CKSUM` |
-| RX | 4-tuple Toeplitz hash → `mbuf.hash.rss` | `RTE_ETH_RX_OFFLOAD_RSS_HASH` |
-| RX | Multi-segment (scatter) | `RTE_ETH_RX_OFFLOAD_SCATTER` |
-| TX | IPv4 header checksum compute | `RTE_ETH_TX_OFFLOAD_IPV4_CKSUM` |
-| TX | TCP checksum compute (SW writes pseudo-header sum only) | `RTE_ETH_TX_OFFLOAD_TCP_CKSUM` |
-| TX | UDP checksum compute | `RTE_ETH_TX_OFFLOAD_UDP_CKSUM` |
-| TX | TCP Segmentation Offload | `RTE_ETH_TX_OFFLOAD_TCP_TSO` |
-| TX | Scatter/gather (multi-segment) | `RTE_ETH_TX_OFFLOAD_MULTI_SEGS` |
-| TX | Fast-free (skip per-mbuf pool check on TX completion) | `RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE` |
-| RSS | IPv4/IPv6 TCP/UDP + frag + L2 payload + L3/L4 src/dst-only masks | `ENA_ALL_RSS_HF` |
+| RX | IPv4 header checksum verify | `RTE_ETH_RX_OFFLOAD_IPV4_CKSUM` (bit 1) |
+| RX | UDP checksum verify | `RTE_ETH_RX_OFFLOAD_UDP_CKSUM` (bit 2) |
+| RX | TCP checksum verify | `RTE_ETH_RX_OFFLOAD_TCP_CKSUM` (bit 3) |
+| RX | VLAN tag filtering | `RTE_ETH_RX_OFFLOAD_VLAN_FILTER` (bit 13) |
+| TX | IPv4 header checksum compute | `RTE_ETH_TX_OFFLOAD_IPV4_CKSUM` (bit 1) |
+| TX | UDP checksum compute | `RTE_ETH_TX_OFFLOAD_UDP_CKSUM` (bit 2) |
+| TX | TCP checksum compute (SW writes pseudo-header sum only) | `RTE_ETH_TX_OFFLOAD_TCP_CKSUM` (bit 3) |
+| TX | Scatter/gather (multi-segment) | `RTE_ETH_TX_OFFLOAD_MULTI_SEGS` (bit 15) |
+| TX | Multi-thread lock-free TX | `RTE_ETH_TX_OFFLOAD_MT_LOCKFREE` (bit 16) |
+
+**Capabilities the ENA PMD does NOT advertise** (contrary to earlier readings of the DPDK source; re-confirmed against live `rte_eth_dev_info_get` at A-HW Task 18 bring-up on 2026-04-20):
+
+| Direction | Capability | DPDK flag |
+|---|---|---|
+| RX | 4-tuple Toeplitz hash → `mbuf.hash.rss` | `RTE_ETH_RX_OFFLOAD_RSS_HASH` (bit 19) **— NOT advertised** |
+| RX | Multi-segment (scatter) | `RTE_ETH_RX_OFFLOAD_SCATTER` — NOT advertised |
+| TX | TCP Segmentation Offload | `RTE_ETH_TX_OFFLOAD_TCP_TSO` — NOT advertised |
+| TX | Fast-free (skip per-mbuf pool check on TX completion) | `RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE` (bit 14) **— NOT advertised** |
+
+The MBUF_FAST_FREE and RSS_HASH gaps are the most operationally significant: A-HW's default feature set compile-requests both, so `eth.offload_missing_mbuf_fast_free = 1` and `eth.offload_missing_rss_hash = 1` are the *expected steady state* on real ENA under DPDK 23.11. The runtime capability-gate per §8.5 drops these bits from the applied mask and flow-table's hash consumer falls back to SipHash (§8 / A-HW spec §8.2).
 
 **ENA-specific (enabled by default in the PMD, `ena_ethdev.c:2239`): Low-Latency Queues (LLQ).** LLQ has the host write the TX descriptor + packet header directly into the NIC's MMIO BAR (device memory), eliminating the NIC-side DMA-read round-trip that would otherwise fetch descriptor + header over PCIe. On ENA this is the single largest per-send latency reduction (~0.5–1 µs off `rte_eth_tx_burst` → wire). No application action is required; the PMD auto-enables LLQ when the device exposes the memory BAR and the `enable_llq` devarg is at its default.
 

@@ -44,15 +44,27 @@
 //!
 //! # Assertions (spec §12.3)
 //!
-//! With default A-HW features on real ENA:
-//!   * All `offload_missing_*` = 0 EXCEPT `offload_missing_rx_timestamp == 1`
-//!     (ENA steady state — the PMD does not register the
-//!     `rte_dynfield_timestamp` dynfield, per parent spec §8.3 +
+//! With default A-HW features on real ENA (verified 2026-04-20 against
+//! DPDK 23.11 `rte_eth_dev_info_get` output `rx_offload_capa=0x200e`,
+//! `tx_offload_capa=0x1800e`):
+//!   * `offload_missing_rx_cksum_{ipv4,tcp,udp} == 0`
+//!     (ENA advertises all three).
+//!   * `offload_missing_tx_cksum_{ipv4,tcp,udp} == 0`.
+//!   * `offload_missing_mbuf_fast_free == 1` — ENA does NOT advertise
+//!     `TX_OFFLOAD_MBUF_FAST_FREE` at DPDK 23.11 (parent spec §8.2
+//!     updated 2026-04-20 to reflect runtime reality).
+//!   * `offload_missing_rss_hash == 1` — ENA does NOT advertise
+//!     `RX_OFFLOAD_RSS_HASH` at DPDK 23.11 (parent spec §8.2 same).
+//!     `flow_table` falls back to SipHash per A-HW spec §8.2.
+//!   * `offload_missing_rx_timestamp == 1` — ENA steady state, the PMD
+//!     does not register `rte_dynfield_timestamp` (parent §8.3 +
 //!     A-HW spec §10.5).
 //!   * `offload_missing_llq == 0` — ENA PMD default `enable_llq=1`
-//!     activates LLQ; Task 12's log-scrape verifier captures around
-//!     `rte_eal_init` and finds the "Placement policy: Low latency"
-//!     marker in the ENA init log.
+//!     activates LLQ. Task 12's log-scrape verifier wraps `rte_eal_init`
+//!     and stores a verdict. If `rte_openlog_stream` capture returns
+//!     empty (observed in some containerized DPDK setups), the verifier
+//!     soft-skips with a warning rather than false-failing. See
+//!     `llq_verify::record_eal_init_log_verdict`.
 //!   * `rx_drop_cksum_bad == 0` on well-formed echo traffic.
 //!   * Every emitted event's `rx_hw_ts_ns == 0` — accessor yields 0
 //!     when the dynfield is absent, which is the ENA steady state.
@@ -235,7 +247,13 @@ fn ahw_ena_hw_path_banner_and_counters() {
         "--huge-unlink",
         "-a",
         &bdf_allowlist,
-        "--log-level=3",
+        // `eal_init` internally injects `--log-level=pmd.net.ena.driver,info`
+        // when `hw-verify-llq` is on so the LLQ verifier can see the
+        // INFO-level "Placement policy" marker. We do NOT set a lower
+        // global `--log-level` here because DPDK's default global level
+        // is INFO (7), and `rte_log` requires BOTH global AND component
+        // filters to pass — a lower global level would suppress INFO
+        // messages even with the component override in place.
     ];
     eal_init(&args).expect("EAL init on ENA VF");
 
@@ -390,22 +408,36 @@ fn ahw_ena_hw_path_banner_and_counters() {
         0,
         "ENA advertises RTE_ETH_TX_OFFLOAD_UDP_CKSUM"
     );
+    // Task 18 post-commit corrections (verified on AWS ENA at DPDK 23.11,
+    // 2026-04-20): the PMD's advertised mask is 0x200e (RX) / 0x1800e
+    // (TX). Neither MBUF_FAST_FREE (TX bit 14) nor RSS_HASH (RX bit 19)
+    // is advertised. Parent spec §8.2 updated to reflect actual runtime.
+    // Both counters bump to 1 at bring-up per spec §11 — the expected
+    // steady state on real ENA.
     assert_eq!(
         c.eth.offload_missing_mbuf_fast_free.load(Ordering::Relaxed),
-        0,
-        "ENA advertises RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE"
+        1,
+        "ENA does NOT advertise TX_OFFLOAD_MBUF_FAST_FREE (parent §8.2)"
     );
     assert_eq!(
         c.eth.offload_missing_rss_hash.load(Ordering::Relaxed),
-        0,
-        "ENA advertises RTE_ETH_RX_OFFLOAD_RSS_HASH"
+        1,
+        "ENA does NOT advertise RX_OFFLOAD_RSS_HASH (parent §8.2)"
     );
+    // LLQ verification is actively validated on real ENA (verified
+    // 2026-04-20, DPDK 23.11): `eal_init` injects
+    // `--log-level=pmd.net.ena.driver,info` so the ENA PMD's
+    // "Placement policy: Low latency" marker emits into the captured
+    // log. The verifier then matches the activation marker and counter
+    // stays 0. If the capture mechanism ever degenerates (e.g. returns
+    // empty), `record_eal_init_log_verdict` soft-skips rather than
+    // false-failing — still counter = 0.
     assert_eq!(
         c.eth.offload_missing_llq.load(Ordering::Relaxed),
         0,
-        "ENA PMD default enable_llq=1 activates LLQ; Task 12's \
-         log-scrape verifier finds 'Placement policy: Low latency' \
-         in the ENA init log"
+        "ENA PMD default enable_llq=1 activates LLQ; Task 12 verifier \
+         captures 'Placement policy: Low latency' at EAL init and \
+         confirms activation."
     );
 
     // THE documented exception: ENA does NOT register

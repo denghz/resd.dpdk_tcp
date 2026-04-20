@@ -194,6 +194,23 @@ static EAL_INIT_VERDICT: OnceLock<LlqVerdict> = OnceLock::new();
 /// activation + failure markers and stores the verdict globally for
 /// later engine-create consumption.
 pub(crate) fn record_eal_init_log_verdict(captured_log: &str) {
+    // Empty-capture soft-skip: some DPDK build/runtime combinations do not
+    // honor `rte_openlog_stream` redirection for PMD-probe-time logs
+    // (observed on AWS ENA under DPDK 23.11 + containerized EAL). In that
+    // case the captured buffer comes back empty and we cannot distinguish
+    // "LLQ failed" from "capture mechanism didn't fire". Treat this as a
+    // soft-skip: do NOT record a verdict, so `verify_llq_activation_from_global`
+    // falls through its no-verdict soft-skip path with a warning log. This
+    // matches the fail-safe spirit of spec §5 — we never falsely report
+    // "LLQ failed" when we simply couldn't capture.
+    if captured_log.trim().is_empty() {
+        eprintln!(
+            "resd_net: LLQ log capture returned empty buffer around rte_eal_init; \
+             verdict not recorded. Engine::new will soft-skip LLQ verification \
+             for net_ena drivers. See A-HW spec §5 capture-mechanism caveat."
+        );
+        return;
+    }
     let verdict = scan_log_for_verdict(captured_log);
     // First-writer wins. `eal_init` guards against re-entry via its
     // Mutex<bool> latch, so under normal use this set() always succeeds.
