@@ -259,7 +259,30 @@ pub struct dpdk_net_eth_counters_t {
     pub offload_missing_llq: u64,
     pub offload_missing_rx_timestamp: u64,
     pub rx_drop_cksum_bad: u64,
-    pub _pad: [u64; 9],
+    // A-HW+ additions — mirror of dpdk_net_core::counters::EthCounters.
+    // Order below MUST match core exactly; field docs live on the core
+    // struct (see counters.rs). Slow-path per spec §9.1.1 — always
+    // allocated for C-ABI stability regardless of feature flags.
+    // H1
+    pub llq_wc_missing: u64,
+    // M1
+    pub llq_header_overflow_risk: u64,
+    // H2 — ENI allowance-exceeded snapshots
+    pub eni_bw_in_allowance_exceeded: u64,
+    pub eni_bw_out_allowance_exceeded: u64,
+    pub eni_pps_allowance_exceeded: u64,
+    pub eni_conntrack_allowance_exceeded: u64,
+    pub eni_linklocal_allowance_exceeded: u64,
+    // M3 — per-queue (queue 0, Stage 1 single-queue) snapshots
+    pub tx_q0_linearize: u64,
+    pub tx_q0_doorbells: u64,
+    pub tx_q0_missed_tx: u64,
+    pub tx_q0_bad_req_id: u64,
+    pub rx_q0_refill_partial: u64,
+    pub rx_q0_bad_desc_num: u64,
+    pub rx_q0_bad_req_id: u64,
+    pub rx_q0_mbuf_alloc_fail: u64,
+    pub _pad: [u64; 2],
 }
 #[repr(C, align(64))]
 pub struct dpdk_net_ip_counters_t {

@@ -42,7 +42,72 @@ pub struct EthCounters {
     /// RTE_MBUF_F_RX_IP_CKSUM_BAD or RTE_MBUF_F_RX_L4_CKSUM_BAD. Expected 0
     /// on well-formed traffic. Not an offload-missing counter.
     pub rx_drop_cksum_bad: AtomicU64,
-    _pad: [AtomicU64; 9],
+    // A-HW+ additions (this plan) — all slow-path per spec §9.1.1.
+    // Always allocated for C-ABI stability. Writes are conditional in
+    // later tasks (wc_verify.rs, ena_xstats.rs, engine bring-up). Order
+    // below is H1 → M1 → H2 cluster → M3 cluster (logical grouping;
+    // mirror in api.rs must match verbatim). See the plan at
+    // docs/superpowers/plans/2026-04-20-stage1-phase-a-hw-plus-ena-obs-knobs.md
+    // and the review at docs/references/ena-dpdk-review-2026-04-20.md.
+    // H1 — WC BAR mapping verification (upstream ENA README §6.1).
+    /// One-shot at bring-up: bumped via `fetch_add(1, Relaxed)` when the
+    /// driver is net_ena AND `/sys/kernel/debug/x86/pat_memtype_list`
+    /// does NOT show write-combining for the prefetchable BAR. WARN-only
+    /// by default — LLQ TX degrades to UC-aligned 8-byte stores. Written
+    /// by `wc_verify.rs` (Task 5). Expected 0 on a correctly-mapped ENA.
+    pub llq_wc_missing: AtomicU64,
+    // M1 — LLQ header overflow risk (upstream ENA README §5.1).
+    /// One-shot at bring-up: bumped via `fetch_add(1, Relaxed)` when the
+    /// worst-case TCP header stack (Eth + IP + TCP + opts) would exceed
+    /// the LLQ default 96 B header limit AND the `ena_large_llq_hdr`
+    /// devarg knob is 0. Written by the engine_create bring-up path
+    /// (Task 8). Expected 0 once the knob defaults to 1 (Task 7).
+    pub llq_header_overflow_risk: AtomicU64,
+    // H2 — ENI allowance-exceeded xstats (upstream ENA README §8.2.2).
+    // Snapshot semantics: `store(value, Relaxed)` overwrites with the
+    // last-scraped value. Written by `ena_xstats.rs` (Task 10) on each
+    // `dpdk_net_scrape_xstats` call. xstats names below are the literal
+    // rte_eth_xstats strings resolved once at engine_create.
+    /// ENA xstat: `bw_in_allowance_exceeded` (PPS-normalized bytes/s
+    /// ingress that AWS shaped). Nonzero = VPC rate-limiter hit.
+    pub eni_bw_in_allowance_exceeded: AtomicU64,
+    /// ENA xstat: `bw_out_allowance_exceeded` (egress counterpart).
+    pub eni_bw_out_allowance_exceeded: AtomicU64,
+    /// ENA xstat: `pps_allowance_exceeded` (aggregate packets/s cap).
+    pub eni_pps_allowance_exceeded: AtomicU64,
+    /// ENA xstat: `conntrack_allowance_exceeded` (VPC conntrack table).
+    pub eni_conntrack_allowance_exceeded: AtomicU64,
+    /// ENA xstat: `linklocal_allowance_exceeded` (IMDS/DNS/NTP cap).
+    pub eni_linklocal_allowance_exceeded: AtomicU64,
+    // M3 — Per-queue ENA xstats, queue 0 only (upstream ENA README
+    // §8.2.3–4). Stage 1 runs a single queue; when we scale to multi-
+    // queue the snapshot set widens to q1..qN. Snapshot semantics:
+    // `store(value, Relaxed)` on the same scrape tick as H2 above.
+    /// ENA xstat: `tx_q0_linearize` — TX mbuf chains we rebuilt into a
+    /// single segment because driver/LLQ couldn't consume the chain.
+    pub tx_q0_linearize: AtomicU64,
+    /// ENA xstat: `tx_q0_doorbells` — TX doorbell writes for queue 0.
+    pub tx_q0_doorbells: AtomicU64,
+    /// ENA xstat: `tx_q0_missed_tx` — AENQ "missing TX completion"
+    /// watchdog (miss_txc_to timeout, see Task 12 knob).
+    pub tx_q0_missed_tx: AtomicU64,
+    /// ENA xstat: `tx_q0_bad_req_id` — TX completion with unknown req_id;
+    /// HW/driver correctness signal. Expected 0.
+    pub tx_q0_bad_req_id: AtomicU64,
+    /// ENA xstat: `rx_q0_refill_partial` — RX refill gave the driver
+    /// fewer mbufs than it asked for (mbuf pool pressure).
+    pub rx_q0_refill_partial: AtomicU64,
+    /// ENA xstat: `rx_q0_bad_desc_num` — RX descriptor count anomaly.
+    pub rx_q0_bad_desc_num: AtomicU64,
+    /// ENA xstat: `rx_q0_bad_req_id` — RX completion with unknown req_id.
+    pub rx_q0_bad_req_id: AtomicU64,
+    /// ENA xstat: `rx_q0_mbuf_alloc_fail` — RX mbuf allocation failed at
+    /// refill time. Correlates with `rx_drop_nomem`.
+    pub rx_q0_mbuf_alloc_fail: AtomicU64,
+    // _pad sized to keep the struct on a 64-byte multiple.
+    // 12 (pre-A-HW) + 11 (A-HW) + 15 (A-HW+) = 38 u64s → 304 B;
+    // next 64-multiple is 320 B → pad with 2 u64s.
+    _pad: [AtomicU64; 2],
 }
 
 #[repr(C, align(64))]
@@ -212,6 +277,17 @@ pub struct ObsCounters {
     /// high value with nonzero events_dropped = actual loss.
     pub events_queue_high_water: AtomicU64,
 }
+
+// Pinned by phase-a-hw-plus Task 1 — `EthCounters` must stay on a
+// cacheline-multiple size with cacheline alignment so the C-ABI mirror
+// in dpdk-net/src/api.rs can hold byte-identical layout. Future
+// additions MUST adjust `_pad` to keep this assertion true. Paired with
+// the mirror-equality assertion at crates/dpdk-net/src/api.rs:381-396.
+const _: () = {
+    use std::mem::{align_of, size_of};
+    assert!(align_of::<EthCounters>() == 64);
+    assert!(size_of::<EthCounters>().is_multiple_of(64));
+};
 
 #[repr(C)]
 pub struct Counters {

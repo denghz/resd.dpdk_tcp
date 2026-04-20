@@ -194,7 +194,22 @@ struct DPDK_NET_ALIGNED(64) dpdk_net_eth_counters_t {
   uint64_t offload_missing_llq;
   uint64_t offload_missing_rx_timestamp;
   uint64_t rx_drop_cksum_bad;
-  uint64_t _pad[9];
+  uint64_t llq_wc_missing;
+  uint64_t llq_header_overflow_risk;
+  uint64_t eni_bw_in_allowance_exceeded;
+  uint64_t eni_bw_out_allowance_exceeded;
+  uint64_t eni_pps_allowance_exceeded;
+  uint64_t eni_conntrack_allowance_exceeded;
+  uint64_t eni_linklocal_allowance_exceeded;
+  uint64_t tx_q0_linearize;
+  uint64_t tx_q0_doorbells;
+  uint64_t tx_q0_missed_tx;
+  uint64_t tx_q0_bad_req_id;
+  uint64_t rx_q0_refill_partial;
+  uint64_t rx_q0_bad_desc_num;
+  uint64_t rx_q0_bad_req_id;
+  uint64_t rx_q0_mbuf_alloc_fail;
+  uint64_t _pad[2];
 };
 
 struct DPDK_NET_ALIGNED(64) dpdk_net_ip_counters_t {
