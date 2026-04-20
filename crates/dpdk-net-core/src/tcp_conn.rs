@@ -90,15 +90,23 @@ impl RecvQueue {
         }
     }
 
+    /// Current buffered-but-not-delivered byte count for flow-control accounting.
+    /// Post-T3: sums `seg.len` across the VecDeque<InOrderSegment>.
+    /// Pre-T3: returns `self.bytes.len() as u32`.
+    #[inline]
+    pub fn buffered_bytes(&self) -> u32 {
+        self.bytes.len() as u32
+    }
+
     /// In-order free-space only (matches A3's semantic).
     pub fn free_space(&self) -> u32 {
-        self.cap.saturating_sub(self.bytes.len() as u32)
+        self.cap.saturating_sub(self.buffered_bytes())
     }
 
     /// Combined free-space across in-order bytes + reorder queue.
     pub fn free_space_total(&self) -> u32 {
         self.cap
-            .saturating_sub(self.bytes.len() as u32)
+            .saturating_sub(self.buffered_bytes())
             .saturating_sub(self.reorder.total_bytes())
     }
 
