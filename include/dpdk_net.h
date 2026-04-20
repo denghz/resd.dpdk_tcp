@@ -437,6 +437,23 @@ uint64_t dpdk_net_now_ns(struct dpdk_net_engine *_p);
 const struct dpdk_net_counters_t *dpdk_net_counters(struct dpdk_net_engine *p);
 
 /**
+ * Slow-path: trigger an ENA-PMD xstats scrape. Reads ENI
+ * allowance-exceeded + per-queue (q0) Tx/Rx counters via DPDK
+ * rte_eth_xstats_get_by_id and writes them into the counters
+ * snapshot. Application calls this on its own cadence (typically
+ * 1 Hz). On non-ENA / non-advertising PMDs this is a cheap no-op.
+ *
+ * Returns 0 on success (always — failures are silent and observable
+ * via the counters staying at their last value).
+ * Returns -EINVAL if `p` is null.
+ *
+ * # Safety
+ * `p` must be a valid Engine pointer obtained from
+ * `dpdk_net_engine_create`.
+ */
+int32_t dpdk_net_scrape_xstats(struct dpdk_net_engine *p);
+
+/**
  * Slow-path snapshot of a connection's send-path + RTT estimator state,
  * for per-order forensics tagging (spec §5.3, §7.2.3–7.2.6). Safe to call
  * at order-emit time; not meant for hot-loop polling.
