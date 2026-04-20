@@ -240,6 +240,25 @@ pub struct EngineConfig {
     pub rx_mempool_elems: u32,
     pub mbuf_data_room: u16,
 
+    /// A6.6-7 Task 10: RX mempool capacity in mbufs. `0` = compute default
+    /// at `Engine::new`:
+    ///   `max(4 * rx_ring_size,
+    ///        2 * max_connections * ceil(recv_buffer_bytes / mbuf_data_room) + 4096)`
+    /// The per-conn term sizes the pool so every connection can fully
+    /// occupy its receive buffer in DPDK-held mbufs concurrently with
+    /// an RX-ring refill, and the 4096 cushion absorbs in-flight
+    /// retransmit / LRO chains. `mbuf_data_room` defaults to 2048 bytes
+    /// (DPDK default); jumbo-frame users either raise `mbuf_data_room`
+    /// or override this knob explicitly. The `4 * rx_ring_size` floor
+    /// guarantees at least 4× the RX descriptor ring so `rte_eth_rx_burst`
+    /// never starves under back-to-back refills. Non-zero caller value
+    /// is used verbatim (no floor clamp) — callers sizing below `4 *
+    /// rx_ring_size` are accepting the starvation risk knowingly.
+    ///
+    /// Retrievable via the `dpdk_net_rx_mempool_size()` FFI getter after
+    /// `Engine::new` / `dpdk_net_engine_create`.
+    pub rx_mempool_size: u32,
+
     // Phase A2 additions (host byte order for IPs; raw bytes for MAC)
     pub local_ip: u32,
     pub gateway_ip: u32,
@@ -326,6 +345,11 @@ impl Default for EngineConfig {
             tx_ring_size: 1024,
             rx_mempool_elems: 8192,
             mbuf_data_room: 2048,
+            // A6.6-7 Task 10: 0 = compute formula-based default in
+            // `Engine::new`. Keeping it here avoids callers of
+            // `EngineConfig::default()` accidentally spawning a size-0
+            // mempool if they never set this field.
+            rx_mempool_size: 0,
             local_ip: 0,
             gateway_ip: 0,
             gateway_mac: [0u8; 6],
@@ -365,6 +389,11 @@ pub struct Engine {
     pub(crate) rtt_histogram_edges: [u32; 15],
     counters: Box<Counters>,
     _rx_mempool: Mempool,
+    /// A6.6-7 Task 10: resolved RX mempool capacity (post zero-sentinel
+    /// substitution + formula application). Exposed via the
+    /// `dpdk_net_rx_mempool_size()` FFI getter so the application can
+    /// report / log the actual pool size without re-deriving the formula.
+    pub(crate) rx_mempool_size: u32,
     tx_hdr_mempool: Mempool,
     tx_data_mempool: Mempool,
     our_mac: [u8; 6],
@@ -732,10 +761,35 @@ impl Engine {
         // preserves the bit pattern (-1 → 0xFFFFFFFF == SOCKET_ID_ANY).
         let socket_id_u = socket_id as u32;
 
+        // A6.6-7 Task 10: resolve `rx_mempool_size`. Caller 0 triggers the
+        // formula default. See EngineConfig.rx_mempool_size doc-comment
+        // for the rationale on each term. Saturating arithmetic throughout:
+        // if a caller sets `recv_buffer_bytes` or `max_connections` pathological-
+        // ly high, the computed value clamps at u32::MAX rather than wrapping.
+        let rx_mempool_size = if cfg.rx_mempool_size > 0 {
+            cfg.rx_mempool_size
+        } else {
+            let mbuf_data_room = cfg.mbuf_data_room as u32;
+            // ceil(recv_buffer_bytes / mbuf_data_room); mbuf_data_room is
+            // non-zero (default 2048) so the `+ mbuf_data_room - 1` form
+            // never wraps. Saturating as belt-and-suspenders against a
+            // future knob-validator that might allow smaller values.
+            let per_conn = cfg
+                .recv_buffer_bytes
+                .saturating_add(mbuf_data_room.saturating_sub(1))
+                / mbuf_data_room.max(1);
+            let computed = 2u32
+                .saturating_mul(cfg.max_connections)
+                .saturating_mul(per_conn)
+                .saturating_add(4096);
+            let floor = 4u32.saturating_mul(cfg.rx_ring_size as u32);
+            computed.max(floor)
+        };
+
         // Allocate three mempools per spec §7.1.
         let rx_mempool = Mempool::new_pktmbuf(
             &format!("rx_mp_{}", cfg.lcore_id),
-            cfg.rx_mempool_elems,
+            rx_mempool_size,
             256,
             0,
             cfg.mbuf_data_room + sys::RTE_PKTMBUF_HEADROOM as u16,
@@ -888,6 +942,7 @@ impl Engine {
         Ok(Self {
             counters,
             _rx_mempool: rx_mempool,
+            rx_mempool_size,
             tx_hdr_mempool,
             tx_data_mempool,
             our_mac,
@@ -1336,6 +1391,13 @@ impl Engine {
 
     pub fn counters(&self) -> &Counters {
         &self.counters
+    }
+
+    /// A6.6-7 Task 10: resolved RX mempool capacity (in mbufs).
+    /// Backing field for the `dpdk_net_rx_mempool_size()` FFI getter.
+    /// See `EngineConfig.rx_mempool_size` for the formula.
+    pub fn rx_mempool_size(&self) -> u32 {
+        self.rx_mempool_size
     }
 
     /// Slow-path: scrape ENA-PMD xstats (ENI allowances + per-queue

@@ -108,6 +108,18 @@ struct dpdk_net_engine_config_t {
    * §5.1 caution). 0 here specifically means "use PMD default".
    */
   uint8_t ena_miss_txc_to_sec;
+  /**
+   * A6.6-7 Task 10: RX mempool capacity in mbufs. `0` = compute
+   * default at `dpdk_net_engine_create` using:
+   *   max(4 * rx_ring_size,
+   *       2 * max_connections * ceil(recv_buffer_bytes / mbuf_data_room) + 4096)
+   * Assumes `mbuf_data_room == 2048` bytes (DPDK default); jumbo-frame
+   * deployments either raise `mbuf_data_room` or set this explicitly.
+   * The resolved value is retrievable post-create via
+   * `dpdk_net_rx_mempool_size()`. Non-zero caller value is used
+   * verbatim (no floor clamp).
+   */
+  uint32_t rx_mempool_size;
 };
 
 typedef uint64_t dpdk_net_conn_t;
@@ -474,6 +486,34 @@ void dpdk_net_flush(struct dpdk_net_engine *p);
 uint64_t dpdk_net_now_ns(struct dpdk_net_engine *_p);
 
 const struct dpdk_net_counters_t *dpdk_net_counters(struct dpdk_net_engine *p);
+
+/**
+ * A6.6-7 Task 10: returns the RX mempool capacity (in mbufs) in use on
+ * this engine. When the caller set `dpdk_net_engine_config_t.rx_mempool_size`
+ * to a non-zero value, that value is returned verbatim. When the caller
+ * left it zero, the returned value is the formula default computed at
+ * `dpdk_net_engine_create` time:
+ *
+ *   max(4 * rx_ring_size,
+ *       2 * max_connections * ceil(recv_buffer_bytes / mbuf_data_room) + 4096)
+ *
+ * where `mbuf_data_room` is the DPDK mbuf payload slot size (2048 bytes
+ * on the standard-MTU default). The `2 * max_conns * per_conn` term is
+ * "two full receive buffers' worth of mbufs per connection" so the RX
+ * path never blocks on mempool exhaustion when all connections
+ * concurrently hold a receive buffer of in-flight data; the `+ 4096`
+ * cushion covers LRO chains, retransmit backlog, and SYN/ACK spikes.
+ * The `4 * rx_ring_size` floor guarantees at least 4× the RX descriptor
+ * count to keep `rte_eth_rx_burst` fully refilled.
+ *
+ * Returns `UINT32_MAX` if `p` is null. Slow-path (reads a single `u32`
+ * field, no locks).
+ *
+ * # Safety
+ * `p` must be a valid Engine pointer obtained from
+ * `dpdk_net_engine_create`, or null.
+ */
+uint32_t dpdk_net_rx_mempool_size(const struct dpdk_net_engine *p);
 
 /**
  * Slow-path: trigger an ENA-PMD xstats scrape. Reads ENI

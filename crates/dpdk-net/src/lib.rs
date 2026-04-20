@@ -149,6 +149,13 @@ pub unsafe extern "C" fn dpdk_net_engine_create(
         tx_ring_size: 1024,
         rx_mempool_elems: 8192,
         mbuf_data_room: 2048,
+        // A6.6-7 Task 10: pass through caller knob as-is. `0` (the common
+        // case from a zero-initialized `dpdk_net_engine_config_t`) signals
+        // `Engine::new` to apply the formula default. Caller-supplied
+        // non-zero values go through verbatim — no zero-sentinel default
+        // at this layer, the substitution lives next to the formula in
+        // `Engine::new` so the two stay co-located.
+        rx_mempool_size: cfg.rx_mempool_size,
         local_ip: cfg.local_ip,
         gateway_ip: cfg.gateway_ip,
         gateway_mac: cfg.gateway_mac,
@@ -466,6 +473,45 @@ pub unsafe extern "C" fn dpdk_net_counters(p: *mut dpdk_net_engine) -> *const dp
         Some(e) => e.counters() as *const Counters as *const dpdk_net_counters_t,
         None => ptr::null(),
     }
+}
+
+/// A6.6-7 Task 10: returns the RX mempool capacity (in mbufs) in use on
+/// this engine. When the caller set `dpdk_net_engine_config_t.rx_mempool_size`
+/// to a non-zero value, that value is returned verbatim. When the caller
+/// left it zero, the returned value is the formula default computed at
+/// `dpdk_net_engine_create` time:
+///
+///   max(4 * rx_ring_size,
+///       2 * max_connections * ceil(recv_buffer_bytes / mbuf_data_room) + 4096)
+///
+/// where `mbuf_data_room` is the DPDK mbuf payload slot size (2048 bytes
+/// on the standard-MTU default). The `2 * max_conns * per_conn` term is
+/// "two full receive buffers' worth of mbufs per connection" so the RX
+/// path never blocks on mempool exhaustion when all connections
+/// concurrently hold a receive buffer of in-flight data; the `+ 4096`
+/// cushion covers LRO chains, retransmit backlog, and SYN/ACK spikes.
+/// The `4 * rx_ring_size` floor guarantees at least 4× the RX descriptor
+/// count to keep `rte_eth_rx_burst` fully refilled.
+///
+/// Returns `UINT32_MAX` if `p` is null. Slow-path (reads a single `u32`
+/// field, no locks).
+///
+/// # Safety
+/// `p` must be a valid Engine pointer obtained from
+/// `dpdk_net_engine_create`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn dpdk_net_rx_mempool_size(p: *const dpdk_net_engine) -> u32 {
+    if p.is_null() {
+        return u32::MAX;
+    }
+    // SAFETY: caller contract pins `p` to a valid
+    // `Box<OpaqueEngine>`-derived pointer. We go through `OpaqueEngine`
+    // (same as `engine_from_raw`) because `box_to_raw` wraps `Engine`
+    // in the opaque newtype. Taking a `*mut` → `&` is the same pattern
+    // `engine_from_raw` uses; the const-pointer signature just matches
+    // the "read-only inspector" intent.
+    let opaque: &OpaqueEngine = unsafe { &*(p as *const OpaqueEngine) };
+    opaque.0.rx_mempool_size()
 }
 
 /// Slow-path: trigger an ENA-PMD xstats scrape. Reads ENI

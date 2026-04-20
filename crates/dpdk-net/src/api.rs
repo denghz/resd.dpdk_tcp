@@ -64,6 +64,16 @@ pub struct dpdk_net_engine_config_t {
     /// disabling causes severe performance degradation (ENA README
     /// §5.1 caution). 0 here specifically means "use PMD default".
     pub ena_miss_txc_to_sec: u8,
+    /// A6.6-7 Task 10: RX mempool capacity in mbufs. `0` = compute
+    /// default at `dpdk_net_engine_create` using:
+    ///   max(4 * rx_ring_size,
+    ///       2 * max_connections * ceil(recv_buffer_bytes / mbuf_data_room) + 4096)
+    /// Assumes `mbuf_data_room == 2048` bytes (DPDK default); jumbo-frame
+    /// deployments either raise `mbuf_data_room` or set this explicitly.
+    /// The resolved value is retrievable post-create via
+    /// `dpdk_net_rx_mempool_size()`. Non-zero caller value is used
+    /// verbatim (no floor clamp).
+    pub rx_mempool_size: u32,
 }
 
 #[repr(C)]
