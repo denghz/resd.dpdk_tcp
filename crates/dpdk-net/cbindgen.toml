@@ -27,6 +27,7 @@ include = [
     "dpdk_net_engine_config_t",
     "dpdk_net_connect_opts_t",
     "dpdk_net_event_kind_t",
+    "dpdk_net_iovec_t",
     "dpdk_net_event_readable_t",
     "dpdk_net_event_error_t",
     "dpdk_net_event_timer_t",

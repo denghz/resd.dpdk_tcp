@@ -86,14 +86,6 @@ pub struct RecvQueue {
     /// A4: out-of-order segments buffered past the in-order point.
     /// Shares `cap` with `bytes`; `free_space_total` reports combined room.
     pub reorder: crate::tcp_reassembly::ReorderQueue,
-    /// A6.5 Task 4c: mbuf handle list pinning payload windows for the
-    /// current poll's READABLE events. Cleared at the start of each
-    /// `dpdk_net_poll` on the owning engine (not here); each stored
-    /// `MbufHandle` drops its held refcount on clear, releasing the
-    /// pin. The public `DPDK_NET_EVT_READABLE.data` pointer lives
-    /// inside one of these mbufs for the duration of the event-
-    /// emission window.
-    pub last_read_mbufs: smallvec::SmallVec<[crate::mempool::MbufHandle; 4]>,
 }
 
 impl RecvQueue {
@@ -102,7 +94,6 @@ impl RecvQueue {
             bytes: VecDeque::new(),
             cap,
             reorder: crate::tcp_reassembly::ReorderQueue::new(cap),
-            last_read_mbufs: smallvec::SmallVec::new(),
         }
     }
 
@@ -306,6 +297,23 @@ pub struct TcpConn {
     /// buckets on one cacheline. Updated after each `rtt_est.sample()`
     /// in `tcp_input.rs` (Task 15). Slow-path update (~5–10 ns).
     pub rtt_histogram: crate::rtt_histogram::RttHistogram,
+
+    /// A6.6 Task 7: segments popped from `recv.bytes` during the most
+    /// recent poll's `deliver_readable`, refcount-pinned until the NEXT
+    /// poll drains them at the top of `poll_once`. Backs the iovec
+    /// slice pointed at by the READABLE event. Full `InOrderSegment`
+    /// is retained (mbuf + offset + len), not just the mbuf handle —
+    /// the offset/len window is what `data_ptr()` reads at iovec
+    /// materialization time.
+    pub delivered_segments: smallvec::SmallVec<[InOrderSegment; 4]>,
+    /// A6.6 Task 7: scratch for iovec array materialization in
+    /// `deliver_readable`. Cleared at the top of each `deliver_readable`
+    /// call for the conn (before pushing new iovecs) and again at the
+    /// top of the NEXT `poll_once`. Capacity retained across polls.
+    /// Uses the core-side `DpdkNetIovec`; the FFI crate's
+    /// `dpdk_net_iovec_t` has identical `#[repr(C)]` layout (layout-
+    /// asserted in `crates/dpdk-net/src/api.rs`).
+    pub readable_scratch_iovecs: Vec<crate::iovec::DpdkNetIovec>,
 }
 
 impl TcpConn {
@@ -396,6 +404,11 @@ impl TcpConn {
             send_refused_pending: false,
             force_tw_skip: false,
             rtt_histogram: crate::rtt_histogram::RttHistogram::default(),
+            // A6.6 Task 7: per-conn scratch for READABLE iovec
+            // materialization + segment-ref holding. Both cleared at
+            // top of each `poll_once`; capacity retained across polls.
+            delivered_segments: smallvec::SmallVec::new(),
+            readable_scratch_iovecs: Vec::new(),
         }
     }
 

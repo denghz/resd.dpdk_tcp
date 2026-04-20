@@ -941,7 +941,7 @@ fn handle_established(
                     // bump is paired with the `MbufHandle::Drop` that
                     // runs when the segment is eventually popped +
                     // released by the consumer (via
-                    // `deliver_readable` → `last_read_mbufs` →
+                    // `deliver_readable` → `delivered_segments` →
                     // next-poll clear).
                     unsafe {
                         sys::shim_rte_mbuf_refcnt_update(ctx.mbuf.as_ptr(), 1);

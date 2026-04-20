@@ -107,10 +107,11 @@ unsafe impl Send for Mbuf {}
 /// refcount on drop, returning the mbuf to its mempool when the count
 /// reaches zero.
 ///
-/// Used by `TcpConn::recv::last_read_mbufs` to pin mbufs across an event
-/// emission window: the engine bumps refcount + wraps in `MbufHandle`
-/// when a READABLE event is queued; clearing `last_read_mbufs` at the
-/// start of the next poll drops every handle, releasing the pins.
+/// Used by `TcpConn::delivered_segments` (A6.6 T7) to pin mbufs across
+/// an event emission window: the engine bumps refcount + wraps in
+/// `MbufHandle` when a READABLE event is queued; clearing
+/// `delivered_segments` at the start of the next poll drops every
+/// handle, releasing the pins.
 ///
 /// Ownership contract: construction via `from_raw` transfers one
 /// refcount from the caller to the handle. Drop decrements that one

@@ -112,9 +112,36 @@ struct dpdk_net_engine_config_t {
 
 typedef uint64_t dpdk_net_conn_t;
 
+/**
+ * Scatter-gather view over a received in-order byte range.
+ * `base` points into a mempool-backed rte_mbuf data area; the pointer is
+ * only valid until the next `dpdk_net_poll` on the same engine.
+ *
+ * ABI: 16 bytes on 64-bit targets (x86_64, ARM64 Graviton). Not 32-bit
+ * compatible — Stage 1 targets are 64-bit only.
+ */
+struct dpdk_net_iovec_t {
+  const uint8_t *base;
+  uint32_t len;
+  uint32_t _pad;
+};
+
+/**
+ * READABLE event payload. `segs` points at an engine-owned array of
+ * `dpdk_net_iovec_t` with `n_segs` entries. Multi-segment when chained
+ * mbufs were received (LRO / jumbo / IP-defragmented); single-segment
+ * for standard MTU packets. `total_len = Σ segs[i].len`.
+ *
+ * Lifetime: `segs` and every `segs[i].base` pointer are only valid
+ * until the next `dpdk_net_poll` on the same engine. The engine reuses
+ * per-conn scratch for the array; the backing mbufs are refcount-
+ * pinned in the connection's `delivered_segments` and released at the
+ * next poll iteration.
+ */
 struct dpdk_net_event_readable_t {
-  const uint8_t *data;
-  uint32_t data_len;
+  const struct dpdk_net_iovec_t *segs;
+  uint32_t n_segs;
+  uint32_t total_len;
 };
 
 struct dpdk_net_event_error_t {

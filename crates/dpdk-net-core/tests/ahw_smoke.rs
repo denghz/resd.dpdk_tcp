@@ -218,25 +218,25 @@ fn ahw_sw_fallback_counters_and_correctness() {
             all_events.push(ev.clone());
             if let InternalEvent::Readable {
                 conn,
-                mbuf_idx,
-                payload_offset,
-                payload_len,
+                seg_idx_start,
+                seg_count,
                 ..
             } = ev
             {
                 if *conn == handle {
                     let ft = engine.flow_table();
                     if let Some(c) = ft.get(handle) {
-                        let idx = *mbuf_idx as usize;
-                        let mbuf_ptr = c.recv.last_read_mbufs[idx].as_ptr();
-                        let data_ptr = unsafe {
-                            (dpdk_net_sys::shim_rte_pktmbuf_data(mbuf_ptr) as *const u8)
-                                .add(*payload_offset as usize)
-                        };
-                        let slice = unsafe {
-                            std::slice::from_raw_parts(data_ptr, *payload_len as usize)
-                        };
-                        echoed.extend_from_slice(slice);
+                        // A6.6 T7/T8: iovec slice lives in the conn's
+                        // `readable_scratch_iovecs`; each entry's
+                        // `base`/`len` is the delivered payload window.
+                        let start = *seg_idx_start as usize;
+                        let end = start + *seg_count as usize;
+                        for iovec in &c.readable_scratch_iovecs[start..end] {
+                            let slice = unsafe {
+                                std::slice::from_raw_parts(iovec.base, iovec.len as usize)
+                            };
+                            echoed.extend_from_slice(slice);
+                        }
                     }
                 }
             }
@@ -530,25 +530,25 @@ fn ahw_sw_only_counters_and_correctness() {
             all_events.push(ev.clone());
             if let InternalEvent::Readable {
                 conn,
-                mbuf_idx,
-                payload_offset,
-                payload_len,
+                seg_idx_start,
+                seg_count,
                 ..
             } = ev
             {
                 if *conn == handle {
                     let ft = engine.flow_table();
                     if let Some(c) = ft.get(handle) {
-                        let idx = *mbuf_idx as usize;
-                        let mbuf_ptr = c.recv.last_read_mbufs[idx].as_ptr();
-                        let data_ptr = unsafe {
-                            (dpdk_net_sys::shim_rte_pktmbuf_data(mbuf_ptr) as *const u8)
-                                .add(*payload_offset as usize)
-                        };
-                        let slice = unsafe {
-                            std::slice::from_raw_parts(data_ptr, *payload_len as usize)
-                        };
-                        echoed.extend_from_slice(slice);
+                        // A6.6 T7/T8: iovec slice lives in the conn's
+                        // `readable_scratch_iovecs`; each entry's
+                        // `base`/`len` is the delivered payload window.
+                        let start = *seg_idx_start as usize;
+                        let end = start + *seg_count as usize;
+                        for iovec in &c.readable_scratch_iovecs[start..end] {
+                            let slice = unsafe {
+                                std::slice::from_raw_parts(iovec.base, iovec.len as usize)
+                            };
+                            echoed.extend_from_slice(slice);
+                        }
                     }
                 }
             }

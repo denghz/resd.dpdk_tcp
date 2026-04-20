@@ -402,8 +402,9 @@ pub struct Engine {
     /// A6.5 Task 10: per-poll scratch for iterating connection handles
     /// out of `flow_table` when the loop body needs `get_mut`-level
     /// access that would conflict with the `iter_handles` borrow. Two
-    /// sites use this today — `poll_once`'s per-conn `last_read_mbufs`
-    /// clear, and `reap_time_wait`'s TIME_WAIT candidate filter. N=8
+    /// sites use this today — `poll_once`'s top-of-poll drain of each
+    /// conn's `delivered_segments` + `readable_scratch_iovecs` (A6.6
+    /// T8), and `reap_time_wait`'s TIME_WAIT candidate filter. N=8
     /// matches the default `max_connections=16` with a cushion; larger
     /// connection counts spill to heap only on the slow path (spill
     /// would bump the audit counter on one poll, which is fine).
@@ -1628,10 +1629,12 @@ impl Engine {
     }
 
     /// One iteration of the run-to-completion loop.
-    /// A3: clears each conn's per-poll `last_read_mbufs` list (dropping
-    /// the held `MbufHandle` refcounts), drains an RX burst, dispatches
-    /// frames through the L2/L3/TCP pipeline, then reaps any TIME_WAIT
-    /// flows past their 2×MSL deadline.
+    /// A6.6 T8: clears each conn's per-poll `delivered_segments`
+    /// (dropping the held `MbufHandle` refcounts) and
+    /// `readable_scratch_iovecs` (invalidating prior-poll iovec
+    /// pointers), drains an RX burst, dispatches frames through the
+    /// L2/L3/TCP pipeline, then reaps any TIME_WAIT flows past their
+    /// 2×MSL deadline.
     pub fn poll_once(&self) -> usize {
         use crate::counters::{add, inc};
         use std::sync::atomic::Ordering;
@@ -1643,15 +1646,15 @@ impl Engine {
         self.rx_drop_nomem_prev
             .set(self.counters.eth.rx_drop_nomem.load(Ordering::Relaxed));
 
-        // Clear per-conn last_read_mbufs so prior event-window mbuf
-        // pins are released (MbufHandle::Drop decrements refcount) per
-        // spec §4.2, before any rx_frame dispatches can push fresh
-        // refs this iteration.
+        // A6.6 T8: release the previous poll's delivered mbuf refs and
+        // clear the per-conn scratch iovec arrays — enforces the "valid
+        // until next dpdk_net_poll" contract at the C ABI boundary per
+        // spec §4.2, before any rx_frame dispatches can push fresh refs
+        // this iteration.
         //
-        // A6.5 Task 10: use the Engine-owned `conn_handles_scratch`
-        // SmallVec instead of a fresh `Vec<_>::new()`. This runs on
-        // every poll, so a per-poll heap allocation was surfaced by
-        // the bench-alloc-audit sweep.
+        // A6.5 Task 10 (carried forward): reuse Engine-owned
+        // `conn_handles_scratch` SmallVec instead of allocating a fresh
+        // `Vec<_>` each poll — surfaced by the bench-alloc-audit sweep.
         {
             let mut ft = self.flow_table.borrow_mut();
             let mut handles = self.conn_handles_scratch.borrow_mut();
@@ -1659,7 +1662,8 @@ impl Engine {
             handles.extend(ft.iter_handles());
             for h in handles.drain(..) {
                 if let Some(c) = ft.get_mut(h) {
-                    c.recv.last_read_mbufs.clear();
+                    c.delivered_segments.clear();
+                    c.readable_scratch_iovecs.clear();
                 }
             }
         }
@@ -3266,13 +3270,15 @@ impl Engine {
         }
 
         if outcome.delivered > 0 {
-            // A6.6 Task 3: segments (both in-order + drained) landed in
-            // `conn.recv.bytes` at tcp_input ingest; `deliver_readable`
-            // pops up to `outcome.delivered` bytes' worth of segments,
-            // transferring their owned mbuf refcounts to
-            // `last_read_mbufs` and emitting one READABLE event per
-            // popped segment. The pre-T3 `rx_mbuf` + `drained_mbufs`
-            // refcount bookkeeping moved to tcp_input ingest.
+            // A6.6 Task 3/T7/T8: segments (both in-order + drained)
+            // landed in `conn.recv.bytes` at tcp_input ingest;
+            // `deliver_readable` pops up to `outcome.delivered` bytes'
+            // worth of segments into `conn.delivered_segments`,
+            // materializes a scatter-gather iovec slice into
+            // `conn.readable_scratch_iovecs`, and emits a single
+            // READABLE event covering the full slice. The pre-T3
+            // `rx_mbuf` + `drained_mbufs` refcount bookkeeping moved
+            // to tcp_input ingest.
             self.deliver_readable(handle, outcome.delivered, hw_rx_ts);
         }
 
@@ -3606,30 +3612,33 @@ impl Engine {
         }
     }
 
-    /// A6.6 Task 3: pop up to `total_delivered` bytes' worth of
-    /// `InOrderSegment` entries from `conn.recv.bytes`, transferring
-    /// their owned mbuf refcounts into `conn.recv.last_read_mbufs` and
-    /// emitting one READABLE event per popped segment.
+    /// A6.6 Task 3 + T7/T8/T9: pop up to `total_delivered` bytes' worth
+    /// of `InOrderSegment` entries from `conn.recv.bytes` into
+    /// `conn.delivered_segments`, materialize a scatter-gather iovec
+    /// slice into `conn.readable_scratch_iovecs`, then emit a SINGLE
+    /// `Event::Readable` covering the full slice.
     ///
-    /// Ownership model post-T3:
+    /// Ownership model post-T7:
     /// - Segments in `recv.bytes` each own exactly one mbuf refcount
     ///   (bumped at tcp_input ingest on the in-order append, or
     ///   transferred via `DrainedMbuf::into_handle()` on the gap-close
     ///   drain).
     /// - Popping a segment transfers ownership from `recv.bytes` to
-    ///   `last_read_mbufs`; no explicit refcount op.
+    ///   `conn.delivered_segments`; no explicit refcount op.
     /// - Partial-segment split (when the segment overshoots the
     ///   remaining `total_delivered` budget) uses
     ///   `MbufHandle::try_clone()` to produce a fresh refcount for the
     ///   delivered portion; the in-queue portion keeps its existing
-    ///   refcount.
-    /// - `last_read_mbufs.clear()` at next `dpdk_net_poll` drops each
-    ///   handle, releasing the pin.
+    ///   refcount and advances its offset / shrinks its len.
+    /// - Top-of-next-`poll_once` clears `conn.delivered_segments`
+    ///   (dropping refcounts via `MbufHandle::Drop`) and
+    ///   `conn.readable_scratch_iovecs` (invalidating the pointers
+    ///   returned at the ABI boundary).
     ///
     /// `rx_hw_ts_ns`: NIC-provided RX timestamp captured at the per-
     /// mbuf decode boundary in `poll_once` and threaded through the
-    /// RX frame path. Stored on each `Readable` event verbatim. `0`
-    /// on ENA / feature-off (spec §10.3, §10.5).
+    /// RX frame path. Stored on the emitted `Readable` event verbatim.
+    /// `0` on ENA / feature-off (spec §10.3, §10.5).
     ///
     /// The pre-T3 `rx_mbuf` / `in_order_len` / `drained_mbufs`
     /// parameters are retired here: both the in-order append and the
@@ -3653,68 +3662,82 @@ impl Engine {
             return;
         };
 
-        let mut events = self.events.borrow_mut();
+        // A6.6 T7/T8: pop into `delivered_segments`, preserving offset
+        // + len windows. The front segment's existing refcount is moved
+        // on full pop; partial pop bumps via `try_clone` and keeps the
+        // remainder in `recv.bytes`.
+        conn.delivered_segments.clear();
         let mut remaining = total_delivered;
         while remaining > 0 {
-            let Some(front) = conn.recv.bytes.front_mut() else {
-                // Invariant break: `total_delivered` was > 0 but
-                // `recv.bytes` drained early. Log via counter? For T3
-                // we just stop — the accounting above (`rcv_nxt`
-                // advanced, `tcp.recv_buf_delivered` credit) remains
-                // consistent with the pop we managed.
-                break;
-            };
-            let seg_len = front.len as u32;
-            if seg_len <= remaining {
-                // Full pop: the segment's refcount transfers from
-                // `recv.bytes` to `last_read_mbufs`.
-                let seg = conn.recv.bytes.pop_front().unwrap();
-                let payload_offset = seg.offset as u32;
-                let payload_len = seg.len as u32;
-                let mbuf_idx = conn.recv.last_read_mbufs.len() as u32;
-                conn.recv.last_read_mbufs.push(seg.mbuf);
-                events.push(
-                    InternalEvent::Readable {
-                        conn: handle,
-                        mbuf_idx,
-                        payload_offset,
-                        payload_len,
-                        rx_hw_ts_ns,
-                        emitted_ts_ns: crate::clock::now_ns(),
-                    },
-                    &self.counters,
-                );
-                remaining -= seg_len;
-            } else {
-                // Partial pop: split the front segment. The delivered
-                // portion gets a fresh refcount via `try_clone`; the
-                // in-queue portion keeps its existing refcount and
-                // advances `offset` / shrinks `len` to cover the
-                // remaining window.
-                let take = remaining as u16;
-                let payload_offset = front.offset as u32;
-                let payload_len = take as u32;
-                let delivered_handle = front.mbuf.try_clone();
-                // Advance the in-queue segment past the delivered
-                // window. Overflow-safe: `take <= front.len` and
-                // `front.offset + front.len` fits u16 by construction.
-                front.offset = front.offset.saturating_add(take);
-                front.len -= take;
-                let mbuf_idx = conn.recv.last_read_mbufs.len() as u32;
-                conn.recv.last_read_mbufs.push(delivered_handle);
-                events.push(
-                    InternalEvent::Readable {
-                        conn: handle,
-                        mbuf_idx,
-                        payload_offset,
-                        payload_len,
-                        rx_hw_ts_ns,
-                        emitted_ts_ns: crate::clock::now_ns(),
-                    },
-                    &self.counters,
-                );
-                remaining = 0;
+            match conn.recv.bytes.front() {
+                None => {
+                    // Invariant break: `total_delivered` was > 0 but
+                    // `recv.bytes` drained early. Stop quietly — the
+                    // accounting above (`rcv_nxt` advanced,
+                    // `tcp.recv_buf_delivered` credit) remains
+                    // consistent with what we managed to pop.
+                    break;
+                }
+                Some(seg) if seg.len as u32 <= remaining => {
+                    remaining -= seg.len as u32;
+                    let popped = conn.recv.bytes.pop_front().unwrap();
+                    conn.delivered_segments.push(popped);
+                }
+                Some(_seg) => {
+                    // Partial pop: split the front segment. The
+                    // delivered portion gets a fresh refcount via
+                    // `try_clone`; the in-queue portion keeps its
+                    // existing refcount and advances `offset` /
+                    // shrinks `len` to cover the remaining window.
+                    let split_off = remaining as u16;
+                    let front = conn.recv.bytes.front_mut().unwrap();
+                    let delivered_offset = front.offset;
+                    let split_mbuf = front.mbuf.try_clone();
+                    front.offset = front.offset.saturating_add(split_off);
+                    front.len = front.len.saturating_sub(split_off);
+                    conn.delivered_segments.push(crate::tcp_conn::InOrderSegment {
+                        mbuf: split_mbuf,
+                        offset: delivered_offset,
+                        len: split_off,
+                    });
+                    remaining = 0;
+                }
             }
+        }
+
+        // A6.6 T8: materialize the iovec array for this READABLE event
+        // into the per-conn scratch. Capacity is retained across polls
+        // (§7.6 scratch-reuse policy); `.clear()` keeps it but discards
+        // stale pointers from the previous event's emission.
+        conn.readable_scratch_iovecs.clear();
+        let mut total_len: u32 = 0;
+        for seg in &conn.delivered_segments {
+            conn.readable_scratch_iovecs.push(crate::iovec::DpdkNetIovec {
+                base: seg.data_ptr(),
+                len: seg.len as u32,
+                _pad: 0,
+            });
+            total_len = total_len.saturating_add(seg.len as u32);
+        }
+        let seg_count = conn.readable_scratch_iovecs.len() as u32;
+
+        // A6.6 T9: single READABLE event covers the full iovec slice.
+        // `seg_idx_start` is always 0 — scratch is cleared at the top
+        // of this call and we only emit one event per deliver_readable
+        // invocation.
+        let mut events = self.events.borrow_mut();
+        if seg_count > 0 {
+            events.push(
+                InternalEvent::Readable {
+                    conn: handle,
+                    seg_idx_start: 0,
+                    seg_count,
+                    total_len,
+                    rx_hw_ts_ns,
+                    emitted_ts_ns: crate::clock::now_ns(),
+                },
+                &self.counters,
+            );
         }
         drop(events);
         drop(ft);

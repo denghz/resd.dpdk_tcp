@@ -122,11 +122,44 @@ pub enum dpdk_net_event_kind_t {
     DPDK_NET_EVT_TCP_STATE_CHANGE = 9,
 }
 
+/// Scatter-gather view over a received in-order byte range.
+/// `base` points into a mempool-backed rte_mbuf data area; the pointer is
+/// only valid until the next `dpdk_net_poll` on the same engine.
+///
+/// ABI: 16 bytes on 64-bit targets (x86_64, ARM64 Graviton). Not 32-bit
+/// compatible — Stage 1 targets are 64-bit only.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct dpdk_net_iovec_t {
+    pub base: *const u8,
+    pub len: u32,
+    pub _pad: u32,
+}
+
+// Layout-compat assertion: the FFI struct and the core-crate struct MUST
+// agree on size, alignment, and field offsets. Any drift breaks the ABI.
+const _: () = {
+    use dpdk_net_core::iovec::DpdkNetIovec;
+    assert!(std::mem::size_of::<dpdk_net_iovec_t>() == std::mem::size_of::<DpdkNetIovec>());
+    assert!(std::mem::align_of::<dpdk_net_iovec_t>() == std::mem::align_of::<DpdkNetIovec>());
+};
+
+/// READABLE event payload. `segs` points at an engine-owned array of
+/// `dpdk_net_iovec_t` with `n_segs` entries. Multi-segment when chained
+/// mbufs were received (LRO / jumbo / IP-defragmented); single-segment
+/// for standard MTU packets. `total_len = Σ segs[i].len`.
+///
+/// Lifetime: `segs` and every `segs[i].base` pointer are only valid
+/// until the next `dpdk_net_poll` on the same engine. The engine reuses
+/// per-conn scratch for the array; the backing mbufs are refcount-
+/// pinned in the connection's `delivered_segments` and released at the
+/// next poll iteration.
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct dpdk_net_event_readable_t {
-    pub data: *const u8,
-    pub data_len: u32,
+    pub segs: *const dpdk_net_iovec_t,
+    pub n_segs: u32,
+    pub total_len: u32,
 }
 
 #[repr(C)]
