@@ -381,6 +381,28 @@ pub fn eal_init(args: &[&str]) -> Result<(), Error> {
     if *guard {
         return Ok(());
     }
+
+    // A-HW Task 12 fixup (2026-04-20): inject `--log-level=pmd.net.ena.driver,info`
+    // when `hw-verify-llq` is compile-enabled. The ENA PMD registers its
+    // `pmd.net.ena.driver` logtype at NOTICE (level 6) by default, which
+    // silences the INFO-level "Placement policy: Low latency" marker —
+    // the exact marker the LLQ verifier needs. Overriding the logtype to
+    // INFO (level 7) lets the marker through without raising the global
+    // log level (which would flood stderr with unrelated telemetry).
+    // Appended to the caller's args; DPDK processes args in order and
+    // last-wins for log-level overrides of the same logtype. Confirmed
+    // at DPDK 23.11 via drivers/net/ena/ena_ethdev.c:3945-3953.
+    #[cfg(feature = "hw-verify-llq")]
+    let _llq_log_override = "--log-level=pmd.net.ena.driver,info".to_string();
+    #[cfg(feature = "hw-verify-llq")]
+    let effective_args: Vec<&str> = {
+        let mut v: Vec<&str> = args.to_vec();
+        v.push(&_llq_log_override);
+        v
+    };
+    #[cfg(feature = "hw-verify-llq")]
+    let args = &effective_args[..];
+
     let cstrs: Vec<CString> = args.iter().map(|s| CString::new(*s).unwrap()).collect();
     let mut argv: Vec<*mut libc::c_char> = cstrs.iter().map(|c| c.as_ptr() as *mut _).collect();
 

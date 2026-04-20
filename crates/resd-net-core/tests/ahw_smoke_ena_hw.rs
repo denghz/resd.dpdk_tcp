@@ -247,7 +247,13 @@ fn ahw_ena_hw_path_banner_and_counters() {
         "--huge-unlink",
         "-a",
         &bdf_allowlist,
-        "--log-level=3",
+        // `eal_init` internally injects `--log-level=pmd.net.ena.driver,info`
+        // when `hw-verify-llq` is on so the LLQ verifier can see the
+        // INFO-level "Placement policy" marker. We do NOT set a lower
+        // global `--log-level` here because DPDK's default global level
+        // is INFO (7), and `rte_log` requires BOTH global AND component
+        // filters to pass — a lower global level would suppress INFO
+        // messages even with the component override in place.
     ];
     eal_init(&args).expect("EAL init on ENA VF");
 
@@ -418,17 +424,20 @@ fn ahw_ena_hw_path_banner_and_counters() {
         1,
         "ENA does NOT advertise RX_OFFLOAD_RSS_HASH (parent §8.2)"
     );
-    // LLQ verification uses a soft-skip when the rte_openlog_stream-based
-    // capture comes back empty (llq_verify.rs record_eal_init_log_verdict).
-    // On real ENA + DPDK 23.11 the capture mechanism returns empty in our
-    // container environment, so the verifier soft-skips and the counter
-    // stays 0. A future capture-mechanism rework (switch to stderr dup2
-    // or rte_log callback) would close this gap.
+    // LLQ verification is actively validated on real ENA (verified
+    // 2026-04-20, DPDK 23.11): `eal_init` injects
+    // `--log-level=pmd.net.ena.driver,info` so the ENA PMD's
+    // "Placement policy: Low latency" marker emits into the captured
+    // log. The verifier then matches the activation marker and counter
+    // stays 0. If the capture mechanism ever degenerates (e.g. returns
+    // empty), `record_eal_init_log_verdict` soft-skips rather than
+    // false-failing — still counter = 0.
     assert_eq!(
         c.eth.offload_missing_llq.load(Ordering::Relaxed),
         0,
-        "LLQ verifier either confirms activation (counter 0) or \
-         soft-skips on empty capture (counter 0). See llq_verify.rs."
+        "ENA PMD default enable_llq=1 activates LLQ; Task 12 verifier \
+         captures 'Placement policy: Low latency' at EAL init and \
+         confirms activation."
     );
 
     // THE documented exception: ENA does NOT register
