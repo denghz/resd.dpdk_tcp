@@ -399,6 +399,38 @@ pub struct Engine {
     /// §7.6. N=8 covers observed P99 per-connection timer depth.
     pub(crate) timer_ids_scratch: RefCell<SmallVec<[crate::tcp_timer_wheel::TimerId; 8]>>,
 
+    /// A6.5 Task 10: per-poll scratch for iterating connection handles
+    /// out of `flow_table` when the loop body needs `get_mut`-level
+    /// access that would conflict with the `iter_handles` borrow. Two
+    /// sites use this today — `poll_once`'s per-conn `last_read_mbufs`
+    /// clear, and `reap_time_wait`'s TIME_WAIT candidate filter. N=8
+    /// matches the default `max_connections=16` with a cushion; larger
+    /// connection counts spill to heap only on the slow path (spill
+    /// would bump the audit counter on one poll, which is fine).
+    pub(crate) conn_handles_scratch:
+        RefCell<SmallVec<[crate::flow_table::ConnHandle; 8]>>,
+
+    /// A6.5 Task 10: per-ACK scratch for mbuf pointers pruned from a
+    /// connection's `snd_retrans` queue. Needed because
+    /// `sys::shim_rte_pktmbuf_free` must be called OUTSIDE the
+    /// `flow_table` RefCell mut-borrow (FFI call sites rule), and the
+    /// old `prune_below -> SmallVec<[RetransEntry;8]>` allocated a
+    /// fresh SmallVec that grew past inline capacity under sustained
+    /// in-flight > 8 segments (the A6.5 audit sampled this path in
+    /// `SendRetrans::prune_below` at tcp_retrans.rs:73). We replace
+    /// the owning-SmallVec with `prune_below_into_mbufs`, which
+    /// drains raw pointers into this engine-scoped scratch so the
+    /// capacity is preserved across polls.
+    pub(crate) pruned_mbufs_scratch:
+        RefCell<SmallVec<[std::ptr::NonNull<sys::rte_mbuf>; 16]>>,
+
+    /// A6.5 Task 10: scratch for `rack_mark_losses_on_rto_into` so the
+    /// RTO-fire handler does not freshly allocate a `Vec<u16>` per
+    /// fire. RTOs are rare under steady-state traffic but the audit
+    /// still needs "zero per unit time", so any rare-event alloc that
+    /// crosses the measurement window surfaces as a regression.
+    pub(crate) rack_lost_idxs_scratch: RefCell<Vec<u16>>,
+
     /// A6 (spec §3.6 Site 3): snapshot of `counters.eth.rx_drop_nomem`
     /// at the top of `poll_once`; compared against the post-RX value at
     /// end-of-poll to emit exactly one `Error{err=-ENOMEM}` per iteration
@@ -875,6 +907,18 @@ impl Engine {
                     + 40,
             )),
             timer_ids_scratch: RefCell::new(SmallVec::new()),
+            conn_handles_scratch: RefCell::new(SmallVec::new()),
+            // Pre-allocate the heap-spill past inline-16 at creation
+            // time so steady-state prune counts (which depend on
+            // cwnd × MSS / send_buffer, and in the audit workload
+            // reliably exceed 16) do not trigger a first-doubling
+            // during the measurement window.
+            pruned_mbufs_scratch: RefCell::new(SmallVec::with_capacity(256)),
+            // A6.5 Task 10: pre-size to `max_in_flight` so the first RTO
+            // fire after startup does not grow the Vec. A typical
+            // trading workload keeps in-flight ≤ 64; capacity 64 covers
+            // the P99 without visibly warming.
+            rack_lost_idxs_scratch: RefCell::new(Vec::with_capacity(64)),
             rx_drop_nomem_prev: std::cell::Cell::new(0),
             tx_cksum_offload_active: outcome.tx_cksum_offload_active,
             rx_cksum_offload_active: outcome.rx_cksum_offload_active,
@@ -1603,10 +1647,17 @@ impl Engine {
         // pins are released (MbufHandle::Drop decrements refcount) per
         // spec §4.2, before any rx_frame dispatches can push fresh
         // refs this iteration.
+        //
+        // A6.5 Task 10: use the Engine-owned `conn_handles_scratch`
+        // SmallVec instead of a fresh `Vec<_>::new()`. This runs on
+        // every poll, so a per-poll heap allocation was surfaced by
+        // the bench-alloc-audit sweep.
         {
             let mut ft = self.flow_table.borrow_mut();
-            let handles: Vec<_> = ft.iter_handles().collect();
-            for h in handles {
+            let mut handles = self.conn_handles_scratch.borrow_mut();
+            handles.clear();
+            handles.extend(ft.iter_handles());
+            for h in handles.drain(..) {
                 if let Some(c) = ft.get_mut(h) {
                     c.recv.last_read_mbufs.clear();
                 }
@@ -1928,24 +1979,33 @@ impl Engine {
         // always matches the `seq == snd_una` clause when snd_retrans
         // is non-empty), fall back to A5 front-only retransmit to
         // avoid regression.
-        let lost_indexes = {
+        // A6.5 Task 10: drain lost indexes into the engine-scoped
+        // `rack_lost_idxs_scratch` rather than allocating a fresh
+        // Vec per RTO fire. The scratch's capacity saturates to the
+        // worst in-flight-depth observed across the lifetime of the
+        // engine; subsequent fires reuse the same allocation.
+        {
+            let mut scratch = self.rack_lost_idxs_scratch.borrow_mut();
+            scratch.clear();
             let ft = self.flow_table.borrow();
             let Some(c) = ft.get(handle) else { return };
             let rtt_us = c.rtt_est.srtt_us().unwrap_or(c.rack.min_rtt_us);
             let reo_wnd = c.rack.reo_wnd_us;
             let now_us = (crate::clock::now_ns() / 1_000) as u32;
-            crate::tcp_rack::rack_mark_losses_on_rto(
+            crate::tcp_rack::rack_mark_losses_on_rto_into(
                 &c.snd_retrans.entries,
                 c.snd_una,
                 rtt_us,
                 reo_wnd,
                 now_us,
-            )
-        };
+                &mut scratch,
+            );
+        }
         {
             let mut ft = self.flow_table.borrow_mut();
             if let Some(c) = ft.get_mut(handle) {
-                for &idx in &lost_indexes {
+                let scratch = self.rack_lost_idxs_scratch.borrow();
+                for &idx in scratch.iter() {
                     if let Some(e) = c.snd_retrans.entries.get_mut(idx as usize) {
                         e.lost = true;
                     }
@@ -1959,11 +2019,24 @@ impl Engine {
         // passes don't see stale flags. `tx_rto` bumps exactly once
         // per fire — preserves A5 one-RTO-fire-counter semantics
         // (one `tx_rto` + N `tx_retrans`).
-        if lost_indexes.is_empty() {
+        let lost_is_empty = self.rack_lost_idxs_scratch.borrow().is_empty();
+        if lost_is_empty {
             // Defensive fallback — helper should always pick the front.
             self.retransmit(handle, 0);
         } else {
-            for &idx in &lost_indexes {
+            // Clone indexes into a small local so `retransmit` (which
+            // re-borrows the engine) doesn't conflict with the scratch
+            // borrow. Typical RTO-recovery burst is ≤ `max_in_flight`;
+            // in our test corpus that's small enough to stack-inline.
+            // We read-copy into a SmallVec; inline-cap 16 covers common
+            // bursts, growth is a one-shot rare event.
+            let indexes: smallvec::SmallVec<[u16; 16]> = self
+                .rack_lost_idxs_scratch
+                .borrow()
+                .iter()
+                .copied()
+                .collect();
+            for &idx in indexes.iter() {
                 self.retransmit(handle, idx as usize);
             }
         }
@@ -1989,14 +2062,14 @@ impl Engine {
                     Some(c) => c,
                     None => return,
                 };
-                if lost_indexes.is_empty() {
+                let lost = self.rack_lost_idxs_scratch.borrow();
+                if lost.is_empty() {
                     c.snd_retrans
                         .front()
                         .map(|e| smallvec![(e.seq, e.xmit_count as u32)])
                         .unwrap_or_default()
                 } else {
-                    lost_indexes
-                        .iter()
+                    lost.iter()
                         .filter_map(|&i| {
                             c.snd_retrans
                                 .entries
@@ -2396,27 +2469,55 @@ impl Engine {
     /// ≤100 connections; A6's timer wheel replaces this.
     fn reap_time_wait(&self) {
         let now = crate::clock::now_ns();
-        let candidates: Vec<_> = {
+        // A6.5 Task 10: reuse Engine-owned `conn_handles_scratch`
+        // instead of allocating a fresh `Vec<_>` per poll. On the hot
+        // path this typically stays empty (no TIME_WAIT candidates),
+        // but the prior `.collect::<Vec<_>>()` allocated an 8-cap Vec
+        // regardless via the iterator's `size_hint`, surfacing as a
+        // per-poll heap alloc under the bench-alloc-audit sweep.
+        //
+        // We unfold the filter-collect into a push loop so the filter
+        // body can short-circuit without holding a closure borrow on
+        // the scratch.
+        {
+            let mut candidates = self.conn_handles_scratch.borrow_mut();
+            candidates.clear();
             let ft = self.flow_table.borrow();
-            ft.iter_handles()
-                .filter(|h| {
-                    let Some(c) = ft.get(*h) else {
-                        return false;
-                    };
-                    // A6 Task 11: `force_tw_skip` (set by
-                    // `close_conn_with_flags` in Task 10 when `ts_enabled`
-                    // is true) short-circuits the 2×MSL wait so the
-                    // connection reaps on the next tick regardless of
-                    // `time_wait_deadline_ns`. Observability parity
-                    // preserved — the close path below still emits the
-                    // same StateChange + Closed events.
-                    c.state == TcpState::TimeWait
-                        && (c.force_tw_skip
-                            || c.time_wait_deadline_ns.is_some_and(|d| now >= d))
-                })
-                .collect()
-        };
-        for h in candidates {
+            for h in ft.iter_handles() {
+                let Some(c) = ft.get(h) else {
+                    continue;
+                };
+                // A6 Task 11: `force_tw_skip` (set by
+                // `close_conn_with_flags` in Task 10 when `ts_enabled`
+                // is true) short-circuits the 2×MSL wait so the
+                // connection reaps on the next tick regardless of
+                // `time_wait_deadline_ns`. Observability parity
+                // preserved — the close path below still emits the
+                // same StateChange + Closed events.
+                if c.state == TcpState::TimeWait
+                    && (c.force_tw_skip
+                        || c.time_wait_deadline_ns.is_some_and(|d| now >= d))
+                {
+                    candidates.push(h);
+                }
+            }
+        }
+        // Drain out of the scratch on each iteration so the scratch's
+        // `RefCell` borrow is released around the loop body — which
+        // transitions the conn (re-borrows `flow_table` mutably) and
+        // also re-borrows `conn_handles_scratch` is NOT required here
+        // because `transition_conn` uses a different scratch, but the
+        // pattern of releasing the scratch borrow across foreign calls
+        // keeps later edits safe. Uses `pop()` which is O(1) and does
+        // not reallocate.
+        loop {
+            let h = {
+                let mut candidates = self.conn_handles_scratch.borrow_mut();
+                match candidates.pop() {
+                    Some(h) => h,
+                    None => break,
+                }
+            };
             self.transition_conn(h, TcpState::Closed);
             self.events.borrow_mut().push(
                 InternalEvent::Closed {
@@ -2983,17 +3084,28 @@ impl Engine {
         //   4. mut-borrow timer_wheel to cancel, release.
         //   5. mut-borrow flow_table to clear rto/tlp_timer_id + prune timer_ids.
         if let Some(new_snd_una) = outcome.snd_una_advanced_to {
-            let dropped = {
+            // A6.5 Task 10: drain pruned mbuf pointers into the engine-
+            // scoped scratch so the per-ACK allocation is reused across
+            // polls. See `pruned_mbufs_scratch` docs for the audit
+            // finding this replaced. The scratch is borrowed inside
+            // (and released before) the FFI-free loop below, so no
+            // RefCell nesting is possible.
+            {
+                let mut scratch = self.pruned_mbufs_scratch.borrow_mut();
+                scratch.clear();
                 let mut ft = self.flow_table.borrow_mut();
                 if let Some(c) = ft.get_mut(handle) {
-                    c.snd_retrans.prune_below(new_snd_una)
-                } else {
-                    smallvec::SmallVec::new()
+                    c.snd_retrans
+                        .prune_below_into_mbufs(new_snd_una, &mut scratch);
                 }
-            };
-            for entry in dropped {
-                unsafe { sys::shim_rte_pktmbuf_free(entry.mbuf.as_ptr()) };
             }
+            {
+                let scratch = self.pruned_mbufs_scratch.borrow();
+                for p in scratch.iter() {
+                    unsafe { sys::shim_rte_pktmbuf_free(p.as_ptr()) };
+                }
+            }
+            self.pruned_mbufs_scratch.borrow_mut().clear();
             let (rto_id_to_cancel, tlp_id_to_cancel) = {
                 let ft = self.flow_table.borrow();
                 if let Some(c) = ft.get(handle) {
