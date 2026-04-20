@@ -20,6 +20,7 @@
 | A5.5 | Event-log forensics + in-flight introspection + TLP tuning (emission-time ts, queue overflow counter, stats getter, per-conn TLP knobs) | **Complete** ✓ | `2026-04-19-stage1-phase-a5-5-event-log-forensics-tlp-tuning.md` |
 | A-HW | ENA hardware offload enablement (LLQ verify + TX/RX checksum + MBUF_FAST_FREE + RSS-hash plumbing) | Not started | — |
 | A6 | Public API surface completeness **+ per-connection RTT histogram** (merged from former A5.6) | Not started | — |
+| A6.5 | Hot-path allocation elimination (reusable scratch, streaming csum, SmallVec, zero-copy reassembly) | Not started | — |
 | A6.6 | RX zero-copy (scatter-gather iovec API, in-order delivery-path mbuf-ref rework, LRO-compatible multi-segment, `rx_mempool_size` knob) | Not started | — |
 | A6.7 | FFI safety audit & hardening (miri, cbindgen header-drift CI, ABI snapshot, panic-firewall test, no-alloc-on-hot-path audit, C++ consumer under ASan/UBSan/LSan) | Not started | — |
 | A7 | Loopback test server + packetdrill-shim | Not started | — |
@@ -332,6 +333,54 @@ Per-connection RTT histogram (merged from A5.6):
 
 ---
 
+## A6.5 — Hot-path allocation elimination
+
+**Numbering note:** Inserted after A6 as a focused perf pack. Uses the decimal "A6.5" tag (per the A5.5 precedent) because the scope is cross-cutting hot-path cleanup that does not change public API and does not justify an integer bump that would shift A7–A14 references. Can run serially between A6 and A7, or in parallel with A7/A8 since there are no API-surface changes.
+
+**Goal:** Eliminate heap allocations on the RX, TX, per-ACK, and per-timer-tick hot paths so benchmark (A10) and steady-state production traffic do not allocate. Per-connection buffers sized at `connect()` remain; this phase targets allocations inside the poll loop.
+
+**Spec refs:** §7 (Memory and Buffer Model) — extends with a new §7.6 "Hot-path scratch reuse policy". §7.3 "Zero-copy path" — the reassembly payload-copy TODO is retired here. §9.1.1 counter-addition policy — analogous discipline for memory: hot-path allocations require the same level of justification as hot-path counters (i.e. none ship by default).
+
+**Deliverables:**
+
+Group 1 — reusable scratch buffers on `Engine`:
+- `Engine.tx_frame_scratch: RefCell<Vec<u8>>` with capacity retained across calls. `engine.rs:2472` `let mut frame = vec![0u8; 1600]` replaced by borrow + `clear()` + grow-if-smaller.
+- Scratch sized once at `engine_create` from `cfg.tcp_mss` + `FRAME_HDRS_MIN` + 40-byte TCP-options cushion.
+
+Group 2 — streaming Internet checksum (no concatenation buffer):
+- `l3_ip::internet_checksum` accepts a disjoint-slice iterator (e.g. `&[&[u8]]`) so TCP pseudo-header + header + payload fold without building a concatenated buffer.
+- `tcp_input::tcp_pseudo_csum` (`tcp_input.rs:102`) drops `Vec::with_capacity(12 + tcp_bytes.len())` and the preceding `scratch = tcp_bytes.to_vec()` (`tcp_input.rs:79`) — folds the pseudo-header + TCP bytes directly.
+- `tcp_output::tcp_checksum_split` (`tcp_output.rs:204`) drops `Vec::with_capacity(...)` — header and payload are already separate, streams in place.
+- Fuzz test (`tests/checksum_streaming_equiv.rs`): random byte sequences, reference (concatenating) implementation vs streaming fold match bit-for-bit across all alignments.
+
+Group 3 — `SmallVec` / caller-buffer for per-ACK and per-tick scratch:
+- `tcp_input.rs:675` `rack_lost_indexes: Vec<u16>` → `SmallVec<[u16; 16]>` (heap only on overflow; typical case ≤ a few losses).
+- `tcp_timer_wheel::fire_due` takes `&mut Vec<TimerId>` (caller-owned, `clear()`-ed per tick). `Engine` parks the buffer; `tcp_timer_wheel.rs:100, 102` `Vec::new()` sites retired.
+- `engine.rs:957` RACK loss-event tuple vec → `SmallVec<[(u32, u32); 4]>`.
+- `tcp_retrans::prune_below` (`tcp_retrans.rs:65`) `let mut dropped = Vec::new()` → in-place `mbuf_free` loop or `&mut SmallVec` from caller (drop the intermediate collection entirely).
+
+Group 4 — zero-copy RX reassembly (completes spec §7.3):
+- `tcp_reassembly.rs` refactor: reassembly holds `Mbuf` refs + offsets instead of `Vec<u8>` payload copies.
+- Removes `to_insert: Vec<(u32, Vec<u8>)>` (`tcp_reassembly.rs:86`) and the two `payload[off..off + take].to_vec()` copies (`tcp_reassembly.rs:102, 121`).
+- READABLE event pins referenced mbufs until the next `resd_net_poll`, consistent with §5.3 mbuf-lifetime contract.
+- Unit tests in `tests/tcp_options_paws_reassembly_sack_tap.rs` updated to assert ref-based reassembly (no byte copies observed via the alloc-audit harness from Group 5).
+
+Group 5 — verification + regression guard:
+- `tools/bench-alloc-hotpath/` — counting `GlobalAlloc` wrapper behind a new `bench-alloc-audit` cargo feature. 60-second steady-state send/recv loop post-warmup asserts `alloc_count_delta == 0`.
+- `tools/bench-obs-overhead/` (from A10) adopts the same wrapper so any reintroduced hot-path allocation fails the A10 regression gate. Report artifact `docs/superpowers/reports/alloc-hotpath.md` lists every hot-path call-site that was retired + the audit-run evidence.
+
+**Does NOT include:**
+- Per-connection `VecDeque<u8>` send/recv buffers sized at `connect()` and `Vec<TimerId> timer_ids` grown on timer-arm (`tcp_conn.rs:24, 59, 307`). One-shot per connection, not per-poll — out of scope.
+- Engine-creation allocations (`Box::new(Counters::new())`, DPDK mempools, timer-wheel slot vectors). Startup cost, irrelevant to steady state.
+- Custom `GlobalAlloc` replacement (bump allocator, arena). Not needed once the hot path does not touch the allocator; default system allocator remains.
+- `String::` / `format!` in error-path `Error` variants and slow-path logging. Slow-path by §9.1.1 classification.
+
+**Dependencies:** A6 (stable public-API event + mbuf-lifetime semantics so the reassembly refactor does not collide with ongoing event-contract changes). **Must land before A10** so the benchmark harness measures the alloc-free hot path, not an interim shape.
+
+**Rough scale:** ~15 tasks (~3 Group 1 + ~3 Group 2 + ~3 Group 3 + ~5 Group 4 + ~1 Group 5 bench-audit harness). Group 4 is the only structural refactor touching segment-lifetime invariants; the rest are mechanical.
+
+---
+
 ## A6.6 — RX zero-copy (scatter-gather, LRO-compatible)
 
 **Numbering note:** Inserted after A6.5 as the API-evolution half of the zero-copy RX story. A6.5 Group 4 retires internal `Vec<u8>` copies inside `tcp_reassembly.rs` (OOO path) and pins mbufs through the READABLE event — strictly internal. A6.6 evolves the *public* API to scatter-gather so chained mbufs (LRO / jumbo / IP-defragmented) deliver without a flatten copy, and finishes the in-order-delivery-path mbuf-ref rework that A6.5 Group 4 does not cover. Uses the "A6.6" decimal tag (A5.5 / A6.5 precedent) to avoid renumbering A7–A14.
@@ -533,7 +582,7 @@ Group 3 — audit artifacts:
 - CI: cargo-criterion per commit with 5% regression gate; nightly e2e on dedicated host (includes `bench-vs-mtcp`).
 - Measurement-discipline precondition check script: `isolcpus`, `nohz_full`, governor, TSC invariant, thermal-throttle detection.
 
-**Dependencies:** A6 (full API needed for meaningful e2e), A9 (FaultInjector used by bench-stress), A-HW (offloads must be enabled so benchmarks measure the production-shape hot path, not the Phase A1 zeroed-`eth_conf` path). `third_party/mtcp` already present from the A2 review-gate setup — no new submodule work.
+**Dependencies:** A6 (full API needed for meaningful e2e), A6.5 (hot path must be alloc-free so benchmarks measure production shape, not an interim allocator-touching path), A9 (FaultInjector used by bench-stress), A-HW (offloads must be enabled so benchmarks measure the production-shape hot path, not the Phase A1 zeroed-`eth_conf` path). `third_party/mtcp` already present from the A2 review-gate setup — no new submodule work.
 
 **Rough scale:** ~21 tasks (+6 for the mTCP comparator: build integration, peer wiring, `burst` grid runner, `maxtp` grid runner, measurement-contract harness with HW TX timestamps + TSC, result/CSV plumbing; +5 for `bench-offload-ab`: feature-matrix rebuild driver, fresh-engine run loop, percentile + CI computation, per-offload decision-rule evaluator, report writer; +3 for `bench-obs-overhead`: introduce `obs-none` umbrella feature + gate the always-on emission sites, observability-specific matrix entries reusing `bench-offload-ab`'s driver, report writer with re-evaluation table).
 
