@@ -34,6 +34,28 @@ pub struct ParsedSegment<'a> {
     pub options: &'a [u8],
 }
 
+/// A6.5 Task 4b: mbuf context for zero-copy OOO reassembly. When the
+/// engine dispatches an RX-origin segment that may end up in the
+/// out-of-order reorder queue, it passes this struct so the insert
+/// path can store `OooSegment::MbufRef` entries referencing the live
+/// mbuf instead of copying payload into a `Vec<u8>`.
+///
+/// Pure-slice test callers pass `None` to `dispatch` and thus exercise
+/// the legacy `insert` (Bytes-variant) path — behavior-preserving.
+///
+/// Refcount contract: the caller is responsible for bumping the mbuf's
+/// refcount before `dispatch` (so the reorder queue can store a live
+/// ref) and for rolling back when `Outcome::mbuf_ref_retained` is
+/// false. Both happen in the engine's RX path.
+#[derive(Debug, Clone, Copy)]
+pub struct MbufInsertCtx {
+    pub mbuf: std::ptr::NonNull<resd_net_sys::rte_mbuf>,
+    /// Offset (in bytes) of the TCP payload within the mbuf's data
+    /// region. Equals `ETH_HDR_LEN + ip.header_len + tcp.header_len`
+    /// at the RX decode boundary.
+    pub payload_offset: u16,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TcpParseError {
     Short,
@@ -214,6 +236,15 @@ pub struct Outcome {
     /// `conn.send_refused_pending` when setting this, so subsequent ACKs
     /// won't re-fire until a fresh `send_bytes` refusal restarts the cycle.
     pub writable_hysteresis_fired: bool,
+    /// A6.5 Task 4b: mirrors `InsertOutcome.mbuf_ref_retained` when the
+    /// OOO-insert took the MbufRef path. `true` iff the reorder queue
+    /// retained an MbufRef from the caller's mbuf; the engine's RX path
+    /// uses this to roll back (`rte_mbuf_refcnt_update(mbuf, -1)`) the
+    /// pre-dispatch up-bump when no segment was retained. `false` on
+    /// every other path (no MbufCtx passed / Bytes-variant insert / no
+    /// OOO insert at all) — the legacy engine paths do not touch
+    /// refcount here.
+    pub mbuf_ref_retained: bool,
     pub connected: bool,
     pub closed: bool,
 }
@@ -244,6 +275,7 @@ impl Outcome {
             tx_tlp_spurious_count: 0,
             syn_retrans_timer_to_cancel: None,
             writable_hysteresis_fired: false,
+            mbuf_ref_retained: false,
             connected: false,
             closed: false,
         }
@@ -277,11 +309,12 @@ pub fn dispatch(
     seg: &ParsedSegment,
     rtt_histogram_edges: &[u32; 15],
     send_buffer_bytes: u32,
+    mbuf_ctx: Option<MbufInsertCtx>,
 ) -> Outcome {
     match conn.state {
         TcpState::SynSent => handle_syn_sent(conn, seg, rtt_histogram_edges),
         TcpState::Established => {
-            handle_established(conn, seg, rtt_histogram_edges, send_buffer_bytes)
+            handle_established(conn, seg, rtt_histogram_edges, send_buffer_bytes, mbuf_ctx)
         }
         TcpState::FinWait1
         | TcpState::FinWait2
@@ -462,6 +495,7 @@ fn handle_established(
     seg: &ParsedSegment,
     rtt_histogram_edges: &[u32; 15],
     send_buffer_bytes: u32,
+    mbuf_ctx: Option<MbufInsertCtx>,
 ) -> Outcome {
     use crate::tcp_seq::{in_window, seq_le, seq_lt};
 
@@ -830,6 +864,14 @@ fn handle_established(
     let mut buf_full_drop = 0u32;
     let mut reassembly_queued_bytes = 0u32;
     let mut reassembly_hole_filled = 0u32;
+    // A6.5 Task 4b: when the engine handed us a mbuf context, the
+    // OOO-insert path records MbufRef entries instead of copying
+    // payload into a Vec<u8>. The caller already bumped the mbuf
+    // refcount pre-dispatch; we surface `mbuf_ref_retained` so the
+    // engine can roll back when no ref was retained. On every other
+    // path (in-order delivery, pure-ACK, no OOO insert), this flag
+    // stays false and the caller's rollback branch is skipped.
+    let mut mbuf_ref_retained = false;
     if !seg.payload.is_empty() {
         if seg.seq == conn.rcv_nxt {
             delivered = conn.recv.append(seg.payload);
@@ -849,12 +891,29 @@ fn handle_established(
             let total_cap = conn.recv.free_space_total();
             if total_cap > 0 {
                 let take = (seg.payload.len() as u32).min(total_cap);
-                let outcome = conn
-                    .recv
-                    .reorder
-                    .insert(seg.seq, &seg.payload[..take as usize]);
+                let outcome = if let Some(ctx) = mbuf_ctx {
+                    // A6.5 Task 4b: mbuf-ref path. The engine has already
+                    // bumped the mbuf refcount by one; if no ref is
+                    // retained, the engine rolls back on seeing
+                    // `outcome.mbuf_ref_retained == false`.
+                    conn.recv.reorder.insert_mbuf(
+                        seg.seq,
+                        &seg.payload[..take as usize],
+                        ctx.mbuf,
+                        ctx.payload_offset,
+                    )
+                } else {
+                    // Legacy Bytes-variant path — test callers + any
+                    // future non-mbuf insert source. `mbuf_ref_retained`
+                    // is false here, so the engine's rollback branch
+                    // never fires on this path.
+                    conn.recv
+                        .reorder
+                        .insert(seg.seq, &seg.payload[..take as usize])
+                };
                 reassembly_queued_bytes = outcome.newly_buffered;
                 buf_full_drop = outcome.cap_dropped;
+                mbuf_ref_retained = outcome.mbuf_ref_retained;
                 if (take as usize) < seg.payload.len() {
                     buf_full_drop += seg.payload.len() as u32 - take;
                 }
@@ -907,6 +966,7 @@ fn handle_established(
         tx_tlp_spurious_count,
         ts_recent_expired,
         writable_hysteresis_fired,
+        mbuf_ref_retained,
         ..Outcome::base()
     }
 }
@@ -1133,7 +1193,7 @@ mod tests {
             payload: &[],
             options: &opts_buf[..opts_len],
         };
-        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
         assert_eq!(out.new_state, Some(TcpState::Established));
         assert_eq!(out.tx, TxAction::Ack);
         assert!(out.connected);
@@ -1195,7 +1255,7 @@ mod tests {
 
         // Act: drive the full dispatcher so we exercise the real call
         // site inside `handle_syn_sent`.
-        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
 
         // Assert: SYN-ACK was accepted AND the helper got invoked.
         assert_eq!(out.new_state, Some(TcpState::Established));
@@ -1243,7 +1303,7 @@ mod tests {
             payload: &[],
             options: &opts_buf[..opts_len],
         };
-        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
         assert_eq!(out.new_state, Some(TcpState::Established));
         // RFC 7323 §1.3: WS only active if both sides advertise.
         assert_eq!(c.ws_shift_in, 0);
@@ -1287,7 +1347,7 @@ mod tests {
             payload: &[],
             options: &opts_buf[..opts_len],
         };
-        let _out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES);
+        let _out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
         assert_eq!(c.snd_wnd, 65535, "SYN-ACK window must be unscaled");
         assert_eq!(c.ws_shift_in, 7, "peer's WS is recorded for post-handshake");
     }
@@ -1325,7 +1385,7 @@ mod tests {
             payload: &[],
             options: &opts_buf[..opts_len],
         };
-        let _out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES);
+        let _out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
         assert_eq!(
             c.ws_shift_in, 14,
             "peer's WS shift MUST be clamped at 14 per RFC 7323 §2.3"
@@ -1352,7 +1412,7 @@ mod tests {
             payload: &[],
             options: &[],
         };
-        let _ = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES);
+        let _ = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
         assert_eq!(
             c.snd_wnd,
             512u32 << 7,
@@ -1386,7 +1446,7 @@ mod tests {
             payload: &[],
             options: &[],
         };
-        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
         assert_eq!(out.tx, TxAction::RstForSynSentBadAck);
     }
 
@@ -1415,7 +1475,7 @@ mod tests {
             payload: &[],
             options: &[],
         };
-        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
         assert_eq!(out.new_state, Some(TcpState::Closed));
         assert!(out.closed);
         assert_eq!(out.tx, TxAction::None);
@@ -1455,7 +1515,7 @@ mod tests {
             payload,
             options: &[],
         };
-        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
         assert_eq!(out.tx, TxAction::Ack);
         assert_eq!(out.delivered, 6);
         assert_eq!(c.rcv_nxt, 5001 + 6);
@@ -1478,7 +1538,7 @@ mod tests {
             payload: b"xyz",
             options: &[],
         };
-        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
         assert_eq!(out.tx, TxAction::Ack);
         assert_eq!(out.delivered, 0);
         assert_eq!(out.reassembly_queued_bytes, 3);
@@ -1508,7 +1568,7 @@ mod tests {
             payload: b"world",
             options: &[],
         };
-        let out_ooo = dispatch(&mut c, &ooo, &TEST_EDGES, TEST_SEND_BUF_BYTES);
+        let out_ooo = dispatch(&mut c, &ooo, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
         assert_eq!(out_ooo.reassembly_queued_bytes, 5);
         assert_eq!(c.rcv_nxt, 5001);
 
@@ -1523,7 +1583,7 @@ mod tests {
             payload: b"ninebytes",
             options: &[],
         };
-        let out_in = dispatch(&mut c, &inorder, &TEST_EDGES, TEST_SEND_BUF_BYTES);
+        let out_in = dispatch(&mut c, &inorder, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
         assert_eq!(out_in.delivered, 9 + 5);
         assert_eq!(out_in.reassembly_hole_filled, 1);
         assert_eq!(c.rcv_nxt, 5015);
@@ -1546,7 +1606,7 @@ mod tests {
             payload: b"abc",
             options: &[],
         };
-        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
         assert_eq!(out.delivered, 3);
         assert_eq!(out.buf_full_drop, 0);
     }
@@ -1570,7 +1630,7 @@ mod tests {
             payload: &payload,
             options: &[],
         };
-        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
         // 1024 accepted, 976 dropped — overflow is `buf_full_drop`, not OOO.
         assert_eq!(out.delivered, 1024);
         assert_eq!(out.buf_full_drop, 2000 - 1024);
@@ -1593,7 +1653,7 @@ mod tests {
             payload: &[],
             options: &[],
         };
-        let _ = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES);
+        let _ = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
         assert_eq!(c.snd_una, 1006);
         assert_eq!(c.snd_wnd, 32000);
         assert_eq!(c.snd.pending.len(), 0);
@@ -1613,7 +1673,7 @@ mod tests {
             payload: &[],
             options: &[],
         };
-        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
         assert_eq!(out.new_state, Some(TcpState::CloseWait));
         assert_eq!(out.tx, TxAction::Ack);
         assert_eq!(c.rcv_nxt, 5002); // FIN consumes one seq
@@ -1633,7 +1693,7 @@ mod tests {
             payload: &[],
             options: &[],
         };
-        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
         assert_eq!(out.new_state, Some(TcpState::Closed));
         assert!(out.closed);
     }
@@ -1652,7 +1712,7 @@ mod tests {
             payload: &[],
             options: &[],
         };
-        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
         assert_eq!(out.new_state, Some(TcpState::Closed));
         assert!(out.closed);
         // seg.flags & TCP_RST is what engine.rs uses to decide conn_rst bump;
@@ -1691,7 +1751,7 @@ mod tests {
             payload: &[],
             options: &[],
         };
-        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
         assert_eq!(out.new_state, Some(TcpState::FinWait2));
     }
 
@@ -1725,7 +1785,7 @@ mod tests {
             payload: &[],
             options: &[],
         };
-        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
         assert_eq!(out.new_state, Some(TcpState::TimeWait));
         assert_eq!(out.tx, TxAction::Ack);
         assert_eq!(c.rcv_nxt, 5002);
@@ -1761,7 +1821,7 @@ mod tests {
             payload: &[],
             options: &[],
         };
-        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
         assert_eq!(out.new_state, Some(TcpState::Closing));
     }
 
@@ -1795,7 +1855,7 @@ mod tests {
             payload: &[],
             options: &[],
         };
-        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
         assert_eq!(out.new_state, Some(TcpState::TimeWait));
     }
 
@@ -1829,7 +1889,7 @@ mod tests {
             payload: &[],
             options: &[],
         };
-        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
         assert_eq!(out.new_state, Some(TcpState::Closed));
         assert!(out.closed);
     }
@@ -1860,7 +1920,7 @@ mod tests {
             payload: b"xxx",
             options: &buf[..n],
         };
-        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
         assert!(out.paws_rejected);
         assert_eq!(out.tx, TxAction::Ack);
         assert_eq!(out.delivered, 0);
@@ -1886,7 +1946,7 @@ mod tests {
             payload: b"hello",
             options: &buf[..n],
         };
-        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
         assert!(!out.paws_rejected);
         assert_eq!(out.delivered, 5);
         assert_eq!(c.ts_recent, 300);
@@ -1906,7 +1966,7 @@ mod tests {
             payload: b"x",
             options: &[],
         };
-        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
         assert!(out.bad_option);
         assert_eq!(out.delivered, 0);
     }
@@ -1942,7 +2002,7 @@ mod tests {
             payload: &[],
             options: &buf[..n],
         };
-        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
         assert_eq!(out.sack_blocks_decoded, 2);
         assert!(c.sack_scoreboard.is_sacked(1005));
         assert!(c.sack_scoreboard.is_sacked(1018));
@@ -1980,7 +2040,7 @@ mod tests {
             payload: &[],
             options: &buf[..n],
         };
-        let _ = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES);
+        let _ = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
         assert_eq!(c.snd_una, 1015);
         assert_eq!(c.sack_scoreboard.len(), 1);
         assert_eq!(c.sack_scoreboard.blocks()[0].left, 1020);
@@ -2106,7 +2166,7 @@ mod tests {
             payload: &[],
             options: &buf[..n],
         };
-        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
         assert_eq!(out.rx_dsack_count, 1);
         assert_eq!(out.sack_blocks_decoded, 1);
         // DSACK block was skipped — scoreboard remains empty, no
@@ -2147,7 +2207,7 @@ mod tests {
             payload: &[],
             options: &buf[..n],
         };
-        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
         assert_eq!(out.rx_dsack_count, 1);
         assert!(c.rack.dsack_seen);
         // Scoreboard unchanged — the DSACK block was skipped, original
@@ -2190,7 +2250,7 @@ mod tests {
             payload: &[],
             options: &buf[..n],
         };
-        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
         assert_eq!(out.rx_dsack_count, 1);
         assert_eq!(out.sack_blocks_decoded, 2);
         assert!(c.rack.dsack_seen);
@@ -2225,7 +2285,7 @@ mod tests {
             payload: &[],
             options: &[],
         };
-        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
         assert_eq!(out.tx, TxAction::Ack);
         assert_eq!(out.new_state, None); // stay in TIME_WAIT until reaper
     }
@@ -2247,7 +2307,7 @@ mod tests {
             payload: b"x",
             options: &[],
         };
-        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
         assert!(out.urgent_dropped);
         assert_eq!(out.tx, TxAction::None);
         assert_eq!(out.delivered, 0);
@@ -2270,7 +2330,7 @@ mod tests {
             payload: b"xxx",
             options: &[],
         };
-        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
         assert!(out.bad_seq);
         assert_eq!(out.tx, TxAction::Ack); // challenge ACK
         assert_eq!(out.delivered, 0);
@@ -2291,7 +2351,7 @@ mod tests {
             payload: &[],
             options: &[],
         };
-        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
         assert!(out.bad_ack);
         assert_eq!(out.tx, TxAction::Ack); // challenge ACK
     }
@@ -2318,7 +2378,7 @@ mod tests {
             payload: &[],
             options: &[],
         };
-        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
         assert!(out.dup_ack);
     }
 
@@ -2340,7 +2400,7 @@ mod tests {
             payload: b"xxx",
             options: &[],
         };
-        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
         assert!(!out.dup_ack);
     }
 
@@ -2362,7 +2422,7 @@ mod tests {
             payload: &[],
             options: &[],
         };
-        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
         assert!(!out.dup_ack);
     }
 
@@ -2384,7 +2444,7 @@ mod tests {
             payload: &[],
             options: &[],
         };
-        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
         assert!(!out.dup_ack);
     }
 
@@ -2409,7 +2469,7 @@ mod tests {
             payload: &[],
             options: &[],
         };
-        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
         assert!(out.dup_ack);
     }
 
@@ -2433,7 +2493,7 @@ mod tests {
             payload: &[],
             options: &[],
         };
-        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
         assert!(!out.dup_ack);
     }
 
@@ -2456,7 +2516,7 @@ mod tests {
             payload: &[],
             options: &[],
         };
-        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
         assert!(!out.dup_ack);
     }
 
@@ -2474,7 +2534,7 @@ mod tests {
             payload: &[],
             options: &[],
         };
-        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
         assert!(out.rx_zero_window);
     }
 
@@ -2492,7 +2552,7 @@ mod tests {
             payload: &[],
             options: &[],
         };
-        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
         assert!(!out.rx_zero_window);
     }
 
@@ -2527,7 +2587,7 @@ mod tests {
             payload: b"x",
             options: &[],
         };
-        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
         assert!(out.bad_seq);
         assert_eq!(out.tx, TxAction::Ack);
     }
@@ -2614,7 +2674,7 @@ mod tests {
             payload: &[],
             options: &opts,
         };
-        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
         // A (index 0) should be marked lost; B (index 1) is SACKed.
         assert!(
             out.rack_lost_indexes.contains(&0),
@@ -2640,7 +2700,7 @@ mod tests {
             payload: &[],
             options: &[],
         };
-        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
         assert!(out.rack_lost_indexes.is_empty());
     }
 }

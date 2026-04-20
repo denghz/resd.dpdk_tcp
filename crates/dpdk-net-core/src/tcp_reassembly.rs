@@ -26,9 +26,20 @@ pub struct OooBytes {
     pub payload: Vec<u8>,
 }
 
-/// A6.5 Task 4b placeholder: references a segment of payload bytes
-/// held inside a DPDK mbuf. Unreachable during Task 6 (4a); insert
-/// path starts producing this variant in Task 7 (4b).
+/// A reassembly-held reference to a range of payload bytes living inside
+/// a DPDK mbuf. The reassembly queue holds one refcount per stored
+/// `OooMbufRef` — bumped at insert, decremented when the segment leaves
+/// the queue (drain / cap-drop / segment-reap). When a single mbuf is
+/// carved into N gap-slices, N separate `OooMbufRef` entries reference
+/// the same mbuf and the queue holds N refcounts on it; each is
+/// decremented independently as the matching segment leaves.
+/// Cloning `OooMbufRef` duplicates the raw pointer WITHOUT bumping the
+/// refcount; callers must uphold the invariant that a cloned ref
+/// either (a) replaces the original in the queue, or (b) is only used
+/// for inspection before the original is dropped. `Clone` is kept
+/// deliberately for Task 7/8's transitional code (gap-carve +
+/// eviction borrows) rather than forcing manual refcount bookkeeping
+/// at every ownership move. Task 9 (4d) collapses the enum.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OooMbufRef {
     pub seq: u32,
@@ -80,6 +91,17 @@ pub struct InsertOutcome {
     /// Bytes dropped because inserting them would push
     /// `total_bytes()` past `cap`.
     pub cap_dropped: u32,
+    /// A6.5 Task 4b: true iff at least one segment derived from the
+    /// caller's mbuf was actually retained in the queue. When false,
+    /// the caller should roll back the refcount up-bump they did prior
+    /// to calling `insert_mbuf` (via `rte_mbuf_refcnt_update(mbuf, -1)`).
+    /// When true, the caller's pre-bump is consumed by the queue; if
+    /// the carve produced multiple gap-slices, `insert_mbuf` has
+    /// already bumped the refcount internally by `(stored_count - 1)`
+    /// so that every stored `OooMbufRef` owns exactly one reference.
+    /// The field is set to `false` by the legacy `insert` (Bytes-variant)
+    /// path, since that path does not involve refcount handoff.
+    pub mbuf_ref_retained: bool,
 }
 
 pub struct ReorderQueue {
@@ -118,6 +140,7 @@ impl ReorderQueue {
             return InsertOutcome {
                 newly_buffered: 0,
                 cap_dropped: 0,
+                mbuf_ref_retained: false,
             };
         }
         let incoming_end = seq.wrapping_add(payload.len() as u32);
@@ -179,6 +202,7 @@ impl ReorderQueue {
         InsertOutcome {
             newly_buffered,
             cap_dropped,
+            mbuf_ref_retained: false,
         }
     }
 
@@ -245,6 +269,163 @@ impl ReorderQueue {
         }
     }
 
+    /// A6.5 Task 4b: insert a range of payload bytes as `MbufRef` entries,
+    /// referencing the supplied mbuf with offset/length. Caller MUST have
+    /// bumped the mbuf refcount by 1 before calling; the queue holds one
+    /// ref for every stored segment and, when a carve produces multiple
+    /// gap-slices, bumps the refcount internally by `(stored_count - 1)`
+    /// to match. Returns `mbuf_ref_retained = true` iff at least one
+    /// gap-slice was actually stored; otherwise caller should roll back
+    /// the up-bump.
+    ///
+    /// Gap-slice carve preserves the same overlap / merge semantics as
+    /// the Bytes-variant `insert`, but produces `OooSegment::MbufRef`
+    /// entries for gap-slice stores. Adjacent MbufRef entries do NOT
+    /// coalesce (that would require concatenating payload which is
+    /// impossible with mbuf refs); they stay as separate seq-sorted
+    /// entries. Cross-variant adjacency (Bytes <-> MbufRef) also does
+    /// not merge.
+    pub fn insert_mbuf(
+        &mut self,
+        seq: u32,
+        payload: &[u8],
+        mbuf: std::ptr::NonNull<sys::rte_mbuf>,
+        mbuf_payload_offset: u16,
+    ) -> InsertOutcome {
+        if payload.is_empty() {
+            return InsertOutcome {
+                newly_buffered: 0,
+                cap_dropped: 0,
+                mbuf_ref_retained: false,
+            };
+        }
+        let incoming_end = seq.wrapping_add(payload.len() as u32);
+        let mut cursor = seq;
+        let mut newly_buffered = 0u32;
+        let mut cap_dropped = 0u32;
+        let mut stored_count = 0u32;
+
+        let n = self.segments.len();
+        let mut i = 0;
+        while i < n {
+            let existing_seq = self.segments[i].seq();
+            let existing_end = self.segments[i].end_seq();
+            if seq_le(incoming_end, existing_seq) {
+                break;
+            }
+            if seq_le(existing_end, cursor) {
+                i += 1;
+                continue;
+            }
+            if seq_lt(cursor, existing_seq) {
+                let gap_len = existing_seq.wrapping_sub(cursor) as usize;
+                let off = cursor.wrapping_sub(seq) as usize;
+                let take_end = off + gap_len.min(payload.len() - off);
+                let remaining_cap = self.cap.saturating_sub(self.total_bytes + newly_buffered);
+                let take = (take_end - off).min(remaining_cap as usize);
+                if take > 0 {
+                    let sub_offset = mbuf_payload_offset + off as u16;
+                    self.insert_merged_mbuf_ref(cursor, mbuf, sub_offset, take as u16);
+                    newly_buffered += take as u32;
+                    stored_count += 1;
+                }
+                if take < take_end - off {
+                    cap_dropped += (take_end - off - take) as u32;
+                }
+                cursor = cursor.wrapping_add((take_end - off) as u32);
+            }
+            if seq_lt(cursor, existing_end) {
+                cursor = existing_end;
+            }
+            i += 1;
+        }
+        if seq_lt(cursor, incoming_end) {
+            let off = cursor.wrapping_sub(seq) as usize;
+            let tail_len = payload.len() - off;
+            let remaining_cap = self.cap.saturating_sub(self.total_bytes + newly_buffered);
+            let take = tail_len.min(remaining_cap as usize);
+            if take > 0 {
+                let sub_offset = mbuf_payload_offset + off as u16;
+                self.insert_merged_mbuf_ref(cursor, mbuf, sub_offset, take as u16);
+                newly_buffered += take as u32;
+                stored_count += 1;
+            }
+            if take < tail_len {
+                cap_dropped += (tail_len - take) as u32;
+            }
+        }
+        self.total_bytes += newly_buffered;
+        // Caller bumped the refcount by +1 pre-call. The queue needs one
+        // ref per stored segment. If the carve produced >1 stored entries,
+        // bump the refcount by `(stored_count - 1)` to cover the extras.
+        // Each `drop_segment_mbuf_ref` call will eventually decrement once
+        // per stored segment, returning the refcount to its caller-side
+        // baseline when the last segment leaves.
+        if stored_count > 1 {
+            let extra = (stored_count - 1) as i16;
+            // SAFETY: the caller asserts that `mbuf` is a live pointer and
+            // that its refcount has been bumped to at least 1 prior to
+            // calling. We are bumping by a positive delta here, which is
+            // always safe.
+            unsafe {
+                sys::resd_rte_mbuf_refcnt_update(mbuf.as_ptr(), extra);
+            }
+        }
+        InsertOutcome {
+            newly_buffered,
+            cap_dropped,
+            mbuf_ref_retained: stored_count > 0,
+        }
+    }
+
+    /// Insert a MbufRef segment at seq/len. Caller has already carved out
+    /// overlap upstream. Adjacent MbufRef entries do NOT physically
+    /// merge (zero-copy contract: no payload concatenation); they stay
+    /// as separate seq-sorted entries.
+    fn insert_merged_mbuf_ref(
+        &mut self,
+        seq: u32,
+        mbuf: std::ptr::NonNull<sys::rte_mbuf>,
+        offset: u16,
+        len: u16,
+    ) {
+        let mut idx = self.segments.len();
+        for (i, s) in self.segments.iter().enumerate() {
+            if seq_lt(seq, s.seq()) {
+                idx = i;
+                break;
+            }
+        }
+        self.segments.insert(
+            idx,
+            OooSegment::MbufRef(OooMbufRef {
+                seq,
+                mbuf,
+                offset,
+                len,
+            }),
+        );
+    }
+
+    /// A6.5 Task 4b: drop the mbuf refcount held for an `OooSegment` that
+    /// is leaving the queue (drain, stale-drop). No-op for the Bytes
+    /// variant. SAFETY: caller guarantees `seg`'s mbuf pointer is still
+    /// valid, which holds as long as the queue's stored refcount has not
+    /// been decremented — this helper IS the decrement, so it runs at
+    /// most once per stored segment.
+    fn drop_segment_mbuf_ref(seg: &OooSegment) {
+        if let OooSegment::MbufRef(m) = seg {
+            // SAFETY: `m.mbuf` was validated at `insert_mbuf` time; the
+            // queue has held a refcount on it since then, so the pointer
+            // is still live. The decrement may take the refcount to zero
+            // and return the mbuf to its mempool, which is the intended
+            // end-of-life behavior.
+            unsafe {
+                sys::resd_rte_mbuf_refcnt_update(m.mbuf.as_ptr(), -1);
+            }
+        }
+    }
+
     /// Pop the contiguous prefix of segments whose seq range starts at
     /// or before `rcv_nxt`. For each popped segment, yield the portion
     /// of its payload that lies at or after `rcv_nxt`. Returns the
@@ -261,7 +442,9 @@ impl ReorderQueue {
             let seg_end = self.segments[0].end_seq();
             let seg_len = self.segments[0].len();
             if seq_le(seg_end, rcv_nxt) {
-                // Entire segment behind rcv_nxt — drop.
+                // Entire segment behind rcv_nxt — drop. MbufRef variant
+                // also requires a refcount decrement; Bytes is a no-op.
+                Self::drop_segment_mbuf_ref(&self.segments[0]);
                 self.total_bytes = self.total_bytes.saturating_sub(seg_len);
                 self.segments.remove(0);
                 drained_segments += 1;
@@ -271,16 +454,30 @@ impl ReorderQueue {
             match &self.segments[0] {
                 OooSegment::Bytes(b) => out.extend_from_slice(&b.payload[skip..]),
                 OooSegment::MbufRef(m) => {
-                    // Task 4a: Bytes variant is the only one currently produced;
-                    // MbufRef cannot be reached here until Task 4b flips the
-                    // insert path. Panic surfaces any premature MbufRef
-                    // reachability.
-                    unreachable!(
-                        "OOO drain reached MbufRef at {:?} before Task 4b insert path is wired",
-                        m
-                    );
+                    // A6.5 Task 4b shim: copy from the mbuf payload region.
+                    // Task 4c retires this by switching to a mbuf-list
+                    // return type so callers consume zero-copy refs. The
+                    // refcount decrement below (via drop_segment_mbuf_ref)
+                    // matches the insert-time up-bump.
+                    //
+                    // SAFETY: `m.mbuf` is still live (queue holds a
+                    // refcount). `m.offset + m.len` is bounded by the
+                    // mbuf's data_len at insert time; `skip <= m.len`
+                    // because `rcv_nxt < seg_end` (checked by the branch
+                    // above) and `seg_end - seg_seq == m.len`.
+                    let payload_area = unsafe {
+                        let mbuf_ptr = m.mbuf.as_ptr();
+                        let base_ptr =
+                            sys::resd_rte_pktmbuf_data(mbuf_ptr) as *const u8;
+                        std::slice::from_raw_parts(
+                            base_ptr.add(m.offset as usize),
+                            m.len as usize,
+                        )
+                    };
+                    out.extend_from_slice(&payload_area[skip..]);
                 }
             }
+            Self::drop_segment_mbuf_ref(&self.segments[0]);
             rcv_nxt = seg_end;
             self.total_bytes = self.total_bytes.saturating_sub(seg_len);
             self.segments.remove(0);
@@ -452,5 +649,81 @@ mod tests {
         let (bytes, n) = q.drain_contiguous_from(500);
         assert!(bytes.is_empty());
         assert_eq!(n, 0);
+    }
+
+    // A6.5 Task 4b (Task 7): insert_mbuf unit tests. These tests exercise
+    // insert logic only — they do NOT call drain (which would deref the
+    // dangling pointer). The TAP integration tests + ahw_smoke exercise
+    // the full real-mbuf lifecycle. SAFETY: ReorderQueue has no custom
+    // Drop impl, so dropping a queue containing MbufRef entries does not
+    // deref the pointer — OooMbufRef's Drop is the auto-derived one
+    // (no-op on NonNull<rte_mbuf>). Refcount bookkeeping is only run
+    // inside drain_contiguous_from, which these tests never call.
+
+    #[test]
+    fn insert_mbuf_produces_mbuf_ref_variant() {
+        let mut q = ReorderQueue::new(1024);
+        // SAFETY: test-only; insert_mbuf only stores the pointer, does not
+        // deref. See module-level comment above about Drop safety.
+        let fake_mbuf: std::ptr::NonNull<sys::rte_mbuf> = std::ptr::NonNull::dangling();
+        let payload = b"hello";
+        let out = q.insert_mbuf(100, payload, fake_mbuf, 64);
+        assert_eq!(out.newly_buffered, payload.len() as u32);
+        assert_eq!(out.cap_dropped, 0);
+        assert!(out.mbuf_ref_retained);
+        assert_eq!(q.len(), 1);
+        match &q.segments()[0] {
+            OooSegment::MbufRef(m) => {
+                assert_eq!(m.seq, 100);
+                assert_eq!(m.offset, 64);
+                assert_eq!(m.len, 5);
+            }
+            _ => panic!("expected MbufRef variant"),
+        }
+    }
+
+    #[test]
+    fn insert_mbuf_cap_overflow_signals_no_retained_ref() {
+        let mut q = ReorderQueue::new(3);
+        let fake_mbuf: std::ptr::NonNull<sys::rte_mbuf> = std::ptr::NonNull::dangling();
+        let payload = b"hello";
+        let out = q.insert_mbuf(100, payload, fake_mbuf, 0);
+        assert_eq!(out.newly_buffered, 3);
+        assert_eq!(out.cap_dropped, 2);
+        assert!(out.mbuf_ref_retained);
+
+        let mut q2 = ReorderQueue::new(0);
+        let out2 = q2.insert_mbuf(100, payload, fake_mbuf, 0);
+        assert_eq!(out2.newly_buffered, 0);
+        assert_eq!(out2.cap_dropped, 5);
+        assert!(!out2.mbuf_ref_retained);
+    }
+
+    #[test]
+    fn insert_mbuf_empty_payload_returns_not_retained() {
+        let mut q = ReorderQueue::new(1024);
+        let fake_mbuf: std::ptr::NonNull<sys::rte_mbuf> = std::ptr::NonNull::dangling();
+        let out = q.insert_mbuf(100, b"", fake_mbuf, 0);
+        assert_eq!(out.newly_buffered, 0);
+        assert_eq!(out.cap_dropped, 0);
+        assert!(!out.mbuf_ref_retained);
+        assert_eq!(q.len(), 0);
+    }
+
+    #[test]
+    fn insert_mbuf_inserts_sort_by_seq() {
+        let mut q = ReorderQueue::new(1024);
+        let fake_mbuf: std::ptr::NonNull<sys::rte_mbuf> = std::ptr::NonNull::dangling();
+        q.insert_mbuf(200, b"bbb", fake_mbuf, 100);
+        q.insert_mbuf(100, b"aaa", fake_mbuf, 200);
+        assert_eq!(q.segments()[0].seq(), 100);
+        assert_eq!(q.segments()[1].seq(), 200);
+        // MbufRef entries do NOT coalesce even when adjacent (zero-copy
+        // contract: no payload concatenation).
+        q.insert_mbuf(103, b"ccc", fake_mbuf, 300);
+        assert_eq!(q.len(), 3);
+        assert_eq!(q.segments()[0].seq(), 100);
+        assert_eq!(q.segments()[1].seq(), 103);
+        assert_eq!(q.segments()[2].seq(), 200);
     }
 }

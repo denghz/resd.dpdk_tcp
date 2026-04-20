@@ -1687,7 +1687,12 @@ impl Engine {
             // RX-origin event emission sites (Connected + Readable).
             let hw_rx_ts = unsafe { self.hw_rx_ts_ns(m) };
             add(&self.counters.eth.rx_bytes, bytes.len() as u64);
-            let _accepted = self.rx_frame(bytes, ol_flags, nic_rss_hash, hw_rx_ts);
+            // A6.5 Task 4b: hand the mbuf pointer to the RX decode chain
+            // so the OOO reorder queue can store zero-copy MbufRef
+            // entries instead of copied Vec<u8>. `m` is non-null by
+            // rx_burst contract.
+            let rx_mbuf = std::ptr::NonNull::new(m);
+            let _accepted = self.rx_frame(bytes, ol_flags, nic_rss_hash, hw_rx_ts, rx_mbuf);
             #[cfg(feature = "obs-byte-counters")]
             {
                 rx_bytes_acc += _accepted as u64;
@@ -2487,7 +2492,22 @@ impl Engine {
     /// `Connected` + `Readable` event emission sites in `tcp_input` +
     /// `deliver_readable` (spec §10.3). `0` when the NIC didn't stamp
     /// one (expected on ENA — spec §10.5).
-    fn rx_frame(&self, bytes: &[u8], ol_flags: u64, nic_rss_hash: u32, hw_rx_ts: u64) -> u32 {
+    ///
+    /// `rx_mbuf` — the mbuf the frame was decoded from, OR `None` for
+    /// non-mbuf test callers. A6.5 Task 4b threads this through to the
+    /// OOO reorder-queue insert site so out-of-order payload can be
+    /// stored as `OooSegment::MbufRef` (zero-copy) instead of a copied
+    /// `Vec<u8>`. `eth_payload_offset` is the offset (in bytes) of the
+    /// L2 payload (= start of the IP header) within the mbuf data
+    /// region; used to compute the TCP payload offset for the MbufRef.
+    fn rx_frame(
+        &self,
+        bytes: &[u8],
+        ol_flags: u64,
+        nic_rss_hash: u32,
+        hw_rx_ts: u64,
+        rx_mbuf: Option<std::ptr::NonNull<sys::rte_mbuf>>,
+    ) -> u32 {
         use crate::counters::inc;
         match crate::l2::l2_decode(bytes, self.our_mac) {
             Err(crate::l2::L2Drop::Short) => {
@@ -2510,9 +2530,14 @@ impl Engine {
                         self.handle_arp(payload);
                         0
                     }
-                    crate::l2::ETHERTYPE_IPV4 => {
-                        self.handle_ipv4(payload, ol_flags, nic_rss_hash, hw_rx_ts)
-                    }
+                    crate::l2::ETHERTYPE_IPV4 => self.handle_ipv4(
+                        payload,
+                        ol_flags,
+                        nic_rss_hash,
+                        hw_rx_ts,
+                        rx_mbuf,
+                        l2.payload_offset as u16,
+                    ),
                     _ => unreachable!("l2_decode filters unsupported ethertypes"),
                 }
             }
@@ -2549,7 +2574,15 @@ impl Engine {
     /// `hw-offload-rx-cksum` feature AND the runtime
     /// `rx_cksum_offload_active` latch — if either is false the
     /// offload-aware wrapper degrades to the software path.
-    fn handle_ipv4(&self, payload: &[u8], ol_flags: u64, nic_rss_hash: u32, hw_rx_ts: u64) -> u32 {
+    fn handle_ipv4(
+        &self,
+        payload: &[u8],
+        ol_flags: u64,
+        nic_rss_hash: u32,
+        hw_rx_ts: u64,
+        rx_mbuf: Option<std::ptr::NonNull<sys::rte_mbuf>>,
+        eth_payload_offset: u16,
+    ) -> u32 {
         use crate::counters::inc;
         match crate::l3_ip::ip_decode_offload_aware(
             payload,
@@ -2599,7 +2632,22 @@ impl Engine {
                 match ip.protocol {
                     crate::l3_ip::IPPROTO_TCP => {
                         inc(&self.counters.ip.rx_tcp);
-                        self.tcp_input(&ip, inner, ol_flags, nic_rss_hash, hw_rx_ts)
+                        // A6.5 Task 4b: `tcp_bytes_offset_in_mbuf` is the
+                        // offset from the mbuf data pointer to the TCP
+                        // header (= eth_payload_offset + ip.header_len).
+                        // `tcp_input` adds `parsed.header_len` to derive
+                        // the TCP payload offset for MbufRef storage.
+                        let tcp_bytes_offset =
+                            eth_payload_offset.saturating_add(ip.header_len as u16);
+                        self.tcp_input(
+                            &ip,
+                            inner,
+                            ol_flags,
+                            nic_rss_hash,
+                            hw_rx_ts,
+                            rx_mbuf,
+                            tcp_bytes_offset,
+                        )
                     }
                     crate::l3_ip::IPPROTO_ICMP => {
                         inc(&self.counters.ip.rx_icmp);
@@ -2640,9 +2688,11 @@ impl Engine {
         ol_flags: u64,
         nic_rss_hash: u32,
         hw_rx_ts: u64,
+        rx_mbuf: Option<std::ptr::NonNull<sys::rte_mbuf>>,
+        tcp_bytes_offset_in_mbuf: u16,
     ) -> u32 {
         use crate::counters::inc;
-        use crate::tcp_input::{dispatch, parse_segment, tuple_from_segment, TxAction};
+        use crate::tcp_input::{dispatch, parse_segment, tuple_from_segment, MbufInsertCtx, TxAction};
 
         // Task 8: classify the NIC-reported L4 checksum outcome before
         // dispatching the software fold inside `parse_segment`. Gated
@@ -2744,9 +2794,50 @@ impl Engine {
             inc(&self.counters.tcp.rx_data);
         }
 
+        // A6.5 Task 4b: build the MbufInsertCtx iff we have a live mbuf
+        // AND the segment has payload (no-payload segments never take
+        // the OOO-insert path). Bump the mbuf refcount before dispatch:
+        // the reorder queue owns one refcount per stored MbufRef; the
+        // caller's subsequent `rte_pktmbuf_free` drops the original RX-
+        // burst reference. If no MbufRef is retained, we roll back the
+        // up-bump after dispatch (via `outcome.mbuf_ref_retained == false`).
+        //
+        // Skip when the OOO path is unreachable: empty payload, or no
+        // mbuf handle (shouldn't happen on the real RX path but keeps
+        // the signature flexible for non-mbuf callers).
+        let mbuf_ctx = if let Some(mb) = rx_mbuf {
+            if !parsed.payload.is_empty() {
+                let payload_offset =
+                    tcp_bytes_offset_in_mbuf.saturating_add(parsed.header_len as u16);
+                // SAFETY: `mb` came from the active rx_burst iteration in
+                // `poll_once`, which has not yet called
+                // `resd_rte_pktmbuf_free` on it. The refcount bump is
+                // ordered before any queue store.
+                unsafe {
+                    sys::resd_rte_mbuf_refcnt_update(mb.as_ptr(), 1);
+                }
+                Some(MbufInsertCtx {
+                    mbuf: mb,
+                    payload_offset,
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let outcome = {
             let mut ft = self.flow_table.borrow_mut();
             let Some(conn) = ft.get_mut(handle) else {
+                // Rare race: conn lookup succeeded above but a concurrent
+                // drop removed it before the borrow_mut. Roll back the
+                // refcount up-bump if we did one.
+                if let Some(ctx) = mbuf_ctx {
+                    unsafe {
+                        sys::resd_rte_mbuf_refcnt_update(ctx.mbuf.as_ptr(), -1);
+                    }
+                }
                 return 0;
             };
             // A6 Task 15 (spec §3.8): pass the engine-wide RTT histogram
@@ -2759,13 +2850,41 @@ impl Engine {
             // (`in_flight ≤ send_buffer_bytes/2`) and surface a one-shot
             // Outcome flag; the engine translator below pushes
             // `InternalEvent::Writable` when set.
+            //
+            // A6.5 Task 4b: `mbuf_ctx` wires the mbuf pointer + payload
+            // offset so the OOO reorder-queue insert path can store
+            // MbufRef entries instead of copied Vec<u8>. `None` on the
+            // pure-slice path (empty payload or no mbuf) falls back to
+            // the legacy Bytes-variant insert.
             dispatch(
                 conn,
                 &parsed,
                 &self.rtt_histogram_edges,
                 self.cfg.send_buffer_bytes,
+                mbuf_ctx,
             )
         };
+
+        // A6.5 Task 4b: roll back the pre-dispatch refcount up-bump when
+        // no OOO segment derived from this mbuf was actually retained.
+        // The three cases where we bumped but need to roll back:
+        //   1. Payload delivered in-order (no OOO insert reached).
+        //   2. OOO-insert path ran but the cap was already exceeded, so
+        //      `insert_mbuf` returned `mbuf_ref_retained = false`.
+        //   3. Segment dropped before the OOO-insert site (e.g. PAWS,
+        //      bad-seq, out-of-window). All such paths leave
+        //      `mbuf_ref_retained = false`.
+        // In all rollback cases, the subsequent `resd_rte_pktmbuf_free`
+        // on the original RX-burst reference will release the mbuf to
+        // its mempool. When `mbuf_ref_retained = true`, the queued ref
+        // keeps the mbuf alive until drain or eviction.
+        if let Some(ctx) = mbuf_ctx {
+            if !outcome.mbuf_ref_retained {
+                unsafe {
+                    sys::resd_rte_mbuf_refcnt_update(ctx.mbuf.as_ptr(), -1);
+                }
+            }
+        }
 
         // A4: map Outcome fields → TcpCounters slow-path bumps. Groups
         // all per-segment counter wiring in one place so the dispatch

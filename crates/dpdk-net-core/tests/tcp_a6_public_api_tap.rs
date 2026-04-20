@@ -314,7 +314,7 @@ fn writable_hysteresis_fires_when_ack_drains_below_half_send_buffer() {
         options: &[],
     };
 
-    let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES_256K);
+    let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES_256K, None);
     assert!(
         out.writable_hysteresis_fired,
         "in_flight=0 post-ACK must flip writable_hysteresis_fired"
@@ -358,7 +358,7 @@ fn writable_hysteresis_silent_when_in_flight_above_threshold() {
 
     // send_buffer_bytes = 8_000 → threshold = 4_000. in_flight after
     // the ACK = 10_000 - 4_000 = 6_000 > 4_000, so no WRITABLE.
-    let out = dispatch(&mut c, &seg, &TEST_EDGES, 8_000);
+    let out = dispatch(&mut c, &seg, &TEST_EDGES, 8_000, None);
     assert!(
         !out.writable_hysteresis_fired,
         "in_flight=6000 > threshold=4000 must NOT fire WRITABLE"
@@ -393,7 +393,7 @@ fn writable_hysteresis_single_edge_per_refusal_cycle() {
         payload: &[],
         options: &[],
     };
-    let out1 = dispatch(&mut c, &first, &TEST_EDGES, TEST_SEND_BUF_BYTES_256K);
+    let out1 = dispatch(&mut c, &first, &TEST_EDGES, TEST_SEND_BUF_BYTES_256K, None);
     assert!(out1.writable_hysteresis_fired, "first edge must fire");
     assert!(!c.send_refused_pending, "first edge must clear pending");
 
@@ -413,7 +413,7 @@ fn writable_hysteresis_single_edge_per_refusal_cycle() {
         payload: &[],
         options: &[],
     };
-    let out2 = dispatch(&mut c, &second, &TEST_EDGES, TEST_SEND_BUF_BYTES_256K);
+    let out2 = dispatch(&mut c, &second, &TEST_EDGES, TEST_SEND_BUF_BYTES_256K, None);
     assert!(
         !out2.writable_hysteresis_fired,
         "second ACK without re-refusal must NOT fire WRITABLE"
@@ -436,7 +436,7 @@ fn writable_hysteresis_single_edge_per_refusal_cycle() {
         payload: &[],
         options: &[],
     };
-    let out3 = dispatch(&mut c, &third, &TEST_EDGES, TEST_SEND_BUF_BYTES_256K);
+    let out3 = dispatch(&mut c, &third, &TEST_EDGES, TEST_SEND_BUF_BYTES_256K, None);
     assert!(
         out3.writable_hysteresis_fired,
         "fresh refusal cycle must re-enable the edge"
@@ -466,7 +466,7 @@ fn writable_hysteresis_silent_when_pending_not_set() {
         payload: &[],
         options: &[],
     };
-    let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES_256K);
+    let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES_256K, None);
     assert!(!out.writable_hysteresis_fired);
 }
 
@@ -512,7 +512,7 @@ fn ts_recent_fresh_conn_sentinel_never_expires() {
         payload: &[],
         options: &buf[..n],
     };
-    let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES_256K);
+    let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES_256K, None);
     assert!(
         !out.ts_recent_expired,
         "age=0 sentinel must NEVER fire expiration even with stale ts_val"
@@ -555,7 +555,7 @@ fn ts_recent_recent_age_does_not_spuriously_expire() {
         payload: &[],
         options: &buf[..n],
     };
-    let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES_256K);
+    let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES_256K, None);
     assert!(
         !out.ts_recent_expired,
         "recent age within 24d must NOT fire lazy expiration"
