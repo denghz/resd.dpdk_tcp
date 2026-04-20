@@ -10,17 +10,62 @@
 //! mTCP-style `CanMerge` / `MergeFragments` semantics applied to
 //! copy-based `(seq, Vec<u8>)` entries.
 
+use resd_net_sys as sys;
+
 use crate::tcp_seq::{seq_le, seq_lt};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OooSegment {
+pub enum OooSegment {
+    Bytes(OooBytes),
+    MbufRef(OooMbufRef),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OooBytes {
     pub seq: u32,
     pub payload: Vec<u8>,
 }
 
+/// A6.5 Task 4b placeholder: references a segment of payload bytes
+/// held inside a DPDK mbuf. Unreachable during Task 6 (4a); insert
+/// path starts producing this variant in Task 7 (4b).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OooMbufRef {
+    pub seq: u32,
+    pub mbuf: std::ptr::NonNull<sys::rte_mbuf>,
+    pub offset: u16,
+    pub len: u16,
+}
+
+// MbufRef's raw pointer is not Send/Sync. ReorderQueue is single-
+// lcore, so we add the marker impls to satisfy any container
+// bounds downstream.
+unsafe impl Send for OooMbufRef {}
+
 impl OooSegment {
+    pub fn seq(&self) -> u32 {
+        match self {
+            OooSegment::Bytes(b) => b.seq,
+            OooSegment::MbufRef(m) => m.seq,
+        }
+    }
+
     pub fn end_seq(&self) -> u32 {
-        self.seq.wrapping_add(self.payload.len() as u32)
+        match self {
+            OooSegment::Bytes(b) => b.seq.wrapping_add(b.payload.len() as u32),
+            OooSegment::MbufRef(m) => m.seq.wrapping_add(m.len as u32),
+        }
+    }
+
+    pub fn len(&self) -> u32 {
+        match self {
+            OooSegment::Bytes(b) => b.payload.len() as u32,
+            OooSegment::MbufRef(m) => m.len as u32,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
@@ -86,14 +131,14 @@ impl ReorderQueue {
         let mut to_insert: Vec<(u32, Vec<u8>)> = Vec::new();
 
         for existing in &self.segments {
-            if seq_le(incoming_end, existing.seq) {
+            if seq_le(incoming_end, existing.seq()) {
                 break;
             }
             if seq_le(existing.end_seq(), cursor) {
                 continue;
             }
-            if seq_lt(cursor, existing.seq) {
-                let gap_len = existing.seq.wrapping_sub(cursor) as usize;
+            if seq_lt(cursor, existing.seq()) {
+                let gap_len = existing.seq().wrapping_sub(cursor) as usize;
                 let off = cursor.wrapping_sub(seq) as usize;
                 let take_end = off + gap_len.min(payload.len() - off);
                 let remaining_cap = self.cap.saturating_sub(self.total_bytes + newly_buffered);
@@ -144,7 +189,7 @@ impl ReorderQueue {
 
         let mut idx = self.segments.len();
         for (i, s) in self.segments.iter().enumerate() {
-            if seq_lt(seq, s.seq) {
+            if seq_lt(seq, s.seq()) {
                 idx = i;
                 break;
             }
@@ -152,24 +197,51 @@ impl ReorderQueue {
 
         let mut merged_left = false;
         if idx > 0 && self.segments[idx - 1].end_seq() == seq {
-            self.segments[idx - 1].payload.extend_from_slice(&payload);
-            merged_left = true;
+            match &mut self.segments[idx - 1] {
+                OooSegment::Bytes(b) => {
+                    b.payload.extend_from_slice(&payload);
+                    merged_left = true;
+                }
+                OooSegment::MbufRef(_) => {
+                    // Cross-variant merge not supported; fall through to insert.
+                    // Task 4a's MbufRef variant is unreachable so this arm is dead
+                    // until Task 7. Guarded here to avoid a cross-variant merge
+                    // bug when 4b lands.
+                }
+            }
         }
 
-        if idx < self.segments.len() && self.segments[idx].seq == end {
+        if idx < self.segments.len() && self.segments[idx].seq() == end {
             if merged_left {
+                // Merge right into (idx-1). Only works Bytes+Bytes.
                 let right = self.segments.remove(idx);
-                self.segments[idx - 1]
-                    .payload
-                    .extend_from_slice(&right.payload);
+                match (&mut self.segments[idx - 1], right) {
+                    (OooSegment::Bytes(left_b), OooSegment::Bytes(right_b)) => {
+                        left_b.payload.extend_from_slice(&right_b.payload);
+                    }
+                    (_, right) => {
+                        // Cross-variant: restore right and skip merge.
+                        self.segments.insert(idx, right);
+                    }
+                }
             } else {
-                let mut new_payload = payload;
-                new_payload.extend_from_slice(&self.segments[idx].payload);
-                self.segments[idx].seq = seq;
-                self.segments[idx].payload = new_payload;
+                match &mut self.segments[idx] {
+                    OooSegment::Bytes(right_b) => {
+                        let mut new_payload = payload;
+                        new_payload.extend_from_slice(&right_b.payload);
+                        right_b.seq = seq;
+                        right_b.payload = new_payload;
+                    }
+                    OooSegment::MbufRef(_) => {
+                        // Cross-variant: insert as new Bytes entry.
+                        self.segments
+                            .insert(idx, OooSegment::Bytes(OooBytes { seq, payload }));
+                    }
+                }
             }
         } else if !merged_left {
-            self.segments.insert(idx, OooSegment { seq, payload });
+            self.segments
+                .insert(idx, OooSegment::Bytes(OooBytes { seq, payload }));
         }
     }
 
@@ -182,26 +254,51 @@ impl ReorderQueue {
         let mut drained_segments = 0u32;
 
         while !self.segments.is_empty() {
-            let seg = &self.segments[0];
-            if seq_lt(rcv_nxt, seg.seq) {
+            let seg_seq = self.segments[0].seq();
+            if seq_lt(rcv_nxt, seg_seq) {
                 break;
             }
-            let seg_end = seg.end_seq();
+            let seg_end = self.segments[0].end_seq();
+            let seg_len = self.segments[0].len();
             if seq_le(seg_end, rcv_nxt) {
                 // Entire segment behind rcv_nxt — drop.
-                self.total_bytes = self.total_bytes.saturating_sub(seg.payload.len() as u32);
+                self.total_bytes = self.total_bytes.saturating_sub(seg_len);
                 self.segments.remove(0);
                 drained_segments += 1;
                 continue;
             }
-            let skip = rcv_nxt.wrapping_sub(seg.seq) as usize;
-            out.extend_from_slice(&seg.payload[skip..]);
+            let skip = rcv_nxt.wrapping_sub(seg_seq) as usize;
+            match &self.segments[0] {
+                OooSegment::Bytes(b) => out.extend_from_slice(&b.payload[skip..]),
+                OooSegment::MbufRef(m) => {
+                    // Task 4a: Bytes variant is the only one currently produced;
+                    // MbufRef cannot be reached here until Task 4b flips the
+                    // insert path. Panic surfaces any premature MbufRef
+                    // reachability.
+                    unreachable!(
+                        "OOO drain reached MbufRef at {:?} before Task 4b insert path is wired",
+                        m
+                    );
+                }
+            }
             rcv_nxt = seg_end;
-            self.total_bytes = self.total_bytes.saturating_sub(seg.payload.len() as u32);
+            self.total_bytes = self.total_bytes.saturating_sub(seg_len);
             self.segments.remove(0);
             drained_segments += 1;
         }
         (out, drained_segments)
+    }
+}
+
+/// Test helper: project an `OooSegment` back to its `OooBytes`
+/// variant, panicking if it's the MbufRef variant. Only the Bytes
+/// variant is reachable in Task 6 (4a); Task 7 (4b) flips the
+/// insert path.
+#[cfg(test)]
+pub(crate) fn expect_bytes(seg: &OooSegment) -> &OooBytes {
+    match seg {
+        OooSegment::Bytes(b) => b,
+        _ => panic!("expected Bytes variant, got {:?}", seg),
     }
 }
 
@@ -223,8 +320,8 @@ mod tests {
         assert_eq!(out.newly_buffered, 5);
         assert_eq!(out.cap_dropped, 0);
         assert_eq!(q.len(), 1);
-        assert_eq!(q.segments()[0].seq, 100);
-        assert_eq!(&q.segments()[0].payload, b"abcde");
+        assert_eq!(q.segments()[0].seq(), 100);
+        assert_eq!(&expect_bytes(&q.segments()[0]).payload, b"abcde");
     }
 
     #[test]
@@ -241,8 +338,8 @@ mod tests {
         let mut q = ReorderQueue::new(1024);
         q.insert(200, b"bbb");
         q.insert(100, b"aaa");
-        assert_eq!(q.segments()[0].seq, 100);
-        assert_eq!(q.segments()[1].seq, 200);
+        assert_eq!(q.segments()[0].seq(), 100);
+        assert_eq!(q.segments()[1].seq(), 200);
     }
 
     #[test]
@@ -251,8 +348,8 @@ mod tests {
         q.insert(100, b"abc");
         q.insert(103, b"def");
         assert_eq!(q.len(), 1);
-        assert_eq!(q.segments()[0].seq, 100);
-        assert_eq!(&q.segments()[0].payload, b"abcdef");
+        assert_eq!(q.segments()[0].seq(), 100);
+        assert_eq!(&expect_bytes(&q.segments()[0]).payload, b"abcdef");
     }
 
     #[test]
@@ -262,8 +359,8 @@ mod tests {
         q.insert(106, b"ccc");
         q.insert(103, b"bbb");
         assert_eq!(q.len(), 1);
-        assert_eq!(q.segments()[0].seq, 100);
-        assert_eq!(&q.segments()[0].payload, b"aaabbbccc");
+        assert_eq!(q.segments()[0].seq(), 100);
+        assert_eq!(&expect_bytes(&q.segments()[0]).payload, b"aaabbbccc");
     }
 
     #[test]
@@ -276,7 +373,7 @@ mod tests {
         assert_eq!(out.newly_buffered, 1);
         assert_eq!(out.cap_dropped, 0);
         assert_eq!(q.len(), 1);
-        assert_eq!(&q.segments()[0].payload, b"abcdefg");
+        assert_eq!(&expect_bytes(&q.segments()[0]).payload, b"abcdefg");
     }
 
     #[test]
@@ -285,7 +382,7 @@ mod tests {
         let out = q.insert(100, b"abcdef");
         assert_eq!(out.newly_buffered, 4);
         assert_eq!(out.cap_dropped, 2);
-        assert_eq!(&q.segments()[0].payload, b"abcd");
+        assert_eq!(&expect_bytes(&q.segments()[0]).payload, b"abcd");
     }
 
     #[test]
@@ -327,7 +424,7 @@ mod tests {
         assert_eq!(&bytes, b"aaabbb");
         assert_eq!(n, 1);
         assert_eq!(q.len(), 1);
-        assert_eq!(q.segments()[0].seq, 200);
+        assert_eq!(q.segments()[0].seq(), 200);
     }
 
     #[test]

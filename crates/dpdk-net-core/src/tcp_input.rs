@@ -1484,7 +1484,10 @@ mod tests {
         assert_eq!(out.reassembly_queued_bytes, 3);
         assert_eq!(c.rcv_nxt, 5001);
         assert_eq!(c.recv.reorder.len(), 1);
-        assert_eq!(&c.recv.reorder.segments()[0].payload, b"xyz");
+        assert_eq!(
+            &crate::tcp_reassembly::expect_bytes(&c.recv.reorder.segments()[0]).payload,
+            b"xyz"
+        );
         // F-8 RFC 2018 §4 MUST-26: triggering OOO range recorded for
         // the upcoming ACK's first SACK block.
         assert_eq!(c.last_sack_trigger, Some((5100, 5103)));

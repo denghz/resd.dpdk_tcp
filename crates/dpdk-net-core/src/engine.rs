@@ -3183,7 +3183,7 @@ impl Engine {
             .reorder
             .segments()
             .iter()
-            .map(|s| (s.seq, s.end_seq()))
+            .map(|s| (s.seq(), s.end_seq()))
             .collect();
         drop(ft);
 
