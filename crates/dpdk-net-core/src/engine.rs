@@ -3641,6 +3641,9 @@ impl Engine {
         // Pre-size to cover the first segment's needed bytes. Inner loop
         // grows on demand for atypical sizes.
         let initial_cap_needed = crate::tcp_output::FRAME_HDRS_MIN + 40 + mss_cap as usize;
+        // Two-phase borrowing doesn't kick in across the `reserve` arg
+        // because the immutable borrow is held through method lookup on
+        // `Vec`; snapshot the capacity to sidestep E0502.
         let current_cap = frame.capacity();
         if current_cap < initial_cap_needed {
             frame.reserve(initial_cap_needed - current_cap);
