@@ -1138,7 +1138,7 @@ After the existing WC-verify call in Task 3, add:
         // M1 — header-overflow-risk warning (slow-path one-shot).
         // Worst-case header: 14 (Ethernet) + 20 (IPv4) + 20 (TCP) + 40
         // (max TCP options) = 94 B. With ena_large_llq_hdr=0 the LLQ
-        // ceiling is 96 B; at 94 B we sit one byte under and any
+        // ceiling is 96 B; at 94 B we sit 2 bytes under and any
         // future option-stack growth silently demotes TX off LLQ. Bump
         // the counter when the knob is unset on net_ena ports — the
         // operator should set ena_large_llq_hdr=1 if they care about

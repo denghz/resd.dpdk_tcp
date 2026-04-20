@@ -973,7 +973,7 @@ impl Engine {
         // M1 — header-overflow-risk warning (slow-path one-shot).
         // Worst-case header: 14 (Ethernet) + 20 (IPv4) + 20 (TCP) + 40
         // (max TCP options) = 94 B. With ena_large_llq_hdr=0 the LLQ
-        // ceiling is 96 B; at 94 B we sit one byte under the limit and
+        // ceiling is 96 B; at 94 B we sit 2 bytes under the limit and
         // any future option-stack growth silently demotes TX off LLQ.
         // The 6 B margin + constant `WORST_CASE_HEADER + LLQ_OVERFLOW_MARGIN
         // > LLQ_DEFAULT_HEADER_LIMIT` tests evaluate to
