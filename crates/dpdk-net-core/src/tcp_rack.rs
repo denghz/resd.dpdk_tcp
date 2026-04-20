@@ -111,6 +111,25 @@ pub fn rack_mark_losses_on_rto(
     now_us: u32,
 ) -> Vec<u16> {
     let mut out = Vec::new();
+    rack_mark_losses_on_rto_into(entries, snd_una, rtt_us, reo_wnd_us, now_us, &mut out);
+    out
+}
+
+/// A6.5 Task 10: alloc-free variant of `rack_mark_losses_on_rto`.
+/// Appends lost-segment indexes into `out` (caller-provided,
+/// typically an Engine-scoped scratch). Kept narrowly scoped: the
+/// RTO-fire path is not the steady-state hot path in the A6.5 audit
+/// (RTOs are rare-event handlers), but surfacing one-shot Vec allocs
+/// here still muddies the "zero per second" property across long
+/// runs with occasional RTO backups, so we thread a scratch instead.
+pub fn rack_mark_losses_on_rto_into(
+    entries: &VecDeque<RetransEntry>,
+    snd_una: u32,
+    rtt_us: u32,
+    reo_wnd_us: u32,
+    now_us: u32,
+    out: &mut Vec<u16>,
+) {
     for (i, e) in entries.iter().enumerate() {
         if e.sacked || e.lost {
             continue;
@@ -126,7 +145,6 @@ pub fn rack_mark_losses_on_rto(
             out.push(i as u16);
         }
     }
-    out
 }
 
 #[cfg(test)]

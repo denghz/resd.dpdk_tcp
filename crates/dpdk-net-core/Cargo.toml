@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 dpdk-net-sys = { path = "../dpdk-net-sys" }
 libc.workspace = true
+smallvec = { workspace = true }
 thiserror.workspace = true
 
 [features]
@@ -59,6 +60,16 @@ hw-offloads-all = [
 ]
 # Meta for the A8 counter-coverage audit.
 obs-all = ["obs-byte-counters", "obs-poll-saturation"]
+# A6.5 Group 5: counting GlobalAlloc wrapper + steady-state
+# alloc-audit regression test. Feature-gated so the probe never
+# ships in release/default builds. The library code does NOT
+# install the allocator globally — the integration test binary
+# does, in `tests/bench_alloc_hotpath.rs`.
+bench-alloc-audit = []
+# Backtrace-capture sub-feature for diagnosing a surfaced allocation.
+# Backtrace capture is itself allocating, so enable only for repro
+# runs of a failing audit.
+bench-alloc-audit-backtrace = ["bench-alloc-audit"]
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "warn"

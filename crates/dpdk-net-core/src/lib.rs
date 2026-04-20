@@ -2,6 +2,8 @@
 //! The public `extern "C"` surface lives in the `dpdk-net` crate.
 
 pub mod arp;
+#[cfg(feature = "bench-alloc-audit")]
+pub mod bench_alloc_audit;
 pub mod clock;
 pub mod counters;
 pub mod dpdk_consts;

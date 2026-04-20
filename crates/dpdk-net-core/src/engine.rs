@@ -1,4 +1,5 @@
 use dpdk_net_sys as sys;
+use smallvec::{smallvec, SmallVec};
 use std::cell::{Cell, RefCell};
 use std::ffi::CString;
 use std::sync::Mutex;
@@ -386,6 +387,49 @@ pub struct Engine {
     /// queue here — they stay on their existing `tx_frame` /
     /// `tx_data_frame` inline paths.
     pub(crate) tx_pending_data: RefCell<Vec<std::ptr::NonNull<sys::rte_mbuf>>>,
+
+    /// Reusable scratch buffer for per-segment TX frame staging. Sized
+    /// at `engine_create` to fit MSS + 40-byte option budget + FRAME_HDRS_MIN.
+    /// Borrow semantics mirror `tx_pending_data`: borrow_mut + clear + resize.
+    /// §7.6 scratch-reuse policy.
+    pub(crate) tx_frame_scratch: RefCell<Vec<u8>>,
+
+    /// Per-poll scratch for copying a connection's timer-id list out
+    /// before cancel operations that would re-borrow the conn. A6.5
+    /// §7.6. N=8 covers observed P99 per-connection timer depth.
+    pub(crate) timer_ids_scratch: RefCell<SmallVec<[crate::tcp_timer_wheel::TimerId; 8]>>,
+
+    /// A6.5 Task 10: per-poll scratch for iterating connection handles
+    /// out of `flow_table` when the loop body needs `get_mut`-level
+    /// access that would conflict with the `iter_handles` borrow. Two
+    /// sites use this today — `poll_once`'s per-conn `last_read_mbufs`
+    /// clear, and `reap_time_wait`'s TIME_WAIT candidate filter. N=8
+    /// matches the default `max_connections=16` with a cushion; larger
+    /// connection counts spill to heap only on the slow path (spill
+    /// would bump the audit counter on one poll, which is fine).
+    pub(crate) conn_handles_scratch:
+        RefCell<SmallVec<[crate::flow_table::ConnHandle; 8]>>,
+
+    /// A6.5 Task 10: per-ACK scratch for mbuf pointers pruned from a
+    /// connection's `snd_retrans` queue. Needed because
+    /// `sys::shim_rte_pktmbuf_free` must be called OUTSIDE the
+    /// `flow_table` RefCell mut-borrow (FFI call sites rule), and the
+    /// old `prune_below -> SmallVec<[RetransEntry;8]>` allocated a
+    /// fresh SmallVec that grew past inline capacity under sustained
+    /// in-flight > 8 segments (the A6.5 audit sampled this path in
+    /// `SendRetrans::prune_below` at tcp_retrans.rs:73). We replace
+    /// the owning-SmallVec with `prune_below_into_mbufs`, which
+    /// drains raw pointers into this engine-scoped scratch so the
+    /// capacity is preserved across polls.
+    pub(crate) pruned_mbufs_scratch:
+        RefCell<SmallVec<[std::ptr::NonNull<sys::rte_mbuf>; 16]>>,
+
+    /// A6.5 Task 10: scratch for `rack_mark_losses_on_rto_into` so the
+    /// RTO-fire handler does not freshly allocate a `Vec<u16>` per
+    /// fire. RTOs are rare under steady-state traffic but the audit
+    /// still needs "zero per unit time", so any rare-event alloc that
+    /// crosses the measurement window surfaces as a regression.
+    pub(crate) rack_lost_idxs_scratch: RefCell<Vec<u16>>,
 
     /// A6 (spec §3.6 Site 3): snapshot of `counters.eth.rx_drop_nomem`
     /// at the top of `poll_once`; compared against the post-RX value at
@@ -857,6 +901,24 @@ impl Engine {
                 (cfg.max_connections as usize).saturating_mul(4),
             )),
             tx_pending_data: RefCell::new(Vec::with_capacity(cfg.tx_ring_size as usize)),
+            tx_frame_scratch: RefCell::new(Vec::with_capacity(
+                cfg.tcp_mss as usize
+                    + crate::tcp_output::FRAME_HDRS_MIN
+                    + 40,
+            )),
+            timer_ids_scratch: RefCell::new(SmallVec::new()),
+            conn_handles_scratch: RefCell::new(SmallVec::new()),
+            // Pre-allocate the heap-spill past inline-16 at creation
+            // time so steady-state prune counts (which depend on
+            // cwnd × MSS / send_buffer, and in the audit workload
+            // reliably exceed 16) do not trigger a first-doubling
+            // during the measurement window.
+            pruned_mbufs_scratch: RefCell::new(SmallVec::with_capacity(256)),
+            // A6.5 Task 10: pre-size to `max_in_flight` so the first RTO
+            // fire after startup does not grow the Vec. A typical
+            // trading workload keeps in-flight ≤ 64; capacity 64 covers
+            // the P99 without visibly warming.
+            rack_lost_idxs_scratch: RefCell::new(Vec::with_capacity(64)),
             rx_drop_nomem_prev: std::cell::Cell::new(0),
             tx_cksum_offload_active: outcome.tx_cksum_offload_active,
             rx_cksum_offload_active: outcome.rx_cksum_offload_active,
@@ -1566,9 +1628,10 @@ impl Engine {
     }
 
     /// One iteration of the run-to-completion loop.
-    /// A3: clears each conn's per-poll `last_read_buf` accumulator,
-    /// drains an RX burst, dispatches frames through the L2/L3/TCP
-    /// pipeline, then reaps any TIME_WAIT flows past their 2×MSL deadline.
+    /// A3: clears each conn's per-poll `last_read_mbufs` list (dropping
+    /// the held `MbufHandle` refcounts), drains an RX burst, dispatches
+    /// frames through the L2/L3/TCP pipeline, then reaps any TIME_WAIT
+    /// flows past their 2×MSL deadline.
     pub fn poll_once(&self) -> usize {
         use crate::counters::{add, inc};
         use std::sync::atomic::Ordering;
@@ -1580,15 +1643,23 @@ impl Engine {
         self.rx_drop_nomem_prev
             .set(self.counters.eth.rx_drop_nomem.load(Ordering::Relaxed));
 
-        // Clear per-conn last_read_buf so prior borrowed views are
-        // invalidated per spec §4.2, before any rx_frame dispatches
-        // can append new data this iteration.
+        // Clear per-conn last_read_mbufs so prior event-window mbuf
+        // pins are released (MbufHandle::Drop decrements refcount) per
+        // spec §4.2, before any rx_frame dispatches can push fresh
+        // refs this iteration.
+        //
+        // A6.5 Task 10: use the Engine-owned `conn_handles_scratch`
+        // SmallVec instead of a fresh `Vec<_>::new()`. This runs on
+        // every poll, so a per-poll heap allocation was surfaced by
+        // the bench-alloc-audit sweep.
         {
             let mut ft = self.flow_table.borrow_mut();
-            let handles: Vec<_> = ft.iter_handles().collect();
-            for h in handles {
+            let mut handles = self.conn_handles_scratch.borrow_mut();
+            handles.clear();
+            handles.extend(ft.iter_handles());
+            for h in handles.drain(..) {
                 if let Some(c) = ft.get_mut(h) {
-                    c.recv.last_read_buf.clear();
+                    c.recv.last_read_mbufs.clear();
                 }
             }
         }
@@ -1669,7 +1740,12 @@ impl Engine {
             // RX-origin event emission sites (Connected + Readable).
             let hw_rx_ts = unsafe { self.hw_rx_ts_ns(m) };
             add(&self.counters.eth.rx_bytes, bytes.len() as u64);
-            let _accepted = self.rx_frame(bytes, ol_flags, nic_rss_hash, hw_rx_ts);
+            // A6.5 Task 4b/4d: hand the mbuf pointer to the RX decode
+            // chain so the OOO reorder queue can store zero-copy
+            // `OooSegment` entries referencing the mbuf instead of
+            // copying payload. `m` is non-null by rx_burst contract.
+            let rx_mbuf = std::ptr::NonNull::new(m);
+            let _accepted = self.rx_frame(bytes, ol_flags, nic_rss_hash, hw_rx_ts, rx_mbuf);
             #[cfg(feature = "obs-byte-counters")]
             {
                 rx_bytes_acc += _accepted as u64;
@@ -1816,9 +1892,10 @@ impl Engine {
     }
 
     /// A5 Task 12: advance the timer wheel to `now_ns` and dispatch fired
-    /// timers by kind. `advance()` returns an owned `Vec`, so the
-    /// `timer_wheel` borrow ends at the semicolon — per-timer handlers are
-    /// free to re-borrow the wheel (e.g. `on_rto_fire` re-arms).
+    /// timers by kind. `advance()` returns an owned `SmallVec<[_; 8]>`
+    /// (A6.5 Task 4; typical per-tick fire count ≤ 8 stays on the stack),
+    /// so the `timer_wheel` borrow ends at the semicolon — per-timer
+    /// handlers are free to re-borrow the wheel (e.g. `on_rto_fire` re-arms).
     fn advance_timer_wheel(&self) {
         let fired = self
             .timer_wheel
@@ -1902,24 +1979,33 @@ impl Engine {
         // always matches the `seq == snd_una` clause when snd_retrans
         // is non-empty), fall back to A5 front-only retransmit to
         // avoid regression.
-        let lost_indexes = {
+        // A6.5 Task 10: drain lost indexes into the engine-scoped
+        // `rack_lost_idxs_scratch` rather than allocating a fresh
+        // Vec per RTO fire. The scratch's capacity saturates to the
+        // worst in-flight-depth observed across the lifetime of the
+        // engine; subsequent fires reuse the same allocation.
+        {
+            let mut scratch = self.rack_lost_idxs_scratch.borrow_mut();
+            scratch.clear();
             let ft = self.flow_table.borrow();
             let Some(c) = ft.get(handle) else { return };
             let rtt_us = c.rtt_est.srtt_us().unwrap_or(c.rack.min_rtt_us);
             let reo_wnd = c.rack.reo_wnd_us;
             let now_us = (crate::clock::now_ns() / 1_000) as u32;
-            crate::tcp_rack::rack_mark_losses_on_rto(
+            crate::tcp_rack::rack_mark_losses_on_rto_into(
                 &c.snd_retrans.entries,
                 c.snd_una,
                 rtt_us,
                 reo_wnd,
                 now_us,
-            )
-        };
+                &mut scratch,
+            );
+        }
         {
             let mut ft = self.flow_table.borrow_mut();
             if let Some(c) = ft.get_mut(handle) {
-                for &idx in &lost_indexes {
+                let scratch = self.rack_lost_idxs_scratch.borrow();
+                for &idx in scratch.iter() {
                     if let Some(e) = c.snd_retrans.entries.get_mut(idx as usize) {
                         e.lost = true;
                     }
@@ -1933,11 +2019,24 @@ impl Engine {
         // passes don't see stale flags. `tx_rto` bumps exactly once
         // per fire — preserves A5 one-RTO-fire-counter semantics
         // (one `tx_rto` + N `tx_retrans`).
-        if lost_indexes.is_empty() {
+        let lost_is_empty = self.rack_lost_idxs_scratch.borrow().is_empty();
+        if lost_is_empty {
             // Defensive fallback — helper should always pick the front.
             self.retransmit(handle, 0);
         } else {
-            for &idx in &lost_indexes {
+            // Clone indexes into a small local so `retransmit` (which
+            // re-borrows the engine) doesn't conflict with the scratch
+            // borrow. Typical RTO-recovery burst is ≤ `max_in_flight`;
+            // in our test corpus that's small enough to stack-inline.
+            // We read-copy into a SmallVec; inline-cap 16 covers common
+            // bursts, growth is a one-shot rare event.
+            let indexes: smallvec::SmallVec<[u16; 16]> = self
+                .rack_lost_idxs_scratch
+                .borrow()
+                .iter()
+                .copied()
+                .collect();
+            for &idx in indexes.iter() {
                 self.retransmit(handle, idx as usize);
             }
         }
@@ -1954,20 +2053,23 @@ impl Engine {
         // phases.
         if self.cfg.tcp_per_packet_events {
             let emitted_ts_ns = crate::clock::now_ns();
-            let retrans_snapshots: Vec<(u32, u32)> = {
+            // A6.5 Task 4: SmallVec<[_; 4]> inline — the empty-lost_indexes
+            // branch emits at most one snapshot; the RACK branch rarely
+            // exceeds a handful of losses in steady state (see spec §2.3).
+            let retrans_snapshots: SmallVec<[(u32, u32); 4]> = {
                 let ft = self.flow_table.borrow();
                 let c = match ft.get(handle) {
                     Some(c) => c,
                     None => return,
                 };
-                if lost_indexes.is_empty() {
+                let lost = self.rack_lost_idxs_scratch.borrow();
+                if lost.is_empty() {
                     c.snd_retrans
                         .front()
-                        .map(|e| vec![(e.seq, e.xmit_count as u32)])
+                        .map(|e| smallvec![(e.seq, e.xmit_count as u32)])
                         .unwrap_or_default()
                 } else {
-                    lost_indexes
-                        .iter()
+                    lost.iter()
                         .filter_map(|&i| {
                             c.snd_retrans
                                 .entries
@@ -2285,12 +2387,19 @@ impl Engine {
         // transition so StateChange emission + state_trans[from][to]
         // counter bumps (spec §9.1 core TCP observability) are not
         // skipped.
+        // A6.5 Task 5: use Engine-owned SmallVec scratch instead of a
+        // per-call Vec. The RefMut guard is moved out of the block
+        // alongside `dropped_entries`; `timer_ids_scratch` is a distinct
+        // RefCell from `flow_table`, so the inner conn borrow drops with
+        // `ft` at the end of this block.
         let (timer_ids_to_cancel, dropped_entries) = {
             let mut ft = self.flow_table.borrow_mut();
             let Some(conn) = ft.get_mut(handle) else {
                 return;
             };
-            let mut ids: Vec<crate::tcp_timer_wheel::TimerId> = conn.timer_ids.to_vec();
+            let mut ids = self.timer_ids_scratch.borrow_mut();
+            ids.clear();
+            ids.extend_from_slice(&conn.timer_ids);
             if let Some(id) = conn.rto_timer_id.take() {
                 ids.push(id);
             }
@@ -2315,10 +2424,11 @@ impl Engine {
         // between `timer_ids` and the three named handles is benign.
         {
             let mut w = self.timer_wheel.borrow_mut();
-            for id in timer_ids_to_cancel {
-                w.cancel(id);
+            for id in timer_ids_to_cancel.iter() {
+                w.cancel(*id);
             }
         }
+        drop(timer_ids_to_cancel);
         // Phase 4: state transition via transition_conn — emits the
         // StateChange event and bumps state_trans[from][Closed], keeping
         // the observability contract intact on ETIMEDOUT force-close.
@@ -2359,27 +2469,55 @@ impl Engine {
     /// ≤100 connections; A6's timer wheel replaces this.
     fn reap_time_wait(&self) {
         let now = crate::clock::now_ns();
-        let candidates: Vec<_> = {
+        // A6.5 Task 10: reuse Engine-owned `conn_handles_scratch`
+        // instead of allocating a fresh `Vec<_>` per poll. On the hot
+        // path this typically stays empty (no TIME_WAIT candidates),
+        // but the prior `.collect::<Vec<_>>()` allocated an 8-cap Vec
+        // regardless via the iterator's `size_hint`, surfacing as a
+        // per-poll heap alloc under the bench-alloc-audit sweep.
+        //
+        // We unfold the filter-collect into a push loop so the filter
+        // body can short-circuit without holding a closure borrow on
+        // the scratch.
+        {
+            let mut candidates = self.conn_handles_scratch.borrow_mut();
+            candidates.clear();
             let ft = self.flow_table.borrow();
-            ft.iter_handles()
-                .filter(|h| {
-                    let Some(c) = ft.get(*h) else {
-                        return false;
-                    };
-                    // A6 Task 11: `force_tw_skip` (set by
-                    // `close_conn_with_flags` in Task 10 when `ts_enabled`
-                    // is true) short-circuits the 2×MSL wait so the
-                    // connection reaps on the next tick regardless of
-                    // `time_wait_deadline_ns`. Observability parity
-                    // preserved — the close path below still emits the
-                    // same StateChange + Closed events.
-                    c.state == TcpState::TimeWait
-                        && (c.force_tw_skip
-                            || c.time_wait_deadline_ns.is_some_and(|d| now >= d))
-                })
-                .collect()
-        };
-        for h in candidates {
+            for h in ft.iter_handles() {
+                let Some(c) = ft.get(h) else {
+                    continue;
+                };
+                // A6 Task 11: `force_tw_skip` (set by
+                // `close_conn_with_flags` in Task 10 when `ts_enabled`
+                // is true) short-circuits the 2×MSL wait so the
+                // connection reaps on the next tick regardless of
+                // `time_wait_deadline_ns`. Observability parity
+                // preserved — the close path below still emits the
+                // same StateChange + Closed events.
+                if c.state == TcpState::TimeWait
+                    && (c.force_tw_skip
+                        || c.time_wait_deadline_ns.is_some_and(|d| now >= d))
+                {
+                    candidates.push(h);
+                }
+            }
+        }
+        // Drain out of the scratch on each iteration so the scratch's
+        // `RefCell` borrow is released around the loop body — which
+        // transitions the conn (re-borrows `flow_table` mutably) and
+        // also re-borrows `conn_handles_scratch` is NOT required here
+        // because `transition_conn` uses a different scratch, but the
+        // pattern of releasing the scratch borrow across foreign calls
+        // keeps later edits safe. Uses `pop()` which is O(1) and does
+        // not reallocate.
+        loop {
+            let h = {
+                let mut candidates = self.conn_handles_scratch.borrow_mut();
+                match candidates.pop() {
+                    Some(h) => h,
+                    None => break,
+                }
+            };
             self.transition_conn(h, TcpState::Closed);
             self.events.borrow_mut().push(
                 InternalEvent::Closed {
@@ -2395,10 +2533,14 @@ impl Engine {
             // A5: cancel any armed timers owned by this conn before
             // removing its slot. `cancel()` is idempotent (Task 5), so
             // overlap between `timer_ids` and named-handle fields is fine.
-            let to_cancel: Vec<crate::tcp_timer_wheel::TimerId> = {
+            // A6.5 Task 5: borrow Engine-owned scratch, clear, extend,
+            // drop before removing the slot.
+            let to_cancel = {
                 let ft = self.flow_table.borrow();
+                let mut ids = self.timer_ids_scratch.borrow_mut();
+                ids.clear();
                 if let Some(conn) = ft.get(h) {
-                    let mut ids: Vec<_> = conn.timer_ids.to_vec();
+                    ids.extend_from_slice(&conn.timer_ids);
                     if let Some(id) = conn.rto_timer_id {
                         ids.push(id);
                     }
@@ -2408,17 +2550,16 @@ impl Engine {
                     if let Some(id) = conn.syn_retrans_timer_id {
                         ids.push(id);
                     }
-                    ids
-                } else {
-                    Vec::new()
                 }
+                ids
             };
             {
                 let mut w = self.timer_wheel.borrow_mut();
-                for id in to_cancel {
-                    w.cancel(id);
+                for id in to_cancel.iter() {
+                    w.cancel(*id);
                 }
             }
+            drop(to_cancel);
             self.flow_table.borrow_mut().remove(h);
         }
     }
@@ -2454,7 +2595,23 @@ impl Engine {
     /// `Connected` + `Readable` event emission sites in `tcp_input` +
     /// `deliver_readable` (spec §10.3). `0` when the NIC didn't stamp
     /// one (expected on ENA — spec §10.5).
-    fn rx_frame(&self, bytes: &[u8], ol_flags: u64, nic_rss_hash: u32, hw_rx_ts: u64) -> u32 {
+    ///
+    /// `rx_mbuf` — the mbuf the frame was decoded from, OR `None` for
+    /// non-mbuf test callers. A6.5 Task 4b/4d threads this through to
+    /// the OOO reorder-queue insert site so out-of-order payload can
+    /// be stored as an `OooSegment` (zero-copy mbuf reference).
+    /// `eth_payload_offset` is the offset (in bytes) of the L2
+    /// payload (= start of the IP header) within the mbuf data
+    /// region; used to compute the TCP payload offset for the
+    /// `OooSegment`.
+    fn rx_frame(
+        &self,
+        bytes: &[u8],
+        ol_flags: u64,
+        nic_rss_hash: u32,
+        hw_rx_ts: u64,
+        rx_mbuf: Option<std::ptr::NonNull<sys::rte_mbuf>>,
+    ) -> u32 {
         use crate::counters::inc;
         match crate::l2::l2_decode(bytes, self.our_mac) {
             Err(crate::l2::L2Drop::Short) => {
@@ -2477,9 +2634,14 @@ impl Engine {
                         self.handle_arp(payload);
                         0
                     }
-                    crate::l2::ETHERTYPE_IPV4 => {
-                        self.handle_ipv4(payload, ol_flags, nic_rss_hash, hw_rx_ts)
-                    }
+                    crate::l2::ETHERTYPE_IPV4 => self.handle_ipv4(
+                        payload,
+                        ol_flags,
+                        nic_rss_hash,
+                        hw_rx_ts,
+                        rx_mbuf,
+                        l2.payload_offset as u16,
+                    ),
                     _ => unreachable!("l2_decode filters unsupported ethertypes"),
                 }
             }
@@ -2516,7 +2678,15 @@ impl Engine {
     /// `hw-offload-rx-cksum` feature AND the runtime
     /// `rx_cksum_offload_active` latch — if either is false the
     /// offload-aware wrapper degrades to the software path.
-    fn handle_ipv4(&self, payload: &[u8], ol_flags: u64, nic_rss_hash: u32, hw_rx_ts: u64) -> u32 {
+    fn handle_ipv4(
+        &self,
+        payload: &[u8],
+        ol_flags: u64,
+        nic_rss_hash: u32,
+        hw_rx_ts: u64,
+        rx_mbuf: Option<std::ptr::NonNull<sys::rte_mbuf>>,
+        eth_payload_offset: u16,
+    ) -> u32 {
         use crate::counters::inc;
         match crate::l3_ip::ip_decode_offload_aware(
             payload,
@@ -2566,7 +2736,23 @@ impl Engine {
                 match ip.protocol {
                     crate::l3_ip::IPPROTO_TCP => {
                         inc(&self.counters.ip.rx_tcp);
-                        self.tcp_input(&ip, inner, ol_flags, nic_rss_hash, hw_rx_ts)
+                        // A6.5 Task 4b: `tcp_bytes_offset_in_mbuf` is the
+                        // offset from the mbuf data pointer to the TCP
+                        // header (= eth_payload_offset + ip.header_len).
+                        // `tcp_input` adds `parsed.header_len` to derive
+                        // the TCP payload offset for `OooSegment`
+                        // storage.
+                        let tcp_bytes_offset =
+                            eth_payload_offset.saturating_add(ip.header_len as u16);
+                        self.tcp_input(
+                            &ip,
+                            inner,
+                            ol_flags,
+                            nic_rss_hash,
+                            hw_rx_ts,
+                            rx_mbuf,
+                            tcp_bytes_offset,
+                        )
                     }
                     crate::l3_ip::IPPROTO_ICMP => {
                         inc(&self.counters.ip.rx_icmp);
@@ -2607,9 +2793,11 @@ impl Engine {
         ol_flags: u64,
         nic_rss_hash: u32,
         hw_rx_ts: u64,
+        rx_mbuf: Option<std::ptr::NonNull<sys::rte_mbuf>>,
+        tcp_bytes_offset_in_mbuf: u16,
     ) -> u32 {
         use crate::counters::inc;
-        use crate::tcp_input::{dispatch, parse_segment, tuple_from_segment, TxAction};
+        use crate::tcp_input::{dispatch, parse_segment, tuple_from_segment, MbufInsertCtx, TxAction};
 
         // Task 8: classify the NIC-reported L4 checksum outcome before
         // dispatching the software fold inside `parse_segment`. Gated
@@ -2711,9 +2899,51 @@ impl Engine {
             inc(&self.counters.tcp.rx_data);
         }
 
-        let outcome = {
+        // A6.5 Task 4b: build the MbufInsertCtx iff we have a live mbuf
+        // AND the segment has payload (no-payload segments never take
+        // the OOO-insert path). Bump the mbuf refcount before dispatch:
+        // the reorder queue owns one refcount per stored `OooSegment`;
+        // the caller's subsequent `rte_pktmbuf_free` drops the
+        // original RX-burst reference. If no ref is retained, we roll
+        // back the up-bump after dispatch (via
+        // `outcome.mbuf_ref_retained == false`).
+        //
+        // Skip when the OOO path is unreachable: empty payload, or no
+        // mbuf handle (shouldn't happen on the real RX path but keeps
+        // the signature flexible for non-mbuf callers).
+        let mbuf_ctx = if let Some(mb) = rx_mbuf {
+            if !parsed.payload.is_empty() {
+                let payload_offset =
+                    tcp_bytes_offset_in_mbuf.saturating_add(parsed.header_len as u16);
+                // SAFETY: `mb` came from the active rx_burst iteration in
+                // `poll_once`, which has not yet called
+                // `shim_rte_pktmbuf_free` on it. The refcount bump is
+                // ordered before any queue store.
+                unsafe {
+                    sys::shim_rte_mbuf_refcnt_update(mb.as_ptr(), 1);
+                }
+                Some(MbufInsertCtx {
+                    mbuf: mb,
+                    payload_offset,
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let mut outcome = {
             let mut ft = self.flow_table.borrow_mut();
             let Some(conn) = ft.get_mut(handle) else {
+                // Rare race: conn lookup succeeded above but a concurrent
+                // drop removed it before the borrow_mut. Roll back the
+                // refcount up-bump if we did one.
+                if let Some(ctx) = mbuf_ctx {
+                    unsafe {
+                        sys::shim_rte_mbuf_refcnt_update(ctx.mbuf.as_ptr(), -1);
+                    }
+                }
                 return 0;
             };
             // A6 Task 15 (spec §3.8): pass the engine-wide RTT histogram
@@ -2726,13 +2956,42 @@ impl Engine {
             // (`in_flight ≤ send_buffer_bytes/2`) and surface a one-shot
             // Outcome flag; the engine translator below pushes
             // `InternalEvent::Writable` when set.
+            //
+            // A6.5 Task 4b/4d: `mbuf_ctx` wires the mbuf pointer +
+            // payload offset so the OOO reorder-queue insert path can
+            // store zero-copy `OooSegment` entries referencing the
+            // mbuf. `None` on the pure-slice path (empty payload or
+            // no mbuf) skips OOO-enqueue entirely — Task 4d retired
+            // the legacy copy-based path.
             dispatch(
                 conn,
                 &parsed,
                 &self.rtt_histogram_edges,
                 self.cfg.send_buffer_bytes,
+                mbuf_ctx,
             )
         };
+
+        // A6.5 Task 4b: roll back the pre-dispatch refcount up-bump when
+        // no OOO segment derived from this mbuf was actually retained.
+        // The three cases where we bumped but need to roll back:
+        //   1. Payload delivered in-order (no OOO insert reached).
+        //   2. OOO-insert path ran but the cap was already exceeded, so
+        //      `insert` returned `mbuf_ref_retained = false`.
+        //   3. Segment dropped before the OOO-insert site (e.g. PAWS,
+        //      bad-seq, out-of-window). All such paths leave
+        //      `mbuf_ref_retained = false`.
+        // In all rollback cases, the subsequent `shim_rte_pktmbuf_free`
+        // on the original RX-burst reference will release the mbuf to
+        // its mempool. When `mbuf_ref_retained = true`, the queued ref
+        // keeps the mbuf alive until drain or eviction.
+        if let Some(ctx) = mbuf_ctx {
+            if !outcome.mbuf_ref_retained {
+                unsafe {
+                    sys::shim_rte_mbuf_refcnt_update(ctx.mbuf.as_ptr(), -1);
+                }
+            }
+        }
 
         // A4: map Outcome fields → TcpCounters slow-path bumps. Groups
         // all per-segment counter wiring in one place so the dispatch
@@ -2825,17 +3084,28 @@ impl Engine {
         //   4. mut-borrow timer_wheel to cancel, release.
         //   5. mut-borrow flow_table to clear rto/tlp_timer_id + prune timer_ids.
         if let Some(new_snd_una) = outcome.snd_una_advanced_to {
-            let dropped = {
+            // A6.5 Task 10: drain pruned mbuf pointers into the engine-
+            // scoped scratch so the per-ACK allocation is reused across
+            // polls. See `pruned_mbufs_scratch` docs for the audit
+            // finding this replaced. The scratch is borrowed inside
+            // (and released before) the FFI-free loop below, so no
+            // RefCell nesting is possible.
+            {
+                let mut scratch = self.pruned_mbufs_scratch.borrow_mut();
+                scratch.clear();
                 let mut ft = self.flow_table.borrow_mut();
                 if let Some(c) = ft.get_mut(handle) {
-                    c.snd_retrans.prune_below(new_snd_una)
-                } else {
-                    Vec::new()
+                    c.snd_retrans
+                        .prune_below_into_mbufs(new_snd_una, &mut scratch);
                 }
-            };
-            for entry in dropped {
-                unsafe { sys::shim_rte_pktmbuf_free(entry.mbuf.as_ptr()) };
             }
+            {
+                let scratch = self.pruned_mbufs_scratch.borrow();
+                for p in scratch.iter() {
+                    unsafe { sys::shim_rte_pktmbuf_free(p.as_ptr()) };
+                }
+            }
+            self.pruned_mbufs_scratch.borrow_mut().clear();
             let (rto_id_to_cancel, tlp_id_to_cancel) = {
                 let ft = self.flow_table.borrow();
                 if let Some(c) = ft.get(handle) {
@@ -2996,7 +3266,26 @@ impl Engine {
         }
 
         if outcome.delivered > 0 {
-            self.deliver_readable(handle, outcome.delivered, hw_rx_ts);
+            // A6.5 Task 4c: pin the RX mbuf (in-order portion) and each
+            // drained mbuf (from the reorder queue's gap-close) via
+            // `conn.recv.last_read_mbufs`, then emit one READABLE event
+            // per pinned mbuf. Drained mbufs already carry a refcount
+            // handed off from the queue; the RX mbuf needs an explicit
+            // bump so the pin outlives the post-dispatch
+            // `rte_pktmbuf_free` on the original RX-burst ref.
+            let in_order_offset = mbuf_ctx
+                .as_ref()
+                .map(|ctx| ctx.payload_offset)
+                .unwrap_or(0);
+            self.deliver_readable(
+                handle,
+                rx_mbuf,
+                in_order_offset,
+                outcome.in_order_delivered_from_seg,
+                std::mem::take(&mut outcome.drained_mbufs),
+                outcome.delivered,
+                hw_rx_ts,
+            );
         }
 
         if outcome.buf_full_drop > 0 {
@@ -3033,10 +3322,14 @@ impl Engine {
                 // removing its slot. `cancel()` is idempotent (Task 5),
                 // so overlap between `timer_ids` and the named-handle
                 // fields is fine.
-                let to_cancel: Vec<crate::tcp_timer_wheel::TimerId> = {
+                // A6.5 Task 5: borrow Engine-owned scratch, clear, extend,
+                // drop before removing the slot.
+                let to_cancel = {
                     let ft = self.flow_table.borrow();
+                    let mut ids = self.timer_ids_scratch.borrow_mut();
+                    ids.clear();
                     if let Some(conn) = ft.get(handle) {
-                        let mut ids: Vec<_> = conn.timer_ids.to_vec();
+                        ids.extend_from_slice(&conn.timer_ids);
                         if let Some(id) = conn.rto_timer_id {
                             ids.push(id);
                         }
@@ -3046,17 +3339,16 @@ impl Engine {
                         if let Some(id) = conn.syn_retrans_timer_id {
                             ids.push(id);
                         }
-                        ids
-                    } else {
-                        Vec::new()
                     }
+                    ids
                 };
                 {
                     let mut w = self.timer_wheel.borrow_mut();
-                    for id in to_cancel {
-                        w.cancel(id);
+                    for id in to_cancel.iter() {
+                        w.cancel(*id);
                     }
                 }
+                drop(to_cancel);
                 self.flow_table.borrow_mut().remove(handle);
             }
         }
@@ -3326,43 +3618,134 @@ impl Engine {
         }
     }
 
-    /// `rx_hw_ts_ns` — NIC-provided RX timestamp captured at the per-mbuf
-    /// decode boundary in `poll_once` and threaded through the RX frame
-    /// path. Stored on the `Readable` event verbatim. Mbuf is no longer
-    /// in scope here (data has already moved from mbuf to `conn.recv.bytes`),
-    /// so this parameter is the only way to surface the NIC timestamp to
-    /// the event consumer. `0` on ENA / feature-off (spec §10.3, §10.5).
-    fn deliver_readable(&self, handle: ConnHandle, delivered: u32, rx_hw_ts_ns: u64) {
+    /// A6.5 Task 4c: pin each delivered-payload mbuf in
+    /// `conn.recv.last_read_mbufs` and emit one READABLE event per
+    /// pinned mbuf.
+    ///
+    /// Ownership model: the in-order mbuf (`rx_mbuf`) gets an explicit
+    /// refcount bump here so the pin outlives the post-dispatch
+    /// `rte_pktmbuf_free` on the original RX-burst ref. Each entry in
+    /// `drained_mbufs` already carries a refcount handoff from the
+    /// reorder queue — it's moved straight into an `MbufHandle`
+    /// without a bump. `MbufHandle::Drop` decrements the count at
+    /// `last_read_mbufs.clear()` time on the next poll-start.
+    ///
+    /// `rx_hw_ts_ns`: NIC-provided RX timestamp captured at the per-
+    /// mbuf decode boundary in `poll_once` and threaded through the
+    /// RX frame path. Stored on each `Readable` event verbatim. `0`
+    /// on ENA / feature-off (spec §10.3, §10.5).
+    ///
+    /// `in_order_offset`: offset of the segment's payload within the
+    /// RX mbuf's data region (from `MbufInsertCtx.payload_offset`).
+    /// `in_order_len`: bytes of this segment's payload delivered
+    /// in-order (`Outcome::in_order_delivered_from_seg`). Zero when
+    /// the segment itself delivered nothing directly (e.g. a pure
+    /// drain-triggering in-order segment that was all in-order from
+    /// reorder, which is impossible — but guard anyway).
+    ///
+    /// `drained_mbufs`: list of reorder-queue mbufs consumed by the
+    /// gap-close drain. Each carries a refcount owned by the caller.
+    /// Pops `total_delivered` bytes from `conn.recv.bytes` to keep
+    /// the recv-buffer invariant ("everything delivered this
+    /// dispatch is flushed from the in-order VecDeque before the
+    /// next ACK re-advertises free_space"). A6.6 retires the
+    /// VecDeque entirely.
+    ///
+    /// Clippy's `too_many_arguments` default threshold is 7 (counting
+    /// `&self`); this fn has 8, so the allow is required.
+    #[allow(clippy::too_many_arguments)]
+    fn deliver_readable(
+        &self,
+        handle: ConnHandle,
+        rx_mbuf: Option<std::ptr::NonNull<sys::rte_mbuf>>,
+        in_order_offset: u16,
+        in_order_len: u32,
+        drained_mbufs: smallvec::SmallVec<[crate::tcp_reassembly::DrainedMbuf; 4]>,
+        total_delivered: u32,
+        rx_hw_ts_ns: u64,
+    ) {
         use crate::counters::add;
         let mut ft = self.flow_table.borrow_mut();
         let Some(conn) = ft.get_mut(handle) else {
+            // Rare race — conn gone. Drain's DrainedMbufs still hold
+            // refcount refs; wrap each in a handle and drop them so
+            // the refcounts are released. rx_mbuf is NOT bumped yet
+            // (we bump only when we push the handle), so no action
+            // there.
+            for d in drained_mbufs {
+                // Consume the refcount handoff into a handle and drop
+                // it immediately so `refcnt_update(-1)` fires exactly
+                // once. `into_handle()` disarms the DrainedMbuf Drop
+                // so we don't double-decrement.
+                let _ = d.into_handle();
+            }
             return;
         };
-        // Append delivered bytes to last_read_buf (do NOT clear — the poll
-        // entry point clears once per iteration so multiple Readable events
-        // within one poll stack contiguously in the buffer).
-        let byte_offset = conn.recv.last_read_buf.len() as u32;
-        conn.recv.last_read_buf.reserve(delivered as usize);
-        let (a, b) = conn.recv.bytes.as_slices();
-        let from_a = a.len().min(delivered as usize);
-        conn.recv.last_read_buf.extend_from_slice(&a[..from_a]);
-        let remaining = delivered as usize - from_a;
-        conn.recv.last_read_buf.extend_from_slice(&b[..remaining]);
-        for _ in 0..delivered {
+
+        // In-order portion from the RX mbuf: push one handle + emit
+        // one event. Skip when there's no in-order byte count (e.g.
+        // the whole delivery came from drain — `rx_mbuf`/`in_order_len`
+        // are still coherent but we'd emit an empty event).
+        if let (Some(mb), true) = (rx_mbuf, in_order_len > 0) {
+            // Bump refcount: pin beyond the post-dispatch
+            // `rte_pktmbuf_free`. Handle drops it on next clear.
+            // SAFETY: `mb` is the live RX mbuf from the rx_burst
+            // iteration; refcount >= 1.
+            unsafe {
+                sys::shim_rte_mbuf_refcnt_update(mb.as_ptr(), 1);
+            }
+            let handle_mbuf = unsafe { crate::mempool::MbufHandle::from_raw(mb) };
+            let mbuf_idx = conn.recv.last_read_mbufs.len() as u32;
+            conn.recv.last_read_mbufs.push(handle_mbuf);
+            self.events.borrow_mut().push(
+                InternalEvent::Readable {
+                    conn: handle,
+                    mbuf_idx,
+                    payload_offset: in_order_offset as u32,
+                    payload_len: in_order_len,
+                    rx_hw_ts_ns,
+                    emitted_ts_ns: crate::clock::now_ns(),
+                },
+                &self.counters,
+            );
+        }
+
+        // Drained portion from the reorder queue: one handle + one
+        // event per entry. Each entry already carries a refcount
+        // handed off from the queue — `into_handle()` moves that count
+        // into an `MbufHandle` and disarms `DrainedMbuf::Drop` so the
+        // decrement happens exactly once (at handle Drop time).
+        for d in drained_mbufs {
+            let payload_offset = d.offset as u32;
+            let payload_len = d.len as u32;
+            let handle_mbuf = d.into_handle();
+            let mbuf_idx = conn.recv.last_read_mbufs.len() as u32;
+            conn.recv.last_read_mbufs.push(handle_mbuf);
+            self.events.borrow_mut().push(
+                InternalEvent::Readable {
+                    conn: handle,
+                    mbuf_idx,
+                    payload_offset,
+                    payload_len,
+                    rx_hw_ts_ns,
+                    emitted_ts_ns: crate::clock::now_ns(),
+                },
+                &self.counters,
+            );
+        }
+
+        // Drain the in-order VecDeque to preserve the recv-buffer
+        // invariant: deliver_readable empties `conn.recv.bytes` of
+        // everything delivered this dispatch so the advertised window
+        // on the next ACK reflects "all delivered bytes are gone from
+        // the buffer". A6.6 retires the VecDeque entirely; until
+        // then, this pop_front loop keeps flow-control accounting
+        // consistent with pre-A6.5 behaviour.
+        for _ in 0..total_delivered {
             conn.recv.bytes.pop_front();
         }
         drop(ft);
-        add(&self.counters.tcp.recv_buf_delivered, delivered as u64);
-        self.events.borrow_mut().push(
-            InternalEvent::Readable {
-                conn: handle,
-                byte_offset,
-                byte_len: delivered,
-                rx_hw_ts_ns,
-                emitted_ts_ns: crate::clock::now_ns(),
-            },
-            &self.counters,
-        );
+        add(&self.counters.tcp.recv_buf_delivered, total_delivered as u64);
     }
 
     /// Open a new client-side connection. Emits a single SYN and
@@ -3626,7 +4009,17 @@ impl Engine {
         #[cfg(feature = "obs-byte-counters")]
         let mut tx_bytes_acc: u64 = 0;
 
-        let mut frame = vec![0u8; 1600];
+        let mut frame = self.tx_frame_scratch.borrow_mut();
+        // Pre-size to cover the first segment's needed bytes. Inner loop
+        // grows on demand for atypical sizes.
+        let initial_cap_needed = crate::tcp_output::FRAME_HDRS_MIN + 40 + mss_cap as usize;
+        // Two-phase borrowing doesn't kick in across the `reserve` arg
+        // because the immutable borrow is held through method lookup on
+        // `Vec`; snapshot the capacity to sidestep E0502.
+        let current_cap = frame.capacity();
+        if current_cap < initial_cap_needed {
+            frame.reserve(initial_cap_needed - current_cap);
+        }
         while remaining > 0 {
             let take = remaining.min(mss_cap as usize);
             let payload = &bytes[offset..offset + take];
@@ -3661,10 +4054,13 @@ impl Engine {
             // payloads the frame grows by 12 bytes. Keep a 40-byte
             // cushion for any future option additions under A5+.
             let needed = crate::tcp_output::FRAME_HDRS_MIN + 40 + take;
-            if frame.len() < needed {
-                frame.resize(needed, 0);
-            }
-            let Some(n) = build_segment(&seg, &mut frame) else {
+            // A6.5 Task 1: reuse the engine-owned scratch buffer across
+            // segments. `clear()` drops the logical length to 0 without
+            // shrinking capacity; `resize()` zero-fills the range
+            // build_segment will overwrite.
+            frame.clear();
+            frame.resize(needed, 0);
+            let Some(n) = build_segment(&seg, frame.as_mut_slice()) else {
                 // Shouldn't happen; buf is sized for hdrs+opts+take.
                 break;
             };

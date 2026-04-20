@@ -15,6 +15,7 @@ license = "Apache-2.0"
 [workspace.dependencies]
 # pinned once, used by all crates
 libc = "0.2"
+smallvec = "1"
 thiserror = "1"
 
 [profile.release]

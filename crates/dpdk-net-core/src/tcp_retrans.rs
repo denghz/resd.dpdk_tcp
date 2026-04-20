@@ -12,6 +12,8 @@
 
 use std::collections::VecDeque;
 
+use smallvec::SmallVec;
+
 use crate::mempool::Mbuf;
 use crate::tcp_options::SackBlock;
 use crate::tcp_seq::{seq_le, seq_lt};
@@ -61,8 +63,16 @@ impl SendRetrans {
 
     /// Drop all entries whose `seq + len` ≤ `snd_una`. Returns dropped entries
     /// so the caller can `refcnt_dec` each mbuf (keeps unsafe ptr work in the engine).
-    pub fn prune_below(&mut self, snd_una: u32) -> Vec<RetransEntry> {
-        let mut dropped = Vec::new();
+    /// A6.5 Task 4: `SmallVec<[_; 8]>` inline buffer — typical per-ACK
+    /// prune count is 1-2, so this is effectively alloc-free.
+    ///
+    /// A6.5 Task 10: the engine hot path uses
+    /// `prune_below_into_mbufs` instead — it drains raw mbuf pointers
+    /// into an engine-scoped scratch so the allocation is reused
+    /// across polls. `prune_below` is kept for tests and any non-
+    /// hot-path caller that prefers the owning-SmallVec ergonomics.
+    pub fn prune_below(&mut self, snd_una: u32) -> SmallVec<[RetransEntry; 8]> {
+        let mut dropped: SmallVec<[RetransEntry; 8]> = SmallVec::new();
         while let Some(front) = self.entries.front() {
             let end_seq = front.seq.wrapping_add(front.len as u32);
             if seq_le(end_seq, snd_una) {
@@ -72,6 +82,35 @@ impl SendRetrans {
             }
         }
         dropped
+    }
+
+    /// Hot-path variant of `prune_below`. Drains the mbuf pointers of
+    /// every pruned entry into `out` (the caller's engine-scoped
+    /// scratch). The RetransEntry itself is dropped inside this
+    /// function, which is safe: `Mbuf` is a pointer-copy with no
+    /// Drop, and the caller retains the refcount responsibility by
+    /// consuming the pushed pointers.
+    ///
+    /// Allocation property (A6.5 Task 10 audit): when `out` already
+    /// has sufficient heap capacity from prior polls, this routine
+    /// performs zero allocations regardless of prune count.
+    pub fn prune_below_into_mbufs(
+        &mut self,
+        snd_una: u32,
+        out: &mut SmallVec<[std::ptr::NonNull<dpdk_net_sys::rte_mbuf>; 16]>,
+    ) {
+        while let Some(front) = self.entries.front() {
+            let end_seq = front.seq.wrapping_add(front.len as u32);
+            if seq_le(end_seq, snd_una) {
+                let e = self.entries.pop_front().unwrap();
+                if let Some(p) = std::ptr::NonNull::new(e.mbuf.as_ptr()) {
+                    out.push(p);
+                }
+                drop(e);
+            } else {
+                break;
+            }
+        }
     }
 
     /// Mark entries overlapping `block` as sacked. Partial overlap at the

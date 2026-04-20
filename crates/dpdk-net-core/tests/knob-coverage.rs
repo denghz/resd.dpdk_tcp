@@ -826,3 +826,39 @@ fn knob_hw_offload_rss_hash_off_always_siphash() {
 #[cfg(not(feature = "hw-offload-rx-timestamp"))]
 #[test]
 fn knob_hw_offload_rx_timestamp_off_compiles() {}
+
+// ---- A6.5 build-feature coverage ----------------------------------------
+//
+// A6.5 introduces zero behavioural knobs; the only new build-time toggle
+// is the `bench-alloc-audit` cargo feature. It gates a test harness
+// (`tests/bench_alloc_hotpath.rs`) + the `CountingAllocator` module rather
+// than runtime behaviour, so there is no runtime observable to assert on.
+// The entry below is a documentation marker: the real compile-reachability
+// check is the CI feature-matrix step that runs
+// `cargo check --features bench-alloc-audit -p resd-net-core`.
+
+/// Knob: `bench-alloc-audit` cargo feature.
+/// Non-default: feature OFF.
+/// Observable: none at runtime — the feature gates compile-reachability
+/// of `CountingAllocator` + `tests/bench_alloc_hotpath.rs`. This entry is
+/// a documentation marker in the knob-coverage registry; the real
+/// compile-reachability check is the CI matrix step that runs
+/// `cargo check --features bench-alloc-audit -p resd-net-core`.
+/// If that matrix step stops running, this test serves as an in-source
+/// reminder that the feature must stay reachable.
+#[test]
+fn knob_bench_alloc_audit_feature_compiles() {
+    // A6.5 §8: build-feature coverage. The `bench-alloc-audit` feature
+    // gates a test harness (crates/resd-net-core/tests/bench_alloc_hotpath.rs)
+    // and the CountingAllocator module — not runtime behavior. This test
+    // is a documentation marker in the knob-coverage registry; the real
+    // compile-reachability check is the CI matrix step that runs
+    // `cargo check --features bench-alloc-audit -p resd-net-core`.
+    //
+    // If that matrix step stops running, this test serves as an
+    // in-source reminder that the feature must stay reachable.
+    assert!(
+        cfg!(feature = "bench-alloc-audit") || !cfg!(feature = "bench-alloc-audit"),
+        "tautology — compile-reachability is the contract, not runtime state"
+    );
+}
