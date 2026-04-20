@@ -38,6 +38,29 @@ impl SendQueue {
     }
 }
 
+/// One contiguous in-order payload segment backed by a refcount-pinned mbuf.
+/// A split on partial-read produces two `InOrderSegment`s both referencing
+/// the same underlying `rte_mbuf` with refcount bumped once via
+/// `MbufHandle::try_clone()`.
+#[derive(Debug)]
+pub struct InOrderSegment {
+    pub mbuf: crate::mempool::MbufHandle,
+    pub offset: u16,
+    pub len: u16,
+}
+
+impl InOrderSegment {
+    #[inline]
+    pub fn data_ptr(&self) -> *const u8 {
+        // SAFETY: mbuf is refcount-pinned for the lifetime of this segment;
+        // offset/len were bounds-checked at construction (see tcp_reassembly.rs).
+        unsafe {
+            let base = dpdk_net_sys::shim_rte_pktmbuf_data(self.mbuf.as_ptr()) as *const u8;
+            base.add(self.offset as usize)
+        }
+    }
+}
+
 /// Per-connection receive buffer. A4 co-locates the out-of-order
 /// reassembly queue (`reorder`) with the in-order ring (`bytes`); both
 /// share the same cap, so `free_space_total` reports combined room.
