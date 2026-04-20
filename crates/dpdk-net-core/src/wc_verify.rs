@@ -13,18 +13,17 @@
 /// the prefetchable BAR at `bar_phys_addr` (e.g. 0xfe900000) has a
 /// `write-combining` mapping. Per the README §6.2.3 the file format is:
 ///
-///     PAT: [mem 0x00000000fe900000-0x00000000fea00000] write-combining
+/// ```text
+/// PAT: [mem 0x00000000fe900000-0x00000000fea00000] write-combining
+/// ```
 ///
 /// Match the second numeric — the start of the range — against
 /// `bar_phys_addr` and confirm the trailing token is `write-combining`.
 ///
-/// `allow(dead_code)` covers Task 2 — the engine bring-up wiring that
-/// will call this function lands in Task 3, mirroring the same gating
-/// pattern used by `llq_verify::verify_llq_activation`. Visibility is
-/// `pub` (not `pub(crate)`) so the Task 12 pure-unit smoke at
-/// `tests/ena_obs_smoke.rs` can exercise the parser across the
-/// integration-test crate boundary.
-#[allow(dead_code)]
+/// Consumed by `verify_wc_for_ena` below (engine bring-up path) and by
+/// the Task 12 pure-unit smoke at `tests/ena_obs_smoke.rs`. Visibility
+/// is `pub` (not `pub(crate)`) so the integration-test crate can reach
+/// it across the crate boundary.
 pub fn parse_pat_memtype_list(
     pat_contents: &str,
     bar_phys_addr: u64,
@@ -52,7 +51,6 @@ pub fn parse_pat_memtype_list(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum WcVerdict {
     WriteCombining,
     OtherMapping,
