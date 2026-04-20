@@ -5,6 +5,7 @@ members = [
     "crates/dpdk-net-core",
     "crates/dpdk-net",
     "tests/ffi-test",
+    "tools/bench-rx-zero-copy",
 ]
 
 [workspace.package]
