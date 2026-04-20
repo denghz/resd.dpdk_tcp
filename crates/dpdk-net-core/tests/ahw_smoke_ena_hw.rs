@@ -485,5 +485,52 @@ fn ahw_ena_hw_path_banner_and_counters() {
         "expected at least 1 Connected + 1 Readable to carry rx_hw_ts_ns; checked {checked}"
     );
 
+    // A-HW+ T11: verify the new ENA-observability counters + xstats scrape.
+    // These assertions are the real-host gate for T1 / T3 / T5 / T9.
+
+    // T3 — WC verification. Must be 0 on a correctly-configured host
+    // (igb_uio wc_activate=1 OR patched vfio-pci). Nonzero exposes a
+    // WC misconfiguration that would silently destroy LLQ perf per
+    // ENA README §6.1 + §14 perf FAQ Q1.
+    assert_eq!(
+        engine
+            .counters()
+            .eth
+            .llq_wc_missing
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "WC verification: prefetchable BAR not mapped write-combining; \
+         check /sys/kernel/debug/x86/pat_memtype_list + ENA README §6.1"
+    );
+
+    // T9 — overflow-risk warn should fire once on ENA with the knob
+    // defaulted to 0 (worst-case header 94 B + 6 B margin > 96 B LLQ
+    // limit). Operators who want the warn suppressed must set
+    // EngineConfig.ena_large_llq_hdr=1 and splice the devarg via T8.
+    assert_eq!(
+        engine
+            .counters()
+            .eth
+            .llq_header_overflow_risk
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "M1 overflow-risk warn expected to fire once with the default knob"
+    );
+
+    // T5 / T6 — xstats scrape reads ENI allowances + per-queue q0
+    // counters via rte_eth_xstats_get_by_id. The scrape must not
+    // panic; allowance counter values are environment-dependent
+    // (nonzero if a prior workload pushed hypervisor limits) so we
+    // only assert the scrape ran.
+    engine.scrape_xstats();
+    let doorbells = engine
+        .counters()
+        .eth
+        .tx_q0_doorbells
+        .load(std::sync::atomic::Ordering::Relaxed);
+    eprintln!("post-scrape eth.tx_q0_doorbells = {}", doorbells);
+    // doorbells may be 0 if no TX burst has happened yet — that's OK.
+    // The non-panic + printable read is the assertion of interest.
+
     drop(engine);
 }
