@@ -9,7 +9,7 @@
 ## Scope
 
 - Our files re-reviewed (delta since prior RE-RUN):
-  - `crates/resd-net-core/src/tcp_options.rs` — E-2 fix commit (4e2c116):
+  - `crates/dpdk-net-core/src/tcp_options.rs` — E-2 fix commit (4e2c116):
     - New const `MAX_SACK_BLOCKS_DECODE = 4` (line 39)
     - `TcpOpts.sack_blocks: [SackBlock; MAX_SACK_BLOCKS_DECODE]` widened from 3 to 4 (line 61)
     - New method `push_sack_block_decode` (lines 82-89) — caps at 4 for decode path
@@ -18,9 +18,9 @@
     - Two new tests: `parse_sack_four_blocks_without_timestamps_all_captured` (lines 518-548) and `parse_rejects_sack_with_five_blocks` (lines 550-560)
 
 - Files re-verified (no regression in prior fixes):
-  - `crates/resd-net-core/src/tcp_input.rs` (F-1/F-2/F-3 lines 290-319, 409-435, 462-472; F-8 trigger set at 528)
-  - `crates/resd-net-core/src/engine.rs` (F-4/F-5/F-6/F-7 lines 1419-1422, 1435-1446, 1548-1562; F-8 build_ack_outcome lines 86-167, trigger clear at 1096)
-  - `crates/resd-net-core/src/tcp_conn.rs` (F-8 `last_sack_trigger` field lines 161-167, default init line 209)
+  - `crates/dpdk-net-core/src/tcp_input.rs` (F-1/F-2/F-3 lines 290-319, 409-435, 462-472; F-8 trigger set at 528)
+  - `crates/dpdk-net-core/src/engine.rs` (F-4/F-5/F-6/F-7 lines 1419-1422, 1435-1446, 1548-1562; F-8 build_ack_outcome lines 86-167, trigger clear at 1096)
+  - `crates/dpdk-net-core/src/tcp_conn.rs` (F-8 `last_sack_trigger` field lines 161-167, default init line 209)
   - Consumer sites for `TcpOpts.sack_blocks`:
     - `tcp_input.rs:443` — `for block in &parsed_opts.sack_blocks[..parsed_opts.sack_block_count as usize]` → length-bounded slice, no fixed-size assumption
     - `engine.rs:1841-1976` — test-only indexes bounded by `sack_block_count` checks, no regression

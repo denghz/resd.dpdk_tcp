@@ -34,7 +34,7 @@ The `phase-a-hw-complete` tag is blocked while either report has an open `[ ]` i
 ## File Structure Created or Modified in This Phase
 
 ```
-crates/resd-net-core/
+crates/dpdk-net-core/
 ├── Cargo.toml                           (MODIFIED: 6 new cargo features + hw-offloads-all meta + updated default list)
 ├── src/
 │   ├── engine.rs                        (MODIFIED: port-config rewrite at current lines 422-450 — dev_info AND + offload masks + RSS rss_conf + reta program + MULTI_SEGS preserve + startup banner; LLQ log-scrape verification gated on hw-verify-llq; RX-timestamp dynfield+dynflag lookup at engine_create + hw_rx_ts_ns inline accessor; per-engine runtime latches on EngineState; deliver_readable signature extended with hw_rx_ts_ns param; engine.rs:1842 Connected + engine.rs:2205 Readable emissions consume threaded value)
@@ -47,13 +47,13 @@ crates/resd-net-core/
 └── tests/
     ├── knob-coverage.rs                 (MODIFIED: new scenario entries for every A-HW feature flag's on/off branch + the hw-offloads-all meta + --no-default-features combo)
     ├── ahw_smoke_sw_fallback.rs         (NEW: SW-fallback + SW-only integration tests — run on net_tap via the A3 TAP-pair harness; assert counter values and full request-response correctness)
-    └── ahw_smoke_ena_hw.rs              (NEW: HW-path integration test — gated on RESD_NET_TEST_ENA=1 env var; runs on actual ENA VF; asserts offload_missing_* counters all zero except offload_missing_rx_timestamp == 1)
+    └── ahw_smoke_ena_hw.rs              (NEW: HW-path integration test — gated on DPDK_NET_TEST_ENA=1 env var; runs on actual ENA VF; asserts offload_missing_* counters all zero except offload_missing_rx_timestamp == 1)
 
-crates/resd-net/src/
-├── api.rs                               (MODIFIED: resd_net_eth_counters_t gains 11 u64 fields mirroring the core; _pad shrinks to compensate; const assertion block extended; no other ABI change)
+crates/dpdk-net/src/
+├── api.rs                               (MODIFIED: dpdk_net_eth_counters_t gains 11 u64 fields mirroring the core; _pad shrinks to compensate; const assertion block extended; no other ABI change)
 └── lib.rs                               (unchanged)
 
-include/resd_net.h                       (REGENERATED via cbindgen: resd_net_eth_counters_t layout extended)
+include/dpdk_net.h                       (REGENERATED via cbindgen: dpdk_net_eth_counters_t layout extended)
 
 scripts/
 └── ci-feature-matrix.sh                 (NEW: 8-build CI matrix driver — runs cargo build --release for each per-offload-off configuration + --no-default-features + default; plus cargo test on default)
@@ -70,7 +70,7 @@ docs/superpowers/reviews/phase-a-hw-rfc-compliance.md     (NEW — Task 20 via r
 
 ## Pre-task: bindings check
 
-Before starting, spot-check that `bindgen` has exposed every DPDK symbol A-HW needs. If any is missing, Task 1 prefix-adds a `resd-net-sys/wrapper.h` allowlist entry + a pass-through shim in `shim.c`; otherwise Task 1 skips the step.
+Before starting, spot-check that `bindgen` has exposed every DPDK symbol A-HW needs. If any is missing, Task 1 prefix-adds a `dpdk-net-sys/wrapper.h` allowlist entry + a pass-through shim in `shim.c`; otherwise Task 1 skips the step.
 
 **Symbols needed:**
 - `rte_eth_dev_info`, `rte_eth_dev_info_get` (already used at engine.rs:435-436 — present).
@@ -126,23 +126,23 @@ RTE_MBUF_F_TX_L4_MASK                = 3ULL << 52
 
 ⚠ The L4 checksum flags are **2-bit field**, not independent bits: `TCP = 01`, `UDP = 11`, `SCTP = 10`. Setting both TCP+UDP simultaneously is undefined — only one L4 proto per segment. Tasks below set exactly one based on segment type.
 
-The Task 1 branch includes a helper module `crates/resd-net-core/src/dpdk_consts.rs` (new — 30 lines) that defines all these as named `pub const` u64s in one place, with a doc comment pointing back at `rte_ethdev.h` / `rte_mbuf_core.h` headers in DPDK 23.11. This keeps the rest of the engine code reading named constants instead of raw `1ULL << N` literals.
+The Task 1 branch includes a helper module `crates/dpdk-net-core/src/dpdk_consts.rs` (new — 30 lines) that defines all these as named `pub const` u64s in one place, with a doc comment pointing back at `rte_ethdev.h` / `rte_mbuf_core.h` headers in DPDK 23.11. This keeps the rest of the engine code reading named constants instead of raw `1ULL << N` literals.
 
 ---
 
-## Task 1: Cargo features + EthCounters fields + resd_net_eth_counters_t mirror + dpdk_consts module
+## Task 1: Cargo features + EthCounters fields + dpdk_net_eth_counters_t mirror + dpdk_consts module
 
 **Files:**
-- Modify: `crates/resd-net-core/Cargo.toml` — add 6 features + `hw-offloads-all` meta + update `default`.
-- Create: `crates/resd-net-core/src/dpdk_consts.rs` — named DPDK bit-position constants.
-- Modify: `crates/resd-net-core/src/lib.rs` — `pub mod dpdk_consts;`
-- Modify: `crates/resd-net-core/src/counters.rs` — add 11 fields to `EthCounters`.
-- Modify: `crates/resd-net/src/api.rs` — mirror the 11 fields into `resd_net_eth_counters_t` and shrink `_pad`.
-- Regenerate: `include/resd_net.h` via cbindgen.
+- Modify: `crates/dpdk-net-core/Cargo.toml` — add 6 features + `hw-offloads-all` meta + update `default`.
+- Create: `crates/dpdk-net-core/src/dpdk_consts.rs` — named DPDK bit-position constants.
+- Modify: `crates/dpdk-net-core/src/lib.rs` — `pub mod dpdk_consts;`
+- Modify: `crates/dpdk-net-core/src/counters.rs` — add 11 fields to `EthCounters`.
+- Modify: `crates/dpdk-net/src/api.rs` — mirror the 11 fields into `dpdk_net_eth_counters_t` and shrink `_pad`.
+- Regenerate: `include/dpdk_net.h` via cbindgen.
 
 - [ ] **Step 1: Add cargo features**
 
-In `crates/resd-net-core/Cargo.toml`, replace the `[features]` block:
+In `crates/dpdk-net-core/Cargo.toml`, replace the `[features]` block:
 
 ```toml
 [features]
@@ -204,10 +204,10 @@ obs-all = ["obs-byte-counters", "obs-poll-saturation"]
 
 - [ ] **Step 2: Verify Cargo.toml parses**
 
-Run: `cargo metadata --no-deps --format-version 1 --manifest-path crates/resd-net-core/Cargo.toml --offline 2>&1 | head -5` (from worktree root).
+Run: `cargo metadata --no-deps --format-version 1 --manifest-path crates/dpdk-net-core/Cargo.toml --offline 2>&1 | head -5` (from worktree root).
 Expected: either JSON output or a registry-lookup error. NOT a TOML parse error. If `metadata` isn't happy, inspect and fix.
 
-- [ ] **Step 3: Create `crates/resd-net-core/src/dpdk_consts.rs`**
+- [ ] **Step 3: Create `crates/dpdk-net-core/src/dpdk_consts.rs`**
 
 ```rust
 //! Named constants for DPDK 23.11 bit positions we consume in A-HW.
@@ -276,7 +276,7 @@ pub const RTE_MBUF_F_TX_IPV6: u64 = 1u64 << 56;
 
 - [ ] **Step 4: Register the module in `lib.rs`**
 
-In `crates/resd-net-core/src/lib.rs` find the existing `pub mod` list (alphabetical) and insert `dpdk_consts` between the existing modules. Likely position is between `counters` and `engine`:
+In `crates/dpdk-net-core/src/lib.rs` find the existing `pub mod` list (alphabetical) and insert `dpdk_consts` between the existing modules. Likely position is between `counters` and `engine`:
 
 ```rust
 pub mod dpdk_consts;
@@ -284,12 +284,12 @@ pub mod dpdk_consts;
 
 - [ ] **Step 5: Build to verify the new module compiles**
 
-Run: `cargo build -p resd-net-core --release 2>&1 | tail -20`
+Run: `cargo build -p dpdk-net-core --release 2>&1 | tail -20`
 Expected: clean build. If you get "unused const" warnings, they're silenced by the `#![allow(dead_code)]` at the top of the new module.
 
 - [ ] **Step 6: Write a unit test for the const values**
 
-Append to `crates/resd-net-core/src/dpdk_consts.rs`:
+Append to `crates/dpdk-net-core/src/dpdk_consts.rs`:
 
 ```rust
 #[cfg(test)]
@@ -320,10 +320,10 @@ mod tests {
 
 - [ ] **Step 7: Run the test**
 
-Run: `cargo test -p resd-net-core --lib dpdk_consts 2>&1 | tail -15`
+Run: `cargo test -p dpdk-net-core --lib dpdk_consts 2>&1 | tail -15`
 Expected: `test result: ok. 1 passed`.
 
-- [ ] **Step 8: Extend `EthCounters` in `crates/resd-net-core/src/counters.rs`**
+- [ ] **Step 8: Extend `EthCounters` in `crates/dpdk-net-core/src/counters.rs`**
 
 Find the existing `pub struct EthCounters` (around line 7). After the existing `tx_arp: AtomicU64,` field (last A2 addition), append the 11 new A-HW fields:
 
@@ -356,14 +356,14 @@ Find the existing `pub struct EthCounters` (around line 7). After the existing `
 
 The existing `_pad` field — DO NOT add one to `EthCounters` (core): only the C ABI mirror uses `_pad`. `EthCounters` core has no pad.
 
-Wait — re-check the current core struct. If the core `EthCounters` has `_pad: [AtomicU64; 4]` already for alignment symmetry with the C mirror, shrink it to match the new count. Reading the current file: the core `EthCounters` at `crates/resd-net-core/src/counters.rs:7-21` does NOT have a `_pad` (only the ABI mirror in `api.rs` has it). So leave the core as-is; just append the 11 fields.
+Wait — re-check the current core struct. If the core `EthCounters` has `_pad: [AtomicU64; 4]` already for alignment symmetry with the C mirror, shrink it to match the new count. Reading the current file: the core `EthCounters` at `crates/dpdk-net-core/src/counters.rs:7-21` does NOT have a `_pad` (only the ABI mirror in `api.rs` has it). So leave the core as-is; just append the 11 fields.
 
-- [ ] **Step 9: Update the C-ABI mirror in `crates/resd-net/src/api.rs`**
+- [ ] **Step 9: Update the C-ABI mirror in `crates/dpdk-net/src/api.rs`**
 
-Find `pub struct resd_net_eth_counters_t` (around line 215). After `pub tx_arp: u64,` (the last existing field before `_pad`), insert the 11 new fields:
+Find `pub struct dpdk_net_eth_counters_t` (around line 215). After `pub tx_arp: u64,` (the last existing field before `_pad`), insert the 11 new fields:
 
 ```rust
-    // A-HW additions — mirror of resd_net_core::counters::EthCounters.
+    // A-HW additions — mirror of dpdk_net_core::counters::EthCounters.
     // Slow-path, always allocated regardless of feature flags.
     pub offload_missing_rx_cksum_ipv4: u64,
     pub offload_missing_rx_cksum_tcp: u64,
@@ -401,70 +401,70 @@ Revised Step 9:
 Add to core `EthCounters` (end of struct, after the 11 new fields):
 ```rust
     /// Padding to bring the struct to an exact cacheline multiple (4 × 64 B = 256 B).
-    /// Required for size parity with resd_net_eth_counters_t; see const
-    /// assertion block in crates/resd-net/src/api.rs.
+    /// Required for size parity with dpdk_net_eth_counters_t; see const
+    /// assertion block in crates/dpdk-net/src/api.rs.
     pub _pad: [AtomicU64; 9],
 ```
 
 Add `#[repr(C, align(64))]` directly above the `pub struct EthCounters` line if not already present. Read first, then decide:
 
 ```bash
-grep -B2 'pub struct EthCounters' /home/ubuntu/resd.dpdk_tcp-a-hw/crates/resd-net-core/src/counters.rs
+grep -B2 'pub struct EthCounters' /home/ubuntu/resd.dpdk_tcp-a-hw/crates/dpdk-net-core/src/counters.rs
 ```
 
 If the struct already has `#[repr(C, align(64))]`, keep it; if not, add it now.
 
-Also add to ABI mirror `resd_net_eth_counters_t`: change `_pad: [u64; 4]` to `_pad: [u64; 9]`.
+Also add to ABI mirror `dpdk_net_eth_counters_t`: change `_pad: [u64; 4]` to `_pad: [u64; 9]`.
 
 - [ ] **Step 10: Verify compile-time ABI assertions**
 
-Run: `cargo build -p resd-net --release 2>&1 | tail -30`
+Run: `cargo build -p dpdk-net --release 2>&1 | tail -30`
 
 Expected: clean build. If the `const _: () = { ... assert!(size_of...)}` block in `api.rs:343` fires, the message `evaluation of constant value failed` tells you exactly which pair mismatched. Adjust the `_pad` count until both `size_of` and `align_of` match. Record the final `_pad` size in the commit message.
 
 - [ ] **Step 11: Initialize the 11 new fields in `Counters::new`**
 
-Check `crates/resd-net-core/src/counters.rs` for the `impl Counters { pub fn new() }` (or `impl Default`). If fields are initialized explicitly (field-by-field), add the 11 new ones each initialized to `AtomicU64::new(0)`. If `#[derive(Default)]` is on the struct, no changes needed — `AtomicU64::default()` = `AtomicU64::new(0)`.
+Check `crates/dpdk-net-core/src/counters.rs` for the `impl Counters { pub fn new() }` (or `impl Default`). If fields are initialized explicitly (field-by-field), add the 11 new ones each initialized to `AtomicU64::new(0)`. If `#[derive(Default)]` is on the struct, no changes needed — `AtomicU64::default()` = `AtomicU64::new(0)`.
 
 The existing struct almost certainly uses `#[derive(Default)]` (consistent with the other counter groups). Verify by reading lines around `impl Counters`:
 
 ```bash
-grep -n 'impl.*Counters\|#\[derive' /home/ubuntu/resd.dpdk_tcp-a-hw/crates/resd-net-core/src/counters.rs | head -20
+grep -n 'impl.*Counters\|#\[derive' /home/ubuntu/resd.dpdk_tcp-a-hw/crates/dpdk-net-core/src/counters.rs | head -20
 ```
 
 If `#[derive(Default)]` is present on `EthCounters`, this step is a no-op.
 
-- [ ] **Step 12: Regenerate `include/resd_net.h`**
+- [ ] **Step 12: Regenerate `include/dpdk_net.h`**
 
 Run: `cargo run --bin cbindgen --manifest-path Cargo.toml --release 2>&1 | tail -10`
 
-(Or the actual cbindgen invocation this repo uses — check `scripts/` or `Cargo.toml` for the right command. If there's no wrapper, run the cbindgen binary directly: `cbindgen --config crates/resd-net/cbindgen.toml --crate resd-net --output include/resd_net.h`.)
+(Or the actual cbindgen invocation this repo uses — check `scripts/` or `Cargo.toml` for the right command. If there's no wrapper, run the cbindgen binary directly: `cbindgen --config crates/dpdk-net/cbindgen.toml --crate dpdk-net --output include/dpdk_net.h`.)
 
-Expected: `include/resd_net.h` regenerates with the 11 new fields appended to `struct resd_net_eth_counters_t` and `_pad: u64[9]`. Inspect the diff:
+Expected: `include/dpdk_net.h` regenerates with the 11 new fields appended to `struct dpdk_net_eth_counters_t` and `_pad: u64[9]`. Inspect the diff:
 
 ```bash
-git diff include/resd_net.h
+git diff include/dpdk_net.h
 ```
 
 Verify: new fields appear in the expected order; `_pad` is `[9]` not `[4]`.
 
 - [ ] **Step 13: Run the full test suite**
 
-Run: `cargo test -p resd-net-core --release 2>&1 | tail -20`
+Run: `cargo test -p dpdk-net-core --release 2>&1 | tail -20`
 Expected: all existing tests pass. Size assertion holds. No regression.
 
-Run: `cargo test -p resd-net --release 2>&1 | tail -20`
+Run: `cargo test -p dpdk-net --release 2>&1 | tail -20`
 Expected: all existing tests pass.
 
 - [ ] **Step 14: Commit**
 
 ```bash
-git add crates/resd-net-core/Cargo.toml \
-        crates/resd-net-core/src/dpdk_consts.rs \
-        crates/resd-net-core/src/lib.rs \
-        crates/resd-net-core/src/counters.rs \
-        crates/resd-net/src/api.rs \
-        include/resd_net.h
+git add crates/dpdk-net-core/Cargo.toml \
+        crates/dpdk-net-core/src/dpdk_consts.rs \
+        crates/dpdk-net-core/src/lib.rs \
+        crates/dpdk-net-core/src/counters.rs \
+        crates/dpdk-net/src/api.rs \
+        include/dpdk_net.h
 
 git commit -m "$(cat <<'EOF'
 a-hw task 1: cargo features + dpdk_consts + counter fields
@@ -473,11 +473,11 @@ Adds six compile-time cargo features (hw-verify-llq plus five
 hw-offload-* flags) with the hw-offloads-all meta, all default ON per
 spec §3. New dpdk_consts module names every DPDK 23.11 bit position
 A-HW consumes (RTE_BIT64 macros that bindgen does not expand). Extends
-EthCounters + resd_net_eth_counters_t with 11 always-allocated
+EthCounters + dpdk_net_eth_counters_t with 11 always-allocated
 AtomicU64 fields (9 offload_missing_* + offload_missing_rx_timestamp
 + rx_drop_cksum_bad) per spec §11; _pad resized so total struct size
 stays cacheline-aligned and both sides pass the compile-time ABI parity
-assertions in crates/resd-net/src/api.rs.
+assertions in crates/dpdk-net/src/api.rs.
 
 No behavior change — all new fields stay at 0 until later tasks wire
 the bring-up counter-bump and TX/RX code-path writes.
@@ -492,13 +492,13 @@ EOF
 ## Task 2: Port-config helper extraction (no-behavior-change refactor)
 
 **Files:**
-- Modify: `crates/resd-net-core/src/engine.rs` — move the existing port-config block (lines 422-450) into a helper `configure_port_offloads`.
+- Modify: `crates/dpdk-net-core/src/engine.rs` — move the existing port-config block (lines 422-450) into a helper `configure_port_offloads`.
 
 **Rationale:** Later tasks add conditional-compilation branches for each offload; consolidating the port-config logic in one helper keeps the feature-gated code sites compact. Task 2 alone is a pure refactor — `cargo test` must pass with zero behavior change.
 
 - [ ] **Step 1: Read the current port-config block**
 
-Read `crates/resd-net-core/src/engine.rs` lines 420-500 to confirm the current structure.
+Read `crates/dpdk-net-core/src/engine.rs` lines 420-500 to confirm the current structure.
 
 - [ ] **Step 2: Define the helper's return type**
 
@@ -575,7 +575,7 @@ impl Engine {
             && (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MULTI_SEGS) == 0
         {
             eprintln!(
-                "resd_net: PMD on port {} does not advertise RTE_ETH_TX_OFFLOAD_MULTI_SEGS; \
+                "dpdk_net: PMD on port {} does not advertise RTE_ETH_TX_OFFLOAD_MULTI_SEGS; \
                  A5 retransmit chain may fail — check NIC/PMD support",
                 cfg.port_id
             );
@@ -590,7 +590,7 @@ impl Engine {
         };
         if rc != 0 {
             return Err(Error::PortConfigure(cfg.port_id, unsafe {
-                sys::resd_rte_errno()
+                sys::shim_rte_errno()
             }));
         }
 
@@ -656,16 +656,16 @@ In the `Engine::new` body, populate from `outcome`:
 
 - [ ] **Step 5: Build + test**
 
-Run: `cargo build -p resd-net-core --release 2>&1 | tail -10`
+Run: `cargo build -p dpdk-net-core --release 2>&1 | tail -10`
 Expected: clean build.
 
-Run: `cargo test -p resd-net-core --release 2>&1 | tail -20`
+Run: `cargo test -p dpdk-net-core --release 2>&1 | tail -20`
 Expected: all existing tests pass. Zero behavior change because `applied_rx_offloads = 0` and `MULTI_SEGS` handling is preserved.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/resd-net-core/src/engine.rs
+git add crates/dpdk-net-core/src/engine.rs
 git commit -m "$(cat <<'EOF'
 a-hw task 2: extract configure_port_offloads helper
 
@@ -689,13 +689,13 @@ EOF
 ## Task 3: Offload bit wiring — MBUF_FAST_FREE + TX cksum + RX cksum
 
 **Files:**
-- Modify: `crates/resd-net-core/src/engine.rs` — extend `configure_port_offloads` with three feature-gated offload-bit branches.
+- Modify: `crates/dpdk-net-core/src/engine.rs` — extend `configure_port_offloads` with three feature-gated offload-bit branches.
 
 **Rationale:** These three offloads share the same pattern — OR a bit into the requested mask, AND against `dev_info.*_offload_capa`, bump `eth.offload_missing_*` on mismatch. Bundling them into one task is cheap and gives a single commit that exercises the pattern end-to-end.
 
 - [ ] **Step 1: Write the failing test**
 
-Create `crates/resd-net-core/src/engine.rs` inside-mod test block (or a new unit test file). Test that `configure_port_offloads` sets the expected bits when all features are on and dev_info advertises every capability.
+Create `crates/dpdk-net-core/src/engine.rs` inside-mod test block (or a new unit test file). Test that `configure_port_offloads` sets the expected bits when all features are on and dev_info advertises every capability.
 
 Actually — `configure_port_offloads` calls real DPDK functions. Unit-testing it requires either (a) a mock layer or (b) an integration test on `net_vdev`. Option (b) is more honest. Since A5.5 tests already run on `net_tap` and the `tests/ffi-test/tests/ffi_smoke.rs` harness exists, plan to exercise this via a Task-23 integration test (see below).
 
@@ -719,7 +719,7 @@ fn and_offload_with_miss_counter(
     if (requested_bit & advertised_mask) == 0 {
         miss_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         eprintln!(
-            "resd_net: PMD on port {} does not advertise {} (0x{:016x}); \
+            "dpdk_net: PMD on port {} does not advertise {} (0x{:016x}); \
              degrading to software path for this offload",
             port_id, name, requested_bit
         );
@@ -770,7 +770,7 @@ mod a_hw_port_config_tests {
 
 - [ ] **Step 2: Run failing test**
 
-Run: `cargo test -p resd-net-core --lib a_hw_port_config_tests 2>&1 | tail -10`
+Run: `cargo test -p dpdk-net-core --lib a_hw_port_config_tests 2>&1 | tail -10`
 Expected: compile error — `and_offload_with_miss_counter` not defined.
 
 - [ ] **Step 3: Add the helper**
@@ -779,7 +779,7 @@ Add `and_offload_with_miss_counter` to `engine.rs` (near the top of the `impl En
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `cargo test -p resd-net-core --lib a_hw_port_config_tests 2>&1 | tail -10`
+Run: `cargo test -p dpdk-net-core --lib a_hw_port_config_tests 2>&1 | tail -10`
 Expected: `test result: ok. 3 passed`.
 
 - [ ] **Step 5: Wire MBUF_FAST_FREE**
@@ -904,14 +904,14 @@ Update `PortConfigOutcome` assembly at the end of the helper:
 
 - [ ] **Step 8: Build + existing tests**
 
-Run: `cargo build -p resd-net-core --release 2>&1 | tail -10`
-Run: `cargo test -p resd-net-core --release 2>&1 | tail -20`
+Run: `cargo build -p dpdk-net-core --release 2>&1 | tail -10`
+Run: `cargo test -p dpdk-net-core --release 2>&1 | tail -20`
 Expected: clean + all pass. On `net_tap` / `net_vdev` CI test setups the offload_missing counters will bump, but no existing test asserts them at zero, so no regression.
 
 - [ ] **Step 9: Commit**
 
 ```bash
-git add crates/resd-net-core/src/engine.rs
+git add crates/dpdk-net-core/src/engine.rs
 git commit -m "$(cat <<'EOF'
 a-hw task 3: feature-gated MBUF_FAST_FREE + TX/RX cksum offload bits
 
@@ -935,7 +935,7 @@ EOF
 ## Task 4: RSS hash offload — port config + rss_conf + reta program
 
 **Files:**
-- Modify: `crates/resd-net-core/src/engine.rs` — extend `configure_port_offloads` with RSS hash branch; add post-`dev_start` reta program.
+- Modify: `crates/dpdk-net-core/src/engine.rs` — extend `configure_port_offloads` with RSS hash branch; add post-`dev_start` reta program.
 
 - [ ] **Step 1: Extend configure_port_offloads with the RSS branch**
 
@@ -1000,7 +1000,7 @@ Also move `eth_conf.rxmode.offloads = applied_rx_offloads;` to BEFORE `rte_eth_d
         };
         if rc != 0 {
             eprintln!(
-                "resd_net: port {} RSS reta program failed rc={}; \
+                "dpdk_net: port {} RSS reta program failed rc={}; \
                  flow_table falls back to SipHash.",
                 port_id, rc
             );
@@ -1031,20 +1031,20 @@ Find `sys::rte_eth_dev_start(cfg.port_id)` in `Engine::new`. Immediately after s
 
 - [ ] **Step 4: Verify bindgen exposes reta symbols**
 
-Run: `grep -n 'rte_eth_rss_reta_entry64\|rte_eth_dev_rss_reta_update' crates/resd-net-sys/src/lib.rs | head -5`
+Run: `grep -n 'rte_eth_rss_reta_entry64\|rte_eth_dev_rss_reta_update' crates/dpdk-net-sys/src/lib.rs | head -5`
 
-If absent, add the needed includes to `wrapper.h` / build.rs bindgen config, then rebuild `resd-net-sys`.
+If absent, add the needed includes to `wrapper.h` / build.rs bindgen config, then rebuild `dpdk-net-sys`.
 
 - [ ] **Step 5: Build + test**
 
-Run: `cargo build -p resd-net-core --release 2>&1 | tail -10`
-Run: `cargo test -p resd-net-core --release 2>&1 | tail -20`
+Run: `cargo build -p dpdk-net-core --release 2>&1 | tail -10`
+Run: `cargo test -p dpdk-net-core --release 2>&1 | tail -20`
 Expected: clean + all pass.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/resd-net-core/src/engine.rs crates/resd-net-sys/
+git add crates/dpdk-net-core/src/engine.rs crates/dpdk-net-sys/
 git commit -m "a-hw task 4: RSS hash offload — port config + reta program
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
@@ -1055,7 +1055,7 @@ Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
 ## Task 5: Startup banner
 
 **Files:**
-- Modify: `crates/resd-net-core/src/engine.rs` — emit informational banners at bring-up.
+- Modify: `crates/dpdk-net-core/src/engine.rs` — emit informational banners at bring-up.
 
 - [ ] **Step 1: Add banners in configure_port_offloads**
 
@@ -1063,7 +1063,7 @@ Immediately after `driver_name` is populated (before any offload branch):
 
 ```rust
         eprintln!(
-            "resd_net: port {} driver={} rx_offload_capa=0x{:016x} \
+            "dpdk_net: port {} driver={} rx_offload_capa=0x{:016x} \
              tx_offload_capa=0x{:016x} dev_flags=0x{:08x}",
             cfg.port_id,
             std::str::from_utf8(
@@ -1079,20 +1079,20 @@ Immediately after `rte_eth_dev_configure` succeeds:
 
 ```rust
         eprintln!(
-            "resd_net: port {} configured rx_offloads=0x{:016x} tx_offloads=0x{:016x}",
+            "dpdk_net: port {} configured rx_offloads=0x{:016x} tx_offloads=0x{:016x}",
             cfg.port_id, applied_rx_offloads, applied_tx_offloads,
         );
 ```
 
 - [ ] **Step 2: Build + test**
 
-Run: `cargo test -p resd-net-core --release 2>&1 | tail -10`
+Run: `cargo test -p dpdk-net-core --release 2>&1 | tail -10`
 Expected: pass.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add crates/resd-net-core/src/engine.rs
+git add crates/dpdk-net-core/src/engine.rs
 git commit -m "a-hw task 5: startup banner — advertised + negotiated offload masks
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
@@ -1103,11 +1103,11 @@ Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
 ## Task 6: Pseudo-header-only TCP checksum helper
 
 **Files:**
-- Modify: `crates/resd-net-core/src/tcp_output.rs` — add `tcp_pseudo_header_checksum(src_ip, dst_ip, tcp_seg_len) -> u16`.
+- Modify: `crates/dpdk-net-core/src/tcp_output.rs` — add `tcp_pseudo_header_checksum(src_ip, dst_ip, tcp_seg_len) -> u16`.
 
 - [ ] **Step 1: Write the failing test**
 
-Append to `crates/resd-net-core/src/tcp_output.rs` `#[cfg(test)] mod tests`:
+Append to `crates/dpdk-net-core/src/tcp_output.rs` `#[cfg(test)] mod tests`:
 
 ```rust
     #[test]
@@ -1130,7 +1130,7 @@ Append to `crates/resd-net-core/src/tcp_output.rs` `#[cfg(test)] mod tests`:
 
 - [ ] **Step 2: Run to verify failure**
 
-Run: `cargo test -p resd-net-core --lib pseudo_header_only 2>&1 | tail -10`
+Run: `cargo test -p dpdk-net-core --lib pseudo_header_only 2>&1 | tail -10`
 Expected: compile error — `tcp_pseudo_header_checksum` not defined.
 
 - [ ] **Step 3: Add the helper to `tcp_output.rs`**
@@ -1157,13 +1157,13 @@ Ensure `internet_checksum` + `IPPROTO_TCP` are in scope via existing `use` lines
 
 - [ ] **Step 4: Run test**
 
-Run: `cargo test -p resd-net-core --lib pseudo_header_only 2>&1 | tail -10`
+Run: `cargo test -p dpdk-net-core --lib pseudo_header_only 2>&1 | tail -10`
 Expected: `test result: ok. 1 passed`.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/resd-net-core/src/tcp_output.rs
+git add crates/dpdk-net-core/src/tcp_output.rs
 git commit -m "a-hw task 6: tcp_pseudo_header_checksum helper
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
@@ -1174,39 +1174,39 @@ Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
 ## Task 7: TX checksum offload finalizer + TX-site wiring
 
 **Files:**
-- Modify: `crates/resd-net-core/src/tcp_output.rs` — add `tx_offload_finalize(mbuf, seg, payload_len, offload_active)`.
-- Modify: `crates/resd-net-core/src/engine.rs` — every TX site that pushes to mbuf calls the finalizer.
-- Possibly modify: `crates/resd-net-sys/shim.c` — pass-through helper for `mbuf.l2_len` / `l3_len` / `l4_len` if bindgen doesn't expose them cleanly.
+- Modify: `crates/dpdk-net-core/src/tcp_output.rs` — add `tx_offload_finalize(mbuf, seg, payload_len, offload_active)`.
+- Modify: `crates/dpdk-net-core/src/engine.rs` — every TX site that pushes to mbuf calls the finalizer.
+- Possibly modify: `crates/dpdk-net-sys/shim.c` — pass-through helper for `mbuf.l2_len` / `l3_len` / `l4_len` if bindgen doesn't expose them cleanly.
 
 - [ ] **Step 1: Study current TX sites**
 
-Run: `grep -n 'build_segment\|build_retrans_header\|rte_eth_tx_burst' crates/resd-net-core/src/engine.rs | head -30`
+Run: `grep -n 'build_segment\|build_retrans_header\|rte_eth_tx_burst' crates/dpdk-net-core/src/engine.rs | head -30`
 
 - [ ] **Step 2: Verify bindgen exposure of `ol_flags` + `tx_offload` on rte_mbuf**
 
-Run: `grep -n 'pub ol_flags\|pub tx_offload\|pub l2_len\|pub l3_len\|pub l4_len' crates/resd-net-sys/src/lib.rs | head -10`
+Run: `grep -n 'pub ol_flags\|pub tx_offload\|pub l2_len\|pub l3_len\|pub l4_len' crates/dpdk-net-sys/src/lib.rs | head -10`
 
-If bindgen emitted `l2_len`/`l3_len`/`l4_len` as individual `u64` bitfield-packed fields (common for union-containing structs), use them directly. If bindgen emitted an anonymous union under a different name, fall back to a shim in `crates/resd-net-sys/shim.c`:
+If bindgen emitted `l2_len`/`l3_len`/`l4_len` as individual `u64` bitfield-packed fields (common for union-containing structs), use them directly. If bindgen emitted an anonymous union under a different name, fall back to a shim in `crates/dpdk-net-sys/shim.c`:
 
 ```c
-void resd_rte_mbuf_set_tx_lens(struct rte_mbuf *m, uint16_t l2, uint16_t l3, uint16_t l4) {
+void shim_rte_mbuf_set_tx_lens(struct rte_mbuf *m, uint16_t l2, uint16_t l3, uint16_t l4) {
     m->l2_len = l2;
     m->l3_len = l3;
     m->l4_len = l4;
 }
-void resd_rte_mbuf_or_ol_flags(struct rte_mbuf *m, uint64_t flags) {
+void shim_rte_mbuf_or_ol_flags(struct rte_mbuf *m, uint64_t flags) {
     m->ol_flags |= flags;
 }
 ```
 
-Plus decls in `wrapper.h` and Rust bindings in `crates/resd-net-sys/src/lib.rs`. Use these helpers from `tx_offload_finalize`.
+Plus decls in `wrapper.h` and Rust bindings in `crates/dpdk-net-sys/src/lib.rs`. Use these helpers from `tx_offload_finalize`.
 
 - [ ] **Step 3: Add the finalizer**
 
 ```rust
 #[cfg(feature = "hw-offload-tx-cksum")]
 pub fn tx_offload_finalize(
-    mbuf: *mut resd_net_sys::rte_mbuf,
+    mbuf: *mut dpdk_net_sys::rte_mbuf,
     seg: &SegmentTx,
     payload_for_csum_len: u32,
     offload_active: bool,
@@ -1221,18 +1221,18 @@ pub fn tx_offload_finalize(
     let opts_len = seg.options.encoded_len();
     let tcp_hdr_len = TCP_HDR_MIN + opts_len;
     unsafe {
-        resd_net_sys::resd_rte_mbuf_or_ol_flags(
+        dpdk_net_sys::shim_rte_mbuf_or_ol_flags(
             mbuf,
             RTE_MBUF_F_TX_IPV4 | RTE_MBUF_F_TX_IP_CKSUM | RTE_MBUF_F_TX_TCP_CKSUM,
         );
-        resd_net_sys::resd_rte_mbuf_set_tx_lens(
+        dpdk_net_sys::shim_rte_mbuf_set_tx_lens(
             mbuf,
             ETH_HDR_LEN as u16,
             IPV4_HDR_MIN as u16,
             tcp_hdr_len as u16,
         );
         // Overwrite TCP cksum + zero IPv4 cksum in the mbuf data buffer.
-        let data_ptr = resd_net_sys::resd_rte_pktmbuf_mtod(mbuf) as *mut u8;
+        let data_ptr = dpdk_net_sys::shim_rte_pktmbuf_mtod(mbuf) as *mut u8;
         let pseudo_len = (tcp_hdr_len as u32) + payload_for_csum_len;
         let pseudo = tcp_pseudo_header_checksum(seg.src_ip, seg.dst_ip, pseudo_len);
         let tcp_cksum_off = ETH_HDR_LEN + IPV4_HDR_MIN + 16;
@@ -1246,7 +1246,7 @@ pub fn tx_offload_finalize(
 
 #[cfg(not(feature = "hw-offload-tx-cksum"))]
 pub fn tx_offload_finalize(
-    _mbuf: *mut resd_net_sys::rte_mbuf,
+    _mbuf: *mut dpdk_net_sys::rte_mbuf,
     _seg: &SegmentTx,
     _payload_for_csum_len: u32,
     _offload_active: bool,
@@ -1266,7 +1266,7 @@ tcp_output::tx_offload_finalize(
 );
 ```
 
-For `build_retrans_header` sites, `payload_for_csum_len` is the chained data mbuf's payload length (read via `resd_rte_pktmbuf_data_len` on the data mbuf).
+For `build_retrans_header` sites, `payload_for_csum_len` is the chained data mbuf's payload length (read via `shim_rte_pktmbuf_data_len` on the data mbuf).
 
 - [ ] **Step 5: Add unit tests**
 
@@ -1282,9 +1282,9 @@ In `tcp_output.rs` `#[cfg(test)] mod tests`:
         // Minimal zeroed mbuf with a data buffer pointer. We don't call
         // DPDK functions; we exercise only tx_offload_finalize's memory
         // writes.
-        let mut mbuf: resd_net_sys::rte_mbuf = unsafe { std::mem::zeroed() };
+        let mut mbuf: dpdk_net_sys::rte_mbuf = unsafe { std::mem::zeroed() };
         let mut data = [0u8; 64];
-        // Configure buf_addr + data_off so resd_rte_pktmbuf_mtod points at data[0].
+        // Configure buf_addr + data_off so shim_rte_pktmbuf_mtod points at data[0].
         mbuf.buf_addr = data.as_mut_ptr() as *mut _;
         mbuf.data_off = 0;
         let seg = minimal_seg_tx();
@@ -1298,7 +1298,7 @@ In `tcp_output.rs` `#[cfg(test)] mod tests`:
     #[cfg(feature = "hw-offload-tx-cksum")]
     #[test]
     fn tx_offload_finalize_noop_when_inactive() {
-        let mut mbuf: resd_net_sys::rte_mbuf = unsafe { std::mem::zeroed() };
+        let mut mbuf: dpdk_net_sys::rte_mbuf = unsafe { std::mem::zeroed() };
         let before = mbuf.ol_flags;
         let seg = minimal_seg_tx();
         tx_offload_finalize(&mut mbuf, &seg, 128, false);
@@ -1318,16 +1318,16 @@ In `tcp_output.rs` `#[cfg(test)] mod tests`:
 
 - [ ] **Step 6: Build + test — default features AND --no-default-features**
 
-Run: `cargo test -p resd-net-core --release 2>&1 | tail -15`
-Run: `cargo build -p resd-net-core --release --no-default-features 2>&1 | tail -10`
+Run: `cargo test -p dpdk-net-core --release 2>&1 | tail -15`
+Run: `cargo build -p dpdk-net-core --release --no-default-features 2>&1 | tail -10`
 Expected: both pass.
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add crates/resd-net-core/src/tcp_output.rs \
-        crates/resd-net-core/src/engine.rs \
-        crates/resd-net-sys/
+git add crates/dpdk-net-core/src/tcp_output.rs \
+        crates/dpdk-net-core/src/engine.rs \
+        crates/dpdk-net-sys/
 git commit -m "a-hw task 7: TX checksum offload finalizer + TX-site wiring
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
@@ -1338,13 +1338,13 @@ Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
 ## Task 8: RX checksum ol_flags inspection — IP + TCP L4
 
 **Files:**
-- Modify: `crates/resd-net-core/src/l3_ip.rs` — add ol_flags classifier + wrapper entry point.
-- Modify: `crates/resd-net-core/src/tcp_input.rs` — consume L4 classification; bump counters on BAD.
-- Modify: `crates/resd-net-core/src/engine.rs` — RX sites thread `ol_flags`.
+- Modify: `crates/dpdk-net-core/src/l3_ip.rs` — add ol_flags classifier + wrapper entry point.
+- Modify: `crates/dpdk-net-core/src/tcp_input.rs` — consume L4 classification; bump counters on BAD.
+- Modify: `crates/dpdk-net-core/src/engine.rs` — RX sites thread `ol_flags`.
 
 - [ ] **Step 1: Write failing unit test**
 
-Append to `crates/resd-net-core/src/l3_ip.rs` `#[cfg(test)] mod tests`:
+Append to `crates/dpdk-net-core/src/l3_ip.rs` `#[cfg(test)] mod tests`:
 
 ```rust
     #[cfg(feature = "hw-offload-rx-cksum")]
@@ -1363,7 +1363,7 @@ Append to `crates/resd-net-core/src/l3_ip.rs` `#[cfg(test)] mod tests`:
 
 - [ ] **Step 2: Run to confirm fail**
 
-`cargo test -p resd-net-core --lib classify_ip 2>&1 | tail -10` → compile error.
+`cargo test -p dpdk-net-core --lib classify_ip 2>&1 | tail -10` → compile error.
 
 - [ ] **Step 3: Add classifiers + offload-aware wrapper**
 
@@ -1428,11 +1428,11 @@ pub fn ip_decode_offload_aware(
 
 - [ ] **Step 4: Verify passes**
 
-`cargo test -p resd-net-core --lib classify_ip 2>&1 | tail -10` → pass.
+`cargo test -p dpdk-net-core --lib classify_ip 2>&1 | tail -10` → pass.
 
 - [ ] **Step 5: Update engine.rs RX call sites**
 
-`grep -n 'l3_ip::ip_decode\b' crates/resd-net-core/src/engine.rs` — for each call, replace with:
+`grep -n 'l3_ip::ip_decode\b' crates/dpdk-net-core/src/engine.rs` — for each call, replace with:
 
 ```rust
 let ol_flags: u64 = unsafe { (*mbuf).ol_flags };
@@ -1443,7 +1443,7 @@ let decoded = l3_ip::ip_decode_offload_aware(
 
 - [ ] **Step 6: Add TCP L4 classification in tcp_input.rs**
 
-Read `crates/resd-net-core/src/tcp_input.rs` to find the current TCP checksum verification path. Wrap it:
+Read `crates/dpdk-net-core/src/tcp_input.rs` to find the current TCP checksum verification path. Wrap it:
 
 ```rust
 #[cfg(feature = "hw-offload-rx-cksum")]
@@ -1466,15 +1466,15 @@ Thread `ol_flags: u64` + `counters: &Counters` into the tcp_input entry point if
 
 - [ ] **Step 7: Run full test suite**
 
-Run: `cargo test -p resd-net-core --release 2>&1 | tail -20`
+Run: `cargo test -p dpdk-net-core --release 2>&1 | tail -20`
 Expected: all pass.
 
 - [ ] **Step 8: Commit**
 
 ```bash
-git add crates/resd-net-core/src/l3_ip.rs \
-        crates/resd-net-core/src/tcp_input.rs \
-        crates/resd-net-core/src/engine.rs
+git add crates/dpdk-net-core/src/l3_ip.rs \
+        crates/dpdk-net-core/src/tcp_input.rs \
+        crates/dpdk-net-core/src/engine.rs
 git commit -m "a-hw task 8: RX checksum ol_flags inspection — IP + TCP L4
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
@@ -1485,11 +1485,11 @@ Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
 ## Task 9: RSS hash read in flow_table.rs
 
 **Files:**
-- Modify: `crates/resd-net-core/src/flow_table.rs` — gated branch at the lookup site.
+- Modify: `crates/dpdk-net-core/src/flow_table.rs` — gated branch at the lookup site.
 
 - [ ] **Step 1: Study current flow_table lookup**
 
-Run: `grep -n 'pub fn .*lookup\|SipHash\|siphash' crates/resd-net-core/src/flow_table.rs | head -10`
+Run: `grep -n 'pub fn .*lookup\|SipHash\|siphash' crates/dpdk-net-core/src/flow_table.rs | head -10`
 
 - [ ] **Step 2: Write failing test**
 
@@ -1571,19 +1571,19 @@ let hash = flow_table::hash_bucket_for_lookup(
 let handle = self.flow_table.borrow().lookup_by_hash(&tup, hash);
 ```
 
-(The exact bindgen field for `hash.rss` may be different — check `grep 'hash\.\|hash_word\|__bindgen' crates/resd-net-sys/src/lib.rs | grep rss`. Use a shim helper if the nested-union access is gnarly: `uint32_t resd_rte_mbuf_rss_hash(const struct rte_mbuf *m) { return m->hash.rss; }`.)
+(The exact bindgen field for `hash.rss` may be different — check `grep 'hash\.\|hash_word\|__bindgen' crates/dpdk-net-sys/src/lib.rs | grep rss`. Use a shim helper if the nested-union access is gnarly: `uint32_t shim_rte_mbuf_rss_hash(const struct rte_mbuf *m) { return m->hash.rss; }`.)
 
 - [ ] **Step 6: Run tests**
 
-Run: `cargo test -p resd-net-core --release 2>&1 | tail -20`
+Run: `cargo test -p dpdk-net-core --release 2>&1 | tail -20`
 Expected: pass.
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add crates/resd-net-core/src/flow_table.rs \
-        crates/resd-net-core/src/engine.rs \
-        crates/resd-net-sys/
+git add crates/dpdk-net-core/src/flow_table.rs \
+        crates/dpdk-net-core/src/engine.rs \
+        crates/dpdk-net-sys/
 git commit -m "a-hw task 9: RSS hash read in flow_table.rs
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
@@ -1594,12 +1594,12 @@ Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
 ## Task 10: RX timestamp dynfield/dynflag lookup + accessor + engine state
 
 **Files:**
-- Modify: `crates/resd-net-core/src/engine.rs` — add dynfield + dynflag lookup at `engine_create`; add `hw_rx_ts_ns` accessor.
-- Possibly modify: `crates/resd-net-sys/shim.c` — pass-through for `rte_mbuf_dynfield_lookup` + `rte_mbuf_dynflag_lookup`.
+- Modify: `crates/dpdk-net-core/src/engine.rs` — add dynfield + dynflag lookup at `engine_create`; add `hw_rx_ts_ns` accessor.
+- Possibly modify: `crates/dpdk-net-sys/shim.c` — pass-through for `rte_mbuf_dynfield_lookup` + `rte_mbuf_dynflag_lookup`.
 
 - [ ] **Step 1: Verify bindgen exposure**
 
-Run: `grep -n 'rte_mbuf_dynfield_lookup\|rte_mbuf_dynflag_lookup' crates/resd-net-sys/src/lib.rs | head -5`
+Run: `grep -n 'rte_mbuf_dynfield_lookup\|rte_mbuf_dynflag_lookup' crates/dpdk-net-sys/src/lib.rs | head -5`
 
 If absent, add `#include <rte_mbuf_dyn.h>` to `wrapper.h` and rebuild. If bindgen still doesn't expose them, add shim pass-throughs.
 
@@ -1646,7 +1646,7 @@ After `rte_eth_dev_start` succeeds:
             if offset.is_none() || mask.is_none() {
                 counters.eth.offload_missing_rx_timestamp.fetch_add(1, Ordering::Relaxed);
                 eprintln!(
-                    "resd_net: RX timestamp dynfield/dynflag unavailable on port {} \
+                    "dpdk_net: RX timestamp dynfield/dynflag unavailable on port {} \
                      (ENA steady state — see spec §10.5)",
                     cfg.port_id
                 );
@@ -1716,15 +1716,15 @@ In `engine.rs` `#[cfg(test)] mod tests`:
 
 - [ ] **Step 6: Build + test with both feature states**
 
-Run: `cargo test -p resd-net-core --release 2>&1 | tail -10`
-Run: `cargo build -p resd-net-core --release --no-default-features 2>&1 | tail -10`
-Run: `cargo build -p resd-net-core --release --no-default-features --features hw-offload-rx-timestamp 2>&1 | tail -10`
+Run: `cargo test -p dpdk-net-core --release 2>&1 | tail -10`
+Run: `cargo build -p dpdk-net-core --release --no-default-features 2>&1 | tail -10`
+Run: `cargo build -p dpdk-net-core --release --no-default-features --features hw-offload-rx-timestamp 2>&1 | tail -10`
 Expected: all clean.
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add crates/resd-net-core/src/engine.rs crates/resd-net-sys/
+git add crates/dpdk-net-core/src/engine.rs crates/dpdk-net-sys/
 git commit -m "a-hw task 10: RX timestamp dynfield/dynflag lookup + accessor
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
@@ -1735,12 +1735,12 @@ Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
 ## Task 11: Thread hw_rx_ts_ns to RX event emission sites
 
 **Files:**
-- Modify: `crates/resd-net-core/src/engine.rs` — capture `hw_rx_ts_ns` at RX decode; thread into `deliver_readable`; update the two RX-origin emission sites (lines 1842 + 2205 in the pre-A-HW worktree).
-- Modify: `crates/resd-net-core/src/tcp_input.rs` — if the RX decode boundary lives here, capture and return the timestamp alongside the existing tcp_input outcome.
+- Modify: `crates/dpdk-net-core/src/engine.rs` — capture `hw_rx_ts_ns` at RX decode; thread into `deliver_readable`; update the two RX-origin emission sites (lines 1842 + 2205 in the pre-A-HW worktree).
+- Modify: `crates/dpdk-net-core/src/tcp_input.rs` — if the RX decode boundary lives here, capture and return the timestamp alongside the existing tcp_input outcome.
 
 - [ ] **Step 1: Identify the RX decode boundary**
 
-Run: `grep -n 'rte_eth_rx_burst\|ip_decode_offload_aware\|tcp_input_offload_aware' crates/resd-net-core/src/engine.rs | head -15`
+Run: `grep -n 'rte_eth_rx_burst\|ip_decode_offload_aware\|tcp_input_offload_aware' crates/dpdk-net-core/src/engine.rs | head -15`
 
 The RX handler's top-of-loop (where each mbuf from `rte_eth_rx_burst` enters) is where the mbuf pointer is live. Capture `hw_rx_ts_ns` there:
 
@@ -1805,18 +1805,18 @@ fn deliver_readable(&self, handle: ConnHandle, delivered: u32, rx_hw_ts_ns: u64)
 
 Every caller of `deliver_readable` now passes `hw_rx_ts`. Grep for callers:
 
-Run: `grep -n 'deliver_readable' crates/resd-net-core/src/engine.rs`
+Run: `grep -n 'deliver_readable' crates/dpdk-net-core/src/engine.rs`
 
 For each call site, thread through the captured `hw_rx_ts` from the RX decode boundary.
 
 - [ ] **Step 4: Build + test**
 
-Run: `cargo test -p resd-net-core --release 2>&1 | tail -20`
+Run: `cargo test -p dpdk-net-core --release 2>&1 | tail -20`
 Expected: pass. Existing tests that run on `net_tap` will get `rx_hw_ts_ns = 0` in all events (dynfield absent) — same as before, no assertion failures.
 
 - [ ] **Step 5: Add unit test**
 
-In `crates/resd-net-core/tests/` or in the engine's test block — add an assertion that Readable events on the net_tap harness still have `rx_hw_ts_ns == 0`:
+In `crates/dpdk-net-core/tests/` or in the engine's test block — add an assertion that Readable events on the net_tap harness still have `rx_hw_ts_ns == 0`:
 
 ```rust
     #[test]
@@ -1834,7 +1834,7 @@ Skip if nothing meaningful fits at this granularity — the real coverage is Tas
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/resd-net-core/src/engine.rs
+git add crates/dpdk-net-core/src/engine.rs
 git commit -m "$(cat <<'EOF'
 a-hw task 11: thread hw_rx_ts_ns to RX event emission sites
 
@@ -1857,18 +1857,18 @@ EOF
 ## Task 12: LLQ log-scrape verification
 
 **Files:**
-- Modify: `crates/resd-net-core/src/engine.rs` — add `verify_llq_activation` gated on `hw-verify-llq`; call around `rte_eth_dev_start`.
-- Possibly modify: `crates/resd-net-sys/shim.c` — add `rte_openlog_stream` wrapper if bindgen doesn't expose it cleanly.
+- Modify: `crates/dpdk-net-core/src/engine.rs` — add `verify_llq_activation` gated on `hw-verify-llq`; call around `rte_eth_dev_start`.
+- Possibly modify: `crates/dpdk-net-sys/shim.c` — add `rte_openlog_stream` wrapper if bindgen doesn't expose it cleanly.
 
 - [ ] **Step 1: Verify bindgen exposure of `rte_openlog_stream`**
 
-Run: `grep -n 'rte_openlog_stream\|rte_log_get_stream' crates/resd-net-sys/src/lib.rs | head -5`
+Run: `grep -n 'rte_openlog_stream\|rte_log_get_stream' crates/dpdk-net-sys/src/lib.rs | head -5`
 
 If absent, add to `wrapper.h`:
 ```c
 #include <rte_log.h>
 ```
-Rebuild `resd-net-sys`. If still not exposed, add a shim pass-through.
+Rebuild `dpdk-net-sys`. If still not exposed, add a shim pass-through.
 
 - [ ] **Step 2: Lock exact ENA PMD log strings for DPDK 23.11**
 
@@ -1933,7 +1933,7 @@ fn verify_llq_activation(
     if has_failure || !has_activation {
         counters.eth.offload_missing_llq.fetch_add(1, Ordering::Relaxed);
         eprintln!(
-            "resd_net: port {} ENA driver but LLQ did not activate at bring-up \
+            "dpdk_net: port {} ENA driver but LLQ did not activate at bring-up \
              (has_failure={}, has_activation={}). Failing hard per spec §5.",
             port_id, has_failure, has_activation
         );
@@ -2039,25 +2039,25 @@ with:
             verify_llq_activation(cfg.port_id, &outcome.driver_name, &counters)
                 .inspect_err(|_| {
                     // Log the captured output for operator debugging.
-                    eprintln!("resd_net: captured PMD log during bring-up:\n{log}");
+                    eprintln!("dpdk_net: captured PMD log during bring-up:\n{log}");
                 })?;
         }
 ```
 
 - [ ] **Step 6: Build + test**
 
-Run: `cargo test -p resd-net-core --release 2>&1 | tail -20`
+Run: `cargo test -p dpdk-net-core --release 2>&1 | tail -20`
 Expected: pass. `net_tap` tests go through the `driver_name != "net_ena"` short-circuit.
 
-Run: `cargo build -p resd-net-core --release --no-default-features 2>&1 | tail -10`
+Run: `cargo build -p dpdk-net-core --release --no-default-features 2>&1 | tail -10`
 Expected: clean; verification block + helpers compile away entirely.
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add crates/resd-net-core/src/engine.rs \
-        crates/resd-net-core/src/error.rs \
-        crates/resd-net-sys/
+git add crates/dpdk-net-core/src/engine.rs \
+        crates/dpdk-net-core/src/error.rs \
+        crates/dpdk-net-sys/
 git commit -m "$(cat <<'EOF'
 a-hw task 12: LLQ activation verification via PMD log-scrape
 
@@ -2147,13 +2147,13 @@ EOF
 ## Task 14: Knob-coverage audit entries for every feature-off branch
 
 **Files:**
-- Modify: `crates/resd-net-core/tests/knob-coverage.rs` — add one scenario per feature-flag off-branch.
+- Modify: `crates/dpdk-net-core/tests/knob-coverage.rs` — add one scenario per feature-flag off-branch.
 
 **Goal:** Every feature-off branch has at least one `#[cfg(not(feature = ...))]` test that asserts a visible, distinguishing consequence of the feature being off.
 
 - [ ] **Step 1: Add scenario per feature**
 
-Append to `crates/resd-net-core/tests/knob-coverage.rs`:
+Append to `crates/dpdk-net-core/tests/knob-coverage.rs`:
 
 ```rust
 // ---- A-HW knob coverage -------------------------------------------------
@@ -2193,8 +2193,8 @@ fn knob_hw_offload_tx_cksum_off_finalize_is_noop() {
 #[cfg(not(feature = "hw-offload-rx-cksum"))]
 #[test]
 fn knob_hw_offload_rx_cksum_off_ip_decode_always_software_verify() {
-    use resd_net_core::counters::Counters;
-    use resd_net_core::l3_ip::ip_decode_offload_aware;
+    use dpdk_net_core::counters::Counters;
+    use dpdk_net_core::l3_ip::ip_decode_offload_aware;
     let counters = Counters::new();
     // Build a minimal valid IPv4 packet that would fail software
     // verify only if nic_csum_ok=false (i.e. software fold mismatch).
@@ -2223,7 +2223,7 @@ fn knob_hw_offload_mbuf_fast_free_off_compiles() {}
 #[cfg(not(feature = "hw-offload-rss-hash"))]
 #[test]
 fn knob_hw_offload_rss_hash_off_always_siphash() {
-    use resd_net_core::flow_table::{hash_bucket_for_lookup, FourTuple};
+    use dpdk_net_core::flow_table::{hash_bucket_for_lookup, FourTuple};
     let tup = FourTuple {
         local_ip: 0x0a000001, local_port: 1,
         peer_ip: 0x0a000002, peer_port: 2,
@@ -2251,8 +2251,8 @@ Plus a helper:
 fn build_valid_ipv4_tcp_packet() -> Vec<u8> {
     // 20-byte IPv4 header + 20-byte TCP header + empty payload.
     // Checksum computed correctly so software verify passes.
-    use resd_net_core::tcp_output::{build_segment, SegmentTx, TCP_ACK};
-    use resd_net_core::tcp_options::TcpOpts;
+    use dpdk_net_core::tcp_output::{build_segment, SegmentTx, TCP_ACK};
+    use dpdk_net_core::tcp_options::TcpOpts;
     let seg = SegmentTx {
         src_mac: [0; 6], dst_mac: [0; 6],
         src_ip: 0x0a000001, dst_ip: 0x0a000002,
@@ -2271,15 +2271,15 @@ fn build_valid_ipv4_tcp_packet() -> Vec<u8> {
 
 - [ ] **Step 2: Run knob-coverage tests in default build**
 
-Run: `cargo test -p resd-net-core --release --test knob-coverage 2>&1 | tail -10`
+Run: `cargo test -p dpdk-net-core --release --test knob-coverage 2>&1 | tail -10`
 Expected: existing A5.5 tests pass; the new A-HW tests ARE feature-gated off, so they don't run in this build — none fail, none skip.
 
 - [ ] **Step 3: Run knob-coverage tests in --no-default-features build**
 
-Run: `cargo test -p resd-net-core --release --test knob-coverage --no-default-features 2>&1 | tail -10`
+Run: `cargo test -p dpdk-net-core --release --test knob-coverage --no-default-features 2>&1 | tail -10`
 Expected: the new `knob_hw_*_off_*` tests run and pass. Existing A5.5 tests that depend on `obs-poll-saturation` may require adding it back: `--features obs-poll-saturation` if they error out.
 
-Adjust: `cargo test -p resd-net-core --release --test knob-coverage --no-default-features --features obs-poll-saturation 2>&1 | tail -10`
+Adjust: `cargo test -p dpdk-net-core --release --test knob-coverage --no-default-features --features obs-poll-saturation 2>&1 | tail -10`
 
 - [ ] **Step 4: Run per-flag configurations from Section 13 of the spec**
 
@@ -2292,7 +2292,7 @@ Loop through each config in `scripts/ci-feature-matrix.sh` (Task 15 adds this).
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/resd-net-core/tests/knob-coverage.rs
+git add crates/dpdk-net-core/tests/knob-coverage.rs
 git commit -m "$(cat <<'EOF'
 a-hw task 14: knob-coverage entries for every A-HW feature-off branch
 
@@ -2335,7 +2335,7 @@ set -euo pipefail
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
-CRATE="-p resd-net-core"
+CRATE="-p dpdk-net-core"
 COMMON_FEATURES="obs-poll-saturation"
 
 echo "=== Build 1/8: default features ==="
@@ -2416,11 +2416,11 @@ EOF
 ## Task 16: SW-fallback smoke test (default features on net_tap)
 
 **Files:**
-- Create: `crates/resd-net-core/tests/ahw_smoke_sw_fallback.rs` — integration test on A3's TAP-pair harness, default features.
+- Create: `crates/dpdk-net-core/tests/ahw_smoke_sw_fallback.rs` — integration test on A3's TAP-pair harness, default features.
 
 - [ ] **Step 1: Study existing TAP-pair integration tests**
 
-Run: `ls crates/resd-net-core/tests/*tap* 2>&1; grep -l 'net_tap\|RESD_NET_TEST_TAP' crates/resd-net-core/tests/*.rs 2>&1 | head -5`
+Run: `ls crates/dpdk-net-core/tests/*tap* 2>&1; grep -l 'net_tap\|DPDK_NET_TEST_TAP' crates/dpdk-net-core/tests/*.rs 2>&1 | head -5`
 
 Read one of the existing TAP tests (e.g. `tcp_options_paws_reassembly_sack_tap.rs`) to reuse the harness setup.
 
@@ -2430,7 +2430,7 @@ Read one of the existing TAP tests (e.g. `tcp_options_paws_reassembly_sack_tap.r
 //! A-HW Task 16: SW-fallback smoke test.
 //!
 //! Build: `cargo test --release --test ahw_smoke_sw_fallback`.
-//! Preconditions: RESD_NET_TEST_TAP=1 (same as existing TAP tests —
+//! Preconditions: DPDK_NET_TEST_TAP=1 (same as existing TAP tests —
 //! requires CAP_NET_ADMIN and a freshly-initialized EAL).
 //!
 //! Runs the A3 TAP-pair harness with default features. The net_tap PMD
@@ -2455,8 +2455,8 @@ include!("../tests_harness/tap_pair.rs");  // ← or whatever it actually is
 
 #[test]
 fn ahw_sw_fallback_counters_and_correctness() {
-    if std::env::var("RESD_NET_TEST_TAP").is_err() {
-        eprintln!("ahw_smoke_sw_fallback: RESD_NET_TEST_TAP not set; skipping");
+    if std::env::var("DPDK_NET_TEST_TAP").is_err() {
+        eprintln!("ahw_smoke_sw_fallback: DPDK_NET_TEST_TAP not set; skipping");
         return;
     }
     let harness = tap_pair::setup(/* config */);
@@ -2488,7 +2488,7 @@ fn ahw_sw_fallback_counters_and_correctness() {
 On first run, the expected values may diverge from the guesses above — net_tap's advertised offload set depends on DPDK version. Run:
 
 ```bash
-RESD_NET_TEST_TAP=1 cargo test --release --test ahw_smoke_sw_fallback -- --nocapture 2>&1 | head -50
+DPDK_NET_TEST_TAP=1 cargo test --release --test ahw_smoke_sw_fallback -- --nocapture 2>&1 | head -50
 ```
 
 Read the startup-banner lines (from Task 5) to see net_tap's actual `tx_offload_capa` / `rx_offload_capa` values. Update the `assert_eq!` expected values to match what the PMD reports. Document the values + PMD build in a code comment so a future DPDK bump that changes them surfaces as a test failure rather than silent drift.
@@ -2496,7 +2496,7 @@ Read the startup-banner lines (from Task 5) to see net_tap's actual `tx_offload_
 - [ ] **Step 4: Re-run to confirm pass**
 
 ```bash
-RESD_NET_TEST_TAP=1 cargo test --release --test ahw_smoke_sw_fallback 2>&1 | tail -10
+DPDK_NET_TEST_TAP=1 cargo test --release --test ahw_smoke_sw_fallback 2>&1 | tail -10
 ```
 
 Expected: `test result: ok. 1 passed`.
@@ -2504,7 +2504,7 @@ Expected: `test result: ok. 1 passed`.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/resd-net-core/tests/ahw_smoke_sw_fallback.rs
+git add crates/dpdk-net-core/tests/ahw_smoke_sw_fallback.rs
 git commit -m "$(cat <<'EOF'
 a-hw task 16: SW-fallback smoke test (default features, net_tap)
 
@@ -2530,7 +2530,7 @@ EOF
 ## Task 17: SW-only smoke test (--no-default-features)
 
 **Files:**
-- Create or Reuse: the same `crates/resd-net-core/tests/ahw_smoke_sw_fallback.rs` file OR a new `ahw_smoke_sw_only.rs` — pick based on whether the harness shares cleanly.
+- Create or Reuse: the same `crates/dpdk-net-core/tests/ahw_smoke_sw_fallback.rs` file OR a new `ahw_smoke_sw_only.rs` — pick based on whether the harness shares cleanly.
 
 - [ ] **Step 1: Decide — reuse or separate**
 
@@ -2554,8 +2554,8 @@ Actually, a cleaner discriminator: `#[cfg(all(not(feature = "hw-offload-tx-cksum
     not(feature = "hw-verify-llq"),
 ))]
 fn ahw_sw_only_counters_and_correctness() {
-    if std::env::var("RESD_NET_TEST_TAP").is_err() {
-        eprintln!("ahw_sw_only: RESD_NET_TEST_TAP not set; skipping");
+    if std::env::var("DPDK_NET_TEST_TAP").is_err() {
+        eprintln!("ahw_sw_only: DPDK_NET_TEST_TAP not set; skipping");
         return;
     }
     let harness = tap_pair::setup(/* config */);
@@ -2586,7 +2586,7 @@ fn ahw_sw_only_counters_and_correctness() {
 - [ ] **Step 3: Run**
 
 ```bash
-RESD_NET_TEST_TAP=1 cargo test --release --test ahw_smoke_sw_fallback --no-default-features --features obs-poll-saturation -- --nocapture 2>&1 | tail -10
+DPDK_NET_TEST_TAP=1 cargo test --release --test ahw_smoke_sw_fallback --no-default-features --features obs-poll-saturation -- --nocapture 2>&1 | tail -10
 ```
 
 Expected: `ahw_sw_only_counters_and_correctness` runs and passes; `ahw_sw_fallback_counters_and_correctness` is gated-off (only runs in default-features build).
@@ -2594,7 +2594,7 @@ Expected: `ahw_sw_only_counters_and_correctness` runs and passes; `ahw_sw_fallba
 - [ ] **Step 4: Commit**
 
 ```bash
-git add crates/resd-net-core/tests/ahw_smoke_sw_fallback.rs
+git add crates/dpdk-net-core/tests/ahw_smoke_sw_fallback.rs
 git commit -m "$(cat <<'EOF'
 a-hw task 17: SW-only smoke test (--no-default-features)
 
@@ -2618,7 +2618,7 @@ EOF
 ## Task 18: HW-path smoke test (default features on ENA VF)
 
 **Files:**
-- Create: `crates/resd-net-core/tests/ahw_smoke_ena_hw.rs` — integration test on real ENA VF, gated on `RESD_NET_TEST_ENA=1`.
+- Create: `crates/dpdk-net-core/tests/ahw_smoke_ena_hw.rs` — integration test on real ENA VF, gated on `DPDK_NET_TEST_ENA=1`.
 
 - [ ] **Step 1: Study existing ENA setup patterns**
 
@@ -2631,7 +2631,7 @@ Preconditions (from operator):
   2. Hugepages reserved: ≥1 GiB of 2MB pages.
   3. EAL args:
      --in-memory --huge-unlink --no-pci -a <ENA_BDF>,enable_llq=1
-  4. Run: RESD_NET_TEST_ENA=1 ENA_BDF=0000:00:06.0 cargo test \
+  4. Run: DPDK_NET_TEST_ENA=1 ENA_BDF=0000:00:06.0 cargo test \
           --release --test ahw_smoke_ena_hw -- --nocapture
   5. No other test in the session shares this VF.
 
@@ -2644,16 +2644,16 @@ the env var does not try to touch a real ENA device.
 ```rust
 //! A-HW Task 18: HW-path smoke test on real ENA VF.
 //!
-//! Preconditions: RESD_NET_TEST_ENA=1 + ENA_BDF=<bdf>.
+//! Preconditions: DPDK_NET_TEST_ENA=1 + ENA_BDF=<bdf>.
 //! Marked #[ignore] so `cargo test` without the env var does not
 //! attempt to initialize DPDK against a real NIC.
 
 use std::sync::atomic::Ordering;
 
 #[test]
-#[ignore = "requires real ENA VF; set RESD_NET_TEST_ENA=1 + ENA_BDF=<bdf>"]
+#[ignore = "requires real ENA VF; set DPDK_NET_TEST_ENA=1 + ENA_BDF=<bdf>"]
 fn ahw_ena_hw_path_banner_and_counters() {
-    if std::env::var("RESD_NET_TEST_ENA").is_err() {
+    if std::env::var("DPDK_NET_TEST_ENA").is_err() {
         return;
     }
     let bdf = std::env::var("ENA_BDF")
@@ -2694,12 +2694,12 @@ fn ahw_ena_hw_path_banner_and_counters() {
 }
 ```
 
-The `ena_harness` module is new — probably a minimal `#[cfg(test)]` helper that wraps `resd_net_core::Engine::new` with ENA-specific EAL args. Write the simplest possible version; do NOT over-abstract.
+The `ena_harness` module is new — probably a minimal `#[cfg(test)]` helper that wraps `dpdk_net_core::Engine::new` with ENA-specific EAL args. Write the simplest possible version; do NOT over-abstract.
 
 - [ ] **Step 3: Run on the actual ENA host**
 
 ```bash
-RESD_NET_TEST_ENA=1 ENA_BDF=0000:00:06.0 cargo test --release --test ahw_smoke_ena_hw -- --ignored --nocapture 2>&1 | tail -30
+DPDK_NET_TEST_ENA=1 ENA_BDF=0000:00:06.0 cargo test --release --test ahw_smoke_ena_hw -- --ignored --nocapture 2>&1 | tail -30
 ```
 
 Expected: test passes. The banner in the stderr output shows the negotiated offload masks including every A-HW bit.
@@ -2709,7 +2709,7 @@ If `offload_missing_llq` is nonzero on ENA, the PMD log-scrape markers in Task 1
 - [ ] **Step 4: Commit**
 
 ```bash
-git add crates/resd-net-core/tests/ahw_smoke_ena_hw.rs
+git add crates/dpdk-net-core/tests/ahw_smoke_ena_hw.rs
 git commit -m "$(cat <<'EOF'
 a-hw task 18: HW-path smoke test on real ENA VF
 
@@ -2724,7 +2724,7 @@ NIC. Asserts that with default A-HW features:
   - Every event's rx_hw_ts_ns = 0 (accessor always yields 0 on ENA).
   - Full request-response correctness.
 
-Preconditions documented in the test file header: RESD_NET_TEST_ENA=1
+Preconditions documented in the test file header: DPDK_NET_TEST_ENA=1
 + ENA_BDF=<bdf> + EAL args including enable_llq=1. Part of the ship
 gate (spec §16 criterion c).
 
@@ -2859,7 +2859,7 @@ Before the subagent-driven execution starts:
 - [ ] Rebase cadence: after each commit, `git fetch && git log --oneline phase-a6 --since=<last check>`; `git rebase phase-a6` if new work landed.
 
 **Coordination hazards with Session 1 (A6):**
-- Shared files: `engine.rs`, `api.rs`, `counters.rs`, `include/resd_net.h`, `Cargo.toml`.
+- Shared files: `engine.rs`, `api.rs`, `counters.rs`, `include/dpdk_net.h`, `Cargo.toml`.
 - A-HW touches: port config (early in Engine::new), RX event sites (engine.rs:1842 + deliver_readable), counters (EthCounters + eth_counters_t).
 - A6 touches: timer wheel, close flags, WRITABLE event, preset, RTT histogram (tcp_rtt.rs + conn stats).
 - Overlap is low — different regions of engine.rs. cbindgen regenerations should be rebasable; counter-struct additions use append-not-insert so they commute.

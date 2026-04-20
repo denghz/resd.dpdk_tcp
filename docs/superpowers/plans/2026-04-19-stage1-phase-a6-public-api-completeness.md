@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Finalize the Stage 1 public C ABI defined in parent spec §4 — public timer API, `WRITABLE` on send-buffer drain, TX-ring-batched `resd_net_flush` (data-path only, control frames stay inline), `resd_net_close(flags)` with `FORCE_TW_SKIP` under RFC 6191 prerequisites, `preset=rfc_compliance`, `ENOMEM` error events, RFC 7323 §5.5 24-day `TS.Recent` lazy expiration — and add per-connection RTT histogram (absorbed from the former A5.6 phase, decisions preserved).
+**Goal:** Finalize the Stage 1 public C ABI defined in parent spec §4 — public timer API, `WRITABLE` on send-buffer drain, TX-ring-batched `dpdk_net_flush` (data-path only, control frames stay inline), `dpdk_net_close(flags)` with `FORCE_TW_SKIP` under RFC 6191 prerequisites, `preset=rfc_compliance`, `ENOMEM` error events, RFC 7323 §5.5 24-day `TS.Recent` lazy expiration — and add per-connection RTT histogram (absorbed from the former A5.6 phase, decisions preserved).
 
 **Architecture:** Surface + observability work layered on top of A5/A5.5's existing wire behavior. No new RFC deviations, no new hot-path counters, no peer-visible behavior changes beyond the listed items. Tasks split into preparatory (wheel `user_data`, new `InternalEvent` variants, `TcpConn` fields, counters — tasks 1–4), engine machinery (TX ring + drain, `rtt_histogram_edges`, `rx_drop_nomem_prev`, public timer add/cancel — tasks 5–8), engine behavioral wiring (preset, close-flag, reap short-circuit, send/retransmit ring push — tasks 9–13), data-path hooks (PAWS lazy expiration, histogram update, WRITABLE hysteresis — tasks 14–16), public API surface (extern C functions, config field, close body, header regen — tasks 17–20), tests + audits (integration tests, knob-coverage, per-conn-histogram audit — tasks 21–22), end-of-phase reviews + tag (task 23).
 
-**Tech Stack:** Rust stable, DPDK 23.11, bindgen, cbindgen (auto-regens `include/resd_net.h` on `cargo build -p resd-net`). No new crate deps, no new cargo features, no new DPDK FFI wrappers.
+**Tech Stack:** Rust stable, DPDK 23.11, bindgen, cbindgen (auto-regens `include/dpdk_net.h` on `cargo build -p dpdk-net`). No new crate deps, no new cargo features, no new DPDK FFI wrappers.
 
 **Spec reference:** design spec at `docs/superpowers/specs/2026-04-19-stage1-phase-a6-public-api-completeness-design.md`; parent spec at `docs/superpowers/specs/2026-04-17-dpdk-tcp-design.md` §§4 (API additions), 4.2 (event-queue + flush + close-flag contracts), 6.3 (RFC matrix — no new rows; RFC 7323 §5.5 expiration text finalized), 6.4 (no new ADs), 6.5 (TIME_WAIT shortening finalized), 7.4 (timer wheel), 9.1 (4 new slow-path counters), 9.3 (ENOMEM / EPERM_TW_REQUIRED event emission sites).
 
@@ -29,21 +29,21 @@ The `phase-a6-complete` tag is blocked while either report has an open `[ ]` in 
 
 - Test-suite harnesses (packetdrill, tcpreq, TCP-Fuzz, smoltcp FaultInjector) — A7 / A8 / A9.
 - Benchmarks — A10.
-- Per-sample `RESD_NET_EVT_RTT_SAMPLE` events — deferred indefinitely; histogram covers the stated need.
+- Per-sample `DPDK_NET_EVT_RTT_SAMPLE` events — deferred indefinitely; histogram covers the stated need.
 - Raw-samples RTT ring — deferred indefinitely.
-- Engine-wide RTT histogram summary (sum across conns) — out of A6 scope per A5.6 §12; apps sum across `resd_net_conn_rtt_histogram` snapshots.
+- Engine-wide RTT histogram summary (sum across conns) — out of A6 scope per A5.6 §12; apps sum across `dpdk_net_conn_rtt_histogram` snapshots.
 - Mid-session bucket-edge changes — edges fixed at `engine_create`.
 - Multi-queue enablement — Stage 1 single-queue.
 - A-HW offload territory — parallel session scope.
 
-**Coordination with parallel session (`phase-a-hw`)** — after each commit on `phase-a6`, run `git fetch && git log --oneline phase-a-hw --since=<last-check>`; if any new commits exist, `git rebase phase-a-hw`. Expected shared files (by region): `engine.rs` (A-HW: port config + offload bits at init; A6: timer wheel + tx_pending_data + event paths + close path — disjoint regions), `api.rs` (A-HW: offload flag bits on `engine_config_t`; A6: `rtt_histogram_bucket_edges_us` + new extern fns — append-at-tail), `include/resd_net.h` (cbindgen-regenerated, auto-resolves), `Cargo.toml` (A-HW: new `hw-offload-*` features; A6: no new features — disjoint).
+**Coordination with parallel session (`phase-a-hw`)** — after each commit on `phase-a6`, run `git fetch && git log --oneline phase-a-hw --since=<last-check>`; if any new commits exist, `git rebase phase-a-hw`. Expected shared files (by region): `engine.rs` (A-HW: port config + offload bits at init; A6: timer wheel + tx_pending_data + event paths + close path — disjoint regions), `api.rs` (A-HW: offload flag bits on `engine_config_t`; A6: `rtt_histogram_bucket_edges_us` + new extern fns — append-at-tail), `include/dpdk_net.h` (cbindgen-regenerated, auto-resolves), `Cargo.toml` (A-HW: new `hw-offload-*` features; A6: no new features — disjoint).
 
 ---
 
 ## File Structure Created or Modified in This Phase
 
 ```
-crates/resd-net-core/
+crates/dpdk-net-core/
 ├── src/
 │   ├── tcp_timer_wheel.rs          (MODIFIED: `TimerNode::user_data: u64` field — zero for kernel timers, populated for ApiPublic)
 │   ├── tcp_events.rs               (MODIFIED: new `InternalEvent::ApiTimer {timer_id, user_data, emitted_ts_ns}`, new `InternalEvent::Writable {conn, emitted_ts_ns}`)
@@ -57,11 +57,11 @@ crates/resd-net-core/
     ├── per-conn-histogram-coverage.rs  (NEW: sibling audit — sweeps RTT across all 16 histogram buckets under default edges)
     └── knob-coverage.rs            (MODIFIED: adds `knob_preset_rfc_compliance_forces_rfc_defaults`, `knob_close_force_tw_skip_when_ts_enabled`, `knob_rtt_histogram_bucket_edges_us_override`)
 
-crates/resd-net/src/
-├── api.rs                          (MODIFIED: `resd_net_engine_config_t::rtt_histogram_bucket_edges_us[15]`; new `resd_net_tcp_rtt_histogram_t` POD; `tx_api_timers_fired`, `ts_recent_expired`, `tx_flush_bursts`, `tx_flush_batched_pkts` on `resd_net_tcp_counters_t`; compile-time layout asserts updated)
-└── lib.rs                          (MODIFIED: `resd_net_timer_add`, `resd_net_timer_cancel`, `resd_net_conn_rtt_histogram` extern fns; `resd_net_flush` body replaced; `resd_net_close` honors flags; `resd_net_engine_create` applies preset + validates histogram edges; `build_event_from_internal` handles `ApiTimer` + `Writable`)
+crates/dpdk-net/src/
+├── api.rs                          (MODIFIED: `dpdk_net_engine_config_t::rtt_histogram_bucket_edges_us[15]`; new `dpdk_net_tcp_rtt_histogram_t` POD; `tx_api_timers_fired`, `ts_recent_expired`, `tx_flush_bursts`, `tx_flush_batched_pkts` on `dpdk_net_tcp_counters_t`; compile-time layout asserts updated)
+└── lib.rs                          (MODIFIED: `dpdk_net_timer_add`, `dpdk_net_timer_cancel`, `dpdk_net_conn_rtt_histogram` extern fns; `dpdk_net_flush` body replaced; `dpdk_net_close` honors flags; `dpdk_net_engine_create` applies preset + validates histogram edges; `build_event_from_internal` handles `ApiTimer` + `Writable`)
 
-include/resd_net.h                  (REGENERATED via cbindgen: new extern C fns + new POD + new config field + updated doc-comments on resd_net_flush / resd_net_close)
+include/dpdk_net.h                  (REGENERATED via cbindgen: new extern C fns + new POD + new config field + updated doc-comments on dpdk_net_flush / dpdk_net_close)
 
 docs/superpowers/specs/2026-04-17-dpdk-tcp-design.md
                                     (MODIFIED during Task 22: §4 API additions, §4.2 contract wording for flush/cancel/close-flag, §6.5 TIME_WAIT shortening final wording, §9.1 counter additions, §9.3 ENOMEM emission sites, plus A5.5-nit citation fixes)
@@ -76,7 +76,7 @@ docs/superpowers/reviews/phase-a6-rfc-compliance.md    (NEW — Task 23)
 ## Task 1: `TimerNode::user_data: u64` field on the internal wheel
 
 **Files:**
-- Modify: `crates/resd-net-core/src/tcp_timer_wheel.rs` — add `user_data: u64` to `TimerNode`; set to `0` for all existing kernel-timer call sites (RTO / TLP / SynRetrans).
+- Modify: `crates/dpdk-net-core/src/tcp_timer_wheel.rs` — add `user_data: u64` to `TimerNode`; set to `0` for all existing kernel-timer call sites (RTO / TLP / SynRetrans).
 
 **Context:** Spec §3.1. The wheel already reserves `TimerKind::ApiPublic`; A6 populates the public-timer fire path. Public timers carry an opaque `user_data: u64` that the wheel must round-trip from `add` to `fire` unchanged. Kernel timers (RTO, TLP, SynRetrans) don't need the field but must be able to zero-init it.
 
@@ -106,12 +106,12 @@ fn timer_node_carries_user_data_through_fire() {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p resd-net-core tcp_timer_wheel::tests::timer_node_carries_user_data_through_fire`
+Run: `cargo test -p dpdk-net-core tcp_timer_wheel::tests::timer_node_carries_user_data_through_fire`
 Expected: compile error, "struct `TimerNode` has no field named `user_data`".
 
 - [ ] **Step 3: Add `user_data: u64` to `TimerNode`**
 
-Edit `crates/resd-net-core/src/tcp_timer_wheel.rs`. Replace the existing `TimerNode` struct with:
+Edit `crates/dpdk-net-core/src/tcp_timer_wheel.rs`. Replace the existing `TimerNode` struct with:
 
 ```rust
 #[derive(Debug, Clone, Copy)]
@@ -145,7 +145,7 @@ fn node(fire_at_ns: u64) -> TimerNode {
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `cargo test -p resd-net-core tcp_timer_wheel`
+Run: `cargo test -p dpdk-net-core tcp_timer_wheel`
 Expected: all 6 wheel tests pass (existing 5 + new 1).
 
 - [ ] **Step 5: Update every `TimerNode { ... }` construction site in the workspace**
@@ -153,7 +153,7 @@ Expected: all 6 wheel tests pass (existing 5 + new 1).
 Grep for every construction site:
 
 ```bash
-grep -rn "TimerNode {" crates/resd-net-core/src/
+grep -rn "TimerNode {" crates/dpdk-net-core/src/
 ```
 
 Expected sites (at `phase-a5-5-complete` tip): `engine.rs:1031, :1239, :1768, :2380, :2613, :2702`. Each corresponds to an RTO / TLP / SynRetrans arm. At each, insert `user_data: 0,` in the struct literal. Example:
@@ -193,7 +193,7 @@ Expected: no compile errors; all tests pass. If any construction site was missed
 - [ ] **Step 7: Commit**
 
 ```bash
-git add crates/resd-net-core/src/tcp_timer_wheel.rs crates/resd-net-core/src/engine.rs
+git add crates/dpdk-net-core/src/tcp_timer_wheel.rs crates/dpdk-net-core/src/engine.rs
 git commit -m "$(cat <<'EOF'
 a6 task 1: TimerNode::user_data field + kernel-timer zero-init
 
@@ -211,14 +211,14 @@ EOF
 ## Task 2: `InternalEvent::ApiTimer` + `InternalEvent::Writable` variants
 
 **Files:**
-- Modify: `crates/resd-net-core/src/tcp_events.rs` — append two new variants to `InternalEvent`, update test-module pattern-match helpers.
-- Modify: `crates/resd-net-core/src/engine.rs` — ensure any existing exhaustive match on `InternalEvent` covers the new variants (compile-error discovery).
+- Modify: `crates/dpdk-net-core/src/tcp_events.rs` — append two new variants to `InternalEvent`, update test-module pattern-match helpers.
+- Modify: `crates/dpdk-net-core/src/engine.rs` — ensure any existing exhaustive match on `InternalEvent` covers the new variants (compile-error discovery).
 
-**Context:** Spec §3.1 (ApiTimer payload), §3.3 (Writable payload). Both are internal-only until task 17/19 wire them to the C ABI. The build_event_from_internal translator in `crates/resd-net/src/lib.rs` also needs new arms — that's deferred to task 17 (timer_add extern) and task 16 (WRITABLE emission site), so we add a placeholder `unreachable!()` arm in this task to keep the workspace compiling until those tasks land.
+**Context:** Spec §3.1 (ApiTimer payload), §3.3 (Writable payload). Both are internal-only until task 17/19 wire them to the C ABI. The build_event_from_internal translator in `crates/dpdk-net/src/lib.rs` also needs new arms — that's deferred to task 17 (timer_add extern) and task 16 (WRITABLE emission site), so we add a placeholder `unreachable!()` arm in this task to keep the workspace compiling until those tasks land.
 
 - [ ] **Step 1: Write failing test — variants exist with required field shape**
 
-Append to `crates/resd-net-core/src/tcp_events.rs::tests`:
+Append to `crates/dpdk-net-core/src/tcp_events.rs::tests`:
 
 ```rust
 #[test]
@@ -257,12 +257,12 @@ fn writable_event_variant_shape() {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p resd-net-core tcp_events::tests::api_timer_event_variant_shape tcp_events::tests::writable_event_variant_shape`
+Run: `cargo test -p dpdk-net-core tcp_events::tests::api_timer_event_variant_shape tcp_events::tests::writable_event_variant_shape`
 Expected: compile errors, "no variant named `ApiTimer` / `Writable`".
 
 - [ ] **Step 3: Add the two variants to `InternalEvent`**
 
-Edit `crates/resd-net-core/src/tcp_events.rs`. After the existing `TcpLossDetected` variant, inside the enum:
+Edit `crates/dpdk-net-core/src/tcp_events.rs`. After the existing `TcpLossDetected` variant, inside the enum:
 
 ```rust
     /// A6: public-timer-API fire. Emitted when an `ApiPublic` wheel node
@@ -291,16 +291,16 @@ Edit `crates/resd-net-core/src/tcp_events.rs`. After the existing `TcpLossDetect
 
 - [ ] **Step 5: Run tests to verify they pass**
 
-Run: `cargo test -p resd-net-core tcp_events`
+Run: `cargo test -p dpdk-net-core tcp_events`
 Expected: all tests (existing + 2 new) pass.
 
 - [ ] **Step 6: Add placeholder translation arms in `build_event_from_internal`**
 
-Edit `crates/resd-net/src/lib.rs`. The existing `build_event_from_internal` has 7 match arms. Add two at the end, inside the `match ev { ... }` block:
+Edit `crates/dpdk-net/src/lib.rs`. The existing `build_event_from_internal` has 7 match arms. Add two at the end, inside the `match ev { ... }` block:
 
 ```rust
         InternalEvent::ApiTimer { .. } => {
-            // Wired in Task 17 (resd_net_timer_add extern). Keeping this
+            // Wired in Task 17 (dpdk_net_timer_add extern). Keeping this
             // unreachable for now lets the workspace compile; no call site
             // pushes an ApiTimer variant until Task 8 + Task 17 both land.
             unreachable!("ApiTimer translation wired in Task 17; no upstream emit until Task 8")
@@ -336,7 +336,7 @@ Expected: compiles clean, all tests pass. No runtime panic from `unreachable!()`
 - [ ] **Step 8: Commit**
 
 ```bash
-git add crates/resd-net-core/src/tcp_events.rs crates/resd-net/src/lib.rs
+git add crates/dpdk-net-core/src/tcp_events.rs crates/dpdk-net/src/lib.rs
 git commit -m "$(cat <<'EOF'
 a6 task 2: InternalEvent::ApiTimer + Writable variants
 
@@ -355,13 +355,13 @@ EOF
 ## Task 3: `TcpConn` field additions — `send_refused_pending`, `force_tw_skip`, `rtt_histogram`
 
 **Files:**
-- Create: `crates/resd-net-core/src/rtt_histogram.rs` — new module for the aligned `RttHistogram` sub-struct and its update method.
-- Modify: `crates/resd-net-core/src/lib.rs` — add `pub mod rtt_histogram;` and re-export `RttHistogram`.
-- Modify: `crates/resd-net-core/src/tcp_conn.rs` — add three new fields to `TcpConn`; zero-init in `new_client`.
+- Create: `crates/dpdk-net-core/src/rtt_histogram.rs` — new module for the aligned `RttHistogram` sub-struct and its update method.
+- Modify: `crates/dpdk-net-core/src/lib.rs` — add `pub mod rtt_histogram;` and re-export `RttHistogram`.
+- Modify: `crates/dpdk-net-core/src/tcp_conn.rs` — add three new fields to `TcpConn`; zero-init in `new_client`.
 
 **Context:** Spec §2.1 (TcpConn fields), §2.3 (aligned RttHistogram sub-struct), §3.3 (send_refused_pending semantics), §3.4 (force_tw_skip semantics), §3.8 (histogram update method). Putting the histogram in its own module keeps `tcp_conn.rs` from ballooning and isolates the alignment constraint so future TcpConn layout changes can't silently break the one-cacheline invariant.
 
-- [ ] **Step 1: Create `crates/resd-net-core/src/rtt_histogram.rs`**
+- [ ] **Step 1: Create `crates/dpdk-net-core/src/rtt_histogram.rs`**
 
 ```rust
 //! Per-connection RTT histogram (spec §3.8). 16 × u32 buckets, exactly
@@ -370,7 +370,7 @@ EOF
 //! No atomics — per-conn state in the single-lcore RTC model.
 
 /// 16 × u32 buckets aligned to exactly one cacheline. Exposed as a
-/// field on `TcpConn`; `resd_net_conn_rtt_histogram` memcpys the
+/// field on `TcpConn`; `dpdk_net_conn_rtt_histogram` memcpys the
 /// inner `[u32; 16]` out to caller memory (Task 18).
 #[repr(C, align(64))]
 #[derive(Debug, Clone, Copy, Default)]
@@ -412,7 +412,7 @@ impl RttHistogram {
     }
 
     /// Snapshot the 64-byte bucket array into caller memory. Used by
-    /// the `resd_net_conn_rtt_histogram` getter (Task 18).
+    /// the `dpdk_net_conn_rtt_histogram` getter (Task 18).
     #[inline]
     pub fn snapshot(&self) -> [u32; 16] {
         self.buckets
@@ -498,7 +498,7 @@ mod tests {
 
 - [ ] **Step 2: Export from `lib.rs`**
 
-Edit `crates/resd-net-core/src/lib.rs`. Add:
+Edit `crates/dpdk-net-core/src/lib.rs`. Add:
 
 ```rust
 pub mod rtt_histogram;
@@ -508,7 +508,7 @@ in module declaration order (alphabetical around existing modules).
 
 - [ ] **Step 3: Run unit tests**
 
-Run: `cargo test -p resd-net-core rtt_histogram`
+Run: `cargo test -p dpdk-net-core rtt_histogram`
 Expected: 5 tests pass (layout, default-edges, update, wraparound, snapshot).
 
 - [ ] **Step 4: Write failing test in tcp_conn.rs: new fields exist + zero-init**
@@ -537,20 +537,20 @@ fn a6_new_fields_zero_init_after_new_client() {
 
 - [ ] **Step 5: Run test to verify it fails**
 
-Run: `cargo test -p resd-net-core tcp_conn::tests::a6_new_fields_zero_init_after_new_client`
+Run: `cargo test -p dpdk-net-core tcp_conn::tests::a6_new_fields_zero_init_after_new_client`
 Expected: compile error, "no field named `send_refused_pending` / `force_tw_skip` / `rtt_histogram` on `TcpConn`".
 
 - [ ] **Step 6: Add the three fields to `TcpConn`**
 
-Edit `crates/resd-net-core/src/tcp_conn.rs`. In the `pub struct TcpConn { ... }` block, at the end of the field list (after `syn_tx_ts_ns: u64` per A5.5 Task 13):
+Edit `crates/dpdk-net-core/src/tcp_conn.rs`. In the `pub struct TcpConn { ... }` block, at the end of the field list (after `syn_tx_ts_ns: u64` per A5.5 Task 13):
 
 ```rust
     /// A6 (spec §3.3): set when a prior `send_bytes` returned
     /// `accepted < len`. Cleared when `WRITABLE` hysteresis fires
     /// on `in_flight <= send_buffer_bytes / 2`.
     pub send_refused_pending: bool,
-    /// A6 (spec §3.4): caller passed `RESD_NET_CLOSE_FORCE_TW_SKIP`
-    /// to `resd_net_close` AND the connection had `ts_enabled=true`
+    /// A6 (spec §3.4): caller passed `DPDK_NET_CLOSE_FORCE_TW_SKIP`
+    /// to `dpdk_net_close` AND the connection had `ts_enabled=true`
     /// at close time. `reap_time_wait` short-circuits the 2×MSL wait
     /// when this is set.
     pub force_tw_skip: bool,
@@ -573,7 +573,7 @@ Update `new_client` to zero-init the three fields (end of struct literal, before
 
 - [ ] **Step 7: Run the test to verify it passes**
 
-Run: `cargo test -p resd-net-core tcp_conn::tests::a6_new_fields_zero_init_after_new_client`
+Run: `cargo test -p dpdk-net-core tcp_conn::tests::a6_new_fields_zero_init_after_new_client`
 Expected: PASS.
 
 - [ ] **Step 8: Run full workspace build + test**
@@ -584,7 +584,7 @@ Expected: all green.
 - [ ] **Step 9: Commit**
 
 ```bash
-git add crates/resd-net-core/src/rtt_histogram.rs crates/resd-net-core/src/lib.rs crates/resd-net-core/src/tcp_conn.rs
+git add crates/dpdk-net-core/src/rtt_histogram.rs crates/dpdk-net-core/src/lib.rs crates/dpdk-net-core/src/tcp_conn.rs
 git commit -m "$(cat <<'EOF'
 a6 task 3: TcpConn fields — send_refused_pending, force_tw_skip, rtt_histogram
 
@@ -602,8 +602,8 @@ EOF
 ## Task 4: `counters.rs` additions — 4 new slow-path `tcp.*` counters
 
 **Files:**
-- Modify: `crates/resd-net-core/src/counters.rs` — consume the `_pad: [u64; 1]` slot and add `tx_api_timers_fired`, `ts_recent_expired`, `tx_flush_bursts`, `tx_flush_batched_pkts`; re-pad if needed.
-- Modify: `crates/resd-net/src/api.rs` — mirror the four new fields on `resd_net_tcp_counters_t`; update the compile-time size/align asserts.
+- Modify: `crates/dpdk-net-core/src/counters.rs` — consume the `_pad: [u64; 1]` slot and add `tx_api_timers_fired`, `ts_recent_expired`, `tx_flush_bursts`, `tx_flush_batched_pkts`; re-pad if needed.
+- Modify: `crates/dpdk-net/src/api.rs` — mirror the four new fields on `dpdk_net_tcp_counters_t`; update the compile-time size/align asserts.
 
 **Context:** Spec §4. All four are slow-path per §9.1.1 rule 1. `tx_api_timers_fired` and `tx_flush_bursts` fire per-event (not per-segment); `ts_recent_expired` fires at most once per 24-day idle event (essentially never on healthy traffic); `tx_flush_batched_pkts` is one aggregate `fetch_add` per drain-helper call. None are hot-path.
 
@@ -624,12 +624,12 @@ fn a6_new_tcp_counters_exist_and_zero() {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p resd-net-core counters::tests::a6_new_tcp_counters_exist_and_zero`
+Run: `cargo test -p dpdk-net-core counters::tests::a6_new_tcp_counters_exist_and_zero`
 Expected: compile error, "no field named `tx_api_timers_fired` / etc. on `TcpCounters`".
 
 - [ ] **Step 3: Add the four fields to `TcpCounters`**
 
-Edit `crates/resd-net-core/src/counters.rs`. Replace the existing tail of `TcpCounters`:
+Edit `crates/dpdk-net-core/src/counters.rs`. Replace the existing tail of `TcpCounters`:
 
 ```rust
     /// A5.5 Task 11/12: TLP probe retroactively classified as spurious via
@@ -655,7 +655,7 @@ with:
     /// trading traffic; nonzero is operationally interesting.
     pub ts_recent_expired: AtomicU64,
     /// A6: `drain_tx_pending_data` called `rte_eth_tx_burst`. One
-    /// fetch_add per drain (per end-of-poll + per `resd_net_flush`).
+    /// fetch_add per drain (per end-of-poll + per `dpdk_net_flush`).
     pub tx_flush_bursts: AtomicU64,
     /// A6: aggregate `sent` count summed across every `tx_flush_bursts`
     /// call. Useful to compute mean-batch-size = tx_flush_batched_pkts
@@ -669,22 +669,22 @@ Notes on layout: we removed the 8-byte `_pad: [u64; 1]` and added 4 × 8 = 32 by
 
 - [ ] **Step 4: Run the unit test to verify it passes**
 
-Run: `cargo test -p resd-net-core counters::tests::a6_new_tcp_counters_exist_and_zero`
+Run: `cargo test -p dpdk-net-core counters::tests::a6_new_tcp_counters_exist_and_zero`
 Expected: PASS.
 
 - [ ] **Step 5: Write failing C-ABI-mirror assert in `api.rs`**
 
-The existing compile-time assert in `crates/resd-net/src/api.rs` enforces `size_of::<resd_net_tcp_counters_t>() == size_of::<CoreTcp>()`. After adding fields to `CoreTcp` it'll fail the build until we mirror. Run:
+The existing compile-time assert in `crates/dpdk-net/src/api.rs` enforces `size_of::<dpdk_net_tcp_counters_t>() == size_of::<CoreTcp>()`. After adding fields to `CoreTcp` it'll fail the build until we mirror. Run:
 
 ```bash
-cargo build -p resd-net
+cargo build -p dpdk-net
 ```
 
-Expected: compile error from the `const _: () = { assert!(size_of::<resd_net_counters_t>() == size_of::<CoreCounters>()); ... }` block.
+Expected: compile error from the `const _: () = { assert!(size_of::<dpdk_net_counters_t>() == size_of::<CoreCounters>()); ... }` block.
 
-- [ ] **Step 6: Mirror the four fields on `resd_net_tcp_counters_t`**
+- [ ] **Step 6: Mirror the four fields on `dpdk_net_tcp_counters_t`**
 
-Edit `crates/resd-net/src/api.rs`. In the existing `resd_net_tcp_counters_t` struct, replace:
+Edit `crates/dpdk-net/src/api.rs`. In the existing `dpdk_net_tcp_counters_t` struct, replace:
 
 ```rust
     /// A5.5 Task 11/12 — see core counters.rs for the full field doc.
@@ -699,7 +699,7 @@ with:
     /// A5.5 Task 11/12 — see core counters.rs for the full field doc.
     pub tx_tlp_spurious: u64,
     // A6 additions — see core counters.rs for field docs. Declaration
-    // order must match `resd_net_core::counters::TcpCounters` exactly.
+    // order must match `dpdk_net_core::counters::TcpCounters` exactly.
     pub tx_api_timers_fired: u64,
     pub ts_recent_expired: u64,
     pub tx_flush_bursts: u64,
@@ -709,13 +709,13 @@ with:
 
 - [ ] **Step 7: Rebuild and confirm cbindgen regenerates the header**
 
-Run: `cargo build -p resd-net`
-Expected: builds cleanly; `include/resd_net.h` now shows four new u64 fields inside `resd_net_tcp_counters_t`.
+Run: `cargo build -p dpdk-net`
+Expected: builds cleanly; `include/dpdk_net.h` now shows four new u64 fields inside `dpdk_net_tcp_counters_t`.
 
 Verify header content:
 
 ```bash
-grep -A 2 'tx_tlp_spurious' include/resd_net.h
+grep -A 2 'tx_tlp_spurious' include/dpdk_net.h
 ```
 
 Expected output includes the four A6 fields after `tx_tlp_spurious`.
@@ -728,7 +728,7 @@ Expected: all tests pass (no behavior change yet — counters exist but have no 
 - [ ] **Step 9: Commit**
 
 ```bash
-git add crates/resd-net-core/src/counters.rs crates/resd-net/src/api.rs include/resd_net.h
+git add crates/dpdk-net-core/src/counters.rs crates/dpdk-net/src/api.rs include/dpdk_net.h
 git commit -m "$(cat <<'EOF'
 a6 task 4: counters — 4 new slow-path tcp.* fields
 
@@ -744,13 +744,13 @@ EOF
 
 ---
 
-## Task 5: `Engine::tx_pending_data` ring + `drain_tx_pending_data` helper + `resd_net_flush` wiring
+## Task 5: `Engine::tx_pending_data` ring + `drain_tx_pending_data` helper + `dpdk_net_flush` wiring
 
 **Files:**
-- Modify: `crates/resd-net-core/src/engine.rs` — add `tx_pending_data: RefCell<Vec<NonNull<sys::rte_mbuf>>>`; add `drain_tx_pending_data(&self)` helper; call it at end of `poll_once`; expose a `pub fn flush_tx_pending_data(&self)` wrapper.
-- Modify: `crates/resd-net/src/lib.rs` — replace `resd_net_flush` body with `e.flush_tx_pending_data()`.
+- Modify: `crates/dpdk-net-core/src/engine.rs` — add `tx_pending_data: RefCell<Vec<NonNull<sys::rte_mbuf>>>`; add `drain_tx_pending_data(&self)` helper; call it at end of `poll_once`; expose a `pub fn flush_tx_pending_data(&self)` wrapper.
+- Modify: `crates/dpdk-net/src/lib.rs` — replace `dpdk_net_flush` body with `e.flush_tx_pending_data()`.
 
-**Context:** Spec §3.2. The ring holds data-segment mbufs only. Control frames stay inline. Cap = `tx_ring_size` (already in `EngineConfig` at 1024). `send_bytes` (Task 12) and `retransmit` (Task 13) will push into the ring; this task only lands the ring + drain infrastructure. `resd_net_flush` went from A1 no-op to actually flushing the batch.
+**Context:** Spec §3.2. The ring holds data-segment mbufs only. Control frames stay inline. Cap = `tx_ring_size` (already in `EngineConfig` at 1024). `send_bytes` (Task 12) and `retransmit` (Task 13) will push into the ring; this task only lands the ring + drain infrastructure. `dpdk_net_flush` went from A1 no-op to actually flushing the batch.
 
 - [ ] **Step 1: Write failing unit test — `flush_tx_pending_data` on an empty ring is a no-op**
 
@@ -772,17 +772,17 @@ fn flush_tx_pending_data_signature_exists() {
 
 - [ ] **Step 2: Run — verify compile error, no method `flush_tx_pending_data`**
 
-Run: `cargo test -p resd-net-core engine::tests::flush_tx_pending_data_signature_exists`
+Run: `cargo test -p dpdk-net-core engine::tests::flush_tx_pending_data_signature_exists`
 Expected: compile error, "no method `flush_tx_pending_data` found for struct `Engine`".
 
 - [ ] **Step 3: Add ring field + drain helper + public wrapper to `Engine`**
 
-Edit `crates/resd-net-core/src/engine.rs`. In the `pub struct Engine { ... }` block, add alongside the existing `timer_wheel` / `events` / `flow_table` fields:
+Edit `crates/dpdk-net-core/src/engine.rs`. In the `pub struct Engine { ... }` block, add alongside the existing `timer_wheel` / `events` / `flow_table` fields:
 
 ```rust
     /// A6 (spec §3.2): pending outbound data-segment mbufs for batched TX.
     /// Populated by `send_bytes` / `retransmit`; drained at end-of-poll
-    /// and from `resd_net_flush` via `drain_tx_pending_data`. Control
+    /// and from `dpdk_net_flush` via `drain_tx_pending_data`. Control
     /// frames (ACK / FIN / SYN / RST) are emitted inline and do NOT
     /// queue here — they stay on their existing `tx_frame` /
     /// `tx_data_frame` inline paths.
@@ -804,7 +804,7 @@ Add the drain helper as an impl method (alongside `advance_timer_wheel`):
     /// The ring clears unconditionally after drain — a send_bytes
     /// caller observes the drop via the counter, not by inspecting
     /// the ring state. Slow-path: fires once per poll end + once per
-    /// `resd_net_flush` call; no hot-path cost.
+    /// `dpdk_net_flush` call; no hot-path cost.
     pub(crate) fn drain_tx_pending_data(&self) {
         use crate::counters::{add, inc};
         let mut ring = self.tx_pending_data.borrow_mut();
@@ -813,7 +813,7 @@ Add the drain helper as an impl method (alongside `advance_timer_wheel`):
         }
         let n = ring.len() as u16;
         let sent = unsafe {
-            sys::resd_rte_eth_tx_burst(
+            sys::shim_rte_eth_tx_burst(
                 self.cfg.port_id,
                 self.cfg.tx_queue_id,
                 ring.as_mut_ptr() as *mut *mut sys::rte_mbuf,
@@ -822,7 +822,7 @@ Add the drain helper as an impl method (alongside `advance_timer_wheel`):
         } as usize;
         // Free tail mbufs (DPDK partial-fill: driver took the prefix, we own the rest).
         for i in sent..ring.len() {
-            unsafe { sys::resd_rte_pktmbuf_free(ring[i].as_ptr()); }
+            unsafe { sys::shim_rte_pktmbuf_free(ring[i].as_ptr()); }
             inc(&self.counters.eth.tx_drop_full_ring);
         }
         ring.clear();
@@ -833,7 +833,7 @@ Add the drain helper as an impl method (alongside `advance_timer_wheel`):
         }
     }
 
-    /// Public entrypoint for `resd_net_flush`. Wrapper so the ABI layer
+    /// Public entrypoint for `dpdk_net_flush`. Wrapper so the ABI layer
     /// doesn't need to know about RefCell or the ring type.
     pub fn flush_tx_pending_data(&self) {
         self.drain_tx_pending_data();
@@ -853,13 +853,13 @@ Find `poll_once` in `engine.rs`. At its end (after timer-wheel advance + TIME_WA
 
 Read `engine.rs:737-815` for the current shape before editing; the drain must go AFTER any RX-triggered emit sites (so RX-burst-driven data sends can be batched into the same drain).
 
-- [ ] **Step 5: Replace `resd_net_flush` body**
+- [ ] **Step 5: Replace `dpdk_net_flush` body**
 
-Edit `crates/resd-net/src/lib.rs`. Replace the existing no-op body:
+Edit `crates/dpdk-net/src/lib.rs`. Replace the existing no-op body:
 
 ```rust
 #[no_mangle]
-pub unsafe extern "C" fn resd_net_flush(_p: *mut resd_net_engine) {
+pub unsafe extern "C" fn dpdk_net_flush(_p: *mut dpdk_net_engine) {
     // Phase A1: no-op; TX burst handled inline in poll_once.
 }
 ```
@@ -868,7 +868,7 @@ with:
 
 ```rust
 #[no_mangle]
-pub unsafe extern "C" fn resd_net_flush(p: *mut resd_net_engine) {
+pub unsafe extern "C" fn dpdk_net_flush(p: *mut dpdk_net_engine) {
     // A6 (spec §3.2): drain the engine's data-segment TX ring via
     // one rte_eth_tx_burst. No-op when ring empty. Idempotent.
     // Control frames (ACK/SYN/FIN/RST) are emitted inline at their
@@ -885,10 +885,10 @@ Expected: all tests pass. No behavior change yet because no call site pushes to 
 
 - [ ] **Step 7: cbindgen regen + header sanity**
 
-The header emission for `resd_net_flush` already exists; cbindgen regen happens automatically on `cargo build -p resd-net`. Verify the doc-comment survived by grepping the generated header:
+The header emission for `dpdk_net_flush` already exists; cbindgen regen happens automatically on `cargo build -p dpdk-net`. Verify the doc-comment survived by grepping the generated header:
 
 ```bash
-grep -B 1 -A 3 'resd_net_flush' include/resd_net.h
+grep -B 1 -A 3 'dpdk_net_flush' include/dpdk_net.h
 ```
 
 If doc-comment is stale (empty), update the Rust side to include a triple-slash comment above the `#[no_mangle]` attribute so cbindgen emits it. Add:
@@ -900,7 +900,7 @@ If doc-comment is stale (empty), update the Rust side to include a triple-slash 
 /// emit site and do not participate in the flush batch — flushing
 /// never blocks or reorders control-frame emission.
 #[no_mangle]
-pub unsafe extern "C" fn resd_net_flush(p: *mut resd_net_engine) {
+pub unsafe extern "C" fn dpdk_net_flush(p: *mut dpdk_net_engine) {
     // ... body as above ...
 }
 ```
@@ -910,12 +910,12 @@ Rebuild and re-verify the header has the doc-comment.
 - [ ] **Step 8: Commit**
 
 ```bash
-git add crates/resd-net-core/src/engine.rs crates/resd-net/src/lib.rs include/resd_net.h
+git add crates/dpdk-net-core/src/engine.rs crates/dpdk-net/src/lib.rs include/dpdk_net.h
 git commit -m "$(cat <<'EOF'
 a6 task 5: TX ring + drain_tx_pending_data + flush wiring
 
 Lands the engine-scope tx_pending_data ring + drain helper. poll_once
-drains at end-of-iter; resd_net_flush now calls the same drain. No
+drains at end-of-iter; dpdk_net_flush now calls the same drain. No
 call site pushes to the ring yet (Task 12 adds send_bytes push; Task
 13 adds retransmit push) so behavior is unchanged at this point.
 
@@ -929,10 +929,10 @@ EOF
 ## Task 6: `Engine::rtt_histogram_edges` + monotonic-edges validation + default substitution
 
 **Files:**
-- Modify: `crates/resd-net-core/src/engine.rs` — new field `rtt_histogram_edges: [u32; 15]`; validate + substitute in `Engine::new`.
-- Modify: `crates/resd-net-core/src/engine.rs` (`EngineConfig`) — new field `rtt_histogram_bucket_edges_us: [u32; 15]`.
+- Modify: `crates/dpdk-net-core/src/engine.rs` — new field `rtt_histogram_edges: [u32; 15]`; validate + substitute in `Engine::new`.
+- Modify: `crates/dpdk-net-core/src/engine.rs` (`EngineConfig`) — new field `rtt_histogram_bucket_edges_us: [u32; 15]`.
 
-**Context:** Spec §3.8.2 (default edges) + §3.8.3 (validation). The ABI-layer plumbing (`resd_net_engine_config_t::rtt_histogram_bucket_edges_us`) lands in Task 20 — this task is the core-side plumbing only.
+**Context:** Spec §3.8.2 (default edges) + §3.8.3 (validation). The ABI-layer plumbing (`dpdk_net_engine_config_t::rtt_histogram_bucket_edges_us`) lands in Task 20 — this task is the core-side plumbing only.
 
 - [ ] **Step 1: Write failing unit test — all-zero edges substitute to defaults**
 
@@ -971,12 +971,12 @@ fn rtt_histogram_edges_monotonic_passes_through() {
 
 - [ ] **Step 2: Run — verify compile error, no function `validate_and_default_histogram_edges`**
 
-Run: `cargo test -p resd-net-core engine::tests::rtt_histogram_edges_defaults_applied_on_all_zero`
+Run: `cargo test -p dpdk-net-core engine::tests::rtt_histogram_edges_defaults_applied_on_all_zero`
 Expected: compile error.
 
 - [ ] **Step 3: Add the validator function + default constant**
 
-Edit `crates/resd-net-core/src/engine.rs`. Near the top of the module (after the `use` statements), add:
+Edit `crates/dpdk-net-core/src/engine.rs`. Near the top of the module (after the `use` statements), add:
 
 ```rust
 /// A6 (spec §3.8.2): default RTT histogram bucket edges, µs.
@@ -1011,12 +1011,12 @@ pub fn validate_and_default_histogram_edges(
 
 - [ ] **Step 4: Run unit tests to verify they pass**
 
-Run: `cargo test -p resd-net-core engine::tests::rtt_histogram`
+Run: `cargo test -p dpdk-net-core engine::tests::rtt_histogram`
 Expected: all 3 new tests pass.
 
 - [ ] **Step 5: Add `rtt_histogram_bucket_edges_us` to `EngineConfig` + `rtt_histogram_edges` to `Engine`**
 
-Edit `crates/resd-net-core/src/engine.rs`. In `pub struct EngineConfig { ... }`, append:
+Edit `crates/dpdk-net-core/src/engine.rs`. In `pub struct EngineConfig { ... }`, append:
 
 ```rust
     /// A6 (spec §3.8): RTT histogram bucket edges in µs. 15 strictly
@@ -1052,7 +1052,7 @@ with a body that validates and substitutes the edges. At the top of `Engine::new
         ).map_err(|_| Error::InvalidHistogramEdges)?;
 ```
 
-Add `InvalidHistogramEdges` to the `Error` enum in `crates/resd-net-core/src/error.rs`:
+Add `InvalidHistogramEdges` to the `Error` enum in `crates/dpdk-net-core/src/error.rs`:
 
 ```rust
     /// A6 (spec §3.8.3): `rtt_histogram_bucket_edges_us` was non-monotonic
@@ -1065,13 +1065,13 @@ Initialize `rtt_histogram_edges` in `Engine::new`'s struct-literal construction.
 - [ ] **Step 6: Run full workspace build**
 
 Run: `cargo build --workspace`
-Expected: compile errors in downstream crates because `EngineConfig` is exhaustively-constructed in several tests / in `resd-net/src/lib.rs`. Fix each by adding `rtt_histogram_bucket_edges_us: [0; 15]` to the struct literal. Grep:
+Expected: compile errors in downstream crates because `EngineConfig` is exhaustively-constructed in several tests / in `dpdk-net/src/lib.rs`. Fix each by adding `rtt_histogram_bucket_edges_us: [0; 15]` to the struct literal. Grep:
 
 ```bash
 grep -rn 'EngineConfig {' crates/ tests/ 2>/dev/null
 ```
 
-Expected sites: `crates/resd-net/src/lib.rs` (in `resd_net_engine_create`), maybe a couple of test helpers in `crates/resd-net-core/src/engine.rs` unit tests.
+Expected sites: `crates/dpdk-net/src/lib.rs` (in `dpdk_net_engine_create`), maybe a couple of test helpers in `crates/dpdk-net-core/src/engine.rs` unit tests.
 
 - [ ] **Step 7: Run workspace tests**
 
@@ -1081,14 +1081,14 @@ Expected: all green.
 - [ ] **Step 8: Commit**
 
 ```bash
-git add crates/resd-net-core/src/engine.rs crates/resd-net-core/src/error.rs crates/resd-net/src/lib.rs
+git add crates/dpdk-net-core/src/engine.rs crates/dpdk-net-core/src/error.rs crates/dpdk-net/src/lib.rs
 git commit -m "$(cat <<'EOF'
 a6 task 6: Engine::rtt_histogram_edges + validation + default substitution
 
 Lands the engine-side plumbing for the per-conn RTT histogram edges.
 All-zero caller input substitutes to the spec §3.8.2 trading-tuned
 defaults; non-monotonic rejected with Error::InvalidHistogramEdges.
-ABI-layer wiring (resd_net_engine_config_t field) lands in Task 20.
+ABI-layer wiring (dpdk_net_engine_config_t field) lands in Task 20.
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
 EOF
@@ -1100,7 +1100,7 @@ EOF
 ## Task 7: `Engine::rx_drop_nomem_prev` snapshot + edge-triggered RX-ENOMEM Error event
 
 **Files:**
-- Modify: `crates/resd-net-core/src/engine.rs` — add `rx_drop_nomem_prev: Cell<u64>` field; emit one `InternalEvent::Error{conn: 0, err: -ENOMEM}` per poll iteration where `eth.rx_drop_nomem` advanced.
+- Modify: `crates/dpdk-net-core/src/engine.rs` — add `rx_drop_nomem_prev: Cell<u64>` field; emit one `InternalEvent::Error{conn: 0, err: -ENOMEM}` per poll iteration where `eth.rx_drop_nomem` advanced.
 
 **Context:** Spec §3.6 Site 3. Edge-triggered to prevent event-queue flood under RX mempool starvation. Cell<u64> gives interior mutability (engine methods take `&self`).
 
@@ -1121,12 +1121,12 @@ fn rx_enomem_edge_trigger_signature_exists() {
 
 - [ ] **Step 2: Run — verify compile error**
 
-Run: `cargo test -p resd-net-core engine::tests::rx_enomem_edge_trigger_signature_exists`
+Run: `cargo test -p dpdk-net-core engine::tests::rx_enomem_edge_trigger_signature_exists`
 Expected: compile error.
 
 - [ ] **Step 3: Add the field + helpers**
 
-Edit `crates/resd-net-core/src/engine.rs`. In `pub struct Engine`:
+Edit `crates/dpdk-net-core/src/engine.rs`. In `pub struct Engine`:
 
 ```rust
     /// A6 (spec §3.6 Site 3): snapshot of `counters.eth.rx_drop_nomem`
@@ -1194,7 +1194,7 @@ Expected: all green. No behavior change until Task 21 drives an actual RX-mempoo
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/resd-net-core/src/engine.rs
+git add crates/dpdk-net-core/src/engine.rs
 git commit -m "$(cat <<'EOF'
 a6 task 7: RX-mempool-drop edge-triggered Error{err=-ENOMEM} event
 
@@ -1212,7 +1212,7 @@ EOF
 ## Task 8: `Engine::public_timer_add` / `public_timer_cancel` + `ApiPublic` fire branch populated
 
 **Files:**
-- Modify: `crates/resd-net-core/src/engine.rs` — add `public_timer_add` and `public_timer_cancel` methods; populate the `TimerKind::ApiPublic` branch in `advance_timer_wheel` to push `InternalEvent::ApiTimer`.
+- Modify: `crates/dpdk-net-core/src/engine.rs` — add `public_timer_add` and `public_timer_cancel` methods; populate the `TimerKind::ApiPublic` branch in `advance_timer_wheel` to push `InternalEvent::ApiTimer`.
 
 **Context:** Spec §3.1 (lifecycle + encoding). `TimerId → u64` packing: `(slot as u64) << 32 | (generation as u64)`. `public_timer_cancel` returns `bool` per the wheel's cancel semantics; the ABI layer (Task 17) maps to `0` / `-ENOENT`.
 
@@ -1253,16 +1253,16 @@ fn align_up_to_tick_zero_and_boundary() {
 
 - [ ] **Step 2: Run — verify compile errors**
 
-Run: `cargo test -p resd-net-core engine::tests::public_timer_add_cancel_signature_exists`
+Run: `cargo test -p dpdk-net-core engine::tests::public_timer_add_cancel_signature_exists`
 Expected: compile error.
 
 - [ ] **Step 3: Add packing helpers + methods**
 
-Edit `crates/resd-net-core/src/engine.rs`. Add module-level helpers:
+Edit `crates/dpdk-net-core/src/engine.rs`. Add module-level helpers:
 
 ```rust
 /// A6 (spec §3.1): pack internal `TimerId{slot, generation}` to the
-/// `u64` exposed as `resd_net_timer_id_t`. Upper 32 = slot; lower 32 =
+/// `u64` exposed as `dpdk_net_timer_id_t`. Upper 32 = slot; lower 32 =
 /// generation. Caller treats as opaque but knows the upper half changes
 /// on slot reuse.
 #[inline]
@@ -1270,7 +1270,7 @@ pub fn pack_timer_id(id: crate::tcp_timer_wheel::TimerId) -> u64 {
     ((id.slot as u64) << 32) | (id.generation as u64)
 }
 
-/// A6 (spec §3.1): unpack `resd_net_timer_id_t` back to the wheel's
+/// A6 (spec §3.1): unpack `dpdk_net_timer_id_t` back to the wheel's
 /// internal representation.
 #[inline]
 pub fn unpack_timer_id(packed: u64) -> crate::tcp_timer_wheel::TimerId {
@@ -1359,7 +1359,7 @@ Expected: all green. The new variant is still behind an unreachable!() in the AB
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/resd-net-core/src/engine.rs
+git add crates/dpdk-net-core/src/engine.rs
 git commit -m "$(cat <<'EOF'
 a6 task 8: public timer add/cancel + ApiPublic fire → InternalEvent::ApiTimer
 
@@ -1368,7 +1368,7 @@ encode TimerId{slot,gen} into u64 for the ABI. align_up_to_tick_ns
 rounds deadlines to wheel resolution. ApiPublic fire branch pushes
 InternalEvent::ApiTimer and bumps tx_api_timers_fired.
 
-ABI-layer wiring (resd_net_timer_add extern) lands in Task 17.
+ABI-layer wiring (dpdk_net_timer_add extern) lands in Task 17.
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
 EOF
@@ -1377,22 +1377,22 @@ EOF
 
 ---
 
-## Task 9: `preset=1` (rfc_compliance) application in `resd_net_engine_create`
+## Task 9: `preset=1` (rfc_compliance) application in `dpdk_net_engine_create`
 
 **Files:**
-- Modify: `crates/resd-net/src/lib.rs` — apply the five-field override when `cfg.preset == 1` after existing zero-sentinel substitution; reject `preset >= 2` with null-return.
+- Modify: `crates/dpdk-net/src/lib.rs` — apply the five-field override when `cfg.preset == 1` after existing zero-sentinel substitution; reject `preset >= 2` with null-return.
 
-**Context:** Spec §3.5. Existing `resd_net_engine_create` ignores `cfg.preset`. A6 honors it: `preset=0` leaves fields as substituted; `preset=1` forces `tcp_nagle=true, tcp_delayed_ack=true, cc_mode=1, tcp_min_rto_us=200_000, tcp_initial_rto_us=1_000_000`.
+**Context:** Spec §3.5. Existing `dpdk_net_engine_create` ignores `cfg.preset`. A6 honors it: `preset=0` leaves fields as substituted; `preset=1` forces `tcp_nagle=true, tcp_delayed_ack=true, cc_mode=1, tcp_min_rto_us=200_000, tcp_initial_rto_us=1_000_000`.
 
 - [ ] **Step 1: Write failing unit test**
 
-Edit `crates/resd-net/src/lib.rs`. Inside the existing `#[cfg(test)] mod tests { ... }`, add:
+Edit `crates/dpdk-net/src/lib.rs`. Inside the existing `#[cfg(test)] mod tests { ... }`, add:
 
 ```rust
 #[test]
 fn preset_rfc_compliance_is_known_constant() {
     // Ensures Task 9 defines the preset value and matches spec §3.5.
-    // (We can't call resd_net_engine_create without EAL; this test
+    // (We can't call dpdk_net_engine_create without EAL; this test
     // pins the constant value and the validator rejection path.)
     assert_eq!(PRESET_LATENCY, 0);
     assert_eq!(PRESET_RFC_COMPLIANCE, 1);
@@ -1400,7 +1400,7 @@ fn preset_rfc_compliance_is_known_constant() {
 
 #[test]
 fn apply_preset_rfc_compliance_overrides_five_fields() {
-    let mut core_cfg = resd_net_core::engine::EngineConfig {
+    let mut core_cfg = dpdk_net_core::engine::EngineConfig {
         tcp_nagle: false,
         // tcp_delayed_ack doesn't exist on EngineConfig (A3 default was
         // per-segment ACKs); post-A6 the preset path stores the flag
@@ -1408,7 +1408,7 @@ fn apply_preset_rfc_compliance_overrides_five_fields() {
         cc_mode: 0,
         tcp_min_rto_us: 5_000,
         tcp_initial_rto_us: 5_000,
-        ..resd_net_core::engine::EngineConfig::default()
+        ..dpdk_net_core::engine::EngineConfig::default()
     };
     apply_preset(1, &mut core_cfg).expect("preset=1 must apply");
     assert!(core_cfg.tcp_nagle);
@@ -1420,12 +1420,12 @@ fn apply_preset_rfc_compliance_overrides_five_fields() {
 
 #[test]
 fn apply_preset_latency_leaves_fields_intact() {
-    let mut core_cfg = resd_net_core::engine::EngineConfig {
+    let mut core_cfg = dpdk_net_core::engine::EngineConfig {
         tcp_nagle: false,
         cc_mode: 0,
         tcp_min_rto_us: 5_000,
         tcp_initial_rto_us: 5_000,
-        ..resd_net_core::engine::EngineConfig::default()
+        ..dpdk_net_core::engine::EngineConfig::default()
     };
     apply_preset(0, &mut core_cfg).expect("preset=0 must be noop");
     assert!(!core_cfg.tcp_nagle);
@@ -1436,7 +1436,7 @@ fn apply_preset_latency_leaves_fields_intact() {
 
 #[test]
 fn apply_preset_unknown_rejected() {
-    let mut core_cfg = resd_net_core::engine::EngineConfig::default();
+    let mut core_cfg = dpdk_net_core::engine::EngineConfig::default();
     assert!(apply_preset(2, &mut core_cfg).is_err());
     assert!(apply_preset(255, &mut core_cfg).is_err());
 }
@@ -1444,12 +1444,12 @@ fn apply_preset_unknown_rejected() {
 
 - [ ] **Step 2: Run — compile error**
 
-Run: `cargo test -p resd-net preset`
+Run: `cargo test -p dpdk-net preset`
 Expected: compile error, "no function `apply_preset`" + "no constants `PRESET_LATENCY` / `PRESET_RFC_COMPLIANCE`" + missing `tcp_delayed_ack` on `EngineConfig`.
 
 - [ ] **Step 3: Add `tcp_delayed_ack` to `EngineConfig` (core side)**
 
-Edit `crates/resd-net-core/src/engine.rs`. In `pub struct EngineConfig`, append:
+Edit `crates/dpdk-net-core/src/engine.rs`. In `pub struct EngineConfig`, append:
 
 ```rust
     /// A6 (spec §3.5): delayed-ACK on/off. Default false (trading
@@ -1463,7 +1463,7 @@ Default to `false`. Update `impl Default for EngineConfig` accordingly.
 
 - [ ] **Step 4: Add the preset constants + `apply_preset` function**
 
-Edit `crates/resd-net/src/lib.rs`. At module top:
+Edit `crates/dpdk-net/src/lib.rs`. At module top:
 
 ```rust
 /// A6 (spec §3.5): latency preset — all existing config fields honored as-written.
@@ -1477,7 +1477,7 @@ pub const PRESET_RFC_COMPLIANCE: u8 = 1;
 /// than defaults — explicit caller values are overwritten.
 pub fn apply_preset(
     preset: u8,
-    core_cfg: &mut resd_net_core::engine::EngineConfig,
+    core_cfg: &mut dpdk_net_core::engine::EngineConfig,
 ) -> Result<(), ()> {
     match preset {
         PRESET_LATENCY => Ok(()),
@@ -1494,9 +1494,9 @@ pub fn apply_preset(
 }
 ```
 
-- [ ] **Step 5: Wire `apply_preset` into `resd_net_engine_create`**
+- [ ] **Step 5: Wire `apply_preset` into `dpdk_net_engine_create`**
 
-Find the existing `resd_net_engine_create` body. After the zero-sentinel substitution for `min_rto_us / initial_rto_us / max_rto_us / max_retrans / msl` and before `let core_cfg = EngineConfig { ... }` is built, apply the preset:
+Find the existing `dpdk_net_engine_create` body. After the zero-sentinel substitution for `min_rto_us / initial_rto_us / max_rto_us / max_retrans / msl` and before `let core_cfg = EngineConfig { ... }` is built, apply the preset:
 
 ```rust
     let core_cfg = EngineConfig {
@@ -1513,13 +1513,13 @@ Find the existing `resd_net_engine_create` body. After the zero-sentinel substit
 
 Concretely: the easiest structure is to mutate `core_cfg` after the struct is built. Make the local `mut`, call `apply_preset`, then pass to `Engine::new`.
 
-- [ ] **Step 6: Verify `tcp_delayed_ack` flows from the ABI `resd_net_engine_config_t`**
+- [ ] **Step 6: Verify `tcp_delayed_ack` flows from the ABI `dpdk_net_engine_config_t`**
 
-Check that `resd_net_engine_config_t::tcp_delayed_ack` already exists (it does — per the header dump in the spec). Check the body of `resd_net_engine_create` reads `cfg.tcp_delayed_ack`; if not, add it to the `EngineConfig { ... }` construction.
+Check that `dpdk_net_engine_config_t::tcp_delayed_ack` already exists (it does — per the header dump in the spec). Check the body of `dpdk_net_engine_create` reads `cfg.tcp_delayed_ack`; if not, add it to the `EngineConfig { ... }` construction.
 
 - [ ] **Step 7: Run tests**
 
-Run: `cargo test -p resd-net preset`
+Run: `cargo test -p dpdk-net preset`
 Expected: all 4 tests pass.
 
 Run: `cargo test --workspace`
@@ -1528,9 +1528,9 @@ Expected: all green.
 - [ ] **Step 8: Commit**
 
 ```bash
-git add crates/resd-net-core/src/engine.rs crates/resd-net/src/lib.rs include/resd_net.h
+git add crates/dpdk-net-core/src/engine.rs crates/dpdk-net/src/lib.rs include/dpdk_net.h
 git commit -m "$(cat <<'EOF'
-a6 task 9: preset=rfc_compliance honored in resd_net_engine_create
+a6 task 9: preset=rfc_compliance honored in dpdk_net_engine_create
 
 Implements the five-field override when preset=1. preset=0 (latency)
 is a no-op on existing caller fields. preset>=2 rejected with null-
@@ -1547,7 +1547,7 @@ EOF
 ## Task 10: `close_conn_with_flags` + `FORCE_TW_SKIP` prerequisite check
 
 **Files:**
-- Modify: `crates/resd-net-core/src/engine.rs` — new `close_conn_with_flags(handle, flags) -> Result<(), Error>` method; routes to existing `close_conn` after flag processing.
+- Modify: `crates/dpdk-net-core/src/engine.rs` — new `close_conn_with_flags(handle, flags) -> Result<(), Error>` method; routes to existing `close_conn` after flag processing.
 
 **Context:** Spec §3.4. Gate on `c.ts_enabled`: when false, emit `Error{err=-EPERM}` and drop the flag; when true, set `c.force_tw_skip = true` for Task 11's short-circuit.
 
@@ -1568,15 +1568,15 @@ fn close_conn_with_flags_signature_exists() {
 
 - [ ] **Step 2: Run — compile error**
 
-Run: `cargo test -p resd-net-core engine::tests::close_conn_with_flags_signature_exists`
+Run: `cargo test -p dpdk-net-core engine::tests::close_conn_with_flags_signature_exists`
 Expected: compile error.
 
 - [ ] **Step 3: Add constant + method**
 
-Edit `crates/resd-net-core/src/engine.rs`. Near the top of the module:
+Edit `crates/dpdk-net-core/src/engine.rs`. Near the top of the module:
 
 ```rust
-/// A6 (spec §3.4): close-flag bit, mirror of `RESD_NET_CLOSE_FORCE_TW_SKIP`.
+/// A6 (spec §3.4): close-flag bit, mirror of `DPDK_NET_CLOSE_FORCE_TW_SKIP`.
 /// Defined core-side so engine logic doesn't depend on the ABI crate.
 pub const CLOSE_FLAG_FORCE_TW_SKIP: u32 = 1 << 0;
 ```
@@ -1637,7 +1637,7 @@ Expected: all green.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/resd-net-core/src/engine.rs
+git add crates/dpdk-net-core/src/engine.rs
 git commit -m "$(cat <<'EOF'
 a6 task 10: close_conn_with_flags + FORCE_TW_SKIP prerequisite check
 
@@ -1656,13 +1656,13 @@ EOF
 ## Task 11: `reap_time_wait` short-circuit for `force_tw_skip`
 
 **Files:**
-- Modify: `crates/resd-net-core/src/engine.rs::reap_time_wait` — when a TIME_WAIT conn has `force_tw_skip == true`, close immediately regardless of `time_wait_deadline_ns`.
+- Modify: `crates/dpdk-net-core/src/engine.rs::reap_time_wait` — when a TIME_WAIT conn has `force_tw_skip == true`, close immediately regardless of `time_wait_deadline_ns`.
 
 **Context:** Spec §3.4. The existing `reap_time_wait` walks the flow table and closes conns past their 2×MSL deadline. A6 extends the candidate predicate.
 
 - [ ] **Step 1: Read the existing function**
 
-Open `crates/resd-net-core/src/engine.rs` around the line `fn reap_time_wait`. Current predicate inside `iter_handles().filter(...)`:
+Open `crates/dpdk-net-core/src/engine.rs` around the line `fn reap_time_wait`. Current predicate inside `iter_handles().filter(...)`:
 
 ```rust
 c.state == TcpState::TimeWait
@@ -1730,7 +1730,7 @@ fn force_tw_skip_short_circuits_reap() {
 
 - [ ] **Step 4: Run tests**
 
-Run: `cargo test -p resd-net-core engine::tests::force_tw_skip_short_circuits_reap`
+Run: `cargo test -p dpdk-net-core engine::tests::force_tw_skip_short_circuits_reap`
 Expected: PASS.
 
 Run: `cargo test --workspace`
@@ -1739,7 +1739,7 @@ Expected: all green.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/resd-net-core/src/engine.rs
+git add crates/dpdk-net-core/src/engine.rs
 git commit -m "$(cat <<'EOF'
 a6 task 11: reap_time_wait short-circuit for force_tw_skip
 
@@ -1758,7 +1758,7 @@ EOF
 ## Task 12: `send_bytes` TX-ring push (replacing per-segment inline `tx_burst`)
 
 **Files:**
-- Modify: `crates/resd-net-core/src/engine.rs::send_bytes` — replace the inline `rte_eth_tx_burst(.., ., 1)` per-segment call with a push into `tx_pending_data`; fall back to immediate drain-then-push when the ring is full.
+- Modify: `crates/dpdk-net-core/src/engine.rs::send_bytes` — replace the inline `rte_eth_tx_burst(.., ., 1)` per-segment call with a push into `tx_pending_data`; fall back to immediate drain-then-push when the ring is full.
 
 **Context:** Spec §3.2. This is the larger of the two call-site refactors. Spec §3.3 also: `send_bytes` must set `c.send_refused_pending = true` when it returns `accepted < bytes.len()` — that signal is what Task 16's WRITABLE hysteresis waits for.
 
@@ -1790,17 +1790,17 @@ fn send_bytes_sets_send_refused_pending_on_short_accept() {
 
 - [ ] **Step 2: Run — compile, no new failure; the test passes trivially**
 
-Run: `cargo test -p resd-net-core engine::tests::send_bytes_sets_send_refused_pending_on_short_accept`
+Run: `cargo test -p dpdk-net-core engine::tests::send_bytes_sets_send_refused_pending_on_short_accept`
 Expected: PASS (compile-only test).
 
 - [ ] **Step 3: Refactor `send_bytes`'s per-segment TX to push-to-ring**
 
-Edit `crates/resd-net-core/src/engine.rs::send_bytes`. Find the `while remaining > 0 { ... }` loop's TX-burst section. Currently:
+Edit `crates/dpdk-net-core/src/engine.rs::send_bytes`. Find the `while remaining > 0 { ... }` loop's TX-burst section. Currently:
 
 ```rust
             let mut pkts = [m];
             let sent = unsafe {
-                sys::resd_rte_eth_tx_burst(
+                sys::shim_rte_eth_tx_burst(
                     self.cfg.port_id,
                     self.cfg.tx_queue_id,
                     pkts.as_mut_ptr(),
@@ -1809,8 +1809,8 @@ Edit `crates/resd-net-core/src/engine.rs::send_bytes`. Find the `while remaining
             } as usize;
             if sent != 1 {
                 // Driver did not take the mbuf — free both refs.
-                unsafe { sys::resd_rte_pktmbuf_free(m) };
-                unsafe { sys::resd_rte_pktmbuf_free(m) };
+                unsafe { sys::shim_rte_pktmbuf_free(m) };
+                unsafe { sys::shim_rte_pktmbuf_free(m) };
                 inc(&self.counters.eth.tx_drop_full_ring);
                 if accepted == 0 { return Err(Error::SendBufferFull); }
                 break;
@@ -1888,7 +1888,7 @@ Note: the previous code double-freed an mbuf on tx-burst failure (line 2560-2561
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/resd-net-core/src/engine.rs
+git add crates/dpdk-net-core/src/engine.rs
 git commit -m "$(cat <<'EOF'
 a6 task 12: send_bytes — batch via tx_pending_data + set refused-pending
 
@@ -1912,20 +1912,20 @@ EOF
 ## Task 13: `retransmit` TX-ring push + retransmit-ENOMEM Error event emission
 
 **Files:**
-- Modify: `crates/resd-net-core/src/engine.rs::retransmit` — replace inline `tx_burst(1)` with ring push; emit `InternalEvent::Error{err=-ENOMEM}` per occurrence when `tx_hdr_mempool` alloc fails.
+- Modify: `crates/dpdk-net-core/src/engine.rs::retransmit` — replace inline `tx_burst(1)` with ring push; emit `InternalEvent::Error{err=-ENOMEM}` per occurrence when `tx_hdr_mempool` alloc fails.
 
 **Context:** Spec §3.2 (retransmit push) + §3.6 Site 2 (per-occurrence Error event on retransmit ENOMEM).
 
 - [ ] **Step 1: Read the existing `retransmit` body**
 
-Inspect `crates/resd-net-core/src/engine.rs` around `pub(crate) fn retransmit(&self, ...)` (starts near line 2815). It allocates `hdr_mbuf` via `rte_pktmbuf_alloc`, chains to the data mbuf, calls `tx_burst(1)`. On alloc failure: `inc(&self.counters.eth.tx_drop_nomem)` and early return.
+Inspect `crates/dpdk-net-core/src/engine.rs` around `pub(crate) fn retransmit(&self, ...)` (starts near line 2815). It allocates `hdr_mbuf` via `rte_pktmbuf_alloc`, chains to the data mbuf, calls `tx_burst(1)`. On alloc failure: `inc(&self.counters.eth.tx_drop_nomem)` and early return.
 
 - [ ] **Step 2: Emit `Error{err=-ENOMEM}` on alloc failure**
 
 Find the block:
 
 ```rust
-        let hdr_mbuf = unsafe { sys::resd_rte_pktmbuf_alloc(self.tx_hdr_mempool.as_ptr()) };
+        let hdr_mbuf = unsafe { sys::shim_rte_pktmbuf_alloc(self.tx_hdr_mempool.as_ptr()) };
         if hdr_mbuf.is_null() {
             inc(&self.counters.eth.tx_drop_nomem);
             return;
@@ -1935,7 +1935,7 @@ Find the block:
 Extend to push the Error event before returning:
 
 ```rust
-        let hdr_mbuf = unsafe { sys::resd_rte_pktmbuf_alloc(self.tx_hdr_mempool.as_ptr()) };
+        let hdr_mbuf = unsafe { sys::shim_rte_pktmbuf_alloc(self.tx_hdr_mempool.as_ptr()) };
         if hdr_mbuf.is_null() {
             inc(&self.counters.eth.tx_drop_nomem);
             // A6 (spec §3.6 Site 2): surface retransmit ENOMEM as an
@@ -1964,7 +1964,7 @@ Find the `tx_burst(.., .., pkts.as_mut_ptr(), 1)` call inside `retransmit`'s fin
 ```rust
         let mut pkts = [hdr_mbuf];
         let sent = unsafe {
-            sys::resd_rte_eth_tx_burst(
+            sys::shim_rte_eth_tx_burst(
                 self.cfg.port_id,
                 self.cfg.tx_queue_id,
                 pkts.as_mut_ptr(),
@@ -2008,7 +2008,7 @@ Expected: all green. Existing retransmit unit tests in `engine.rs` + integration
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/resd-net-core/src/engine.rs
+git add crates/dpdk-net-core/src/engine.rs
 git commit -m "$(cat <<'EOF'
 a6 task 13: retransmit push-to-ring + ENOMEM Error event per occurrence
 
@@ -2027,13 +2027,13 @@ EOF
 ## Task 14: RFC 7323 §5.5 24-day `TS.Recent` lazy expiration in `tcp_input.rs`
 
 **Files:**
-- Modify: `crates/resd-net-core/src/tcp_input.rs` — at the PAWS gate, compute `idle_ns = now_ns - ts_recent_age`; if > 24d, treat `TS.Recent` as absent for this segment, adopt `seg_tsval` unconditionally, reset the age, bump `tcp.ts_recent_expired`.
+- Modify: `crates/dpdk-net-core/src/tcp_input.rs` — at the PAWS gate, compute `idle_ns = now_ns - ts_recent_age`; if > 24d, treat `TS.Recent` as absent for this segment, adopt `seg_tsval` unconditionally, reset the age, bump `tcp.ts_recent_expired`.
 
 **Context:** Spec §3.7. Lazy (no timer wheel involvement). Zero hot-path cost on fresh connections. RFC-7323-§5.5-equivalent outcome: first segment after 24d idle re-seeds `TS.Recent` instead of being rejected by PAWS.
 
 - [ ] **Step 1: Add the expiry constant as a module-level const**
 
-Edit `crates/resd-net-core/src/tcp_input.rs`. At top of the module (after `use` statements):
+Edit `crates/dpdk-net-core/src/tcp_input.rs`. At top of the module (after `use` statements):
 
 ```rust
 /// A6 (spec §3.7): RFC 7323 §5.5 24-day `TS.Recent` expiration window
@@ -2047,7 +2047,7 @@ const TS_RECENT_EXPIRY_NS: u64 = 24 * 86_400 * 1_000_000_000;
 Grep for `ts_recent` in tcp_input.rs to find the PAWS gate:
 
 ```bash
-grep -n 'ts_recent' crates/resd-net-core/src/tcp_input.rs
+grep -n 'ts_recent' crates/dpdk-net-core/src/tcp_input.rs
 ```
 
 You're looking for the block that reads `c.ts_recent` and compares against `seg_tsval`. PAWS drops a segment when `seg_tsval < c.ts_recent` (RFC 7323 §5). The lazy expiration inserts before that comparison.
@@ -2089,7 +2089,7 @@ The PAWS skip sets `ts_recent_age = now_ns`. But the *normal* (non-expired) TS.R
 
 - [ ] **Step 5: Write integration test — mock-clock 25-day jump produces one `ts_recent_expired` bump**
 
-Land in `crates/resd-net-core/tests/tcp_a6_public_api_tap.rs` (new file created in Task 21). For this task, write the test assertion as a placeholder header and note that the integration-test body is authored in Task 21's scenario list. In Task 21 we add:
+Land in `crates/dpdk-net-core/tests/tcp_a6_public_api_tap.rs` (new file created in Task 21). For this task, write the test assertion as a placeholder header and note that the integration-test body is authored in Task 21's scenario list. In Task 21 we add:
 
 ```rust
 #[test]
@@ -2111,7 +2111,7 @@ Expected: all green. The PAWS-gate edit is a no-op on any path where `ts_recent_
 - [ ] **Step 7: Commit**
 
 ```bash
-git add crates/resd-net-core/src/tcp_input.rs
+git add crates/dpdk-net-core/src/tcp_input.rs
 git commit -m "$(cat <<'EOF'
 a6 task 14: RFC 7323 §5.5 24-day TS.Recent lazy expiration at PAWS
 
@@ -2134,14 +2134,14 @@ EOF
 ## Task 15: RTT histogram update hook after `rtt_est.sample`
 
 **Files:**
-- Modify: `crates/resd-net-core/src/tcp_input.rs` — after the existing `rtt_est.sample(rtt_us)` call (and the `tcp.rtt_samples` counter bump), call `conn.rtt_histogram.update(rtt_us, &engine.rtt_histogram_edges)`.
+- Modify: `crates/dpdk-net-core/src/tcp_input.rs` — after the existing `rtt_est.sample(rtt_us)` call (and the `tcp.rtt_samples` counter bump), call `conn.rtt_histogram.update(rtt_us, &engine.rtt_histogram_edges)`.
 
 **Context:** Spec §3.8 + §3.8.1. Site: every RTT-sample-taking path (timestamp-based and Karn's-rule-based). Cost: ~5-10 ns. No atomic (per-conn, RTC).
 
 - [ ] **Step 1: Find the existing `rtt_est.sample` call sites**
 
 ```bash
-grep -n 'rtt_est.sample' crates/resd-net-core/src/tcp_input.rs crates/resd-net-core/src/engine.rs
+grep -n 'rtt_est.sample' crates/dpdk-net-core/src/tcp_input.rs crates/dpdk-net-core/src/engine.rs
 ```
 
 Expected: at least two sites — one in `tcp_input.rs` (regular ACK path) and one in `engine.rs` (SYN-ACK path per A5.5 Task 13). For A6's histogram, we want BOTH sites instrumented. A centralizing helper avoids repetition.
@@ -2161,7 +2161,7 @@ Context: `self` here is `&Engine` when the site is in `engine.rs`; inside `tcp_i
 
 - [ ] **Step 3: Run existing RTT tests to confirm no regression**
 
-Run: `cargo test -p resd-net-core rtt`
+Run: `cargo test -p dpdk-net-core rtt`
 Expected: existing RTT estimator tests pass. The histogram update is additive; no existing test mutates or observes it.
 
 - [ ] **Step 4: Write a Layer-B integration assertion (placeholder for Task 21)**
@@ -2173,14 +2173,14 @@ The distribution-shape assertion in `tcp_a6_public_api_tap.rs` lives in Task 21.
 fn rtt_histogram_update_fires_on_sample() {
     // Task 21 body: establish conn, drive N ACKs with known controlled
     // RTTs, verify the bucket matching each RTT advances by exactly 1
-    // per ACK (via resd_net_conn_rtt_histogram — Task 18).
+    // per ACK (via dpdk_net_conn_rtt_histogram — Task 18).
 }
 ```
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/resd-net-core/src/tcp_input.rs crates/resd-net-core/src/engine.rs
+git add crates/dpdk-net-core/src/tcp_input.rs crates/dpdk-net-core/src/engine.rs
 git commit -m "$(cat <<'EOF'
 a6 task 15: RTT histogram update hook after rtt_est.sample
 
@@ -2199,8 +2199,8 @@ EOF
 ## Task 16: `WRITABLE` hysteresis emission on ACK-prune path
 
 **Files:**
-- Modify: `crates/resd-net-core/src/tcp_input.rs` — after the existing `snd_una` advance (ACK prune) block, if `c.send_refused_pending && in_flight ≤ send_buffer_bytes / 2`, push `InternalEvent::Writable` + clear the bit.
-- Modify: `crates/resd-net/src/lib.rs::build_event_from_internal` — replace the Task-2 placeholder for `Writable` with the real translation arm.
+- Modify: `crates/dpdk-net-core/src/tcp_input.rs` — after the existing `snd_una` advance (ACK prune) block, if `c.send_refused_pending && in_flight ≤ send_buffer_bytes / 2`, push `InternalEvent::Writable` + clear the bit.
+- Modify: `crates/dpdk-net/src/lib.rs::build_event_from_internal` — replace the Task-2 placeholder for `Writable` with the real translation arm.
 
 **Context:** Spec §3.3. Level-triggered, single-edge-per-refusal-cycle. Send-buffer half-drain is the hysteresis gate.
 
@@ -2209,7 +2209,7 @@ EOF
 Grep `tcp_input.rs` for where `snd_una` advances on a valid ACK. Typically inside `handle_ack` or a similarly-named block.
 
 ```bash
-grep -n 'snd_una' crates/resd-net-core/src/tcp_input.rs | head -20
+grep -n 'snd_una' crates/dpdk-net-core/src/tcp_input.rs | head -20
 ```
 
 The relevant block updates `c.snd_una = seg_ack` after validation, then prunes `snd_retrans` entries that are now cumulatively acked.
@@ -2246,7 +2246,7 @@ Context: match the function's existing borrow discipline. If the function alread
 
 - [ ] **Step 3: Replace the `Writable` ABI-translator placeholder**
 
-Edit `crates/resd-net/src/lib.rs::build_event_from_internal`. Replace the placeholder arm:
+Edit `crates/dpdk-net/src/lib.rs::build_event_from_internal`. Replace the placeholder arm:
 
 ```rust
         InternalEvent::Writable { .. } => {
@@ -2257,13 +2257,13 @@ Edit `crates/resd-net/src/lib.rs::build_event_from_internal`. Replace the placeh
 with:
 
 ```rust
-        InternalEvent::Writable { conn, .. } => resd_net_event_t {
-            kind: resd_net_event_kind_t::RESD_NET_EVT_WRITABLE,
+        InternalEvent::Writable { conn, .. } => dpdk_net_event_t {
+            kind: dpdk_net_event_kind_t::DPDK_NET_EVT_WRITABLE,
             conn: *conn as u64,
             rx_hw_ts_ns: 0,
             enqueued_ts_ns: emitted,
             // No payload on WRITABLE — zero the union.
-            u: resd_net_event_payload_t { _pad: [0u8; 16] },
+            u: dpdk_net_event_payload_t { _pad: [0u8; 16] },
         },
 ```
 
@@ -2275,13 +2275,13 @@ Expected: all green. No existing test drives the WRITABLE code path (Task 21 lan
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/resd-net-core/src/tcp_input.rs crates/resd-net/src/lib.rs
+git add crates/dpdk-net-core/src/tcp_input.rs crates/dpdk-net/src/lib.rs
 git commit -m "$(cat <<'EOF'
 a6 task 16: WRITABLE hysteresis on ACK-prune + ABI translator
 
 Emits InternalEvent::Writable when send_refused_pending is set and
 in_flight drops to ≤ send_buffer_bytes / 2 (level-triggered, cleared
-on fire). build_event_from_internal translates to RESD_NET_EVT_WRITABLE
+on fire). build_event_from_internal translates to DPDK_NET_EVT_WRITABLE
 with empty payload. Integration tests in Task 21.
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
@@ -2291,23 +2291,23 @@ EOF
 
 ---
 
-## Task 17: `resd_net_timer_add` / `resd_net_timer_cancel` extern "C" functions + ApiTimer ABI translator
+## Task 17: `dpdk_net_timer_add` / `dpdk_net_timer_cancel` extern "C" functions + ApiTimer ABI translator
 
 **Files:**
-- Modify: `crates/resd-net/src/lib.rs` — add `resd_net_timer_add` and `resd_net_timer_cancel` extern fns; replace the Task-2 `ApiTimer` placeholder with the real translator.
+- Modify: `crates/dpdk-net/src/lib.rs` — add `dpdk_net_timer_add` and `dpdk_net_timer_cancel` extern fns; replace the Task-2 `ApiTimer` placeholder with the real translator.
 
 **Context:** Spec §5.3. Both functions wrap `Engine::public_timer_add` / `_cancel` from Task 8 and pack/unpack `TimerId` via the helpers from Task 8.
 
 - [ ] **Step 1: Write failing unit test — null-arg rejection**
 
-Append to `crates/resd-net/src/lib.rs::tests`:
+Append to `crates/dpdk-net/src/lib.rs::tests`:
 
 ```rust
 #[test]
 fn timer_add_null_engine_returns_einval() {
     let mut out: u64 = 0;
     let rc = unsafe {
-        resd_net_timer_add(std::ptr::null_mut(), 0, 0, &mut out)
+        dpdk_net_timer_add(std::ptr::null_mut(), 0, 0, &mut out)
     };
     assert_eq!(rc, -libc::EINVAL);
 }
@@ -2317,41 +2317,41 @@ fn timer_add_null_out_returns_einval() {
     // A non-null engine pointer is safe to pass with a null out because
     // the null-out check fires before any engine deref. Use dangling
     // to emulate.
-    let fake_engine = std::ptr::dangling_mut::<resd_net_engine>();
+    let fake_engine = std::ptr::dangling_mut::<dpdk_net_engine>();
     let rc = unsafe {
-        resd_net_timer_add(fake_engine, 0, 0, std::ptr::null_mut())
+        dpdk_net_timer_add(fake_engine, 0, 0, std::ptr::null_mut())
     };
     assert_eq!(rc, -libc::EINVAL);
 }
 
 #[test]
 fn timer_cancel_null_engine_returns_einval() {
-    let rc = unsafe { resd_net_timer_cancel(std::ptr::null_mut(), 0) };
+    let rc = unsafe { dpdk_net_timer_cancel(std::ptr::null_mut(), 0) };
     assert_eq!(rc, -libc::EINVAL);
 }
 ```
 
 - [ ] **Step 2: Run — compile error**
 
-Run: `cargo test -p resd-net timer_add_null_engine_returns_einval`
-Expected: "cannot find function `resd_net_timer_add`".
+Run: `cargo test -p dpdk-net timer_add_null_engine_returns_einval`
+Expected: "cannot find function `dpdk_net_timer_add`".
 
 - [ ] **Step 3: Add the extern fns**
 
-Edit `crates/resd-net/src/lib.rs`. Append near the other extern fns:
+Edit `crates/dpdk-net/src/lib.rs`. Append near the other extern fns:
 
 ```rust
 /// A6 (spec §5.3): schedule a one-shot timer. `deadline_ns` is in the
-/// engine's monotonic clock domain (see `resd_net_now_ns`). Rounded up
+/// engine's monotonic clock domain (see `dpdk_net_now_ns`). Rounded up
 /// to the next 10 µs wheel tick; past deadlines fire on the next poll.
-/// On fire, emits `RESD_NET_EVT_TIMER` with the returned `timer_id`
+/// On fire, emits `DPDK_NET_EVT_TIMER` with the returned `timer_id`
 /// and the caller-supplied `user_data` echoed back.
 ///
 /// Returns 0 on success (populates `*timer_id_out`); -EINVAL on
 /// null engine/out.
 #[no_mangle]
-pub unsafe extern "C" fn resd_net_timer_add(
-    engine: *mut resd_net_engine,
+pub unsafe extern "C" fn dpdk_net_timer_add(
+    engine: *mut dpdk_net_engine,
     deadline_ns: u64,
     user_data: u64,
     timer_id_out: *mut u64,
@@ -2363,7 +2363,7 @@ pub unsafe extern "C" fn resd_net_timer_add(
         return -libc::EINVAL;
     };
     let id = e.public_timer_add(deadline_ns, user_data);
-    *timer_id_out = resd_net_core::engine::pack_timer_id(id);
+    *timer_id_out = dpdk_net_core::engine::pack_timer_id(id);
     0
 }
 
@@ -2373,8 +2373,8 @@ pub unsafe extern "C" fn resd_net_timer_add(
 /// Callers must always drain any queued TIMER events regardless of
 /// this return — the event queue is authoritative.
 #[no_mangle]
-pub unsafe extern "C" fn resd_net_timer_cancel(
-    engine: *mut resd_net_engine,
+pub unsafe extern "C" fn dpdk_net_timer_cancel(
+    engine: *mut dpdk_net_engine,
     timer_id: u64,
 ) -> i32 {
     if engine.is_null() {
@@ -2383,7 +2383,7 @@ pub unsafe extern "C" fn resd_net_timer_cancel(
     let Some(e) = engine_from_raw(engine) else {
         return -libc::EINVAL;
     };
-    let id = resd_net_core::engine::unpack_timer_id(timer_id);
+    let id = dpdk_net_core::engine::unpack_timer_id(timer_id);
     if e.public_timer_cancel(id) {
         0
     } else {
@@ -2406,14 +2406,14 @@ with:
 
 ```rust
         InternalEvent::ApiTimer { timer_id, user_data, .. } => {
-            resd_net_event_t {
-                kind: resd_net_event_kind_t::RESD_NET_EVT_TIMER,
+            dpdk_net_event_t {
+                kind: dpdk_net_event_kind_t::DPDK_NET_EVT_TIMER,
                 conn: 0,  // public timers not bound to a conn
                 rx_hw_ts_ns: 0,
                 enqueued_ts_ns: emitted,
-                u: resd_net_event_payload_t {
-                    timer: resd_net_event_timer_t {
-                        timer_id: resd_net_core::engine::pack_timer_id(*timer_id),
+                u: dpdk_net_event_payload_t {
+                    timer: dpdk_net_event_timer_t {
+                        timer_id: dpdk_net_core::engine::pack_timer_id(*timer_id),
                         user_data: *user_data,
                     },
                 },
@@ -2423,7 +2423,7 @@ with:
 
 - [ ] **Step 5: Run tests**
 
-Run: `cargo test -p resd-net`
+Run: `cargo test -p dpdk-net`
 Expected: 3 new null-arg rejection tests pass; pre-existing tests stay green.
 
 Run: `cargo test --workspace`
@@ -2432,8 +2432,8 @@ Expected: all green.
 - [ ] **Step 6: Verify cbindgen emits the new functions**
 
 ```bash
-cargo build -p resd-net
-grep -A 4 'resd_net_timer_add\|resd_net_timer_cancel' include/resd_net.h
+cargo build -p dpdk-net
+grep -A 4 'dpdk_net_timer_add\|dpdk_net_timer_cancel' include/dpdk_net.h
 ```
 
 Expected: two new `extern "C"` prototypes with doc-comments.
@@ -2441,9 +2441,9 @@ Expected: two new `extern "C"` prototypes with doc-comments.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add crates/resd-net/src/lib.rs include/resd_net.h
+git add crates/dpdk-net/src/lib.rs include/dpdk_net.h
 git commit -m "$(cat <<'EOF'
-a6 task 17: resd_net_timer_add + resd_net_timer_cancel extern "C"
+a6 task 17: dpdk_net_timer_add + dpdk_net_timer_cancel extern "C"
 
 ABI wrappers on Engine::public_timer_add / _cancel from Task 8.
 ApiTimer variant translator replaces Task 2's unreachable!()
@@ -2457,17 +2457,17 @@ EOF
 
 ---
 
-## Task 18: `resd_net_conn_rtt_histogram` extern + `resd_net_tcp_rtt_histogram_t` POD
+## Task 18: `dpdk_net_conn_rtt_histogram` extern + `dpdk_net_tcp_rtt_histogram_t` POD
 
 **Files:**
-- Modify: `crates/resd-net/src/api.rs` — add `resd_net_tcp_rtt_histogram_t { bucket: [u32; 16] }` POD; compile-time size=64 assert.
-- Modify: `crates/resd-net/src/lib.rs` — add `resd_net_conn_rtt_histogram` extern fn.
+- Modify: `crates/dpdk-net/src/api.rs` — add `dpdk_net_tcp_rtt_histogram_t { bucket: [u32; 16] }` POD; compile-time size=64 assert.
+- Modify: `crates/dpdk-net/src/lib.rs` — add `dpdk_net_conn_rtt_histogram` extern fn.
 
 **Context:** Spec §5.2, §5.3. Slow-path snapshot; safe per-order or per-minute.
 
 - [ ] **Step 1: Add the POD struct**
 
-Edit `crates/resd-net/src/api.rs`. Append near the other POD structs:
+Edit `crates/dpdk-net/src/api.rs`. Append near the other POD structs:
 
 ```rust
 /// A6 (spec §3.8, §5.2): per-connection RTT histogram snapshot POD.
@@ -2476,19 +2476,19 @@ Edit `crates/resd-net/src/api.rs`. Append near the other POD structs:
 /// alongside this struct; see that module for the full contract.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
-pub struct resd_net_tcp_rtt_histogram_t {
+pub struct dpdk_net_tcp_rtt_histogram_t {
     pub bucket: [u32; 16],
 }
 
 const _: () = {
     use std::mem::size_of;
-    assert!(size_of::<resd_net_tcp_rtt_histogram_t>() == 64);
+    assert!(size_of::<dpdk_net_tcp_rtt_histogram_t>() == 64);
 };
 ```
 
 - [ ] **Step 2: Add the extern fn**
 
-Edit `crates/resd-net/src/lib.rs`. Append:
+Edit `crates/dpdk-net/src/lib.rs`. Append:
 
 ```rust
 /// A6 (spec §3.8, §5.3): per-connection RTT histogram snapshot.
@@ -2508,10 +2508,10 @@ Edit `crates/resd-net/src/lib.rs`. Append:
 ///   -EINVAL engine or out is NULL.
 ///   -ENOENT conn is not a live handle in the engine's flow table.
 #[no_mangle]
-pub unsafe extern "C" fn resd_net_conn_rtt_histogram(
-    engine: *mut resd_net_engine,
-    conn: resd_net_conn_t,
-    out: *mut resd_net_tcp_rtt_histogram_t,
+pub unsafe extern "C" fn dpdk_net_conn_rtt_histogram(
+    engine: *mut dpdk_net_engine,
+    conn: dpdk_net_conn_t,
+    out: *mut dpdk_net_tcp_rtt_histogram_t,
 ) -> i32 {
     if engine.is_null() || out.is_null() {
         return -libc::EINVAL;
@@ -2519,7 +2519,7 @@ pub unsafe extern "C" fn resd_net_conn_rtt_histogram(
     let Some(e) = engine_from_raw(engine) else {
         return -libc::EINVAL;
     };
-    let handle = conn as resd_net_core::flow_table::ConnHandle;
+    let handle = conn as dpdk_net_core::flow_table::ConnHandle;
     let ft = e.flow_table();
     match ft.get(handle) {
         Some(c) => {
@@ -2534,23 +2534,23 @@ pub unsafe extern "C" fn resd_net_conn_rtt_histogram(
 
 - [ ] **Step 3: Write null-arg tests**
 
-Append to `crates/resd-net/src/lib.rs::tests`:
+Append to `crates/dpdk-net/src/lib.rs::tests`:
 
 ```rust
 #[test]
 fn rtt_histogram_null_engine_returns_einval() {
-    let mut out = resd_net_tcp_rtt_histogram_t::default();
+    let mut out = dpdk_net_tcp_rtt_histogram_t::default();
     let rc = unsafe {
-        resd_net_conn_rtt_histogram(std::ptr::null_mut(), 0, &mut out)
+        dpdk_net_conn_rtt_histogram(std::ptr::null_mut(), 0, &mut out)
     };
     assert_eq!(rc, -libc::EINVAL);
 }
 
 #[test]
 fn rtt_histogram_null_out_returns_einval() {
-    let fake_engine = std::ptr::dangling_mut::<resd_net_engine>();
+    let fake_engine = std::ptr::dangling_mut::<dpdk_net_engine>();
     let rc = unsafe {
-        resd_net_conn_rtt_histogram(fake_engine, 0, std::ptr::null_mut())
+        dpdk_net_conn_rtt_histogram(fake_engine, 0, std::ptr::null_mut())
     };
     assert_eq!(rc, -libc::EINVAL);
 }
@@ -2558,14 +2558,14 @@ fn rtt_histogram_null_out_returns_einval() {
 
 - [ ] **Step 4: Run tests**
 
-Run: `cargo test -p resd-net rtt_histogram`
+Run: `cargo test -p dpdk-net rtt_histogram`
 Expected: both null-arg tests pass.
 
 - [ ] **Step 5: Verify cbindgen regenerates the header with the new type + fn**
 
 ```bash
-cargo build -p resd-net
-grep -B 1 -A 3 'resd_net_tcp_rtt_histogram' include/resd_net.h
+cargo build -p dpdk-net
+grep -B 1 -A 3 'dpdk_net_tcp_rtt_histogram' include/dpdk_net.h
 ```
 
 Expected: typedef + extern fn both present.
@@ -2573,9 +2573,9 @@ Expected: typedef + extern fn both present.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/resd-net/src/api.rs crates/resd-net/src/lib.rs include/resd_net.h
+git add crates/dpdk-net/src/api.rs crates/dpdk-net/src/lib.rs include/dpdk_net.h
 git commit -m "$(cat <<'EOF'
-a6 task 18: resd_net_conn_rtt_histogram extern + POD
+a6 task 18: dpdk_net_conn_rtt_histogram extern + POD
 
 Per-conn histogram snapshot. Exactly 64 B (compile-time size assert).
 Reads c.rtt_histogram.snapshot() and memcpys into caller-owned out
@@ -2588,22 +2588,22 @@ EOF
 
 ---
 
-## Task 19: `resd_net_close` honors flags
+## Task 19: `dpdk_net_close` honors flags
 
 **Files:**
-- Modify: `crates/resd-net/src/lib.rs::resd_net_close` — call `e.close_conn_with_flags(handle, flags)` instead of `e.close_conn(handle)`; update the doc-comment.
+- Modify: `crates/dpdk-net/src/lib.rs::dpdk_net_close` — call `e.close_conn_with_flags(handle, flags)` instead of `e.close_conn(handle)`; update the doc-comment.
 
 **Context:** Spec §5.4 + §3.4. Task 10 added the core-side logic; A6 completes the ABI boundary.
 
 - [ ] **Step 1: Update the extern body**
 
-Edit `crates/resd-net/src/lib.rs::resd_net_close`. Replace:
+Edit `crates/dpdk-net/src/lib.rs::dpdk_net_close`. Replace:
 
 ```rust
 #[no_mangle]
-pub unsafe extern "C" fn resd_net_close(
-    p: *mut resd_net_engine,
-    conn: resd_net_conn_t,
+pub unsafe extern "C" fn dpdk_net_close(
+    p: *mut dpdk_net_engine,
+    conn: dpdk_net_conn_t,
     _flags: u32,
 ) -> i32 {
     // FORCE_TW_SKIP flag is A6; ignore in A3.
@@ -2611,7 +2611,7 @@ pub unsafe extern "C" fn resd_net_close(
     let Some(e) = engine_from_raw(p) else { return -libc::EINVAL; };
     match e.close_conn(conn as u32) {
         Ok(()) => 0,
-        Err(resd_net_core::Error::InvalidConnHandle(_)) => -libc::ENOTCONN,
+        Err(dpdk_net_core::Error::InvalidConnHandle(_)) => -libc::ENOTCONN,
         Err(_) => -libc::EIO,
     }
 }
@@ -2623,13 +2623,13 @@ with:
 /// A6 (spec §5.4, §3.4): close a connection, honoring the `flags` bitmask.
 ///
 /// Defined flags:
-/// * `RESD_NET_CLOSE_FORCE_TW_SKIP` — request to skip 2×MSL TIME_WAIT.
+/// * `DPDK_NET_CLOSE_FORCE_TW_SKIP` — request to skip 2×MSL TIME_WAIT.
 ///   Honored only when the connection negotiated timestamps
 ///   (`c.ts_enabled == true`) at close time — the combination of PAWS
 ///   on the peer (RFC 7323 §5) + monotonic ISS on our side (RFC 6528,
 ///   spec §6.5) is the client-side analog of RFC 6191's protections.
 ///   When the prerequisite is not met, the flag is silently dropped
-///   and a `RESD_NET_EVT_ERROR{err=-EPERM}` is emitted for visibility;
+///   and a `DPDK_NET_EVT_ERROR{err=-EPERM}` is emitted for visibility;
 ///   the normal FIN + 2×MSL TIME_WAIT sequence proceeds.
 ///
 /// Undefined flag bits are reserved for future extension and silently
@@ -2640,16 +2640,16 @@ with:
 ///   -ENOTCONN  conn is not a live handle
 ///   -EIO  internal error (TX path or flow-table)
 #[no_mangle]
-pub unsafe extern "C" fn resd_net_close(
-    p: *mut resd_net_engine,
-    conn: resd_net_conn_t,
+pub unsafe extern "C" fn dpdk_net_close(
+    p: *mut dpdk_net_engine,
+    conn: dpdk_net_conn_t,
     flags: u32,
 ) -> i32 {
     if p.is_null() { return -libc::EINVAL; }
     let Some(e) = engine_from_raw(p) else { return -libc::EINVAL; };
     match e.close_conn_with_flags(conn as u32, flags) {
         Ok(()) => 0,
-        Err(resd_net_core::Error::InvalidConnHandle(_)) => -libc::ENOTCONN,
+        Err(dpdk_net_core::Error::InvalidConnHandle(_)) => -libc::ENOTCONN,
         Err(_) => -libc::EIO,
     }
 }
@@ -2657,7 +2657,7 @@ pub unsafe extern "C" fn resd_net_close(
 
 - [ ] **Step 2: Run tests**
 
-Run: `cargo test -p resd-net close`
+Run: `cargo test -p dpdk-net close`
 Expected: existing `close_null_engine_returns_einval` passes.
 
 Run: `cargo test --workspace`
@@ -2666,8 +2666,8 @@ Expected: all green.
 - [ ] **Step 3: Verify cbindgen emits updated doc-comment**
 
 ```bash
-cargo build -p resd-net
-grep -B 18 -A 4 'resd_net_close' include/resd_net.h | head -30
+cargo build -p dpdk-net
+grep -B 18 -A 4 'dpdk_net_close' include/dpdk_net.h | head -30
 ```
 
 Expected: doc-comment in header matches the new Rust-side `///` text.
@@ -2675,9 +2675,9 @@ Expected: doc-comment in header matches the new Rust-side `///` text.
 - [ ] **Step 4: Commit**
 
 ```bash
-git add crates/resd-net/src/lib.rs include/resd_net.h
+git add crates/dpdk-net/src/lib.rs include/dpdk_net.h
 git commit -m "$(cat <<'EOF'
-a6 task 19: resd_net_close honors RESD_NET_CLOSE_FORCE_TW_SKIP flag
+a6 task 19: dpdk_net_close honors DPDK_NET_CLOSE_FORCE_TW_SKIP flag
 
 Calls Engine::close_conn_with_flags (Task 10). Header doc-comment
 documents the ts_enabled prerequisite and the client-side RFC 6191
@@ -2694,45 +2694,45 @@ EOF
 ## Task 20: `rtt_histogram_bucket_edges_us` config field + ABI plumb + `preset>=2` rejection
 
 **Files:**
-- Modify: `crates/resd-net/src/api.rs` — append `rtt_histogram_bucket_edges_us: [u32; 15]` to `resd_net_engine_config_t`.
-- Modify: `crates/resd-net/src/lib.rs::resd_net_engine_create` — plumb the field into `EngineConfig`; `preset>=2` rejection check (already added via `apply_preset` in Task 9; verify).
+- Modify: `crates/dpdk-net/src/api.rs` — append `rtt_histogram_bucket_edges_us: [u32; 15]` to `dpdk_net_engine_config_t`.
+- Modify: `crates/dpdk-net/src/lib.rs::dpdk_net_engine_create` — plumb the field into `EngineConfig`; `preset>=2` rejection check (already added via `apply_preset` in Task 9; verify).
 - Modify: `examples/cpp-consumer/main.cpp` — add a zero-initializer line for the new field so existing example builds.
 
 **Context:** Spec §5.1 (config field) + §3.5 (preset rejection). Task 6 lands the engine-side validation; this task is the ABI layer's plumb.
 
-- [ ] **Step 1: Add the field to `resd_net_engine_config_t`**
+- [ ] **Step 1: Add the field to `dpdk_net_engine_config_t`**
 
-Edit `crates/resd-net/src/api.rs`. In `pub struct resd_net_engine_config_t`, append:
+Edit `crates/dpdk-net/src/api.rs`. In `pub struct dpdk_net_engine_config_t`, append:
 
 ```rust
     /// A6 (spec §5.1, §3.8): RTT histogram bucket edges, µs. 15 strictly
     /// monotonically increasing edges define 16 buckets. All-zero input
     /// means "use the stack's trading-tuned defaults" (see spec §3.8.2).
-    /// Non-monotonic rejected at `resd_net_engine_create` with null-return.
+    /// Non-monotonic rejected at `dpdk_net_engine_create` with null-return.
     pub rtt_histogram_bucket_edges_us: [u32; 15],
 ```
 
-- [ ] **Step 2: Plumb the field into `EngineConfig` in `resd_net_engine_create`**
+- [ ] **Step 2: Plumb the field into `EngineConfig` in `dpdk_net_engine_create`**
 
-Edit `crates/resd-net/src/lib.rs`. In the `let core_cfg = EngineConfig { ... }` construction, add:
+Edit `crates/dpdk-net/src/lib.rs`. In the `let core_cfg = EngineConfig { ... }` construction, add:
 
 ```rust
         rtt_histogram_bucket_edges_us: cfg.rtt_histogram_bucket_edges_us,
 ```
 
-- [ ] **Step 3: Update all existing `resd_net_engine_config_t { ... }` literals in tests**
+- [ ] **Step 3: Update all existing `dpdk_net_engine_config_t { ... }` literals in tests**
 
 Grep for sites:
 
 ```bash
-grep -rn 'resd_net_engine_config_t {' crates/ tests/ examples/
+grep -rn 'dpdk_net_engine_config_t {' crates/ tests/ examples/
 ```
 
 At each site, add `rtt_histogram_bucket_edges_us: [0u32; 15],` as a trailing field.
 
 - [ ] **Step 4: Update the cpp example**
 
-Edit `examples/cpp-consumer/main.cpp`. Find the `resd_net_engine_config_t cfg = { ... }` initializer; add the field zero-init at the tail:
+Edit `examples/cpp-consumer/main.cpp`. Find the `dpdk_net_engine_config_t cfg = { ... }` initializer; add the field zero-init at the tail:
 
 ```cpp
     cfg.rtt_histogram_bucket_edges_us = {0};  // all-zero = use defaults
@@ -2751,20 +2751,20 @@ Expected: compile succeeds with the new field.
 - [ ] **Step 7: Verify cbindgen emits the new field**
 
 ```bash
-grep -A 3 'rtt_histogram_bucket_edges_us' include/resd_net.h
+grep -A 3 'rtt_histogram_bucket_edges_us' include/dpdk_net.h
 ```
 
-Expected: `uint32_t rtt_histogram_bucket_edges_us[15];` at the tail of `resd_net_engine_config_t`.
+Expected: `uint32_t rtt_histogram_bucket_edges_us[15];` at the tail of `dpdk_net_engine_config_t`.
 
 - [ ] **Step 8: Commit**
 
 ```bash
-git add crates/resd-net/src/api.rs crates/resd-net/src/lib.rs include/resd_net.h examples/cpp-consumer/main.cpp
+git add crates/dpdk-net/src/api.rs crates/dpdk-net/src/lib.rs include/dpdk_net.h examples/cpp-consumer/main.cpp
 git commit -m "$(cat <<'EOF'
 a6 task 20: rtt_histogram_bucket_edges_us ABI field + plumbing
 
-Appends the 15×u32 bucket-edges field to resd_net_engine_config_t,
-plumbs it through resd_net_engine_create into EngineConfig for Task
+Appends the 15×u32 bucket-edges field to dpdk_net_engine_config_t,
+plumbs it through dpdk_net_engine_create into EngineConfig for Task
 6's validator to see. cpp-consumer example zero-initializes (→
 defaults). Header regenerated; engine-side default substitution +
 non-monotonic rejection lands from Task 6.
@@ -2779,13 +2779,13 @@ EOF
 ## Task 21: Integration tests — `tcp_a6_public_api_tap.rs`
 
 **Files:**
-- Create: `crates/resd-net-core/tests/tcp_a6_public_api_tap.rs` — 17 Layer-B integration tests covering timers (add/fire/cancel), flush batching, control-frame independence, WRITABLE hysteresis, FORCE_TW_SKIP, RX/retransmit ENOMEM, TS.Recent expiry, histogram distribution.
+- Create: `crates/dpdk-net-core/tests/tcp_a6_public_api_tap.rs` — 17 Layer-B integration tests covering timers (add/fire/cancel), flush batching, control-frame independence, WRITABLE hysteresis, FORCE_TW_SKIP, RX/retransmit ENOMEM, TS.Recent expiry, histogram distribution.
 
 **Context:** Spec §7.2. All tests use the existing `net_tap`-pair harness established in prior phases (see `tests/common/mod.rs`). Tests land as one file for review atomicity; they can run in parallel (cargo test default).
 
 - [ ] **Step 1: Scaffold the test file with common-harness import**
 
-Create `crates/resd-net-core/tests/tcp_a6_public_api_tap.rs`:
+Create `crates/dpdk-net-core/tests/tcp_a6_public_api_tap.rs`:
 
 ```rust
 //! A6 integration tests — public API surface completeness (spec §7.2).
@@ -2796,7 +2796,7 @@ Create `crates/resd-net-core/tests/tcp_a6_public_api_tap.rs`:
 mod common;
 
 use common::{a3_tap_harness, advance_mock_clock_ns};
-use resd_net_core::{
+use dpdk_net_core::{
     engine::{pack_timer_id, Engine, EngineConfig, DEFAULT_RTT_HISTOGRAM_EDGES_US},
     flow_table::ConnHandle,
     tcp_events::InternalEvent,
@@ -2827,7 +2827,7 @@ fn count_event_kinds(events: &[InternalEvent]) -> (usize, usize, usize, usize) {
 Note: `advance_mock_clock_ns` helper must exist in `tests/common/mod.rs`. If it doesn't (A5.5 should have it), add it as an extension in a separate sub-task before starting this one. Grep:
 
 ```bash
-grep -n 'advance_mock_clock' crates/resd-net-core/tests/common/mod.rs
+grep -n 'advance_mock_clock' crates/dpdk-net-core/tests/common/mod.rs
 ```
 
 If absent, extend `tests/common/mod.rs` with a mock-clock setter helper that writes into the shared clock state. The pattern: `pub fn advance_mock_clock_ns(delta: u64) { /* CAS the clock's offset */ }` — implementation depends on how A5.5's tests mock the clock.
@@ -2895,7 +2895,7 @@ fn timer_id_packing_stable_across_add() {
     let id1 = e.public_timer_add(h.clock_now_ns() + 1_000_000, 0);
     let packed = pack_timer_id(id1);
     // The ABI pack is deterministic: same slot+gen produces same packed.
-    let id2 = resd_net_core::engine::unpack_timer_id(packed);
+    let id2 = dpdk_net_core::engine::unpack_timer_id(packed);
     assert_eq!(id1, id2);
 }
 ```
@@ -2990,7 +2990,7 @@ fn force_tw_skip_honored_when_ts_enabled() {
     let e = &h.engine;
     let conn = h.establish_conn();  // ts_enabled=true by harness config
     // Close with FORCE_TW_SKIP, drive peer FIN-ACK to reach TIME_WAIT.
-    use resd_net_core::engine::CLOSE_FLAG_FORCE_TW_SKIP;
+    use dpdk_net_core::engine::CLOSE_FLAG_FORCE_TW_SKIP;
     e.close_conn_with_flags(conn, CLOSE_FLAG_FORCE_TW_SKIP).unwrap();
     h.peer_send_fin_ack(conn);
     e.poll_once();
@@ -3002,7 +3002,7 @@ fn force_tw_skip_honored_when_ts_enabled() {
             _ => None,
         }
     }).collect();
-    assert!(state_changes.contains(&resd_net_core::tcp_state::TcpState::Closed),
+    assert!(state_changes.contains(&dpdk_net_core::tcp_state::TcpState::Closed),
         "force_tw_skip must reap TIME_WAIT immediately");
 }
 
@@ -3011,7 +3011,7 @@ fn force_tw_skip_rejected_when_ts_disabled() {
     let h = a3_tap_harness_with_ts_disabled();
     let e = &h.engine;
     let conn = h.establish_conn();  // ts_enabled=false
-    use resd_net_core::engine::CLOSE_FLAG_FORCE_TW_SKIP;
+    use dpdk_net_core::engine::CLOSE_FLAG_FORCE_TW_SKIP;
     e.close_conn_with_flags(conn, CLOSE_FLAG_FORCE_TW_SKIP).unwrap();
     let errs: Vec<_> = h.drain_all_events().iter().filter_map(|e| {
         match e {
@@ -3100,7 +3100,7 @@ fn rtt_histogram_distribution_shape() {
     // of the default edge set: 25 → b0, 150 → b2, 750 → b5 (edges [...500,750]),
     // 4000 → b9, 200000 → b14.
     h.drive_rtt_samples(conn, &[25, 150, 750, 4000, 200000]);
-    let mut out = resd_net_core::rtt_histogram::RttHistogram::default();
+    let mut out = dpdk_net_core::rtt_histogram::RttHistogram::default();
     // Snapshot via the core getter (ABI getter exercised in a separate test).
     let ft = e.flow_table();
     out = ft.get(conn).unwrap().rtt_histogram;
@@ -3119,9 +3119,9 @@ fn rtt_histogram_getter_unknown_handle_returns_enoent() {
     // This test exercises the ABI extern directly.
     let h = a3_tap_harness();
     let engine_ptr = h.as_raw_engine();
-    let mut out = resd_net_tcp_rtt_histogram_t::default();
+    let mut out = dpdk_net_tcp_rtt_histogram_t::default();
     let rc = unsafe {
-        resd_net::resd_net_conn_rtt_histogram(engine_ptr, 0xDEAD_BEEF, &mut out)
+        dpdk_net::dpdk_net_conn_rtt_histogram(engine_ptr, 0xDEAD_BEEF, &mut out)
     };
     assert_eq!(rc, -libc::ENOENT);
 }
@@ -3163,13 +3163,13 @@ fn event_queue_overflow_drops_oldest() {
 
 - [ ] **Step 10: Run integration tests**
 
-Run: `cargo test -p resd-net-core --test tcp_a6_public_api_tap`
+Run: `cargo test -p dpdk-net-core --test tcp_a6_public_api_tap`
 Expected: all 17 tests pass. Any that fail indicate a gap in tasks 1-20 that the plan missed; triage and patch.
 
 - [ ] **Step 11: Commit**
 
 ```bash
-git add crates/resd-net-core/tests/tcp_a6_public_api_tap.rs crates/resd-net-core/tests/common/mod.rs
+git add crates/dpdk-net-core/tests/tcp_a6_public_api_tap.rs crates/dpdk-net-core/tests/common/mod.rs
 git commit -m "$(cat <<'EOF'
 a6 task 21: integration tests — tcp_a6_public_api_tap.rs
 
@@ -3190,27 +3190,27 @@ EOF
 ## Task 22: Knob-coverage + per-conn-histogram audit + parent-spec updates
 
 **Files:**
-- Modify: `crates/resd-net-core/tests/knob-coverage.rs` — add 3 scenario tests per spec §7.3.
-- Create: `crates/resd-net-core/tests/per-conn-histogram-coverage.rs` — sibling audit sweeping RTT across all 16 default buckets.
+- Modify: `crates/dpdk-net-core/tests/knob-coverage.rs` — add 3 scenario tests per spec §7.3.
+- Create: `crates/dpdk-net-core/tests/per-conn-histogram-coverage.rs` — sibling audit sweeping RTT across all 16 default buckets.
 - Modify: `docs/superpowers/specs/2026-04-17-dpdk-tcp-design.md` — apply §4, §4.2, §6.5, §9.1, §9.3 updates per design spec §10.
 
 **Context:** Spec §7.3, §7.4, §10. Three parallel tracks in one task because each is small in isolation; reviewer subagents scrutinize them jointly.
 
 - [ ] **Step 1: Add `knob_preset_rfc_compliance_forces_rfc_defaults`**
 
-Append to `crates/resd-net-core/tests/knob-coverage.rs`:
+Append to `crates/dpdk-net-core/tests/knob-coverage.rs`:
 
 ```rust
 // ---- knob 7: preset (engine-wide) ---------------------------------------
 
-/// Knob: `EngineConfig::preset` via `resd_net::apply_preset`.
+/// Knob: `EngineConfig::preset` via `dpdk_net::apply_preset`.
 /// Non-default value: `PRESET_RFC_COMPLIANCE` (1). Default is `PRESET_LATENCY`
 /// (0; leaves caller fields as-written).
 /// Observable consequence: the five fields are overridden; preset=0 baseline
 /// passes through.
 #[test]
 fn knob_preset_rfc_compliance_forces_rfc_defaults() {
-    use resd_net_core::engine::EngineConfig;
+    use dpdk_net_core::engine::EngineConfig;
     let mut cfg = EngineConfig {
         tcp_nagle: false,
         tcp_delayed_ack: false,
@@ -3219,7 +3219,7 @@ fn knob_preset_rfc_compliance_forces_rfc_defaults() {
         tcp_initial_rto_us: 5_000,
         ..EngineConfig::default()
     };
-    resd_net::apply_preset(1, &mut cfg).unwrap();
+    dpdk_net::apply_preset(1, &mut cfg).unwrap();
     assert!(cfg.tcp_nagle);
     assert!(cfg.tcp_delayed_ack);
     assert_eq!(cfg.cc_mode, 1);
@@ -3229,7 +3229,7 @@ fn knob_preset_rfc_compliance_forces_rfc_defaults() {
 
 #[test]
 fn knob_preset_latency_leaves_user_config_intact() {
-    use resd_net_core::engine::EngineConfig;
+    use dpdk_net_core::engine::EngineConfig;
     let orig = EngineConfig {
         tcp_nagle: false,
         tcp_delayed_ack: false,
@@ -3239,7 +3239,7 @@ fn knob_preset_latency_leaves_user_config_intact() {
         ..EngineConfig::default()
     };
     let mut cfg = orig;
-    resd_net::apply_preset(0, &mut cfg).unwrap();
+    dpdk_net::apply_preset(0, &mut cfg).unwrap();
     assert_eq!(cfg.tcp_nagle, orig.tcp_nagle);
     assert_eq!(cfg.cc_mode, orig.cc_mode);
     assert_eq!(cfg.tcp_min_rto_us, orig.tcp_min_rto_us);
@@ -3251,7 +3251,7 @@ fn knob_preset_latency_leaves_user_config_intact() {
 ```rust
 // ---- knob 8: close flag FORCE_TW_SKIP ------------------------------------
 
-/// Knob: `resd_net_close` flag `RESD_NET_CLOSE_FORCE_TW_SKIP` (bit 0).
+/// Knob: `dpdk_net_close` flag `DPDK_NET_CLOSE_FORCE_TW_SKIP` (bit 0).
 /// Non-default value: flag set.
 /// Observable consequences:
 /// (a) ts_enabled=true → force_tw_skip=true set on TcpConn.
@@ -3289,7 +3289,7 @@ fn knob_close_force_tw_skip_when_ts_enabled() {
 /// bucket, NOT the default-edge bucket (they differ in the index).
 #[test]
 fn knob_rtt_histogram_bucket_edges_us_override() {
-    use resd_net_core::rtt_histogram::{select_bucket, RttHistogram};
+    use dpdk_net_core::rtt_histogram::{select_bucket, RttHistogram};
 
     // Custom edges — bucket 1 holds (100, 200], contrasting with default
     // edges where (100, 200] is bucket 2.
@@ -3315,12 +3315,12 @@ fn knob_rtt_histogram_bucket_edges_us_override() {
 
 - [ ] **Step 4: Run knob-coverage suite**
 
-Run: `cargo test -p resd-net-core --test knob-coverage`
+Run: `cargo test -p dpdk-net-core --test knob-coverage`
 Expected: all 9 knob tests pass (6 A5.5 + 3 new A6).
 
 - [ ] **Step 5: Create `tests/per-conn-histogram-coverage.rs`**
 
-Create `crates/resd-net-core/tests/per-conn-histogram-coverage.rs`:
+Create `crates/dpdk-net-core/tests/per-conn-histogram-coverage.rs`:
 
 ```rust
 //! A6 sibling audit — per-connection RTT histogram coverage.
@@ -3330,8 +3330,8 @@ Create `crates/resd-net-core/tests/per-conn-histogram-coverage.rs`:
 //! histogram buckets is reachable under the default edge set via one
 //! scenario that sweeps RTT across the bucket range.
 
-use resd_net_core::engine::DEFAULT_RTT_HISTOGRAM_EDGES_US;
-use resd_net_core::rtt_histogram::{select_bucket, RttHistogram};
+use dpdk_net_core::engine::DEFAULT_RTT_HISTOGRAM_EDGES_US;
+use dpdk_net_core::rtt_histogram::{select_bucket, RttHistogram};
 
 /// Every default bucket [0, 16) reachable by at least one RTT sample.
 #[test]
@@ -3394,16 +3394,16 @@ fn beyond_last_edge_lands_in_catchall() {
 
 - [ ] **Step 6: Run the new audit**
 
-Run: `cargo test -p resd-net-core --test per-conn-histogram-coverage`
+Run: `cargo test -p dpdk-net-core --test per-conn-histogram-coverage`
 Expected: all 3 tests pass.
 
 - [ ] **Step 7: Update parent spec `docs/superpowers/specs/2026-04-17-dpdk-tcp-design.md`**
 
 Per A6 design spec §10. Edit in-place (reuse existing section numbers):
 
-**§4 API**: inside the Timer & Clock paragraph (and the extern fn listings), finalize the wording around `resd_net_timer_cancel` — "`-EALREADY` collapses into `-ENOENT`; callers must drain any queued TIMER events regardless of the cancel return." Add `resd_net_conn_rtt_histogram` under the Introspection (A5.5) paragraph. Add the `resd_net_tcp_rtt_histogram_t` POD definition. Add `rtt_histogram_bucket_edges_us[15]` to the `resd_net_engine_config_t` listing.
+**§4 API**: inside the Timer & Clock paragraph (and the extern fn listings), finalize the wording around `dpdk_net_timer_cancel` — "`-EALREADY` collapses into `-ENOENT`; callers must drain any queued TIMER events regardless of the cancel return." Add `dpdk_net_conn_rtt_histogram` under the Introspection (A5.5) paragraph. Add the `dpdk_net_tcp_rtt_histogram_t` POD definition. Add `rtt_histogram_bucket_edges_us[15]` to the `dpdk_net_engine_config_t` listing.
 
-**§4.2 contracts**: Update `resd_net_flush` wording to "drains the pending data-segment TX batch via exactly one `rte_eth_tx_burst`. Control frames (ACK, SYN, FIN, RST) are emitted inline at their emit site and do not participate in the flush batch." Update the `resd_net_close` flag + error-code paragraph: "When `RESD_NET_CLOSE_FORCE_TW_SKIP` is set but the connection did not negotiate timestamps, the flag is silently dropped, a `RESD_NET_EVT_ERROR{err=-EPERM}` event is emitted for visibility, and the normal FIN + 2×MSL TIME_WAIT sequence proceeds."
+**§4.2 contracts**: Update `dpdk_net_flush` wording to "drains the pending data-segment TX batch via exactly one `rte_eth_tx_burst`. Control frames (ACK, SYN, FIN, RST) are emitted inline at their emit site and do not participate in the flush batch." Update the `dpdk_net_close` flag + error-code paragraph: "When `DPDK_NET_CLOSE_FORCE_TW_SKIP` is set but the connection did not negotiate timestamps, the flag is silently dropped, a `DPDK_NET_EVT_ERROR{err=-EPERM}` event is emitted for visibility, and the normal FIN + 2×MSL TIME_WAIT sequence proceeds."
 
 **§6.5**: Replace the existing TIME_WAIT shortening paragraph with the final A6 wording — "honored only when `c.ts_enabled == true` at close time; the combination of PAWS on the peer (RFC 7323 §5) + monotonic ISS on our side (RFC 6528, §6.5 implementation choice) is the client-side analog of RFC 6191's protections."
 
@@ -3413,7 +3413,7 @@ Per A6 design spec §10. Edit in-place (reuse existing section numbers):
 - `tcp.tx_flush_bursts`
 - `tcp.tx_flush_batched_pkts`
 
-Also note: per-conn RTT histogram lives on `TcpConn` and is read via `resd_net_conn_rtt_histogram`, not in `resd_net_counters_t`.
+Also note: per-conn RTT histogram lives on `TcpConn` and is read via `dpdk_net_conn_rtt_histogram`, not in `dpdk_net_counters_t`.
 
 **§9.3**: Document the three ENOMEM emission sites — `send_bytes` sync return, internal retransmit per-occurrence, RX mempool edge-triggered per poll iteration.
 
@@ -3427,7 +3427,7 @@ Expected: all green.
 - [ ] **Step 9: Commit**
 
 ```bash
-git add crates/resd-net-core/tests/knob-coverage.rs crates/resd-net-core/tests/per-conn-histogram-coverage.rs docs/superpowers/specs/2026-04-17-dpdk-tcp-design.md
+git add crates/dpdk-net-core/tests/knob-coverage.rs crates/dpdk-net-core/tests/per-conn-histogram-coverage.rs docs/superpowers/specs/2026-04-17-dpdk-tcp-design.md
 git commit -m "$(cat <<'EOF'
 a6 task 22: knob-coverage + per-conn-histogram audit + parent-spec updates
 
@@ -3550,9 +3550,9 @@ Report back to the session coordinator:
 **Type consistency check:**
 - `TimerId` → `u64` packing helper `pack_timer_id` used consistently across tasks 8, 17, 21.
 - `RttHistogram` → `rtt_histogram` field reference consistent (tasks 3, 15, 18, 21, 22).
-- `CLOSE_FLAG_FORCE_TW_SKIP` (core-side) vs. `RESD_NET_CLOSE_FORCE_TW_SKIP` (ABI-side) — both exist (core constant in task 10, ABI constant already in api.rs at Stage A3); task 19 maps ABI to core via bitmask equivalence. Numeric value `1 << 0` stable across both.
-- `Error::InvalidHistogramEdges` — added in task 6; used in task 20 (`resd_net_engine_create` null-return propagation).
-- `apply_preset` — core-level helper in `resd-net` crate (task 9); used by the ABI entry point and by knob-coverage test (task 22).
+- `CLOSE_FLAG_FORCE_TW_SKIP` (core-side) vs. `DPDK_NET_CLOSE_FORCE_TW_SKIP` (ABI-side) — both exist (core constant in task 10, ABI constant already in api.rs at Stage A3); task 19 maps ABI to core via bitmask equivalence. Numeric value `1 << 0` stable across both.
+- `Error::InvalidHistogramEdges` — added in task 6; used in task 20 (`dpdk_net_engine_create` null-return propagation).
+- `apply_preset` — core-level helper in `dpdk-net` crate (task 9); used by the ABI entry point and by knob-coverage test (task 22).
 
 No type drift detected. Plan is internally consistent.
 

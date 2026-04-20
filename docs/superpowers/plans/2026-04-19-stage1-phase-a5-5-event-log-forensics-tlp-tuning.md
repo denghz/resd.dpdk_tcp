@@ -4,7 +4,7 @@
 
 **Goal:** Close four A5 review-identified gaps (event emission timestamps, event-queue overflow protection, per-connection stats getter, TLP tuning knobs) plus three Stage-2 Accepted Deviations (AD-15 retirement, AD-17 `RACK_mark_losses_on_RTO`, AD-18 arm-TLP-on-send) plus SRTT seed from the SYN handshake round-trip — all without touching A5's shipped wire behavior under default configs.
 
-**Architecture:** Primarily an observability phase that grew a modest wire-behavior surface during brainstorm. Observability tasks (1–8) touch `tcp_events.rs`, `engine.rs` event-push sites, `counters.rs` (new `obs` group), `tcp_conn.rs` (new `stats()` projection), `flow_table.rs`, and the `resd-net` C ABI (`resd_net_conn_stats` extern + new counter fields). TLP tuning tasks (9–12) extend `tcp_tlp.rs::pto_us` to consume a `TlpConfig`, add 5 per-connect knobs to `resd_net_connect_opts_t`, add multi-probe budget tracking + DSACK spurious-probe attribution on `TcpConn`, and add one new counter `tcp.tx_tlp_spurious`. AD closures (13–15) add SRTT-seed-from-SYN-handshake wiring in `tcp_input.rs::handle_syn_sent`, a `RACK_mark_losses_on_RTO` pass at the top of `engine.rs::on_rto_fire`, and an `arm_tlp_pto` helper invoked from `Engine::send_bytes`. Bookkeeping (16–17) retires AD-15 + closes AD-17/18 in the A5 RFC review record and extends `tests/knob-coverage.rs` per roadmap §A11.
+**Architecture:** Primarily an observability phase that grew a modest wire-behavior surface during brainstorm. Observability tasks (1–8) touch `tcp_events.rs`, `engine.rs` event-push sites, `counters.rs` (new `obs` group), `tcp_conn.rs` (new `stats()` projection), `flow_table.rs`, and the `dpdk-net` C ABI (`dpdk_net_conn_stats` extern + new counter fields). TLP tuning tasks (9–12) extend `tcp_tlp.rs::pto_us` to consume a `TlpConfig`, add 5 per-connect knobs to `dpdk_net_connect_opts_t`, add multi-probe budget tracking + DSACK spurious-probe attribution on `TcpConn`, and add one new counter `tcp.tx_tlp_spurious`. AD closures (13–15) add SRTT-seed-from-SYN-handshake wiring in `tcp_input.rs::handle_syn_sent`, a `RACK_mark_losses_on_RTO` pass at the top of `engine.rs::on_rto_fire`, and an `arm_tlp_pto` helper invoked from `Engine::send_bytes`. Bookkeeping (16–17) retires AD-15 + closes AD-17/18 in the A5 RFC review record and extends `tests/knob-coverage.rs` per roadmap §A11.
 
 **Tech Stack:** same as A5 — Rust stable, DPDK 23.11, bindgen, cbindgen. No new crate deps. No new cargo features. No new DPDK FFI wrappers.
 
@@ -46,7 +46,7 @@ The `phase-a5-5-complete` tag is blocked while either report has an open `[ ]` i
 ## File Structure Created or Modified in This Phase
 
 ```
-crates/resd-net-core/
+crates/dpdk-net-core/
 ├── src/
 │   ├── tcp_events.rs                (MODIFIED: `InternalEvent::*::emitted_ts_ns` field on every variant; `EventQueue::push` takes `&EngineCounters` for drop-oldest + high-water; `EventQueue::with_cap` + min-64 check)
 │   ├── engine.rs                    (MODIFIED: 13 push-site updates to include `emitted_ts_ns: self.clock.now_ns()`; `EventQueue::push` call-site passes counters; `on_rto_fire` gains §6.3 RACK_mark_losses_on_RTO pass; `send_bytes` gains `arm_tlp_pto` call post-TX; TLP scheduling consults `tlp_consecutive_probes_fired` / `tlp_max_consecutive_probes`; `on_tlp_fire` increments the counter + records the probe in `tlp_recent_probes`)
@@ -62,13 +62,13 @@ crates/resd-net-core/
     ├── tcp_a5_5_ad_closures.rs      (NEW: integration 7.2.14–7.2.23 — SRTT-from-SYN nonzero / Karn's rule / bounds, AD-17 multi-segment RTO recovery / age-based marking / front-entry-only, AD-18 first-burst PTO / re-arm / SYN_SENT no-op / budget-exhausted no-op)
     └── knob-coverage.rs             (MODIFIED: extends scenario table with 5 A5.5 TLP knobs + `event_queue_soft_cap` + the aggressive-preset combination per roadmap §A11)
 
-crates/resd-net/src/
-├── api.rs                           (MODIFIED: `resd_net_engine_config_t::event_queue_soft_cap`; `resd_net_connect_opts_t` gains 5 TLP fields; `resd_net_counters_t` gains `obs_events_dropped`, `obs_events_queue_high_water`; `resd_net_tcp_counters_t` gains `tx_tlp_spurious`; new `resd_net_conn_stats_t` POD + `resd_net_conn_stats` extern)
-└── lib.rs                           (MODIFIED: `resd_net_poll` drain reads `emitted_ts_ns` through instead of sampling at drain; `resd_net_connect` validates the 5 TLP fields; `resd_net_conn_stats` extern entrypoint; `resd_net_engine_create` validates `event_queue_soft_cap >= 64`)
+crates/dpdk-net/src/
+├── api.rs                           (MODIFIED: `dpdk_net_engine_config_t::event_queue_soft_cap`; `dpdk_net_connect_opts_t` gains 5 TLP fields; `dpdk_net_counters_t` gains `obs_events_dropped`, `obs_events_queue_high_water`; `dpdk_net_tcp_counters_t` gains `tx_tlp_spurious`; new `dpdk_net_conn_stats_t` POD + `dpdk_net_conn_stats` extern)
+└── lib.rs                           (MODIFIED: `dpdk_net_poll` drain reads `emitted_ts_ns` through instead of sampling at drain; `dpdk_net_connect` validates the 5 TLP fields; `dpdk_net_conn_stats` extern entrypoint; `dpdk_net_engine_create` validates `event_queue_soft_cap >= 64`)
 
-include/resd_net.h                   (REGENERATED via cbindgen: 1 engine-config field, 5 connect-opts fields, 3 new counter fields, 1 new extern, 1 new struct, doc-comment changes on `enqueued_ts_ns`)
+include/dpdk_net.h                   (REGENERATED via cbindgen: 1 engine-config field, 5 connect-opts fields, 3 new counter fields, 1 new extern, 1 new struct, doc-comment changes on `enqueued_ts_ns`)
 
-examples/cpp-consumer/main.cpp       (MODIFIED: set a reasonable `event_queue_soft_cap`; print the three new counters; demo one call to `resd_net_conn_stats`)
+examples/cpp-consumer/main.cpp       (MODIFIED: set a reasonable `event_queue_soft_cap`; print the three new counters; demo one call to `dpdk_net_conn_stats`)
 
 docs/superpowers/specs/2026-04-17-dpdk-tcp-design.md
                                      (MODIFIED during Task 16: §4 API adds Introspection API paragraph; §4.2 documents queue soft-cap; §6.3 RFC matrix updates RFC 8985 row; §6.4 adds 8 new AD rows; §9.1 counter examples updated; §9.3 events clarifies `enqueued_ts_ns` semantics)
@@ -85,20 +85,20 @@ docs/superpowers/reviews/phase-a5-5-rfc-compliance.md    (NEW — Task 19)
 ## Task 1: `InternalEvent::emitted_ts_ns` field + producer wiring at 13 engine call sites
 
 **Files:**
-- Modify: `crates/resd-net-core/src/tcp_events.rs` — add `emitted_ts_ns: u64` to every `InternalEvent` variant (7 variants as of HEAD: `Connected`, `Readable`, `Closed`, `StateChange`, `Error`, `TcpRetrans`, `TcpLossDetected`)
-- Modify: `crates/resd-net-core/src/engine.rs` — update 13 push call sites to include `emitted_ts_ns: self.clock.now_ns()` in the constructor
+- Modify: `crates/dpdk-net-core/src/tcp_events.rs` — add `emitted_ts_ns: u64` to every `InternalEvent` variant (7 variants as of HEAD: `Connected`, `Readable`, `Closed`, `StateChange`, `Error`, `TcpRetrans`, `TcpLossDetected`)
+- Modify: `crates/dpdk-net-core/src/engine.rs` — update 13 push call sites to include `emitted_ts_ns: self.clock.now_ns()` in the constructor
 
-**Context:** Spec §3.1. Current `enqueued_ts_ns` is sampled at `resd_net_poll` drain time in `crates/resd-net/src/lib.rs`; the skew between stack emission and drain is bounded by the app poll interval (10 µs at 100 kHz, 100 µs at 10 kHz). We want emission-time semantics. This task only adds the field on the internal variant + wires producers; Task 2 updates the drain path to read it through. The 13 call sites were verified via grep at `engine.rs:856, :861, :994, :999, :1169, :1173, :1204, :1480, :1485, :1690, :1709, :1788, :2041` at tip of `phase-a5-complete` (`39b01cd`). If subsequent work adds more push sites before A5.5 lands, the task's grep step catches them.
+**Context:** Spec §3.1. Current `enqueued_ts_ns` is sampled at `dpdk_net_poll` drain time in `crates/dpdk-net/src/lib.rs`; the skew between stack emission and drain is bounded by the app poll interval (10 µs at 100 kHz, 100 µs at 10 kHz). We want emission-time semantics. This task only adds the field on the internal variant + wires producers; Task 2 updates the drain path to read it through. The 13 call sites were verified via grep at `engine.rs:856, :861, :994, :999, :1169, :1173, :1204, :1480, :1485, :1690, :1709, :1788, :2041` at tip of `phase-a5-complete` (`39b01cd`). If subsequent work adds more push sites before A5.5 lands, the task's grep step catches them.
 
 - [ ] **Step 1: Write failing test (the field must exist on every variant)**
 
 ```rust
 // tests/tcp_a5_5_observability.rs — new file
-// Placed in crates/resd-net-core/tests/ — create the directory if needed.
+// Placed in crates/dpdk-net-core/tests/ — create the directory if needed.
 
-use resd_net_core::flow_table::ConnHandle;
-use resd_net_core::tcp_events::{EventQueue, InternalEvent, LossCause};
-use resd_net_core::tcp_state::TcpState;
+use dpdk_net_core::flow_table::ConnHandle;
+use dpdk_net_core::tcp_events::{EventQueue, InternalEvent, LossCause};
+use dpdk_net_core::tcp_state::TcpState;
 
 #[test]
 fn internal_event_carries_emitted_ts_ns_on_every_variant() {
@@ -161,12 +161,12 @@ fn emitted_ts_ns_of(ev: &InternalEvent) -> u64 {
 
 - [ ] **Step 2: Run test to verify it fails with "no field named `emitted_ts_ns`"**
 
-Run: `cargo test -p resd-net-core --test tcp_a5_5_observability internal_event_carries_emitted_ts_ns_on_every_variant`
+Run: `cargo test -p dpdk-net-core --test tcp_a5_5_observability internal_event_carries_emitted_ts_ns_on_every_variant`
 Expected: compile error, "struct has no field named `emitted_ts_ns`" on each variant constructor.
 
 - [ ] **Step 3: Add `emitted_ts_ns: u64` to every `InternalEvent` variant**
 
-Edit `crates/resd-net-core/src/tcp_events.rs` in the `pub enum InternalEvent { … }` block. For each of the 7 variants add `emitted_ts_ns: u64` as the last struct field. Preserve existing field order; add the new field at the end for consistency.
+Edit `crates/dpdk-net-core/src/tcp_events.rs` in the `pub enum InternalEvent { … }` block. For each of the 7 variants add `emitted_ts_ns: u64` as the last struct field. Preserve existing field order; add the new field at the end for consistency.
 
 ```rust
 // Example — apply the analogous change to all 7 variants
@@ -220,7 +220,7 @@ Update `tcp_events.rs` unit tests and the doc-comment at `tcp_events.rs:62-66` (
 Verify the 13 call sites with a grep before editing:
 
 ```bash
-grep -n "push(InternalEvent::" crates/resd-net-core/src/engine.rs
+grep -n "push(InternalEvent::" crates/dpdk-net-core/src/engine.rs
 ```
 
 At each call site, add `emitted_ts_ns: self.clock.now_ns(),` to the constructor. Pattern (illustrative — actual lines shift as edits are applied):
@@ -248,47 +248,47 @@ If any other module (e.g., `tcp_input.rs`) pushes events via a borrow to `EventQ
 
 - [ ] **Step 5: Run test to verify it passes + existing tests still green**
 
-Run: `cargo test -p resd-net-core`
+Run: `cargo test -p dpdk-net-core`
 Expected: the new test passes; all pre-existing tests pass unchanged.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/resd-net-core/src/tcp_events.rs crates/resd-net-core/src/engine.rs crates/resd-net-core/tests/tcp_a5_5_observability.rs
+git add crates/dpdk-net-core/src/tcp_events.rs crates/dpdk-net-core/src/engine.rs crates/dpdk-net-core/tests/tcp_a5_5_observability.rs
 git commit -m "a5.5 task 1: add InternalEvent::emitted_ts_ns + producer wiring
 
 Adds emitted_ts_ns: u64 to every InternalEvent variant and updates
 all 13 push call sites in engine.rs to sample self.clock.now_ns()
-at push time. Drain-time consumer in resd-net/src/lib.rs still
+at push time. Drain-time consumer in dpdk-net/src/lib.rs still
 samples at drain — Task 2 wires it through."
 ```
 
 ---
 
-## Task 2: `resd_net_poll` drain simplification — read `emitted_ts_ns` through
+## Task 2: `dpdk_net_poll` drain simplification — read `emitted_ts_ns` through
 
 **Files:**
-- Modify: `crates/resd-net/src/lib.rs` — `resd_net_poll` drain path at lines `142-224` (pre-A5.5)
-- Modify: `crates/resd-net/src/api.rs` — doc comment on `resd_net_event_t::enqueued_ts_ns` (struct field)
+- Modify: `crates/dpdk-net/src/lib.rs` — `dpdk_net_poll` drain path at lines `142-224` (pre-A5.5)
+- Modify: `crates/dpdk-net/src/api.rs` — doc comment on `dpdk_net_event_t::enqueued_ts_ns` (struct field)
 
-**Context:** Spec §3.1, §5.2. The drain-time `let ts = resd_net_core::clock::now_ns();` goes away. Each event's `enqueued_ts_ns` is populated from the `InternalEvent` variant's `emitted_ts_ns` field. The C ABI field name stays (no rename — scaffold §3.1 rationale), doc comment tightens semantic meaning to "sampled at event emission inside the stack."
+**Context:** Spec §3.1, §5.2. The drain-time `let ts = dpdk_net_core::clock::now_ns();` goes away. Each event's `enqueued_ts_ns` is populated from the `InternalEvent` variant's `emitted_ts_ns` field. The C ABI field name stays (no rename — scaffold §3.1 rationale), doc comment tightens semantic meaning to "sampled at event emission inside the stack."
 
 - [ ] **Step 1: Write failing test asserting drain-time sampling is gone**
 
 ```rust
 // tests/tcp_a5_5_observability.rs — add to existing test module
 #[test]
-fn resd_net_poll_does_not_sample_clock_at_drain() {
+fn dpdk_net_poll_does_not_sample_clock_at_drain() {
     // Build an engine with a mock clock; push an event at t=100; advance
-    // the clock to t=500 before calling resd_net_poll; assert the drained
+    // the clock to t=500 before calling dpdk_net_poll; assert the drained
     // event carries enqueued_ts_ns == 100 (not 500).
-    let mut e = resd_net_core::test_support::make_test_engine_with_mock_clock();
+    let mut e = dpdk_net_core::test_support::make_test_engine_with_mock_clock();
     e.mock_clock_set_ns(100);
     e.push_event_connected(ConnHandle(1));  // test helper emits Connected variant
     e.mock_clock_set_ns(500);
-    let mut events_out = [unsafe { std::mem::zeroed::<resd_net::api::resd_net_event_t>() }; 4];
+    let mut events_out = [unsafe { std::mem::zeroed::<dpdk_net::api::dpdk_net_event_t>() }; 4];
     let n = unsafe {
-        resd_net::resd_net_poll(
+        dpdk_net::dpdk_net_poll(
             e.as_engine_ptr(),
             events_out.as_mut_ptr(),
             events_out.len() as u32,
@@ -299,20 +299,20 @@ fn resd_net_poll_does_not_sample_clock_at_drain() {
 }
 ```
 
-Note: `test_support::make_test_engine_with_mock_clock` + `push_event_connected` helpers may need adding if A5 doesn't already expose them. If they don't exist, add minimal stubs gated behind `#[cfg(feature = "test-support")]` in `crates/resd-net-core/src/test_support.rs`.
+Note: `test_support::make_test_engine_with_mock_clock` + `push_event_connected` helpers may need adding if A5 doesn't already expose them. If they don't exist, add minimal stubs gated behind `#[cfg(feature = "test-support")]` in `crates/dpdk-net-core/src/test_support.rs`.
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p resd-net --test tcp_a5_5_observability resd_net_poll_does_not_sample_clock_at_drain`
+Run: `cargo test -p dpdk-net --test tcp_a5_5_observability dpdk_net_poll_does_not_sample_clock_at_drain`
 Expected: fail with `left: 500, right: 100` (or similar), proving the drain still samples at drain time.
 
 - [ ] **Step 3: Rewrite the drain loop to consume `emitted_ts_ns`**
 
-In `crates/resd-net/src/lib.rs`, locate the `resd_net_poll` drain block (A5 HEAD line range `~142-224`). Replace:
+In `crates/dpdk-net/src/lib.rs`, locate the `dpdk_net_poll` drain block (A5 HEAD line range `~142-224`). Replace:
 
 ```rust
 // BEFORE (illustrative — actual wording differs)
-let ts = resd_net_core::clock::now_ns();
+let ts = dpdk_net_core::clock::now_ns();
 while let Some(ev) = engine.events.borrow_mut().pop() {
     match ev {
         InternalEvent::Connected { conn, rx_hw_ts_ns } => {
@@ -352,11 +352,11 @@ while let Some(ev) = engine.events.borrow_mut().pop() {
 }
 ```
 
-Every branch of the match that populates a `resd_net_event_t` must set `enqueued_ts_ns = emitted`. Double-check by grepping the block for `enqueued_ts_ns` and verifying all assignments use `emitted`.
+Every branch of the match that populates a `dpdk_net_event_t` must set `enqueued_ts_ns = emitted`. Double-check by grepping the block for `enqueued_ts_ns` and verifying all assignments use `emitted`.
 
-- [ ] **Step 4: Update the doc-comment on `resd_net_event_t::enqueued_ts_ns`**
+- [ ] **Step 4: Update the doc-comment on `dpdk_net_event_t::enqueued_ts_ns`**
 
-In `crates/resd-net/src/api.rs` find the `resd_net_event_t` struct and update the doc comment on `enqueued_ts_ns` from drain-time wording to:
+In `crates/dpdk-net/src/api.rs` find the `dpdk_net_event_t` struct and update the doc comment on `enqueued_ts_ns` from drain-time wording to:
 
 ```rust
 /// ns timestamp (engine monotonic clock) sampled at event emission
@@ -371,19 +371,19 @@ pub enqueued_ts_ns: u64,
 - [ ] **Step 5: Run tests to verify green + regen header**
 
 ```bash
-cargo test -p resd-net
-cargo build -p resd-net                      # regenerates include/resd_net.h via cbindgen build.rs
+cargo test -p dpdk-net
+cargo build -p dpdk-net                      # regenerates include/dpdk_net.h via cbindgen build.rs
 ```
 
-Verify the regenerated `include/resd_net.h` shows the new doc comment on `enqueued_ts_ns`. If the header has not changed, the cbindgen invocation may be cached — check the `build.rs` side and force a rebuild.
+Verify the regenerated `include/dpdk_net.h` shows the new doc comment on `enqueued_ts_ns`. If the header has not changed, the cbindgen invocation may be cached — check the `build.rs` side and force a rebuild.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/resd-net/src/lib.rs crates/resd-net/src/api.rs include/resd_net.h
-git commit -m "a5.5 task 2: resd_net_poll reads emitted_ts_ns through at drain
+git add crates/dpdk-net/src/lib.rs crates/dpdk-net/src/api.rs include/dpdk_net.h
+git commit -m "a5.5 task 2: dpdk_net_poll reads emitted_ts_ns through at drain
 
-resd_net_event_t::enqueued_ts_ns now reports the engine-internal
+dpdk_net_event_t::enqueued_ts_ns now reports the engine-internal
 emission time (sampled at push) instead of the drain-call time.
 Field name unchanged; doc comment updated. Closes spec §3.1."
 ```
@@ -393,8 +393,8 @@ Field name unchanged; doc comment updated. Closes spec §3.1."
 ## Task 3: `EventQueue` soft-cap + drop-oldest + counter wiring
 
 **Files:**
-- Modify: `crates/resd-net-core/src/tcp_events.rs` — `EventQueue` grows `soft_cap`, `with_cap(cap)` constructor, `push(&mut self, ev, counters: &EngineCounters)` takes counters reference
-- Modify: `crates/resd-net-core/src/engine.rs` — engine construction passes `soft_cap` to `EventQueue::with_cap`; every push site passes `&self.counters`
+- Modify: `crates/dpdk-net-core/src/tcp_events.rs` — `EventQueue` grows `soft_cap`, `with_cap(cap)` constructor, `push(&mut self, ev, counters: &EngineCounters)` takes counters reference
+- Modify: `crates/dpdk-net-core/src/engine.rs` — engine construction passes `soft_cap` to `EventQueue::with_cap`; every push site passes `&self.counters`
 
 **Context:** Spec §3.2. The queue is currently unbounded `VecDeque` with a starting capacity of 64. A5.5 adds a soft cap (default 4096, min 64 enforced at `engine_create`) + drop-oldest on overflow + two counters (`obs.events_dropped`, `obs.events_queue_high_water`). Task 4 adds the counters themselves; Task 5 wires the engine-config field. This task adds the `EventQueue` mechanism, temporarily referencing the counters via a feature flag or placeholder struct until Task 4 lands them — or sequence so Task 4 lands first. Plan order: do Task 4 first, then this task. Reorder if needed.
 
@@ -406,9 +406,9 @@ Field name unchanged; doc comment updated. Closes spec §3.1."
 // tests/tcp_a5_5_observability.rs — extend test module
 #[test]
 fn event_queue_overflow_drops_oldest_preserves_newest() {
-    use resd_net_core::counters::EngineCounters;
-    use resd_net_core::flow_table::ConnHandle;
-    use resd_net_core::tcp_events::{EventQueue, InternalEvent};
+    use dpdk_net_core::counters::EngineCounters;
+    use dpdk_net_core::flow_table::ConnHandle;
+    use dpdk_net_core::tcp_events::{EventQueue, InternalEvent};
     use std::sync::atomic::Ordering;
 
     let counters = EngineCounters::new();
@@ -442,7 +442,7 @@ fn event_queue_overflow_drops_oldest_preserves_newest() {
 
 #[test]
 fn event_queue_with_cap_rejects_below_64() {
-    use resd_net_core::tcp_events::EventQueue;
+    use dpdk_net_core::tcp_events::EventQueue;
     let result = std::panic::catch_unwind(|| EventQueue::with_cap(32));
     assert!(result.is_err(), "with_cap(<64) should panic or return Err");
 }
@@ -450,12 +450,12 @@ fn event_queue_with_cap_rejects_below_64() {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p resd-net-core --test tcp_a5_5_observability event_queue_overflow`
+Run: `cargo test -p dpdk-net-core --test tcp_a5_5_observability event_queue_overflow`
 Expected: compile error on `with_cap`, `counters` as second arg, or both.
 
 - [ ] **Step 3: Rewrite `EventQueue`**
 
-In `crates/resd-net-core/src/tcp_events.rs`:
+In `crates/dpdk-net-core/src/tcp_events.rs`:
 
 ```rust
 use std::sync::atomic::Ordering;
@@ -553,13 +553,13 @@ Grep `push(InternalEvent::` across the workspace to catch every site. Update the
 
 - [ ] **Step 5: Run tests**
 
-Run: `cargo test -p resd-net-core`
+Run: `cargo test -p dpdk-net-core`
 Expected: new queue tests pass; existing tests (which use the default cap of 4096) pass unchanged.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/resd-net-core/src/tcp_events.rs crates/resd-net-core/src/engine.rs
+git add crates/dpdk-net-core/src/tcp_events.rs crates/dpdk-net-core/src/engine.rs
 git commit -m "a5.5 task 3: EventQueue soft-cap + drop-oldest + counter wiring
 
 EventQueue grows soft_cap + with_cap constructor. push() now takes
@@ -572,8 +572,8 @@ into obs.events_queue_high_water. Closes spec §3.2."
 ## Task 4: `counters.rs` — new `obs` group with `events_dropped` + `events_queue_high_water`
 
 **Files:**
-- Modify: `crates/resd-net-core/src/counters.rs` — new `ObsCounters` struct, `EngineCounters` gains `obs: ObsCounters`
-- Modify: `crates/resd-net/src/api.rs` — `resd_net_counters_t` gains `obs_events_dropped`, `obs_events_queue_high_water`
+- Modify: `crates/dpdk-net-core/src/counters.rs` — new `ObsCounters` struct, `EngineCounters` gains `obs: ObsCounters`
+- Modify: `crates/dpdk-net/src/api.rs` — `dpdk_net_counters_t` gains `obs_events_dropped`, `obs_events_queue_high_water`
 
 **Context:** Spec §4, §5.4. A new `obs` group (short for "observability") for engine-internal observability counters distinct from the existing packet-path groups (`poll`/`eth`/`ip`/`tcp`). Both fields are `AtomicU64`, slow-path (Task 3 increments only when queue pressure exists). Per `feedback_counter_policy.md`: slow-path is the default; no hot-path additions here.
 
@@ -582,7 +582,7 @@ into obs.events_queue_high_water. Closes spec §3.2."
 - [ ] **Step 1: Write failing test**
 
 ```rust
-// crates/resd-net-core/src/counters.rs — inline test
+// crates/dpdk-net-core/src/counters.rs — inline test
 #[cfg(test)]
 mod a5_5_tests {
     use super::*;
@@ -599,12 +599,12 @@ mod a5_5_tests {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p resd-net-core counters::a5_5_tests::engine_counters_has_obs_group_zero_initialized`
+Run: `cargo test -p dpdk-net-core counters::a5_5_tests::engine_counters_has_obs_group_zero_initialized`
 Expected: compile error `no field 'obs' on struct EngineCounters`.
 
 - [ ] **Step 3: Add `ObsCounters` struct and the `obs` field on `EngineCounters`**
 
-In `crates/resd-net-core/src/counters.rs`:
+In `crates/dpdk-net-core/src/counters.rs`:
 
 ```rust
 /// Engine-internal observability counters (A5.5).
@@ -644,13 +644,13 @@ impl EngineCounters {
 }
 ```
 
-- [ ] **Step 4: Mirror the new fields into the C ABI `resd_net_counters_t`**
+- [ ] **Step 4: Mirror the new fields into the C ABI `dpdk_net_counters_t`**
 
-In `crates/resd-net/src/api.rs` find the `resd_net_counters_t` struct. Append (do not insert mid-struct — C ABI stability):
+In `crates/dpdk-net/src/api.rs` find the `dpdk_net_counters_t` struct. Append (do not insert mid-struct — C ABI stability):
 
 ```rust
 #[repr(C)]
-pub struct resd_net_counters_t {
+pub struct dpdk_net_counters_t {
     // … all existing fields unchanged …
 
     // A5.5: observability counters (obs group, slow-path)
@@ -659,40 +659,40 @@ pub struct resd_net_counters_t {
 }
 ```
 
-Update the `resd_net_counters_get` implementation in `crates/resd-net/src/lib.rs` to populate the two new fields from `engine.counters.obs.events_dropped.load(Relaxed)` and `.events_queue_high_water.load(Relaxed)`.
+Update the `dpdk_net_counters_get` implementation in `crates/dpdk-net/src/lib.rs` to populate the two new fields from `engine.counters.obs.events_dropped.load(Relaxed)` and `.events_queue_high_water.load(Relaxed)`.
 
 - [ ] **Step 5: Run tests + regen header**
 
 ```bash
-cargo test -p resd-net-core counters
-cargo build -p resd-net
+cargo test -p dpdk-net-core counters
+cargo build -p dpdk-net
 ```
 
-Confirm `include/resd_net.h` shows the two new fields appended to `resd_net_counters_t`.
+Confirm `include/dpdk_net.h` shows the two new fields appended to `dpdk_net_counters_t`.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/resd-net-core/src/counters.rs crates/resd-net/src/api.rs crates/resd-net/src/lib.rs include/resd_net.h
+git add crates/dpdk-net-core/src/counters.rs crates/dpdk-net/src/api.rs crates/dpdk-net/src/lib.rs include/dpdk_net.h
 git commit -m "a5.5 task 4: counters.rs obs group + events_dropped/high_water
 
 New ObsCounters group carrying events_dropped (count of events
 discarded from the FIFO due to soft-cap overflow) and
 events_queue_high_water (latched max observed depth). Mirrored
-into resd_net_counters_t as appended fields; no layout churn on
+into dpdk_net_counters_t as appended fields; no layout churn on
 existing fields."
 ```
 
 ---
 
-## Task 5: `resd_net_engine_config_t::event_queue_soft_cap`
+## Task 5: `dpdk_net_engine_config_t::event_queue_soft_cap`
 
 **Files:**
-- Modify: `crates/resd-net/src/api.rs` — `resd_net_engine_config_t` gains `event_queue_soft_cap: u32`
-- Modify: `crates/resd-net/src/lib.rs` — `resd_net_engine_create` validates `event_queue_soft_cap >= 64`; passes through to core
-- Modify: `crates/resd-net-core/src/engine.rs` — `EngineConfig` mirrors the field; `Engine::new` calls `EventQueue::with_cap(cfg.event_queue_soft_cap as usize)`
+- Modify: `crates/dpdk-net/src/api.rs` — `dpdk_net_engine_config_t` gains `event_queue_soft_cap: u32`
+- Modify: `crates/dpdk-net/src/lib.rs` — `dpdk_net_engine_create` validates `event_queue_soft_cap >= 64`; passes through to core
+- Modify: `crates/dpdk-net-core/src/engine.rs` — `EngineConfig` mirrors the field; `Engine::new` calls `EventQueue::with_cap(cfg.event_queue_soft_cap as usize)`
 
-**Context:** Spec §5.1. Field default is 4096; min is 64. Below-64 is rejected with `-EINVAL` at `resd_net_engine_create` entry. Values above `u32::MAX` are not a concern since `u32` is the ABI type.
+**Context:** Spec §5.1. Field default is 4096; min is 64. Below-64 is rejected with `-EINVAL` at `dpdk_net_engine_create` entry. Values above `u32::MAX` are not a concern since `u32` is the ABI type.
 
 - [ ] **Step 1: Write failing test**
 
@@ -702,7 +702,7 @@ existing fields."
 fn engine_create_rejects_event_queue_soft_cap_below_64() {
     let mut cfg = make_minimal_engine_config();
     cfg.event_queue_soft_cap = 32;
-    let rc = unsafe { resd_net::resd_net_engine_create(&cfg, std::ptr::null_mut()) };
+    let rc = unsafe { dpdk_net::dpdk_net_engine_create(&cfg, std::ptr::null_mut()) };
     assert_eq!(rc, -libc::EINVAL);
 }
 
@@ -710,11 +710,11 @@ fn engine_create_rejects_event_queue_soft_cap_below_64() {
 fn engine_create_accepts_event_queue_soft_cap_default() {
     let mut cfg = make_minimal_engine_config();
     cfg.event_queue_soft_cap = 4096;
-    let mut out_engine: *mut resd_net::resd_net_engine = std::ptr::null_mut();
-    let rc = unsafe { resd_net::resd_net_engine_create(&cfg, &mut out_engine) };
+    let mut out_engine: *mut dpdk_net::dpdk_net_engine = std::ptr::null_mut();
+    let rc = unsafe { dpdk_net::dpdk_net_engine_create(&cfg, &mut out_engine) };
     assert_eq!(rc, 0);
     assert!(!out_engine.is_null());
-    unsafe { resd_net::resd_net_engine_destroy(out_engine) };
+    unsafe { dpdk_net::dpdk_net_engine_destroy(out_engine) };
 }
 ```
 
@@ -722,16 +722,16 @@ Where `make_minimal_engine_config()` is a test helper that fills every pre-A5.5 
 
 - [ ] **Step 2: Run tests**
 
-Run: `cargo test -p resd-net-core --test tcp_a5_5_observability engine_create_rejects`
+Run: `cargo test -p dpdk-net-core --test tcp_a5_5_observability engine_create_rejects`
 Expected: compile error on `cfg.event_queue_soft_cap`.
 
 - [ ] **Step 3: Add the field on both sides of the ABI boundary**
 
-In `crates/resd-net/src/api.rs`, append to `resd_net_engine_config_t`:
+In `crates/dpdk-net/src/api.rs`, append to `dpdk_net_engine_config_t`:
 
 ```rust
 #[repr(C)]
-pub struct resd_net_engine_config_t {
+pub struct dpdk_net_engine_config_t {
     // … existing fields …
     pub garp_interval_sec: u32,
     // A5.5: event-queue overflow guard (§3.2 / §5.1).
@@ -740,7 +740,7 @@ pub struct resd_net_engine_config_t {
 }
 ```
 
-In `crates/resd-net-core/src/engine.rs` `EngineConfig` struct (the Rust-internal mirror), add:
+In `crates/dpdk-net-core/src/engine.rs` `EngineConfig` struct (the Rust-internal mirror), add:
 
 ```rust
 pub struct EngineConfig {
@@ -751,13 +751,13 @@ pub struct EngineConfig {
 
 Default: `4096` if constructed via a convenience constructor. Any Rust-side default impl should reflect 4096.
 
-In `crates/resd-net/src/lib.rs` `resd_net_engine_create`:
+In `crates/dpdk-net/src/lib.rs` `dpdk_net_engine_create`:
 
 ```rust
 #[no_mangle]
-pub unsafe extern "C" fn resd_net_engine_create(
-    cfg: *const resd_net_engine_config_t,
-    out_engine: *mut *mut resd_net_engine,
+pub unsafe extern "C" fn dpdk_net_engine_create(
+    cfg: *const dpdk_net_engine_config_t,
+    out_engine: *mut *mut dpdk_net_engine,
 ) -> i32 {
     if cfg.is_null() || out_engine.is_null() {
         return -libc::EINVAL;
@@ -774,27 +774,27 @@ pub unsafe extern "C" fn resd_net_engine_create(
 
 - [ ] **Step 4: Wire `EventQueue::with_cap` in `Engine::new`**
 
-In the `Engine::new` constructor (file `crates/resd-net-core/src/engine.rs`), replace the existing `EventQueue::new()` (or `::default()`) with `EventQueue::with_cap(cfg.event_queue_soft_cap as usize)`.
+In the `Engine::new` constructor (file `crates/dpdk-net-core/src/engine.rs`), replace the existing `EventQueue::new()` (or `::default()`) with `EventQueue::with_cap(cfg.event_queue_soft_cap as usize)`.
 
 - [ ] **Step 5: Update `examples/cpp-consumer/main.cpp` + cbindgen header regen**
 
 In `examples/cpp-consumer/main.cpp` set `cfg.event_queue_soft_cap = 4096;` alongside the existing config fields. Regenerate the header:
 
 ```bash
-cargo build -p resd-net
+cargo build -p dpdk-net
 ```
 
-Verify `include/resd_net.h` shows `event_queue_soft_cap` appended to `resd_net_engine_config_t`.
+Verify `include/dpdk_net.h` shows `event_queue_soft_cap` appended to `dpdk_net_engine_config_t`.
 
 - [ ] **Step 6: Run tests**
 
-Run: `cargo test -p resd-net-core -p resd-net`
+Run: `cargo test -p dpdk-net-core -p dpdk-net`
 Expected: both new tests pass; all existing tests pass.
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add crates/resd-net/src/api.rs crates/resd-net/src/lib.rs crates/resd-net-core/src/engine.rs include/resd_net.h examples/cpp-consumer/main.cpp
+git add crates/dpdk-net/src/api.rs crates/dpdk-net/src/lib.rs crates/dpdk-net-core/src/engine.rs include/dpdk_net.h examples/cpp-consumer/main.cpp
 git commit -m "a5.5 task 5: engine_config event_queue_soft_cap + validation
 
 Exposes the Task 3 soft-cap as a cbindgen-visible field. Default
@@ -807,15 +807,15 @@ sets the field explicitly."
 ## Task 6: `TcpConn::stats` + `ConnStats` struct + `flow_table::get_stats`
 
 **Files:**
-- Modify: `crates/resd-net-core/src/tcp_conn.rs` — add `ConnStats` `#[repr(C)]` POD + `TcpConn::stats(&self) -> ConnStats`
-- Modify: `crates/resd-net-core/src/flow_table.rs` — add `get_stats(&self, handle: ConnHandle) -> Option<ConnStats>`
+- Modify: `crates/dpdk-net-core/src/tcp_conn.rs` — add `ConnStats` `#[repr(C)]` POD + `TcpConn::stats(&self) -> ConnStats`
+- Modify: `crates/dpdk-net-core/src/flow_table.rs` — add `get_stats(&self, handle: ConnHandle) -> Option<ConnStats>`
 
 **Context:** Spec §3.3. Pure projection over existing internal state. Fields: 5 send-path (`snd_una`, `snd_nxt`, `snd_wnd`, `send_buf_bytes_pending`, `send_buf_bytes_free`) + 4 RTT/RTO (`srtt_us`, `rttvar_us`, `min_rtt_us`, `rto_us`). `rtt_est.srtt_us()` returns `Option<u32>` — map `None → 0`. Pre-first-sample values: srtt/rttvar/min_rtt = 0; rto = `rtt_est.rto_us()` which itself starts at `tcp_initial_rto_us`.
 
 - [ ] **Step 1: Write failing unit tests**
 
 ```rust
-// crates/resd-net-core/src/tcp_conn.rs — inline test
+// crates/dpdk-net-core/src/tcp_conn.rs — inline test
 #[cfg(test)]
 mod a5_5_stats_tests {
     use super::*;
@@ -857,12 +857,12 @@ mod a5_5_stats_tests {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p resd-net-core tcp_conn::a5_5_stats_tests`
+Run: `cargo test -p dpdk-net-core tcp_conn::a5_5_stats_tests`
 Expected: compile error on `c.stats(...)` — method does not exist.
 
 - [ ] **Step 3: Add the `ConnStats` struct and the `stats()` method**
 
-In `crates/resd-net-core/src/tcp_conn.rs`:
+In `crates/dpdk-net-core/src/tcp_conn.rs`:
 
 ```rust
 /// Per-connection observable state snapshot (A5.5). Pure projection.
@@ -889,7 +889,7 @@ pub struct ConnStats {
 
 impl TcpConn {
     /// Slow-path snapshot for forensics / per-order tagging. Called
-    /// from the app via `resd_net_conn_stats`; not on any hot path.
+    /// from the app via `dpdk_net_conn_stats`; not on any hot path.
     pub fn stats(&self, send_buffer_bytes: u32) -> ConnStats {
         let pending = self.snd.pending.len() as u32;
         ConnStats {
@@ -911,7 +911,7 @@ Note: `send_buffer_bytes` is an engine-level config, not a `TcpConn` field — t
 
 - [ ] **Step 4: Add `flow_table::get_stats`**
 
-In `crates/resd-net-core/src/flow_table.rs`:
+In `crates/dpdk-net-core/src/flow_table.rs`:
 
 ```rust
 impl FlowTable {
@@ -924,13 +924,13 @@ impl FlowTable {
 
 - [ ] **Step 5: Run tests**
 
-Run: `cargo test -p resd-net-core tcp_conn flow_table`
+Run: `cargo test -p dpdk-net-core tcp_conn flow_table`
 Expected: new tests pass; existing tests unchanged.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/resd-net-core/src/tcp_conn.rs crates/resd-net-core/src/flow_table.rs
+git add crates/dpdk-net-core/src/tcp_conn.rs crates/dpdk-net-core/src/flow_table.rs
 git commit -m "a5.5 task 6: TcpConn::stats + ConnStats POD + flow_table::get_stats
 
 Adds a 9-field POD snapshot (5 send-path + 4 RTT/RTO) as a pure
@@ -940,12 +940,12 @@ RTT fields are zero and rto_us reports tcp_initial_rto_us."
 
 ---
 
-## Task 7: `resd_net_conn_stats` extern "C" + `resd_net_conn_stats_t` header struct + integration tests
+## Task 7: `dpdk_net_conn_stats` extern "C" + `dpdk_net_conn_stats_t` header struct + integration tests
 
 **Files:**
-- Modify: `crates/resd-net/src/api.rs` — new `resd_net_conn_stats_t` POD
-- Modify: `crates/resd-net/src/lib.rs` — new `resd_net_conn_stats` extern
-- Create (extend): `crates/resd-net-core/tests/tcp_a5_5_observability.rs` — integration tests 7.2.3 through 7.2.6
+- Modify: `crates/dpdk-net/src/api.rs` — new `dpdk_net_conn_stats_t` POD
+- Modify: `crates/dpdk-net/src/lib.rs` — new `dpdk_net_conn_stats` extern
+- Create (extend): `crates/dpdk-net-core/tests/tcp_a5_5_observability.rs` — integration tests 7.2.3 through 7.2.6
 
 **Context:** Spec §5.3, §7.2.3–7.2.6. Layer the C ABI on top of Task 6. Validation: `-EINVAL` on null engine or out; `-ENOENT` on unknown handle; `0` on success.
 
@@ -954,11 +954,11 @@ RTT fields are zero and rto_us reports tcp_initial_rto_us."
 ```rust
 // tests/tcp_a5_5_observability.rs — extend
 #[test]
-fn resd_net_conn_stats_returns_enoent_on_stale_handle() {
+fn dpdk_net_conn_stats_returns_enoent_on_stale_handle() {
     let e = make_test_engine_with_tap();
-    let mut out = unsafe { std::mem::zeroed::<resd_net::api::resd_net_conn_stats_t>() };
+    let mut out = unsafe { std::mem::zeroed::<dpdk_net::api::dpdk_net_conn_stats_t>() };
     let rc = unsafe {
-        resd_net::resd_net_conn_stats(
+        dpdk_net::dpdk_net_conn_stats(
             e.as_engine_ptr(),
             0xdead_beef_dead_beef,  // never-allocated handle
             &mut out,
@@ -968,12 +968,12 @@ fn resd_net_conn_stats_returns_enoent_on_stale_handle() {
 }
 
 #[test]
-fn resd_net_conn_stats_reports_pre_sample_rto_initial() {
+fn dpdk_net_conn_stats_reports_pre_sample_rto_initial() {
     // Just after a fresh connection: stats.rto_us == tcp_initial_rto_us.
     let mut e = make_test_engine_with_tap();
     let handle = e.connect_test_peer_and_wait_established();
-    let mut out = unsafe { std::mem::zeroed::<resd_net::api::resd_net_conn_stats_t>() };
-    let rc = unsafe { resd_net::resd_net_conn_stats(e.as_engine_ptr(), handle, &mut out) };
+    let mut out = unsafe { std::mem::zeroed::<dpdk_net::api::dpdk_net_conn_stats_t>() };
+    let rc = unsafe { dpdk_net::dpdk_net_conn_stats(e.as_engine_ptr(), handle, &mut out) };
     assert_eq!(rc, 0);
     // Before Task 13 lands, SRTT is None at this point → rto_us = tcp_initial_rto_us.
     // After Task 13 (SYN-seed), srtt_us > 0 and rto_us reflects the seeded srtt.
@@ -983,20 +983,20 @@ fn resd_net_conn_stats_reports_pre_sample_rto_initial() {
 }
 
 #[test]
-fn resd_net_conn_stats_reports_send_buf_pending_under_backpressure() {
+fn dpdk_net_conn_stats_reports_send_buf_pending_under_backpressure() {
     let mut e = make_test_engine_with_tap_small_rwnd();   // peer rwnd=32
     let handle = e.connect_test_peer_and_wait_established();
     // Send 4 KiB; only 32 bytes will fit in peer rwnd.
     let _ = unsafe {
-        resd_net::resd_net_send(
+        dpdk_net::dpdk_net_send(
             e.as_engine_ptr(),
             handle,
             std::ptr::null(),    // buf placeholder; use helper
             4096,
         )
     };
-    let mut out = unsafe { std::mem::zeroed::<resd_net::api::resd_net_conn_stats_t>() };
-    let _ = unsafe { resd_net::resd_net_conn_stats(e.as_engine_ptr(), handle, &mut out) };
+    let mut out = unsafe { std::mem::zeroed::<dpdk_net::api::dpdk_net_conn_stats_t>() };
+    let _ = unsafe { dpdk_net::dpdk_net_conn_stats(e.as_engine_ptr(), handle, &mut out) };
     assert!(out.send_buf_bytes_pending > 0);
     assert!(out.snd_wnd <= 32);
 }
@@ -1004,17 +1004,17 @@ fn resd_net_conn_stats_reports_send_buf_pending_under_backpressure() {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p resd-net-core --test tcp_a5_5_observability resd_net_conn_stats`
-Expected: compile error — symbol `resd_net_conn_stats` not found.
+Run: `cargo test -p dpdk-net-core --test tcp_a5_5_observability dpdk_net_conn_stats`
+Expected: compile error — symbol `dpdk_net_conn_stats` not found.
 
 - [ ] **Step 3: Add the ABI struct + extern**
 
-In `crates/resd-net/src/api.rs`:
+In `crates/dpdk-net/src/api.rs`:
 
 ```rust
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
-pub struct resd_net_conn_stats_t {
+pub struct dpdk_net_conn_stats_t {
     // Send-path state.
     pub snd_una: u32,
     pub snd_nxt: u32,
@@ -1035,7 +1035,7 @@ pub struct resd_net_conn_stats_t {
 }
 ```
 
-In `crates/resd-net/src/lib.rs`:
+In `crates/dpdk-net/src/lib.rs`:
 
 ```rust
 /// Slow-path snapshot of the connection's send-path + RTT estimator state.
@@ -1046,10 +1046,10 @@ In `crates/resd-net/src/lib.rs`:
 ///   -EINVAL     engine or out is NULL.
 ///   -ENOENT     conn is not a live handle in the flow table.
 #[no_mangle]
-pub unsafe extern "C" fn resd_net_conn_stats(
-    engine: *mut resd_net_engine,
+pub unsafe extern "C" fn dpdk_net_conn_stats(
+    engine: *mut dpdk_net_engine,
     conn: u64,
-    out: *mut resd_net_conn_stats_t,
+    out: *mut dpdk_net_conn_stats_t,
 ) -> i32 {
     if engine.is_null() || out.is_null() {
         return -libc::EINVAL;
@@ -1081,14 +1081,14 @@ Note: `ConnHandle(conn as u32)` — confirm the A5 handle encoding. If `ConnHand
 - [ ] **Step 4: Regenerate the C header and update the cpp-consumer**
 
 ```bash
-cargo build -p resd-net
+cargo build -p dpdk-net
 ```
 
-Verify `include/resd_net.h` shows `resd_net_conn_stats_t` POD + `resd_net_conn_stats` function declaration. In `examples/cpp-consumer/main.cpp`, add a demo call after the first send-and-ACK round:
+Verify `include/dpdk_net.h` shows `dpdk_net_conn_stats_t` POD + `dpdk_net_conn_stats` function declaration. In `examples/cpp-consumer/main.cpp`, add a demo call after the first send-and-ACK round:
 
 ```cpp
-resd_net_conn_stats_t pre;
-if (resd_net_conn_stats(engine, conn, &pre) == 0) {
+dpdk_net_conn_stats_t pre;
+if (dpdk_net_conn_stats(engine, conn, &pre) == 0) {
     printf("stats: snd_nxt=%u srtt_us=%u rto_us=%u\n",
            pre.snd_nxt, pre.srtt_us, pre.rto_us);
 }
@@ -1096,14 +1096,14 @@ if (resd_net_conn_stats(engine, conn, &pre) == 0) {
 
 - [ ] **Step 5: Run integration tests**
 
-Run: `cargo test -p resd-net-core --test tcp_a5_5_observability`
+Run: `cargo test -p dpdk-net-core --test tcp_a5_5_observability`
 Expected: all three new tests pass.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/resd-net/src/api.rs crates/resd-net/src/lib.rs include/resd_net.h examples/cpp-consumer/main.cpp crates/resd-net-core/tests/tcp_a5_5_observability.rs
-git commit -m "a5.5 task 7: resd_net_conn_stats extern + resd_net_conn_stats_t
+git add crates/dpdk-net/src/api.rs crates/dpdk-net/src/lib.rs include/dpdk_net.h examples/cpp-consumer/main.cpp crates/dpdk-net-core/tests/tcp_a5_5_observability.rs
+git commit -m "a5.5 task 7: dpdk_net_conn_stats extern + dpdk_net_conn_stats_t
 
 C ABI for Task 6's ConnStats projection. -EINVAL on null args,
 -ENOENT on unknown handle, 0 on success. Cpp-consumer demo
@@ -1115,7 +1115,7 @@ prints the projection after the first ACK."
 ## Task 8: Integration tests for emission-time + queue overflow
 
 **Files:**
-- Modify: `crates/resd-net-core/tests/tcp_a5_5_observability.rs` — add integration tests 7.2.1 (emission-time correctness) + 7.2.2 (queue overflow)
+- Modify: `crates/dpdk-net-core/tests/tcp_a5_5_observability.rs` — add integration tests 7.2.1 (emission-time correctness) + 7.2.2 (queue overflow)
 
 **Context:** Spec §7.2.1, §7.2.2. These need a TAP-pair harness that can inject delay between event emission and app poll, plus a way to produce event pressure without polling. Reuse the A3/A4 TAP harness patterns.
 
@@ -1133,7 +1133,7 @@ fn enqueued_ts_ns_reflects_emission_not_drain() {
     let ts_at_send = e.tap_send_and_sample_ts(handle, b"data");
     e.advance_clock_by_ns(50_000);   // 50 µs of "poll lag"
     let events = e.poll_drain();
-    let readable = events.iter().find(|e| e.kind == RESD_NET_EVT_READABLE).unwrap();
+    let readable = events.iter().find(|e| e.kind == DPDK_NET_EVT_READABLE).unwrap();
     // Allow ≤ a few hundred ns of TSC jitter.
     let delta = readable.enqueued_ts_ns.abs_diff(ts_at_send);
     assert!(delta < 1_000, "enqueued_ts_ns {} too far from emission ts {}", readable.enqueued_ts_ns, ts_at_send);
@@ -1165,7 +1165,7 @@ fn queue_overflow_drops_oldest_and_counts_loss() {
 
 - [ ] **Step 2: Run — expected PASS (no new stack changes; this task only writes tests that validate tasks 1-7)**
 
-Run: `cargo test -p resd-net-core --test tcp_a5_5_observability`
+Run: `cargo test -p dpdk-net-core --test tcp_a5_5_observability`
 Expected: both new tests pass on first run (tasks 1-7 already wired the machinery).
 
 If a test fails, fix the actual stack bug — do not "fix the test." Common culprits: missed push site in Task 1; wrong counter group access in Task 3; off-by-one in drop-oldest loop.
@@ -1173,7 +1173,7 @@ If a test fails, fix the actual stack bug — do not "fix the test." Common culp
 - [ ] **Step 3: Commit**
 
 ```bash
-git add crates/resd-net-core/tests/tcp_a5_5_observability.rs
+git add crates/dpdk-net-core/tests/tcp_a5_5_observability.rs
 git commit -m "a5.5 task 8: integration tests 7.2.1-7.2.2
 
 emission-time ts skew collapses to TSC resolution; overflow drops
@@ -1185,7 +1185,7 @@ oldest and counts via obs.events_dropped/high_water."
 ## Task 9: `TlpConfig` + `pto_us` signature migration
 
 **Files:**
-- Modify: `crates/resd-net-core/src/tcp_tlp.rs` — new `TlpConfig` POD; `pto_us` signature becomes `(srtt_us, &TlpConfig, flight_size) → u32`
+- Modify: `crates/dpdk-net-core/src/tcp_tlp.rs` — new `TlpConfig` POD; `pto_us` signature becomes `(srtt_us, &TlpConfig, flight_size) → u32`
 
 **Context:** Spec §3.4. Extract the three tunable pieces of the PTO formula into a config struct. Keep A5's existing behavior under `TlpConfig::default()` so all A5 unit tests pass unchanged.
 
@@ -1194,7 +1194,7 @@ A5's current formula: `pto_us(srtt, min_rto) = max(2 * srtt, min_rto)` — no Fl
 - [ ] **Step 1: Write failing tests for the new formula**
 
 ```rust
-// crates/resd-net-core/src/tcp_tlp.rs — inline tests block extension
+// crates/dpdk-net-core/src/tcp_tlp.rs — inline tests block extension
 #[cfg(test)]
 mod a5_5_tests {
     use super::*;
@@ -1257,7 +1257,7 @@ mod a5_5_tests {
 
 - [ ] **Step 2: Run tests — expect compile error**
 
-Run: `cargo test -p resd-net-core tcp_tlp::a5_5_tests`
+Run: `cargo test -p dpdk-net-core tcp_tlp::a5_5_tests`
 Expected: compile error — `TlpConfig` type and new `pto_us` signature do not exist yet.
 
 - [ ] **Step 3: Extend `tcp_tlp.rs` with `TlpConfig` and the new `pto_us`**
@@ -1346,7 +1346,7 @@ This keeps A5's RFC 8985 default behavior intact: `TlpConfig::a5_compat(min_rto)
 If `snd_retrans.flight_size()` does not exist, add it as a small helper:
 
 ```rust
-// crates/resd-net-core/src/tcp_retrans.rs
+// crates/dpdk-net-core/src/tcp_retrans.rs
 impl SendRetrans {
     /// FlightSize per RFC 8985 §7 — count of unacked, unsacked segments.
     pub fn flight_size(&self) -> usize {
@@ -1357,13 +1357,13 @@ impl SendRetrans {
 
 - [ ] **Step 5: Run all tests**
 
-Run: `cargo test -p resd-net-core`
+Run: `cargo test -p dpdk-net-core`
 Expected: all A5 tests pass (`TlpConfig::default` preserves behavior for srtt ≥ min_rto); all 5 new A5.5 tests pass.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/resd-net-core/src/tcp_tlp.rs crates/resd-net-core/src/engine.rs crates/resd-net-core/src/tcp_retrans.rs
+git add crates/dpdk-net-core/src/tcp_tlp.rs crates/dpdk-net-core/src/engine.rs crates/dpdk-net-core/src/tcp_retrans.rs
 git commit -m "a5.5 task 9: TlpConfig + pto_us(srtt, &cfg, flight_size)
 
 Extends the PTO formula with (a) configurable floor, (b)
@@ -1374,15 +1374,15 @@ preserves RFC 8985 behavior; all A5 tests green."
 
 ---
 
-## Task 10: `resd_net_connect_opts_t` — 5 TLP tuning fields + validation
+## Task 10: `dpdk_net_connect_opts_t` — 5 TLP tuning fields + validation
 
 **Files:**
-- Modify: `crates/resd-net/src/api.rs` — extend `resd_net_connect_opts_t`
-- Modify: `crates/resd-net/src/lib.rs` — `resd_net_connect` validates the 5 new fields
-- Modify: `crates/resd-net-core/src/tcp_conn.rs` — `TcpConn` mirrors the 5 fields + 4 runtime state fields
-- Modify: `crates/resd-net-core/src/engine.rs` — `ConnectOpts` mirrors; projection into `TlpConfig`
+- Modify: `crates/dpdk-net/src/api.rs` — extend `dpdk_net_connect_opts_t`
+- Modify: `crates/dpdk-net/src/lib.rs` — `dpdk_net_connect` validates the 5 new fields
+- Modify: `crates/dpdk-net-core/src/tcp_conn.rs` — `TcpConn` mirrors the 5 fields + 4 runtime state fields
+- Modify: `crates/dpdk-net-core/src/engine.rs` — `ConnectOpts` mirrors; projection into `TlpConfig`
 
-**Context:** Spec §5.5. All 5 fields default to behavior-preserving values. Invalid combinations rejected with `-EINVAL` at `resd_net_connect` entry:
+**Context:** Spec §5.5. All 5 fields default to behavior-preserving values. Invalid combinations rejected with `-EINVAL` at `dpdk_net_connect` entry:
 - `tlp_pto_srtt_multiplier_x100 < 100 OR > 200`
 - `tlp_max_consecutive_probes == 0 OR > 5`
 - `tlp_pto_min_floor_us > cfg.tcp_max_rto_us`
@@ -1402,7 +1402,7 @@ fn connect_rejects_tlp_multiplier_below_100() {
     let mut opts = make_minimal_connect_opts();
     opts.tlp_pto_srtt_multiplier_x100 = 50;
     let rc = unsafe {
-        resd_net::resd_net_connect(e.as_engine_ptr(), &opts, std::ptr::null_mut())
+        dpdk_net::dpdk_net_connect(e.as_engine_ptr(), &opts, std::ptr::null_mut())
     };
     assert_eq!(rc, -libc::EINVAL);
 }
@@ -1413,7 +1413,7 @@ fn connect_rejects_tlp_multiplier_above_200() {
     let mut opts = make_minimal_connect_opts();
     opts.tlp_pto_srtt_multiplier_x100 = 250;
     let rc = unsafe {
-        resd_net::resd_net_connect(e.as_engine_ptr(), &opts, std::ptr::null_mut())
+        dpdk_net::dpdk_net_connect(e.as_engine_ptr(), &opts, std::ptr::null_mut())
     };
     assert_eq!(rc, -libc::EINVAL);
 }
@@ -1425,7 +1425,7 @@ fn connect_rejects_tlp_max_consecutive_probes_zero_or_above_5() {
         let mut opts = make_minimal_connect_opts();
         opts.tlp_max_consecutive_probes = bad;
         let rc = unsafe {
-            resd_net::resd_net_connect(e.as_engine_ptr(), &opts, std::ptr::null_mut())
+            dpdk_net::dpdk_net_connect(e.as_engine_ptr(), &opts, std::ptr::null_mut())
         };
         assert_eq!(rc, -libc::EINVAL, "tlp_max_consecutive_probes={} should be rejected", bad);
     }
@@ -1437,7 +1437,7 @@ fn connect_rejects_tlp_pto_floor_above_max_rto() {
     let mut opts = make_minimal_connect_opts();
     opts.tlp_pto_min_floor_us = 2_000_000;   // 2s > 1s
     let rc = unsafe {
-        resd_net::resd_net_connect(e.as_engine_ptr(), &opts, std::ptr::null_mut())
+        dpdk_net::dpdk_net_connect(e.as_engine_ptr(), &opts, std::ptr::null_mut())
     };
     assert_eq!(rc, -libc::EINVAL);
 }
@@ -1448,7 +1448,7 @@ fn connect_accepts_default_tlp_opts() {
     let opts = make_minimal_connect_opts();   // all TLP knobs at defaults
     let mut out_handle: u64 = 0;
     let rc = unsafe {
-        resd_net::resd_net_connect(e.as_engine_ptr(), &opts, &mut out_handle)
+        dpdk_net::dpdk_net_connect(e.as_engine_ptr(), &opts, &mut out_handle)
     };
     assert_eq!(rc, 0);
 }
@@ -1456,16 +1456,16 @@ fn connect_accepts_default_tlp_opts() {
 
 - [ ] **Step 2: Run tests — expect compile error**
 
-Run: `cargo test -p resd-net --test tcp_a5_5_tlp_tuning connect_rejects`
+Run: `cargo test -p dpdk-net --test tcp_a5_5_tlp_tuning connect_rejects`
 Expected: compile error — fields don't exist.
 
-- [ ] **Step 3: Add the 5 fields to `resd_net_connect_opts_t`**
+- [ ] **Step 3: Add the 5 fields to `dpdk_net_connect_opts_t`**
 
-In `crates/resd-net/src/api.rs`, extend (append, do not mid-insert):
+In `crates/dpdk-net/src/api.rs`, extend (append, do not mid-insert):
 
 ```rust
 #[repr(C)]
-pub struct resd_net_connect_opts_t {
+pub struct dpdk_net_connect_opts_t {
     // … existing fields up to rto_no_backoff …
     pub rack_aggressive: bool,
     pub rto_no_backoff: bool,
@@ -1480,14 +1480,14 @@ pub struct resd_net_connect_opts_t {
 }
 ```
 
-- [ ] **Step 4: Validate in `resd_net_connect`**
+- [ ] **Step 4: Validate in `dpdk_net_connect`**
 
-In `crates/resd-net/src/lib.rs`:
+In `crates/dpdk-net/src/lib.rs`:
 
 ```rust
-pub unsafe extern "C" fn resd_net_connect(
-    engine: *mut resd_net_engine,
-    opts: *const resd_net_connect_opts_t,
+pub unsafe extern "C" fn dpdk_net_connect(
+    engine: *mut dpdk_net_engine,
+    opts: *const dpdk_net_connect_opts_t,
     out_handle: *mut u64,
 ) -> i32 {
     // … existing null-checks + peer_addr / peer_port checks …
@@ -1515,13 +1515,13 @@ Mirror the 5 fields into `engine.rs::ConnectOpts` (the Rust-internal struct).
 
 - [ ] **Step 5: Add the fields to `TcpConn` + zero-initialize + add the 3 runtime state fields**
 
-In `crates/resd-net-core/src/tcp_conn.rs`:
+In `crates/dpdk-net-core/src/tcp_conn.rs`:
 
 ```rust
 pub struct TcpConn {
     // … existing fields …
 
-    // A5.5 per-connect TLP tuning (mirrored from resd_net_connect_opts_t).
+    // A5.5 per-connect TLP tuning (mirrored from dpdk_net_connect_opts_t).
     pub tlp_pto_min_floor_us: u32,
     pub tlp_pto_srtt_multiplier_x100: u16,
     pub tlp_skip_flight_size_gate: bool,
@@ -1581,7 +1581,7 @@ impl TcpConn {
 }
 ```
 
-Caveat: if the user did **not** touch the TLP knobs (zero-init), the 5 fields are all zeros/false. A zero-init `tlp_pto_srtt_multiplier_x100 == 0` would violate the `[100, 200]` invariant. Validation at `resd_net_connect` (Step 4) rejects `< 100`. **But zero-init callers will fail that check.** Resolve by treating zero-init as "use A5 defaults": at `resd_net_connect` entry, after the structural validation, apply default substitution:
+Caveat: if the user did **not** touch the TLP knobs (zero-init), the 5 fields are all zeros/false. A zero-init `tlp_pto_srtt_multiplier_x100 == 0` would violate the `[100, 200]` invariant. Validation at `dpdk_net_connect` (Step 4) rejects `< 100`. **But zero-init callers will fail that check.** Resolve by treating zero-init as "use A5 defaults": at `dpdk_net_connect` entry, after the structural validation, apply default substitution:
 
 ```rust
 // Apply A5-compatible defaults if the caller zero-init'd (pre-A5.5 callers).
@@ -1631,19 +1631,19 @@ let floor = if self.tlp_pto_min_floor_us == u32::MAX {
 - [ ] **Step 7: Run tests + header regen**
 
 ```bash
-cargo test -p resd-net-core -p resd-net --test tcp_a5_5_tlp_tuning
-cargo build -p resd-net
+cargo test -p dpdk-net-core -p dpdk-net --test tcp_a5_5_tlp_tuning
+cargo build -p dpdk-net
 ```
 
-Verify `include/resd_net.h` shows the 5 new fields on `resd_net_connect_opts_t`.
+Verify `include/dpdk_net.h` shows the 5 new fields on `dpdk_net_connect_opts_t`.
 
 - [ ] **Step 8: Commit**
 
 ```bash
-git add crates/resd-net/src/api.rs crates/resd-net/src/lib.rs crates/resd-net-core/src/tcp_conn.rs crates/resd-net-core/src/engine.rs include/resd_net.h crates/resd-net-core/tests/tcp_a5_5_tlp_tuning.rs
+git add crates/dpdk-net/src/api.rs crates/dpdk-net/src/lib.rs crates/dpdk-net-core/src/tcp_conn.rs crates/dpdk-net-core/src/engine.rs include/dpdk_net.h crates/dpdk-net-core/tests/tcp_a5_5_tlp_tuning.rs
 git commit -m "a5.5 task 10: 5 per-connect TLP knobs + validation + TcpConn state
 
-resd_net_connect validates multiplier in [100,200], max_probes in
+dpdk_net_connect validates multiplier in [100,200], max_probes in
 [1,5], floor<=tcp_max_rto_us (or u32::MAX sentinel for no-floor).
 Zero-init ABI callers get A5 defaults; explicit no-floor uses
 u32::MAX. TcpConn also gains 4 runtime TLP state fields
@@ -1656,11 +1656,11 @@ the 5-entry recent_probes ring for Task 12)."
 ## Task 11: Multi-probe TLP scheduling + budget reset + `tcp.tx_tlp_spurious` counter declared
 
 **Files:**
-- Modify: `crates/resd-net-core/src/counters.rs` — `TcpCounters::tx_tlp_spurious: AtomicU64`
-- Modify: `crates/resd-net/src/api.rs` — `resd_net_tcp_counters_t::tx_tlp_spurious`
-- Modify: `crates/resd-net-core/src/engine.rs` — TLP scheduling consults the budget + tlp_skip_rtt_sample_gate
-- Modify: `crates/resd-net-core/src/engine.rs` — `on_tlp_fire` increments `tlp_consecutive_probes_fired`, clears `tlp_rtt_sample_seen_since_last_tlp`, records the probe in `tlp_recent_probes`
-- Modify: `crates/resd-net-core/src/tcp_input.rs` — RTT-sample / new-data-ACK path resets the budget; flips the sample-seen flag
+- Modify: `crates/dpdk-net-core/src/counters.rs` — `TcpCounters::tx_tlp_spurious: AtomicU64`
+- Modify: `crates/dpdk-net/src/api.rs` — `dpdk_net_tcp_counters_t::tx_tlp_spurious`
+- Modify: `crates/dpdk-net-core/src/engine.rs` — TLP scheduling consults the budget + tlp_skip_rtt_sample_gate
+- Modify: `crates/dpdk-net-core/src/engine.rs` — `on_tlp_fire` increments `tlp_consecutive_probes_fired`, clears `tlp_rtt_sample_seen_since_last_tlp`, records the probe in `tlp_recent_probes`
+- Modify: `crates/dpdk-net-core/src/tcp_input.rs` — RTT-sample / new-data-ACK path resets the budget; flips the sample-seen flag
 
 **Context:** Spec §3.4. The scheduling side (where-to-arm) is the existing A5 arm-on-ACK path at `engine.rs:1614-1643`. Task 15 adds a second arm site (arm-on-send). This task: gate the arm on the multi-probe budget + wire the state transitions. The counter `tx_tlp_spurious` is declared here but actually incremented in Task 12.
 
@@ -1731,12 +1731,12 @@ fn budget_resets_on_new_data_ack() {
 
 - [ ] **Step 2: Run tests — expect fail**
 
-Run: `cargo test -p resd-net --test tcp_a5_5_tlp_tuning multi_probe_tlp_fires_three_then_rto budget_resets_on_new_data_ack`
+Run: `cargo test -p dpdk-net --test tcp_a5_5_tlp_tuning multi_probe_tlp_fires_three_then_rto budget_resets_on_new_data_ack`
 Expected: fail — scheduling doesn't yet gate on budget; A5 fires one probe then RTO-only.
 
 - [ ] **Step 3: Add `tx_tlp_spurious` to counters**
 
-In `crates/resd-net-core/src/counters.rs`:
+In `crates/dpdk-net-core/src/counters.rs`:
 
 ```rust
 pub struct TcpCounters {
@@ -1745,11 +1745,11 @@ pub struct TcpCounters {
 }
 ```
 
-In `crates/resd-net/src/api.rs` `resd_net_tcp_counters_t`: append `pub tx_tlp_spurious: u64;` — do not mid-insert. Update the counter-mirror code in `crates/resd-net/src/lib.rs` to populate it.
+In `crates/dpdk-net/src/api.rs` `dpdk_net_tcp_counters_t`: append `pub tx_tlp_spurious: u64;` — do not mid-insert. Update the counter-mirror code in `crates/dpdk-net/src/lib.rs` to populate it.
 
 - [ ] **Step 4: Wire the arm-time budget gate**
 
-In `crates/resd-net-core/src/engine.rs` at the existing A5 TLP arm block (`:1608-1643`):
+In `crates/dpdk-net-core/src/engine.rs` at the existing A5 TLP arm block (`:1608-1643`):
 
 ```rust
 // BEFORE (A5)
@@ -1821,7 +1821,7 @@ c.tlp_rtt_sample_seen_since_last_tlp = false;
 
 - [ ] **Step 6: Reset the budget on RTT sample / new-data ACK in `tcp_input.rs`**
 
-In `crates/resd-net-core/src/tcp_input.rs` at the ACK-processing block where `rtt_est.sample()` is called (the two branches at `:574` TS-source and `:582` Karn's-fallback):
+In `crates/dpdk-net-core/src/tcp_input.rs` at the ACK-processing block where `rtt_est.sample()` is called (the two branches at `:574` TS-source and `:582` Karn's-fallback):
 
 ```rust
 if let Some(rtt) = ts_sample {
@@ -1854,7 +1854,7 @@ if seg.ack_seq != snd_una_before {
 
 - [ ] **Step 7: Run tests**
 
-Run: `cargo test -p resd-net-core -p resd-net --test tcp_a5_5_tlp_tuning multi_probe_tlp_fires_three_then_rto budget_resets_on_new_data_ack`
+Run: `cargo test -p dpdk-net-core -p dpdk-net --test tcp_a5_5_tlp_tuning multi_probe_tlp_fires_three_then_rto budget_resets_on_new_data_ack`
 Expected: both pass. All existing tests continue to pass (`tlp_max_consecutive_probes=1` default and `skip_rtt_sample_gate=false` default preserve A5 RFC 8985 behavior).
 
 - [ ] **Step 8: Run integration tests 7.2.7–7.2.11**
@@ -1891,13 +1891,13 @@ fn skip_flight_size_gate_omits_max_ack_delay_penalty() {
 
 Flesh out the scenarios with the TAP harness helpers.
 
-Run: `cargo test -p resd-net --test tcp_a5_5_tlp_tuning`
+Run: `cargo test -p dpdk-net --test tcp_a5_5_tlp_tuning`
 Expected: all pass.
 
 - [ ] **Step 9: Commit**
 
 ```bash
-git add crates/resd-net-core/src/counters.rs crates/resd-net-core/src/engine.rs crates/resd-net-core/src/tcp_input.rs crates/resd-net/src/api.rs crates/resd-net/src/lib.rs include/resd_net.h crates/resd-net-core/tests/tcp_a5_5_tlp_tuning.rs
+git add crates/dpdk-net-core/src/counters.rs crates/dpdk-net-core/src/engine.rs crates/dpdk-net-core/src/tcp_input.rs crates/dpdk-net/src/api.rs crates/dpdk-net/src/lib.rs include/dpdk_net.h crates/dpdk-net-core/tests/tcp_a5_5_tlp_tuning.rs
 git commit -m "a5.5 task 11: multi-probe TLP + budget reset + tx_tlp_spurious
 
 Gates TLP arm on tlp_consecutive_probes_fired<tlp_max_consecutive_probes
@@ -1912,7 +1912,7 @@ Counter tx_tlp_spurious declared (incremented in Task 12)."
 ## Task 12: DSACK spurious-probe attribution + `tx_tlp_spurious` increments
 
 **Files:**
-- Modify: `crates/resd-net-core/src/tcp_input.rs` — DSACK-detection block attributes to `tlp_recent_probes`
+- Modify: `crates/dpdk-net-core/src/tcp_input.rs` — DSACK-detection block attributes to `tlp_recent_probes`
 
 **Context:** Spec §3.4 spurious-attribution subsection. When a DSACK block intersects a recent probe's `[seq, seq+len)` range AND the probe's `tx_ts_ns` is within `4·SRTT` of now, increment `tcp.tx_tlp_spurious` once per probe and set the probe's `attributed` flag. The 4·SRTT plausibility window prevents attribution across seq-space wraparound.
 
@@ -1953,12 +1953,12 @@ fn dsack_after_tlp_increments_tx_tlp_spurious_once() {
 
 - [ ] **Step 2: Run — expected fail**
 
-Run: `cargo test -p resd-net --test tcp_a5_5_tlp_tuning dsack_after_tlp_increments_tx_tlp_spurious_once`
+Run: `cargo test -p dpdk-net --test tcp_a5_5_tlp_tuning dsack_after_tlp_increments_tx_tlp_spurious_once`
 Expected: fail with `left: 0, right: 1` on `tx_tlp_spurious`.
 
 - [ ] **Step 3: Implement attribution in the DSACK-detection block**
 
-In `crates/resd-net-core/src/tcp_input.rs` find the existing DSACK detection block (A5 Task 16 wired it — grep `rx_dsack` for the site). Per-DSACK-block attribution:
+In `crates/dpdk-net-core/src/tcp_input.rs` find the existing DSACK detection block (A5 Task 16 wired it — grep `rx_dsack` for the site). Per-DSACK-block attribution:
 
 ```rust
 // A5.5 Task 12: attribute DSACK to a recent TLP probe.
@@ -1989,13 +1989,13 @@ Caveat: multiple DSACK blocks in one SACK option could each attribute. The `brea
 
 - [ ] **Step 4: Run tests**
 
-Run: `cargo test -p resd-net --test tcp_a5_5_tlp_tuning dsack_after_tlp_increments_tx_tlp_spurious_once`
+Run: `cargo test -p dpdk-net --test tcp_a5_5_tlp_tuning dsack_after_tlp_increments_tx_tlp_spurious_once`
 Expected: pass.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/resd-net-core/src/tcp_input.rs crates/resd-net-core/tests/tcp_a5_5_tlp_tuning.rs
+git add crates/dpdk-net-core/src/tcp_input.rs crates/dpdk-net-core/tests/tcp_a5_5_tlp_tuning.rs
 git commit -m "a5.5 task 12: DSACK spurious-probe attribution for tx_tlp_spurious
 
 DSACK blocks that cover a recent probe's seq range increment
@@ -2008,9 +2008,9 @@ window. Prevents double-count via probe.attributed flag."
 ## Task 13: SRTT seeded from SYN handshake round-trip
 
 **Files:**
-- Modify: `crates/resd-net-core/src/tcp_conn.rs` — `syn_tx_ts_ns: u64` field already added in Task 10; ensure default = 0
-- Modify: `crates/resd-net-core/src/engine.rs` — on SYN emission (the SYN-out path in `resd_net_connect` or the SYN handler), set `c.syn_tx_ts_ns = self.clock.now_ns()`
-- Modify: `crates/resd-net-core/src/tcp_input.rs` — `handle_syn_sent` valid-SYN-ACK branch absorbs the RTT sample
+- Modify: `crates/dpdk-net-core/src/tcp_conn.rs` — `syn_tx_ts_ns: u64` field already added in Task 10; ensure default = 0
+- Modify: `crates/dpdk-net-core/src/engine.rs` — on SYN emission (the SYN-out path in `dpdk_net_connect` or the SYN handler), set `c.syn_tx_ts_ns = self.clock.now_ns()`
+- Modify: `crates/dpdk-net-core/src/tcp_input.rs` — `handle_syn_sent` valid-SYN-ACK branch absorbs the RTT sample
 
 **Context:** Spec §3.5. RFC 6298 §3.3 MAY: "The RTT of the SYN segment MAY be used as the first SRTT." Karn's rule: only the first SYN's ACK counts.
 
@@ -2022,8 +2022,8 @@ window. Prevents double-count via probe.attributed flag."
 fn srtt_nonzero_immediately_after_established() {
     let mut e = make_test_engine_with_tap();
     let handle = e.connect_test_peer_and_wait_established();
-    let mut out = unsafe { std::mem::zeroed::<resd_net::api::resd_net_conn_stats_t>() };
-    let _ = unsafe { resd_net::resd_net_conn_stats(e.as_engine_ptr(), handle, &mut out) };
+    let mut out = unsafe { std::mem::zeroed::<dpdk_net::api::dpdk_net_conn_stats_t>() };
+    let _ = unsafe { dpdk_net::dpdk_net_conn_stats(e.as_engine_ptr(), handle, &mut out) };
     assert!(out.srtt_us > 0, "expected SRTT > 0 post-ESTABLISHED (seeded from SYN round-trip)");
     assert!(out.min_rtt_us > 0);
     // rto_us should reflect SRTT + 4·RTTVAR clamped to [min_rto, max_rto],
@@ -2034,14 +2034,14 @@ fn srtt_nonzero_immediately_after_established() {
 fn karns_rule_on_syn_retransmit_skips_seed() {
     let mut e = make_test_engine_with_tap_drop_first_syn();
     let handle = e.connect_test_peer_and_wait_established();
-    let mut out = unsafe { std::mem::zeroed::<resd_net::api::resd_net_conn_stats_t>() };
-    let _ = unsafe { resd_net::resd_net_conn_stats(e.as_engine_ptr(), handle, &mut out) };
+    let mut out = unsafe { std::mem::zeroed::<dpdk_net::api::dpdk_net_conn_stats_t>() };
+    let _ = unsafe { dpdk_net::dpdk_net_conn_stats(e.as_engine_ptr(), handle, &mut out) };
     // First SYN was dropped; retransmitted SYN's ACK does NOT seed.
     assert_eq!(out.srtt_us, 0);
     assert_eq!(out.min_rtt_us, 0);
     // Send + ACK one data round — now SRTT seeds normally from data-ACK.
     e.simulate_round_trip(handle, 100_000);
-    let _ = unsafe { resd_net::resd_net_conn_stats(e.as_engine_ptr(), handle, &mut out) };
+    let _ = unsafe { dpdk_net::dpdk_net_conn_stats(e.as_engine_ptr(), handle, &mut out) };
     assert!(out.srtt_us > 0);
 }
 
@@ -2058,7 +2058,7 @@ fn syn_rtt_sample_bounds_checked() {
 
 - [ ] **Step 2: Run — expected fail**
 
-Run: `cargo test -p resd-net --test tcp_a5_5_ad_closures srtt_nonzero_immediately_after_established`
+Run: `cargo test -p dpdk-net --test tcp_a5_5_ad_closures srtt_nonzero_immediately_after_established`
 Expected: fail — `srtt_us` is 0 right after ESTABLISHED because A5 only samples on data-ACK.
 
 - [ ] **Step 3: Set `syn_tx_ts_ns` at SYN emission**
@@ -2078,7 +2078,7 @@ Actually, simpler: set on the original SYN only. The SYN retransmit path should 
 
 - [ ] **Step 4: Absorb the RTT sample in `handle_syn_sent`**
 
-In `crates/resd-net-core/src/tcp_input.rs::handle_syn_sent`, at the valid-SYN-ACK accept branch (after option negotiation, before state transition):
+In `crates/dpdk-net-core/src/tcp_input.rs::handle_syn_sent`, at the valid-SYN-ACK accept branch (after option negotiation, before state transition):
 
 ```rust
 // A5.5 Task 13: seed SRTT from the SYN round-trip (RFC 6298 §3.3 MAY).
@@ -2098,20 +2098,20 @@ The bounds check mirrors the existing A5 data-ACK sampler (`tcp_input.rs:564, 58
 
 - [ ] **Step 5: Run tests**
 
-Run: `cargo test -p resd-net --test tcp_a5_5_ad_closures srtt_nonzero_immediately_after_established karns_rule_on_syn_retransmit_skips_seed`
+Run: `cargo test -p dpdk-net --test tcp_a5_5_ad_closures srtt_nonzero_immediately_after_established karns_rule_on_syn_retransmit_skips_seed`
 Expected: both pass.
 
-Run: `cargo test -p resd-net-core` — verify no A5 tests regressed. Some A5 tests may have asserted `srtt_us == 0` immediately after ESTABLISHED; those need updating to reflect the new invariant. Grep `srtt_us.*== 0` in the core tests and patch any that break.
+Run: `cargo test -p dpdk-net-core` — verify no A5 tests regressed. Some A5 tests may have asserted `srtt_us == 0` immediately after ESTABLISHED; those need updating to reflect the new invariant. Grep `srtt_us.*== 0` in the core tests and patch any that break.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/resd-net-core/src/engine.rs crates/resd-net-core/src/tcp_input.rs crates/resd-net-core/tests/tcp_a5_5_ad_closures.rs
+git add crates/dpdk-net-core/src/engine.rs crates/dpdk-net-core/src/tcp_input.rs crates/dpdk-net-core/tests/tcp_a5_5_ad_closures.rs
 git commit -m "a5.5 task 13: SRTT seeded from SYN handshake (closes AD-18 window)
 
 handle_syn_sent absorbs the SYN round-trip as the first RTT sample
 when syn_retrans_count == 0 (Karn's rule). RFC 6298 §3.3 MAY.
-Makes resd_net_conn_stats return srtt_us > 0 immediately post-
+Makes dpdk_net_conn_stats return srtt_us > 0 immediately post-
 ESTABLISHED and gives AD-18's arm-TLP-on-send a valid PTO basis."
 ```
 
@@ -2120,7 +2120,7 @@ ESTABLISHED and gives AD-18's arm-TLP-on-send a valid PTO basis."
 ## Task 14: AD-17 close — `RACK_mark_losses_on_RTO` pass in `on_rto_fire`
 
 **Files:**
-- Modify: `crates/resd-net-core/src/engine.rs` — `on_rto_fire` Phase 3 gains the §6.3 pass before the existing `self.retransmit(handle, 0)`
+- Modify: `crates/dpdk-net-core/src/engine.rs` — `on_rto_fire` Phase 3 gains the §6.3 pass before the existing `self.retransmit(handle, 0)`
 
 **Context:** Spec §3.6. RFC 8985 §6.3 walks `snd_retrans` and flags `entry.lost = true` for every unacked, unsacked entry matching the formula. Route through the existing `rack_lost_indexes` retransmit loop (A5 at `engine.rs:1467-1491`). Semantic: one RTO fire → N retransmits but **one** `tcp.tx_rto` increment.
 
@@ -2151,7 +2151,7 @@ fn multi_segment_tail_loss_rto_retransmits_all_in_one_burst() {
 
 #[test]
 fn rack_mark_losses_on_rto_unit_age_based_marking() {
-    use resd_net_core::engine::rack_mark_losses_on_rto;
+    use dpdk_net_core::engine::rack_mark_losses_on_rto;
 
     let mut entries = vec![
         /* seq=100, xmit_ts=100_000_ns (fresh), not sacked, not lost */
@@ -2192,12 +2192,12 @@ fn single_segment_rto_retransmit_semantics_preserved() {
 
 - [ ] **Step 2: Run — expected fail**
 
-Run: `cargo test -p resd-net --test tcp_a5_5_ad_closures multi_segment_tail_loss_rto_retransmits_all_in_one_burst`
+Run: `cargo test -p dpdk-net --test tcp_a5_5_ad_closures multi_segment_tail_loss_rto_retransmits_all_in_one_burst`
 Expected: fail with `tcp_tx_retrans left: 1, right: 5`.
 
 - [ ] **Step 3: Extract the formula into a testable helper**
 
-In `crates/resd-net-core/src/engine.rs` (or `tcp_rack.rs` alongside `detect_lost`):
+In `crates/dpdk-net-core/src/engine.rs` (or `tcp_rack.rs` alongside `detect_lost`):
 
 ```rust
 /// RFC 8985 §6.3 RACK_mark_losses_on_RTO. Returns indexes of entries
@@ -2283,13 +2283,13 @@ Add inline unit tests in `engine.rs` or wherever the helper lives. Cover:
 
 - [ ] **Step 6: Run all tests**
 
-Run: `cargo test -p resd-net-core -p resd-net`
+Run: `cargo test -p dpdk-net-core -p dpdk-net`
 Expected: all new tests pass; A5's single-RTO-fire tests stay green (front-entry-only case preserved).
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add crates/resd-net-core/src/engine.rs crates/resd-net-core/tests/tcp_a5_5_ad_closures.rs
+git add crates/dpdk-net-core/src/engine.rs crates/dpdk-net-core/tests/tcp_a5_5_ad_closures.rs
 git commit -m "a5.5 task 14: AD-17 close — RACK_mark_losses_on_RTO in on_rto_fire
 
 Every RTO fire now walks snd_retrans and marks all §6.3-eligible
@@ -2303,7 +2303,7 @@ per-subsequent-ACK tail-recovery pacing fixed."
 ## Task 15: AD-18 close — TLP armed on every new-data send
 
 **Files:**
-- Modify: `crates/resd-net-core/src/engine.rs` — new helper `fn arm_tlp_pto`; called from `Engine::send_bytes` after segments are enqueued
+- Modify: `crates/dpdk-net-core/src/engine.rs` — new helper `fn arm_tlp_pto`; called from `Engine::send_bytes` after segments are enqueued
 
 **Context:** Spec §3.7. Add an arm site at the `send_bytes` TX path in addition to the existing arm-on-ACK. Gate: `snd_retrans.len() >= 1 && tlp_timer_id.is_none() && rtt_est.srtt_us().is_some() && tlp_consecutive_probes_fired < tlp_max_consecutive_probes`. Post-Task 13 SRTT seed, the `srtt_us().is_some()` guard holds from ESTABLISHED.
 
@@ -2367,12 +2367,12 @@ fn arm_tlp_pto_noop_when_budget_exhausted() {
 
 - [ ] **Step 2: Run — expected fail**
 
-Run: `cargo test -p resd-net --test tcp_a5_5_ad_closures first_burst_tlp_fires_at_pto_not_rto`
+Run: `cargo test -p dpdk-net --test tcp_a5_5_ad_closures first_burst_tlp_fires_at_pto_not_rto`
 Expected: fail — `tcp_tx_tlp` is 0 because A5 only arms TLP from the ACK handler.
 
 - [ ] **Step 3: Add `arm_tlp_pto` helper**
 
-In `crates/resd-net-core/src/engine.rs`:
+In `crates/dpdk-net-core/src/engine.rs`:
 
 ```rust
 impl Engine {
@@ -2439,15 +2439,15 @@ if accepted > 0 {
 
 - [ ] **Step 5: Run tests**
 
-Run: `cargo test -p resd-net --test tcp_a5_5_ad_closures first_burst_tlp_fires_at_pto_not_rto arm_tlp_pto_is_noop_in_syn_sent arm_tlp_pto_noop_when_budget_exhausted`
+Run: `cargo test -p dpdk-net --test tcp_a5_5_ad_closures first_burst_tlp_fires_at_pto_not_rto arm_tlp_pto_is_noop_in_syn_sent arm_tlp_pto_noop_when_budget_exhausted`
 Expected: all three pass.
 
-Run: `cargo test -p resd-net-core` — verify A5 tests green. A5 TLP arm-on-ACK tests should see no behavior change (TLP already armed by time the ACK handler runs; the second arm attempt is no-op via `tlp_timer_id.is_some()` guard).
+Run: `cargo test -p dpdk-net-core` — verify A5 tests green. A5 TLP arm-on-ACK tests should see no behavior change (TLP already armed by time the ACK handler runs; the second arm attempt is no-op via `tlp_timer_id.is_some()` guard).
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/resd-net-core/src/engine.rs crates/resd-net-core/tests/tcp_a5_5_ad_closures.rs
+git add crates/dpdk-net-core/src/engine.rs crates/dpdk-net-core/tests/tcp_a5_5_ad_closures.rs
 git commit -m "a5.5 task 15: AD-18 close — TLP armed on every new-data send
 
 Engine::send_bytes calls arm_tlp_pto after the segment is enqueued
@@ -2498,7 +2498,7 @@ Gate status:
 
 In the parent spec:
 
-- **§4 API** — add or extend an "Introspection API" paragraph: "`resd_net_conn_stats(engine, conn, out) → i32` returns 9 u32 fields covering send-path state and RTT estimator state; slow-path; safe per-order; see A5.5 design spec §3.3 / §5.3."
+- **§4 API** — add or extend an "Introspection API" paragraph: "`dpdk_net_conn_stats(engine, conn, out) → i32` returns 9 u32 fields covering send-path state and RTT estimator state; slow-path; safe per-order; see A5.5 design spec §3.3 / §5.3."
 
 - **§4.2 contracts** — document the event-queue soft-cap contract: "The engine event queue has a configurable soft cap (`event_queue_soft_cap`, default 4096, min 64). On overflow, the oldest event is dropped and `obs.events_dropped` increments; `obs.events_queue_high_water` latches max depth."
 
@@ -2516,7 +2516,7 @@ In the parent spec:
 
 - **§9.1 counter examples** — add `obs.events_dropped`, `obs.events_queue_high_water`, `tcp.tx_tlp_spurious` to the example list; introduce the `obs` group alongside `poll`/`eth`/`ip`/`tcp`.
 
-- **§9.3 events** — clarify `enqueued_ts_ns` is emission-time, not drain-time: "sampled at event emission inside the stack, not at `resd_net_poll` drain (A5.5)."
+- **§9.3 events** — clarify `enqueued_ts_ns` is emission-time, not drain-time: "sampled at event emission inside the stack, not at `dpdk_net_poll` drain (A5.5)."
 
 - **§4 connect opts** — list the 5 new TLP tuning fields below `rack_aggressive` / `rto_no_backoff`.
 
@@ -2526,7 +2526,7 @@ In `docs/superpowers/specs/2026-04-18-stage1-phase-a5-5-event-log-forensics-desi
 
 Replace the current `tlp_pto_min_floor_us` row to match the plan's zero-init-friendly semantics:
 
-> `tlp_pto_min_floor_us` | `u32` | `0` inherits engine `tcp_min_rto_us` | 0 .. `tcp_max_rto_us` OR `u32::MAX` | `0` (default) inherits engine-wide `tcp_min_rto_us`. `u32::MAX` sentinel = explicit no-floor. Any other value > `tcp_max_rto_us` is rejected at `resd_net_connect` with `-EINVAL`. Zero-init callers see A5-default behavior unchanged.
+> `tlp_pto_min_floor_us` | `u32` | `0` inherits engine `tcp_min_rto_us` | 0 .. `tcp_max_rto_us` OR `u32::MAX` | `0` (default) inherits engine-wide `tcp_min_rto_us`. `u32::MAX` sentinel = explicit no-floor. Any other value > `tcp_max_rto_us` is rejected at `dpdk_net_connect` with `-EINVAL`. Zero-init callers see A5-default behavior unchanged.
 
 Also update the aggressive-preset example at §5.5 to use the `u32::MAX` sentinel:
 
@@ -2553,7 +2553,7 @@ u32::MAX is explicit no-floor (zero-init-friendly)."
 ## Task 17: A5.5 knob-coverage extension in `tests/knob-coverage.rs`
 
 **Files:**
-- Modify: `crates/resd-net-core/tests/knob-coverage.rs` (or wherever A5 landed it — check the A5 roadmap §A11 row for the canonical path)
+- Modify: `crates/dpdk-net-core/tests/knob-coverage.rs` (or wherever A5 landed it — check the A5 roadmap §A11 row for the canonical path)
 
 **Context:** Roadmap §A11 requires a knob-coverage audit entry per new behavioral knob plus the aggressive-preset combination. Each entry names a scenario fn and a non-default value; the dynamic check runs the scenario and asserts an observable consequence.
 
@@ -2563,7 +2563,7 @@ u32::MAX is explicit no-floor (zero-init-friendly)."
 find crates -name "knob-coverage.rs" -o -name "knob_coverage.rs" 2>/dev/null
 ```
 
-If it does not exist yet (A11 is not yet started), create the scaffold in `crates/resd-net-core/tests/knob-coverage.rs` with a placeholder structure, noting it'll be absorbed into A11's full audit. If it does exist, extend.
+If it does not exist yet (A11 is not yet started), create the scaffold in `crates/dpdk-net-core/tests/knob-coverage.rs` with a placeholder structure, noting it'll be absorbed into A11's full audit. If it does exist, extend.
 
 - [ ] **Step 2: Add entries for A5.5 knobs**
 
@@ -2654,13 +2654,13 @@ If A5 has not yet landed `knob-coverage.rs`, leave a `TODO(A11)` comment with a 
 
 - [ ] **Step 3: Run coverage tests**
 
-Run: `cargo test -p resd-net-core --test knob-coverage`
+Run: `cargo test -p dpdk-net-core --test knob-coverage`
 Expected: all A5.5 scenarios pass (they reuse existing integration tests from earlier tasks).
 
 - [ ] **Step 4: Commit**
 
 ```bash
-git add crates/resd-net-core/tests/knob-coverage.rs
+git add crates/dpdk-net-core/tests/knob-coverage.rs
 git commit -m "a5.5 task 17: knob-coverage entries for A5.5 knobs + aggressive preset
 
 Extends tests/knob-coverage.rs with 6 entries per the roadmap §A11
@@ -2689,7 +2689,7 @@ Review A5.5 (Event-log forensics + in-flight introspection + TLP tuning) against
 
 Focus areas:
 - Event-queue overflow accounting vs mTCP's event/log model — note mTCP has no bounded event queue (scope-difference not behavioral).
-- `resd_net_conn_stats` vs mTCP's `tcp_api_get_conn_state` — different shape; our projection covers send-path + RTT in one slow-path call. Note scope.
+- `dpdk_net_conn_stats` vs mTCP's `tcp_api_get_conn_state` — different shape; our projection covers send-path + RTT in one slow-path call. Note scope.
 - TLP tuning knobs + AD-18 arm-on-send vs mTCP's RTO-only tail recovery — mTCP does not implement TLP. Document as scope-difference for the 5 knob ADs; document AD-18 as matching the E-2 finding from A5's review and now closed.
 - AD-17 `RACK_mark_losses_on_RTO` vs mTCP — mTCP does not implement RACK. Scope-difference.
 - SRTT seed from SYN — mTCP's `CreateTCPStream` does not seed SRTT until first data-ACK; our deviation is a strict improvement under RFC 6298 §3.3 MAY.

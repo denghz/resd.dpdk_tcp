@@ -12,7 +12,7 @@ set -euo pipefail
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
-CRATE="-p resd-net-core"
+CRATE="-p dpdk-net-core"
 COMMON_FEATURES="obs-poll-saturation"
 
 echo "=== Build 1/8: default features ==="

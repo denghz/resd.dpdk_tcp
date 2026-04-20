@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Bring the repo from empty to a state where Rust + C++ code can create a `resd_net_engine`, the engine brings up DPDK EAL and a NIC port, allocates mempools, calibrates the TSC clock, exposes counters, and runs a poll loop that does rx_burst/tx_burst (dropping all packets — no protocol processing yet). This is the scaffolding every later phase builds on.
+**Goal:** Bring the repo from empty to a state where Rust + C++ code can create a `dpdk_net_engine`, the engine brings up DPDK EAL and a NIC port, allocates mempools, calibrates the TSC clock, exposes counters, and runs a poll loop that does rx_burst/tx_burst (dropping all packets — no protocol processing yet). This is the scaffolding every later phase builds on.
 
-**Architecture:** Rust cargo workspace with three crates: `resd-net-sys` (DPDK FFI via bindgen), `resd-net-core` (pure-Rust stack internals), `resd-net` (public API crate exposing `extern "C"` functions; header auto-generated via cbindgen). A C++ consumer sample under `examples/cpp-consumer/` verifies the FFI boundary end-to-end.
+**Architecture:** Rust cargo workspace with three crates: `dpdk-net-sys` (DPDK FFI via bindgen), `dpdk-net-core` (pure-Rust stack internals), `dpdk-net` (public API crate exposing `extern "C"` functions; header auto-generated via cbindgen). A C++ consumer sample under `examples/cpp-consumer/` verifies the FFI boundary end-to-end.
 
-**Tech Stack:** Rust (latest stable), cargo workspace, DPDK 23.11 LTS, `bindgen` for DPDK FFI, `cbindgen` for generating `include/resd_net.h`, `pkg-config` to locate libdpdk, CMake for the C++ consumer.
+**Tech Stack:** Rust (latest stable), cargo workspace, DPDK 23.11 LTS, `bindgen` for DPDK FFI, `cbindgen` for generating `include/dpdk_net.h`, `pkg-config` to locate libdpdk, CMake for the C++ consumer.
 
 **Prerequisites on the build host (install before starting):**
 - DPDK 23.11 built and installed (libdpdk.pc discoverable via `pkg-config --cflags --libs libdpdk`).
@@ -28,12 +28,12 @@ resd.dpdk_tcp/
 ├── .gitignore
 ├── README.md
 ├── crates/
-│   ├── resd-net-sys/
+│   ├── dpdk-net-sys/
 │   │   ├── Cargo.toml
 │   │   ├── build.rs                # bindgen DPDK
 │   │   ├── wrapper.h               # #include DPDK headers
 │   │   └── src/lib.rs              # re-export bindgen types
-│   ├── resd-net-core/
+│   ├── dpdk-net-core/
 │   │   ├── Cargo.toml
 │   │   └── src/
 │   │       ├── lib.rs              # module tree
@@ -42,7 +42,7 @@ resd.dpdk_tcp/
 │   │       ├── mempool.rs          # RAII mempool wrapper
 │   │       ├── engine.rs           # Engine struct, create/destroy, poll stub
 │   │       └── error.rs            # crate error type
-│   └── resd-net/
+│   └── dpdk-net/
 │       ├── Cargo.toml
 │       ├── cbindgen.toml
 │       ├── build.rs                # run cbindgen
@@ -50,7 +50,7 @@ resd.dpdk_tcp/
 │           ├── lib.rs              # extern "C" wrappers
 │           └── api.rs              # C ABI types (engine_config, event, etc.)
 ├── include/
-│   └── resd_net.h                  # cbindgen-generated; committed
+│   └── dpdk_net.h                  # cbindgen-generated; committed
 ├── examples/
 │   └── cpp-consumer/
 │       ├── CMakeLists.txt
@@ -77,9 +77,9 @@ resd.dpdk_tcp/
 [workspace]
 resolver = "2"
 members = [
-    "crates/resd-net-sys",
-    "crates/resd-net-core",
-    "crates/resd-net",
+    "crates/dpdk-net-sys",
+    "crates/dpdk-net-core",
+    "crates/dpdk-net",
 ]
 
 [workspace.package]
@@ -152,19 +152,19 @@ Expected: "no packages found"-style failure because crate dirs don't exist yet. 
 
 ---
 
-## Task 2: `resd-net-sys` crate with DPDK bindgen
+## Task 2: `dpdk-net-sys` crate with DPDK bindgen
 
 **Files:**
-- Create: `crates/resd-net-sys/Cargo.toml`
-- Create: `crates/resd-net-sys/build.rs`
-- Create: `crates/resd-net-sys/wrapper.h`
-- Create: `crates/resd-net-sys/src/lib.rs`
+- Create: `crates/dpdk-net-sys/Cargo.toml`
+- Create: `crates/dpdk-net-sys/build.rs`
+- Create: `crates/dpdk-net-sys/wrapper.h`
+- Create: `crates/dpdk-net-sys/src/lib.rs`
 
-- [ ] **Step 1: Write `crates/resd-net-sys/Cargo.toml`**
+- [ ] **Step 1: Write `crates/dpdk-net-sys/Cargo.toml`**
 
 ```toml
 [package]
-name = "resd-net-sys"
+name = "dpdk-net-sys"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -178,7 +178,7 @@ bindgen = "0.69"
 pkg-config = "0.3"
 ```
 
-- [ ] **Step 2: Write `crates/resd-net-sys/wrapper.h`**
+- [ ] **Step 2: Write `crates/dpdk-net-sys/wrapper.h`**
 
 ```c
 /* Single include point for bindgen. Only includes the DPDK headers
@@ -202,12 +202,12 @@ pkg-config = "0.3"
 
 /* `rte_errno` is a macro expanding to a thread-local int; bindgen
  * cannot reliably expose it. Wrap it in a trivial C shim that bindgen
- * does expose. All Rust callers use `resd_rte_errno()`.
+ * does expose. All Rust callers use `shim_rte_errno()`.
  */
-static inline int resd_rte_errno(void) { return rte_errno; }
+static inline int shim_rte_errno(void) { return rte_errno; }
 ```
 
-- [ ] **Step 3: Write `crates/resd-net-sys/build.rs`**
+- [ ] **Step 3: Write `crates/dpdk-net-sys/build.rs`**
 
 ```rust
 use std::env;
@@ -253,7 +253,7 @@ fn main() {
 }
 ```
 
-- [ ] **Step 4: Write `crates/resd-net-sys/src/lib.rs`**
+- [ ] **Step 4: Write `crates/dpdk-net-sys/src/lib.rs`**
 
 ```rust
 #![allow(non_upper_case_globals, non_camel_case_types, non_snake_case, dead_code)]
@@ -279,53 +279,53 @@ mod tests {
 
 - [ ] **Step 5: Build and test the sys crate**
 
-Run: `cargo test -p resd-net-sys -- --nocapture`
+Run: `cargo test -p dpdk-net-sys -- --nocapture`
 Expected: `dpdk_version_string_nonempty` passes; stdout shows DPDK version.
 
 - [ ] **Step 6: Commit**
 
 ```sh
-git add Cargo.toml rust-toolchain.toml .gitignore README.md crates/resd-net-sys/
-git commit -m "bootstrap workspace and resd-net-sys DPDK bindings"
+git add Cargo.toml rust-toolchain.toml .gitignore README.md crates/dpdk-net-sys/
+git commit -m "bootstrap workspace and dpdk-net-sys DPDK bindings"
 ```
 
 #### Task 2 post-implementation deltas (shipped across commits d738799 / d3665db)
 
 The shipped code differs from the Task 2 snippets above. If you are re-implementing, follow the shipped code (not the snippets) because bindgen + DPDK + the LLVM 22 install need workarounds the original snippets lacked:
 
-- `wrapper.h`: `resd_rte_errno` is declared `int resd_rte_errno(void);` (a real extern, not `static inline`) — bindgen cannot emit FFI stubs for static-inline C functions without `--wrap-static-fns` + a `cc` compile step.
-- New file `crates/resd-net-sys/shim.c`: `int resd_rte_errno(void) { return rte_errno; }` — the extern declaration binds to this.
-- `crates/resd-net-sys/Cargo.toml` adds `cc = "1"` to `[build-dependencies]`.
-- `build.rs` adds `.allowlist_function("resd_.*")` so the symbol is emitted.
+- `wrapper.h`: `shim_rte_errno` is declared `int shim_rte_errno(void);` (a real extern, not `static inline`) — bindgen cannot emit FFI stubs for static-inline C functions without `--wrap-static-fns` + a `cc` compile step.
+- New file `crates/dpdk-net-sys/shim.c`: `int shim_rte_errno(void) { return rte_errno; }` — the extern declaration binds to this.
+- `crates/dpdk-net-sys/Cargo.toml` adds `cc = "1"` to `[build-dependencies]`.
+- `build.rs` adds `.allowlist_function("shim_rte_.*")` so the symbol is emitted.
 - `build.rs` adds a `cc::Build::new().file("shim.c")` compile step that shares pkg-config include paths + cflags with bindgen (so `-include rte_config.h` and `-march=...` reach both).
 - `build.rs` adds `detect_clang_resource_dir()` (three-step fallback: `BINDGEN_RESOURCE_DIR` env → `$LIBCLANG_PATH/clang/*` → `clang-NN -print-resource-dir` for NN 22..14) to paper over mismatched libclang resource dirs on hosts with multiple LLVM installs. Emits `cargo:warning=...` with `BINDGEN_RESOURCE_DIR` hint when detection returns None.
 - `build.rs` shells out to `pkg-config --cflags libdpdk` in addition to using `lib.include_paths`, so DPDK's `-march=corei7 -mrtm -include rte_config.h` reach bindgen.
 - `build.rs` adds `.opaque_type("rte_arp_.*")`, `.opaque_type("rte_l2tpv2_.*")`, `.opaque_type("rte_gtp_.*")` to work around packed-with-inner-align E0588 errors. None of those DPDK types are used by Stage 1.
 - `src/lib.rs` adds `println!("{s}")` in `dpdk_version_string_nonempty` so `--nocapture` surfaces the DPDK version.
-- `src/lib.rs` adds a `resd_rte_errno_linkable` test proving the shim symbol links.
-- Workspace `Cargo.toml` narrows `members` to just `resd-net-sys` at the end of T2; Task 3 uncomments `"crates/resd-net-core"` and Task 8 uncomments `"crates/resd-net"`.
+- `src/lib.rs` adds a `shim_rte_errno_linkable` test proving the shim symbol links.
+- Workspace `Cargo.toml` narrows `members` to just `dpdk-net-sys` at the end of T2; Task 3 uncomments `"crates/dpdk-net-core"` and Task 8 uncomments `"crates/dpdk-net"`.
 
 ---
 
-## Task 3: `resd-net-core` — crate skeleton + clock
+## Task 3: `dpdk-net-core` — crate skeleton + clock
 
 **Files:**
-- Create: `crates/resd-net-core/Cargo.toml`
-- Create: `crates/resd-net-core/src/lib.rs`
-- Create: `crates/resd-net-core/src/error.rs`
-- Create: `crates/resd-net-core/src/clock.rs`
+- Create: `crates/dpdk-net-core/Cargo.toml`
+- Create: `crates/dpdk-net-core/src/lib.rs`
+- Create: `crates/dpdk-net-core/src/error.rs`
+- Create: `crates/dpdk-net-core/src/clock.rs`
 
-- [ ] **Step 1: Write `crates/resd-net-core/Cargo.toml`**
+- [ ] **Step 1: Write `crates/dpdk-net-core/Cargo.toml`**
 
 ```toml
 [package]
-name = "resd-net-core"
+name = "dpdk-net-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-resd-net-sys = { path = "../resd-net-sys" }
+dpdk-net-sys = { path = "../dpdk-net-sys" }
 libc.workspace = true
 thiserror.workspace = true
 
@@ -333,11 +333,11 @@ thiserror.workspace = true
 unsafe_op_in_unsafe_fn = "warn"
 ```
 
-- [ ] **Step 2: Write `crates/resd-net-core/src/lib.rs`**
+- [ ] **Step 2: Write `crates/dpdk-net-core/src/lib.rs`**
 
 ```rust
 //! Pure-Rust internals of the resd.dpdk_tcp stack.
-//! The public `extern "C"` surface lives in the `resd-net` crate.
+//! The public `extern "C"` surface lives in the `dpdk-net` crate.
 
 pub mod clock;
 pub mod counters;
@@ -348,7 +348,7 @@ pub mod mempool;
 pub use error::Error;
 ```
 
-- [ ] **Step 3: Write `crates/resd-net-core/src/error.rs`**
+- [ ] **Step 3: Write `crates/dpdk-net-core/src/error.rs`**
 
 ```rust
 use thiserror::Error;
@@ -376,7 +376,7 @@ pub enum Error {
 
 - [ ] **Step 4: Write the failing test for `clock.rs`**
 
-Add `crates/resd-net-core/src/clock.rs`:
+Add `crates/dpdk-net-core/src/clock.rs`:
 
 ```rust
 use std::sync::OnceLock;
@@ -404,7 +404,7 @@ pub fn rdtsc() -> u64 {
         core::arch::x86_64::_rdtsc()
     }
     #[cfg(not(target_arch = "x86_64"))]
-    compile_error!("resd-net-core currently only supports x86_64");
+    compile_error!("dpdk-net-core currently only supports x86_64");
 }
 
 #[inline]
@@ -482,24 +482,24 @@ mod tests {
 
 - [ ] **Step 5: Run the tests and confirm they fail compilation — module `counters`, `engine`, `mempool` aren't written yet**
 
-Run: `cargo build -p resd-net-core`
+Run: `cargo build -p dpdk-net-core`
 Expected: failure with "file not found for module `counters`" etc.
 
 - [ ] **Step 6: Add stub module files so the crate compiles**
 
-Create `crates/resd-net-core/src/counters.rs`:
+Create `crates/dpdk-net-core/src/counters.rs`:
 
 ```rust
 // Stubbed in Task 4.
 ```
 
-Create `crates/resd-net-core/src/mempool.rs`:
+Create `crates/dpdk-net-core/src/mempool.rs`:
 
 ```rust
 // Stubbed in Task 5.
 ```
 
-Create `crates/resd-net-core/src/engine.rs`:
+Create `crates/dpdk-net-core/src/engine.rs`:
 
 ```rust
 // Stubbed in Task 6.
@@ -507,22 +507,22 @@ Create `crates/resd-net-core/src/engine.rs`:
 
 - [ ] **Step 7: Run clock tests**
 
-Run: `cargo test -p resd-net-core clock::`
+Run: `cargo test -p dpdk-net-core clock::`
 Expected: both `now_ns_monotonic_increasing` and `now_ns_within_one_percent_of_wall_clock` PASS.
 
 - [ ] **Step 8: Commit**
 
 ```sh
-git add crates/resd-net-core/
-git commit -m "add resd-net-core crate scaffold + TSC clock calibration"
+git add crates/dpdk-net-core/
+git commit -m "add dpdk-net-core crate scaffold + TSC clock calibration"
 ```
 
 ---
 
-## Task 4: `resd-net-core/counters.rs` — AtomicU64 counter groups
+## Task 4: `dpdk-net-core/counters.rs` — AtomicU64 counter groups
 
 **Files:**
-- Modify: `crates/resd-net-core/src/counters.rs`
+- Modify: `crates/dpdk-net-core/src/counters.rs`
 
 - [ ] **Step 1: Write the failing test**
 
@@ -685,29 +685,29 @@ mod tests {
 
 - [ ] **Step 2: Run tests**
 
-Run: `cargo test -p resd-net-core counters::`
+Run: `cargo test -p dpdk-net-core counters::`
 Expected: four PASS.
 
 - [ ] **Step 3: Commit**
 
 ```sh
-git add crates/resd-net-core/src/counters.rs
+git add crates/dpdk-net-core/src/counters.rs
 git commit -m "add per-lcore counters with cacheline grouping"
 ```
 
 ---
 
-## Task 5: `resd-net-core/mempool.rs` — RAII DPDK mempool wrapper
+## Task 5: `dpdk-net-core/mempool.rs` — RAII DPDK mempool wrapper
 
 **Files:**
-- Modify: `crates/resd-net-core/src/mempool.rs`
+- Modify: `crates/dpdk-net-core/src/mempool.rs`
 
 - [ ] **Step 1: Write the wrapper**
 
 Replace `mempool.rs` with:
 
 ```rust
-use resd_net_sys as sys;
+use dpdk_net_sys as sys;
 use std::ffi::CString;
 use std::ptr::NonNull;
 
@@ -777,29 +777,29 @@ Mempool creation requires EAL to be initialized. Integration testing happens in 
 
 - [ ] **Step 3: Confirm it compiles**
 
-Run: `cargo build -p resd-net-core`
+Run: `cargo build -p dpdk-net-core`
 Expected: compiles cleanly.
 
 - [ ] **Step 4: Commit**
 
 ```sh
-git add crates/resd-net-core/src/mempool.rs
+git add crates/dpdk-net-core/src/mempool.rs
 git commit -m "add RAII Mempool wrapper"
 ```
 
 ---
 
-## Task 6: `resd-net-core/engine.rs` — Engine struct + EAL init
+## Task 6: `dpdk-net-core/engine.rs` — Engine struct + EAL init
 
 **Files:**
-- Modify: `crates/resd-net-core/src/engine.rs`
+- Modify: `crates/dpdk-net-core/src/engine.rs`
 
 - [ ] **Step 1: Write Engine skeleton + EAL init**
 
 Replace `engine.rs` with:
 
 ```rust
-use resd_net_sys as sys;
+use dpdk_net_sys as sys;
 use std::ffi::{CStr, CString};
 use std::sync::Mutex;
 
@@ -835,7 +835,7 @@ impl Default for EngineConfig {
     }
 }
 
-/// A resd-net engine. One per lcore; owns the NIC queues and mempools for that lcore.
+/// A dpdk-net engine. One per lcore; owns the NIC queues and mempools for that lcore.
 pub struct Engine {
     cfg: EngineConfig,
     counters: Box<Counters>,
@@ -861,7 +861,7 @@ pub fn eal_init(args: &[&str]) -> Result<(), Error> {
     // Safety: rte_eal_init mutates argv internally; we pass the constructed array.
     let rc = unsafe { sys::rte_eal_init(argv.len() as i32, argv.as_mut_ptr()) };
     if rc < 0 {
-        return Err(Error::EalInit(unsafe { sys::resd_rte_errno() }));
+        return Err(Error::EalInit(unsafe { sys::shim_rte_errno() }));
     }
     *guard = true;
     Ok(())
@@ -906,7 +906,7 @@ impl Engine {
             sys::rte_eth_dev_configure(cfg.port_id, 1, 1, &eth_conf as *const _)
         };
         if rc != 0 {
-            return Err(Error::PortConfigure(cfg.port_id, unsafe { sys::resd_rte_errno() }));
+            return Err(Error::PortConfigure(cfg.port_id, unsafe { sys::shim_rte_errno() }));
         }
 
         let rc = unsafe {
@@ -920,7 +920,7 @@ impl Engine {
             )
         };
         if rc < 0 {
-            return Err(Error::RxQueueSetup(cfg.port_id, unsafe { sys::resd_rte_errno() }));
+            return Err(Error::RxQueueSetup(cfg.port_id, unsafe { sys::shim_rte_errno() }));
         }
 
         let rc = unsafe {
@@ -933,12 +933,12 @@ impl Engine {
             )
         };
         if rc < 0 {
-            return Err(Error::TxQueueSetup(cfg.port_id, unsafe { sys::resd_rte_errno() }));
+            return Err(Error::TxQueueSetup(cfg.port_id, unsafe { sys::shim_rte_errno() }));
         }
 
         let rc = unsafe { sys::rte_eth_dev_start(cfg.port_id) };
         if rc < 0 {
-            return Err(Error::PortStart(cfg.port_id, unsafe { sys::resd_rte_errno() }));
+            return Err(Error::PortStart(cfg.port_id, unsafe { sys::shim_rte_errno() }));
         }
 
         let counters = Box::new(Counters::new());
@@ -1001,15 +1001,15 @@ impl Drop for Engine {
 
 - [ ] **Step 2: Build the crate**
 
-Run: `cargo build -p resd-net-core`
-Expected: compiles. `sys::resd_rte_errno()` comes from the C shim added in Task 2's `wrapper.h`.
+Run: `cargo build -p dpdk-net-core`
+Expected: compiles. `sys::shim_rte_errno()` comes from the C shim added in Task 2's `wrapper.h`.
 
 - [ ] **Step 3: No unit test for this task — integration test comes in Task 7 (needs a real NIC or TAP)**
 
 - [ ] **Step 4: Commit**
 
 ```sh
-git add crates/resd-net-core/src/engine.rs
+git add crates/dpdk-net-core/src/engine.rs
 git commit -m "add Engine with EAL init, mempools, NIC queue setup, empty poll loop"
 ```
 
@@ -1018,37 +1018,37 @@ git commit -m "add Engine with EAL init, mempools, NIC queue setup, empty poll l
 ## Task 7: Integration smoke test — engine lifecycle on a TAP device
 
 **Files:**
-- Create: `crates/resd-net-core/tests/engine_smoke.rs`
+- Create: `crates/dpdk-net-core/tests/engine_smoke.rs`
 
 - [ ] **Step 1: Write the integration test**
 
 ```rust
 //! Integration test that brings up an engine against a TAP virtual device
-//! (no real NIC needed). Runs only when RESD_NET_TEST_TAP=1 in env.
+//! (no real NIC needed). Runs only when DPDK_NET_TEST_TAP=1 in env.
 
 #[test]
 fn engine_lifecycle_on_tap() {
-    if std::env::var("RESD_NET_TEST_TAP").ok().as_deref() != Some("1") {
-        eprintln!("skipping; set RESD_NET_TEST_TAP=1 to run");
+    if std::env::var("DPDK_NET_TEST_TAP").ok().as_deref() != Some("1") {
+        eprintln!("skipping; set DPDK_NET_TEST_TAP=1 to run");
         return;
     }
 
     // EAL args: in-memory, use vdev TAP so no real NIC is required.
     let args = [
-        "resd-net-test",
+        "dpdk-net-test",
         "--in-memory",
         "--no-pci",
-        "--vdev=net_tap0,iface=resdtap0",
+        "--vdev=net_tap0,iface=dpdktap0",
         "-l", "0-1",
         "--log-level=3",
     ];
-    resd_net_core::engine::eal_init(&args).expect("EAL init");
+    dpdk_net_core::engine::eal_init(&args).expect("EAL init");
 
-    let cfg = resd_net_core::engine::EngineConfig {
+    let cfg = dpdk_net_core::engine::EngineConfig {
         port_id: 0,
         ..Default::default()
     };
-    let engine = resd_net_core::engine::Engine::new(cfg).expect("engine new");
+    let engine = dpdk_net_core::engine::Engine::new(cfg).expect("engine new");
 
     // Poll a few times on an idle link; expect 0 packets.
     for _ in 0..10 {
@@ -1064,7 +1064,7 @@ fn engine_lifecycle_on_tap() {
 - [ ] **Step 2: Run with the TAP env var (requires sudo for DPDK)**
 
 ```sh
-sudo -E RESD_NET_TEST_TAP=1 $(command -v cargo) test -p resd-net-core --test engine_smoke -- --nocapture
+sudo -E DPDK_NET_TEST_TAP=1 $(command -v cargo) test -p dpdk-net-core --test engine_smoke -- --nocapture
 ```
 
 Expected: PASS; poll counter ≥ 10.
@@ -1077,55 +1077,55 @@ Append to `README.md`:
 ## Integration tests (require DPDK TAP and root)
 
 ```sh
-sudo -E RESD_NET_TEST_TAP=1 cargo test -p resd-net-core --test engine_smoke -- --nocapture
+sudo -E DPDK_NET_TEST_TAP=1 cargo test -p dpdk-net-core --test engine_smoke -- --nocapture
 ```
 ```
 
 - [ ] **Step 4: Commit**
 
 ```sh
-git add crates/resd-net-core/tests/engine_smoke.rs README.md
+git add crates/dpdk-net-core/tests/engine_smoke.rs README.md
 git commit -m "add engine lifecycle smoke test over DPDK TAP"
 ```
 
 ---
 
-## Task 8: `resd-net` public crate — C ABI types
+## Task 8: `dpdk-net` public crate — C ABI types
 
 **Files:**
-- Create: `crates/resd-net/Cargo.toml`
-- Create: `crates/resd-net/cbindgen.toml`
-- Create: `crates/resd-net/build.rs`
-- Create: `crates/resd-net/src/lib.rs`
-- Create: `crates/resd-net/src/api.rs`
+- Create: `crates/dpdk-net/Cargo.toml`
+- Create: `crates/dpdk-net/cbindgen.toml`
+- Create: `crates/dpdk-net/build.rs`
+- Create: `crates/dpdk-net/src/lib.rs`
+- Create: `crates/dpdk-net/src/api.rs`
 
-- [ ] **Step 1: Write `crates/resd-net/Cargo.toml`**
+- [ ] **Step 1: Write `crates/dpdk-net/Cargo.toml`**
 
 ```toml
 [package]
-name = "resd-net"
+name = "dpdk-net"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [lib]
-name = "resd_net"
+name = "dpdk_net"
 # staticlib for static linking into C++; cdylib for dynamic.
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [dependencies]
-resd-net-core = { path = "../resd-net-core" }
+dpdk-net-core = { path = "../dpdk-net-core" }
 libc.workspace = true
 
 [build-dependencies]
 cbindgen = "0.26"
 ```
 
-- [ ] **Step 2: Write `crates/resd-net/cbindgen.toml`**
+- [ ] **Step 2: Write `crates/dpdk-net/cbindgen.toml`**
 
 ```toml
 language = "C"
-include_guard = "RESD_NET_H"
+include_guard = "DPDK_NET_H"
 pragma_once = true
 autogen_warning = "/* DO NOT EDIT: generated from Rust via cbindgen */"
 no_includes = false
@@ -1133,14 +1133,14 @@ sys_includes = ["stdint.h", "stdbool.h", "stddef.h", "arpa/inet.h"]
 style = "tag"
 
 [export]
-prefix = "resd_net_"
+prefix = "dpdk_net_"
 exclude = ["EngineConfigRustOnly"]
 
 [parse]
 parse_deps = false
 ```
 
-- [ ] **Step 3: Write `crates/resd-net/src/api.rs`** (Stage 1 C ABI types — matches spec §4)
+- [ ] **Step 3: Write `crates/dpdk-net/src/api.rs`** (Stage 1 C ABI types — matches spec §4)
 
 ```rust
 //! Public C ABI type definitions.
@@ -1154,15 +1154,15 @@ parse_deps = false
 //! atomic C type. See the layout assertion at the bottom of the file.
 
 #[repr(C)]
-pub struct resd_net_engine {
+pub struct dpdk_net_engine {
     _opaque: [u8; 0],
 }
 
-pub type resd_net_conn_t = u64;
-pub type resd_net_timer_id_t = u64;
+pub type dpdk_net_conn_t = u64;
+pub type dpdk_net_timer_id_t = u64;
 
 #[repr(C)]
-pub struct resd_net_engine_config_t {
+pub struct dpdk_net_engine_config_t {
     pub port_id: u16,
     pub rx_queue_id: u16,
     pub tx_queue_id: u16,
@@ -1184,7 +1184,7 @@ pub struct resd_net_engine_config_t {
 }
 
 #[repr(C)]
-pub struct resd_net_connect_opts_t {
+pub struct dpdk_net_connect_opts_t {
     pub peer_addr: u32,         // network byte order IPv4
     pub peer_port: u16,
     pub local_addr: u32,
@@ -1194,49 +1194,49 @@ pub struct resd_net_connect_opts_t {
 }
 
 #[repr(u32)]
-pub enum resd_net_event_kind_t {
-    RESD_NET_EVT_CONNECTED = 1,
-    RESD_NET_EVT_READABLE = 2,
-    RESD_NET_EVT_WRITABLE = 3,
-    RESD_NET_EVT_CLOSED = 4,
-    RESD_NET_EVT_ERROR = 5,
-    RESD_NET_EVT_TIMER = 6,
-    RESD_NET_EVT_TCP_RETRANS = 7,
-    RESD_NET_EVT_TCP_LOSS_DETECTED = 8,
-    RESD_NET_EVT_TCP_STATE_CHANGE = 9,
+pub enum dpdk_net_event_kind_t {
+    DPDK_NET_EVT_CONNECTED = 1,
+    DPDK_NET_EVT_READABLE = 2,
+    DPDK_NET_EVT_WRITABLE = 3,
+    DPDK_NET_EVT_CLOSED = 4,
+    DPDK_NET_EVT_ERROR = 5,
+    DPDK_NET_EVT_TIMER = 6,
+    DPDK_NET_EVT_TCP_RETRANS = 7,
+    DPDK_NET_EVT_TCP_LOSS_DETECTED = 8,
+    DPDK_NET_EVT_TCP_STATE_CHANGE = 9,
 }
 
 #[repr(C)]
-pub struct resd_net_event_readable_t {
+pub struct dpdk_net_event_readable_t {
     pub data: *const u8,
     pub data_len: u32,
 }
 
 #[repr(C)]
-pub struct resd_net_event_error_t {
+pub struct dpdk_net_event_error_t {
     pub err: i32,
 }
 
 #[repr(C)]
-pub struct resd_net_event_timer_t {
+pub struct dpdk_net_event_timer_t {
     pub timer_id: u64,
     pub user_data: u64,
 }
 
 #[repr(C)]
-pub struct resd_net_event_tcp_retrans_t {
+pub struct dpdk_net_event_tcp_retrans_t {
     pub seq: u32,
     pub rtx_count: u32,
 }
 
 #[repr(C)]
-pub struct resd_net_event_tcp_loss_t {
+pub struct dpdk_net_event_tcp_loss_t {
     pub first_seq: u32,
     pub trigger: u8,
 }
 
 #[repr(C)]
-pub struct resd_net_event_tcp_state_t {
+pub struct dpdk_net_event_tcp_state_t {
     pub from_state: u8,
     pub to_state: u8,
 }
@@ -1244,39 +1244,39 @@ pub struct resd_net_event_tcp_state_t {
 /// Union-of-payloads approach: we lay out the union as a byte array and
 /// expose accessor helpers. cbindgen emits it as a C union.
 #[repr(C)]
-pub union resd_net_event_payload_t {
-    pub readable: resd_net_event_readable_t,
-    pub error: resd_net_event_error_t,
-    pub closed: resd_net_event_error_t,
-    pub timer: resd_net_event_timer_t,
-    pub tcp_retrans: resd_net_event_tcp_retrans_t,
-    pub tcp_loss: resd_net_event_tcp_loss_t,
-    pub tcp_state: resd_net_event_tcp_state_t,
+pub union dpdk_net_event_payload_t {
+    pub readable: dpdk_net_event_readable_t,
+    pub error: dpdk_net_event_error_t,
+    pub closed: dpdk_net_event_error_t,
+    pub timer: dpdk_net_event_timer_t,
+    pub tcp_retrans: dpdk_net_event_tcp_retrans_t,
+    pub tcp_loss: dpdk_net_event_tcp_loss_t,
+    pub tcp_state: dpdk_net_event_tcp_state_t,
     pub _pad: [u8; 16],
 }
 
 #[repr(C)]
-pub struct resd_net_event_t {
-    pub kind: resd_net_event_kind_t,
-    pub conn: resd_net_conn_t,
+pub struct dpdk_net_event_t {
+    pub kind: dpdk_net_event_kind_t,
+    pub conn: dpdk_net_conn_t,
     pub rx_hw_ts_ns: u64,
     pub enqueued_ts_ns: u64,
-    pub u: resd_net_event_payload_t,
+    pub u: dpdk_net_event_payload_t,
 }
 
-/// Close flags — bitmask for resd_net_close.
-pub const RESD_NET_CLOSE_FORCE_TW_SKIP: u32 = 1 << 0;
+/// Close flags — bitmask for dpdk_net_close.
+pub const DPDK_NET_CLOSE_FORCE_TW_SKIP: u32 = 1 << 0;
 
-/// Counters struct — exposed to application via resd_net_counters().
+/// Counters struct — exposed to application via dpdk_net_counters().
 /// Fields are plain u64 on the C ABI for clean cbindgen emission, but
 /// internally the stack writes them as AtomicU64 (Relaxed). AtomicU64
 /// has identical size and alignment as u64 on x86_64 so pointer-casting
-/// between resd_net_core::Counters and resd_net_counters_t is sound.
+/// between dpdk_net_core::Counters and dpdk_net_counters_t is sound.
 /// C/C++ readers should use `__atomic_load_n(&field, __ATOMIC_RELAXED)`
 /// (or `std::atomic_ref<uint64_t>`) for strictly correct reads; on x86_64
 /// this compiles to a plain `mov` so there's no runtime cost.
 #[repr(C, align(64))]
-pub struct resd_net_eth_counters_t {
+pub struct dpdk_net_eth_counters_t {
     pub rx_pkts: u64,
     pub rx_bytes: u64,
     pub rx_drop_miss_mac: u64,
@@ -1288,7 +1288,7 @@ pub struct resd_net_eth_counters_t {
     pub _pad: [u64; 8],
 }
 #[repr(C, align(64))]
-pub struct resd_net_ip_counters_t {
+pub struct dpdk_net_ip_counters_t {
     pub rx_csum_bad: u64,
     pub rx_ttl_zero: u64,
     pub rx_frag: u64,
@@ -1297,7 +1297,7 @@ pub struct resd_net_ip_counters_t {
     pub _pad: [u64; 11],
 }
 #[repr(C, align(64))]
-pub struct resd_net_tcp_counters_t {
+pub struct dpdk_net_tcp_counters_t {
     pub rx_syn_ack: u64,
     pub rx_data: u64,
     pub rx_ack: u64,
@@ -1314,7 +1314,7 @@ pub struct resd_net_tcp_counters_t {
     pub _pad: [u64; 3],
 }
 #[repr(C, align(64))]
-pub struct resd_net_poll_counters_t {
+pub struct dpdk_net_poll_counters_t {
     pub iters: u64,
     pub iters_with_rx: u64,
     pub iters_with_tx: u64,
@@ -1322,36 +1322,36 @@ pub struct resd_net_poll_counters_t {
     pub _pad: [u64; 12],
 }
 #[repr(C)]
-pub struct resd_net_counters_t {
-    pub eth: resd_net_eth_counters_t,
-    pub ip: resd_net_ip_counters_t,
-    pub tcp: resd_net_tcp_counters_t,
-    pub poll: resd_net_poll_counters_t,
+pub struct dpdk_net_counters_t {
+    pub eth: dpdk_net_eth_counters_t,
+    pub ip: dpdk_net_ip_counters_t,
+    pub tcp: dpdk_net_tcp_counters_t,
+    pub poll: dpdk_net_poll_counters_t,
 }
 
 // Compile-time checks: the public counters struct must have the same
-// size AND alignment as resd_net_core::Counters (AtomicU64 has the same
+// size AND alignment as dpdk_net_core::Counters (AtomicU64 has the same
 // layout as u64 on targets we support). If either diverges, the
-// pointer-cast in resd_net_counters() is unsound and this is a bug.
+// pointer-cast in dpdk_net_counters() is unsound and this is a bug.
 const _: () = {
-    use resd_net_core::counters::{
+    use dpdk_net_core::counters::{
         Counters as CoreCounters, EthCounters as CoreEth, IpCounters as CoreIp,
         PollCounters as CorePoll, TcpCounters as CoreTcp,
     };
     use std::mem::{align_of, size_of};
-    assert!(size_of::<resd_net_counters_t>() == size_of::<CoreCounters>());
-    assert!(align_of::<resd_net_eth_counters_t>() == align_of::<CoreEth>());
-    assert!(align_of::<resd_net_ip_counters_t>() == align_of::<CoreIp>());
-    assert!(align_of::<resd_net_tcp_counters_t>() == align_of::<CoreTcp>());
-    assert!(align_of::<resd_net_poll_counters_t>() == align_of::<CorePoll>());
-    assert!(size_of::<resd_net_eth_counters_t>() == size_of::<CoreEth>());
-    assert!(size_of::<resd_net_ip_counters_t>() == size_of::<CoreIp>());
-    assert!(size_of::<resd_net_tcp_counters_t>() == size_of::<CoreTcp>());
-    assert!(size_of::<resd_net_poll_counters_t>() == size_of::<CorePoll>());
+    assert!(size_of::<dpdk_net_counters_t>() == size_of::<CoreCounters>());
+    assert!(align_of::<dpdk_net_eth_counters_t>() == align_of::<CoreEth>());
+    assert!(align_of::<dpdk_net_ip_counters_t>() == align_of::<CoreIp>());
+    assert!(align_of::<dpdk_net_tcp_counters_t>() == align_of::<CoreTcp>());
+    assert!(align_of::<dpdk_net_poll_counters_t>() == align_of::<CorePoll>());
+    assert!(size_of::<dpdk_net_eth_counters_t>() == size_of::<CoreEth>());
+    assert!(size_of::<dpdk_net_ip_counters_t>() == size_of::<CoreIp>());
+    assert!(size_of::<dpdk_net_tcp_counters_t>() == size_of::<CoreTcp>());
+    assert!(size_of::<dpdk_net_poll_counters_t>() == size_of::<CorePoll>());
 };
 ```
 
-- [ ] **Step 4: Write `crates/resd-net/src/lib.rs`** (stubbed extern functions; filled in Task 9)
+- [ ] **Step 4: Write `crates/dpdk-net/src/lib.rs`** (stubbed extern functions; filled in Task 9)
 
 ```rust
 #![allow(non_camel_case_types, non_snake_case)]
@@ -1361,7 +1361,7 @@ pub mod api;
 // Implementations come in Task 9.
 ```
 
-- [ ] **Step 5: Write `crates/resd-net/build.rs`** (cbindgen)
+- [ ] **Step 5: Write `crates/dpdk-net/build.rs`** (cbindgen)
 
 ```rust
 use std::env;
@@ -1369,8 +1369,8 @@ use std::path::PathBuf;
 
 fn main() {
     let crate_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
-    // Generate into ../../include/resd_net.h so both the repo and consumers see it.
-    let out = PathBuf::from(&crate_dir).join("../../include/resd_net.h");
+    // Generate into ../../include/dpdk_net.h so both the repo and consumers see it.
+    let out = PathBuf::from(&crate_dir).join("../../include/dpdk_net.h");
 
     let cfg = cbindgen::Config::from_file(PathBuf::from(&crate_dir).join("cbindgen.toml"))
         .expect("read cbindgen.toml");
@@ -1389,27 +1389,27 @@ fn main() {
 
 - [ ] **Step 6: Build**
 
-Run: `cargo build -p resd-net`
-Expected: compiles. `include/resd_net.h` appears.
+Run: `cargo build -p dpdk-net`
+Expected: compiles. `include/dpdk_net.h` appears.
 
 - [ ] **Step 7: Confirm header was generated and committed**
 
-Run: `head -40 include/resd_net.h`
+Run: `head -40 include/dpdk_net.h`
 Expected: pragma-once + type declarations.
 
 - [ ] **Step 8: Commit**
 
 ```sh
-git add crates/resd-net/ include/resd_net.h
-git commit -m "add resd-net public crate with C ABI types + cbindgen"
+git add crates/dpdk-net/ include/dpdk_net.h
+git commit -m "add dpdk-net public crate with C ABI types + cbindgen"
 ```
 
 ---
 
-## Task 9: `resd-net` — `extern "C"` functions for engine lifecycle
+## Task 9: `dpdk-net` — `extern "C"` functions for engine lifecycle
 
 **Files:**
-- Modify: `crates/resd-net/src/lib.rs`
+- Modify: `crates/dpdk-net/src/lib.rs`
 
 - [ ] **Step 1: Fill in the extern "C" wrappers**
 
@@ -1421,33 +1421,33 @@ Replace `lib.rs` with:
 pub mod api;
 
 use api::*;
-use resd_net_core::clock;
-use resd_net_core::counters::Counters;
-use resd_net_core::engine::{self, Engine, EngineConfig};
+use dpdk_net_core::clock;
+use dpdk_net_core::counters::Counters;
+use dpdk_net_core::engine::{self, Engine, EngineConfig};
 use std::ffi::CStr;
 use std::ptr;
 
-/// Opaque handle — actually a Box<Engine> reinterpreted as *mut resd_net_engine.
+/// Opaque handle — actually a Box<Engine> reinterpreted as *mut dpdk_net_engine.
 struct OpaqueEngine(Engine);
 
-fn box_to_raw(e: Engine) -> *mut resd_net_engine {
-    Box::into_raw(Box::new(OpaqueEngine(e))) as *mut resd_net_engine
+fn box_to_raw(e: Engine) -> *mut dpdk_net_engine {
+    Box::into_raw(Box::new(OpaqueEngine(e))) as *mut dpdk_net_engine
 }
 
-unsafe fn engine_from_raw<'a>(p: *mut resd_net_engine) -> Option<&'a Engine> {
+unsafe fn engine_from_raw<'a>(p: *mut dpdk_net_engine) -> Option<&'a Engine> {
     if p.is_null() {
         return None;
     }
     Some(&(&*(p as *const OpaqueEngine)).0)
 }
 
-/// Initialize DPDK EAL. Must be called before resd_net_engine_create.
+/// Initialize DPDK EAL. Must be called before dpdk_net_engine_create.
 /// `argv` is a C-style argv array; the function does NOT take ownership
 /// (copies each argument into Rust-owned CStrings internally).
 /// Safe to call multiple times; subsequent calls after the first return 0.
 /// Returns 0 on success, negative errno on failure.
 #[no_mangle]
-pub unsafe extern "C" fn resd_net_eal_init(
+pub unsafe extern "C" fn dpdk_net_eal_init(
     argc: i32,
     argv: *const *const libc::c_char,
 ) -> i32 {
@@ -1472,10 +1472,10 @@ pub unsafe extern "C" fn resd_net_eal_init(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn resd_net_engine_create(
+pub unsafe extern "C" fn dpdk_net_engine_create(
     lcore_id: u16,
-    cfg: *const resd_net_engine_config_t,
-) -> *mut resd_net_engine {
+    cfg: *const dpdk_net_engine_config_t,
+) -> *mut dpdk_net_engine {
     if cfg.is_null() {
         return ptr::null_mut();
     }
@@ -1497,7 +1497,7 @@ pub unsafe extern "C" fn resd_net_engine_create(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn resd_net_engine_destroy(p: *mut resd_net_engine) {
+pub unsafe extern "C" fn dpdk_net_engine_destroy(p: *mut dpdk_net_engine) {
     if p.is_null() {
         return;
     }
@@ -1506,9 +1506,9 @@ pub unsafe extern "C" fn resd_net_engine_destroy(p: *mut resd_net_engine) {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn resd_net_poll(
-    p: *mut resd_net_engine,
-    _events_out: *mut resd_net_event_t,
+pub unsafe extern "C" fn dpdk_net_poll(
+    p: *mut dpdk_net_engine,
+    _events_out: *mut dpdk_net_event_t,
     _max_events: u32,
     _timeout_ns: u64,
 ) -> i32 {
@@ -1522,21 +1522,21 @@ pub unsafe extern "C" fn resd_net_poll(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn resd_net_flush(_p: *mut resd_net_engine) {
+pub unsafe extern "C" fn dpdk_net_flush(_p: *mut dpdk_net_engine) {
     // Phase A1: no-op; TX burst handled inline in poll_once.
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn resd_net_now_ns(_p: *mut resd_net_engine) -> u64 {
+pub unsafe extern "C" fn dpdk_net_now_ns(_p: *mut dpdk_net_engine) -> u64 {
     clock::now_ns()
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn resd_net_counters(
-    p: *mut resd_net_engine,
-) -> *const resd_net_counters_t {
+pub unsafe extern "C" fn dpdk_net_counters(
+    p: *mut dpdk_net_engine,
+) -> *const dpdk_net_counters_t {
     match engine_from_raw(p) {
-        Some(e) => e.counters() as *const Counters as *const resd_net_counters_t,
+        Some(e) => e.counters() as *const Counters as *const dpdk_net_counters_t,
         None => ptr::null(),
     }
 }
@@ -1544,7 +1544,7 @@ pub unsafe extern "C" fn resd_net_counters(
 
 - [ ] **Step 2: Build**
 
-Run: `cargo build -p resd-net`
+Run: `cargo build -p dpdk-net`
 Expected: compiles.
 
 - [ ] **Step 3: Unit test the FFI**
@@ -1559,28 +1559,28 @@ mod tests {
     #[test]
     fn create_with_null_cfg_returns_null() {
         // Safety: we pass a valid null pointer and an arbitrary lcore_id.
-        let p = unsafe { resd_net_engine_create(0, std::ptr::null()) };
+        let p = unsafe { dpdk_net_engine_create(0, std::ptr::null()) };
         assert!(p.is_null());
     }
 
     #[test]
     fn destroy_null_is_safe() {
         // Must not panic / segfault.
-        unsafe { resd_net_engine_destroy(std::ptr::null_mut()) };
+        unsafe { dpdk_net_engine_destroy(std::ptr::null_mut()) };
     }
 
     #[test]
     fn poll_null_returns_einval() {
         let rc = unsafe {
-            resd_net_poll(std::ptr::null_mut(), std::ptr::null_mut(), 0, 0)
+            dpdk_net_poll(std::ptr::null_mut(), std::ptr::null_mut(), 0, 0)
         };
         assert_eq!(rc, -libc::EINVAL);
     }
 
     #[test]
     fn now_ns_advances() {
-        let a = unsafe { resd_net_now_ns(std::ptr::null_mut()) };
-        let b = unsafe { resd_net_now_ns(std::ptr::null_mut()) };
+        let a = unsafe { dpdk_net_now_ns(std::ptr::null_mut()) };
+        let b = unsafe { dpdk_net_now_ns(std::ptr::null_mut()) };
         assert!(b >= a);
     }
 }
@@ -1588,13 +1588,13 @@ mod tests {
 
 - [ ] **Step 4: Run tests**
 
-Run: `cargo test -p resd-net`
+Run: `cargo test -p dpdk-net`
 Expected: four PASS.
 
 - [ ] **Step 5: Commit**
 
 ```sh
-git add crates/resd-net/src/lib.rs
+git add crates/dpdk-net/src/lib.rs
 git commit -m "add extern \"C\" wrappers for engine lifecycle + poll + counters"
 ```
 
@@ -1603,17 +1603,17 @@ git commit -m "add extern \"C\" wrappers for engine lifecycle + poll + counters"
 ## Task 10: Regenerate header and add CI check
 
 **Files:**
-- Modify: `include/resd_net.h` (regenerated)
+- Modify: `include/dpdk_net.h` (regenerated)
 - Create: `scripts/check-header.sh`
 
 - [ ] **Step 1: Regenerate the header**
 
-Run: `cargo build -p resd-net`
-Expected: `include/resd_net.h` updates to include `resd_net_engine_create`, `resd_net_engine_destroy`, `resd_net_poll`, `resd_net_flush`, `resd_net_now_ns`, `resd_net_counters`.
+Run: `cargo build -p dpdk-net`
+Expected: `include/dpdk_net.h` updates to include `dpdk_net_engine_create`, `dpdk_net_engine_destroy`, `dpdk_net_poll`, `dpdk_net_flush`, `dpdk_net_now_ns`, `dpdk_net_counters`.
 
 - [ ] **Step 2: Inspect**
 
-Run: `grep -E '^(void|int|uint|struct|typedef)' include/resd_net.h | head -40`
+Run: `grep -E '^(void|int|uint|struct|typedef)' include/dpdk_net.h | head -40`
 Expected: declarations for the above functions present.
 
 - [ ] **Step 3: Create `scripts/check-header.sh`**
@@ -1623,10 +1623,10 @@ Expected: declarations for the above functions present.
 # Fails CI if the committed header differs from what cbindgen produces.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-cargo build -p resd-net --quiet
-if ! git diff --quiet include/resd_net.h; then
-    echo "ERROR: include/resd_net.h differs from cbindgen output. Run 'cargo build -p resd-net' and commit." >&2
-    git --no-pager diff include/resd_net.h >&2
+cargo build -p dpdk-net --quiet
+if ! git diff --quiet include/dpdk_net.h; then
+    echo "ERROR: include/dpdk_net.h differs from cbindgen output. Run 'cargo build -p dpdk-net' and commit." >&2
+    git --no-pager diff include/dpdk_net.h >&2
     exit 1
 fi
 ```
@@ -1638,7 +1638,7 @@ Run: `chmod +x scripts/check-header.sh`
 - [ ] **Step 5: Commit regenerated header + CI script**
 
 ```sh
-git add include/resd_net.h scripts/check-header.sh
+git add include/dpdk_net.h scripts/check-header.sh
 git commit -m "regenerate header with lifecycle functions; add CI drift check"
 ```
 
@@ -1654,26 +1654,26 @@ git commit -m "regenerate header with lifecycle functions; add CI drift check"
 
 ```cmake
 cmake_minimum_required(VERSION 3.22)
-project(resd_net_cpp_consumer CXX)
+project(dpdk_net_cpp_consumer CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # Expect the Rust library to be built before invoking cmake.
-set(RESD_NET_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
-set(RESD_NET_INCLUDE "${RESD_NET_ROOT}/include")
+set(DPDK_NET_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
+set(DPDK_NET_INCLUDE "${DPDK_NET_ROOT}/include")
 # Configurable: debug or release; default release.
-set(RESD_NET_PROFILE "release" CACHE STRING "cargo profile to link")
-set(RESD_NET_LIB "${RESD_NET_ROOT}/target/${RESD_NET_PROFILE}/libresd_net.a")
+set(DPDK_NET_PROFILE "release" CACHE STRING "cargo profile to link")
+set(DPDK_NET_LIB "${DPDK_NET_ROOT}/target/${DPDK_NET_PROFILE}/libdpdk_net.a")
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(DPDK REQUIRED libdpdk)
 
 add_executable(cpp_consumer main.cpp)
-target_include_directories(cpp_consumer PRIVATE "${RESD_NET_INCLUDE}" ${DPDK_INCLUDE_DIRS})
+target_include_directories(cpp_consumer PRIVATE "${DPDK_NET_INCLUDE}" ${DPDK_INCLUDE_DIRS})
 target_link_libraries(cpp_consumer PRIVATE
-    "${RESD_NET_LIB}"
+    "${DPDK_NET_LIB}"
     ${DPDK_LIBRARIES}
     pthread
     dl
@@ -1685,14 +1685,14 @@ target_compile_options(cpp_consumer PRIVATE -Wall -Wextra -Werror)
 - [ ] **Step 2: Write main.cpp**
 
 ```cpp
-#include "resd_net.h"
+#include "dpdk_net.h"
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
 
 int main() {
     // Minimal config. Assumes port 0 is already configured via EAL env.
-    resd_net_engine_config_t cfg{};
+    dpdk_net_engine_config_t cfg{};
     cfg.port_id = 0;
     cfg.rx_queue_id = 0;
     cfg.tx_queue_id = 0;
@@ -1716,21 +1716,21 @@ int main() {
     // The default args below work on any host with hugepages; use the TAP
     // vdev so no real NIC is required for local smoke testing.
     const char* eal_args[] = {
-        "resd-net-cpp-consumer",
+        "dpdk-net-cpp-consumer",
         "--in-memory",
         "--no-pci",
-        "--vdev=net_tap0,iface=resdtap0",
+        "--vdev=net_tap0,iface=dpdktap0",
         "-l", "0-1",
         "--log-level=3",
     };
     int eal_argc = (int)(sizeof(eal_args) / sizeof(eal_args[0]));
-    int eal_rc = resd_net_eal_init(eal_argc, eal_args);
+    int eal_rc = dpdk_net_eal_init(eal_argc, eal_args);
     if (eal_rc != 0) {
-        std::fprintf(stderr, "resd_net_eal_init failed: %d\n", eal_rc);
+        std::fprintf(stderr, "dpdk_net_eal_init failed: %d\n", eal_rc);
         return 1;
     }
 
-    resd_net_engine* eng = resd_net_engine_create(0, &cfg);
+    dpdk_net_engine* eng = dpdk_net_engine_create(0, &cfg);
     if (!eng) {
         std::fprintf(stderr, "engine create failed\n");
         return 1;
@@ -1738,12 +1738,12 @@ int main() {
 
     // Poll a few times, print counters.
     for (int i = 0; i < 100; i++) {
-        resd_net_event_t events[32];
-        int n = resd_net_poll(eng, events, 32, 0);
+        dpdk_net_event_t events[32];
+        int n = dpdk_net_poll(eng, events, 32, 0);
         (void)n;
     }
 
-    const resd_net_counters_t* c = resd_net_counters(eng);
+    const dpdk_net_counters_t* c = dpdk_net_counters(eng);
     // Counter fields are plain uint64_t on the C ABI but written atomically
     // by the stack. For strictly correct cross-thread reads, use
     // __atomic_load_n(..., __ATOMIC_RELAXED); on x86_64 this compiles to a
@@ -1751,9 +1751,9 @@ int main() {
     uint64_t iters = __atomic_load_n(&c->poll.iters, __ATOMIC_RELAXED);
     std::printf("poll iters: %llu\n", (unsigned long long)iters);
     std::printf("now_ns: %llu\n",
-        (unsigned long long)resd_net_now_ns(eng));
+        (unsigned long long)dpdk_net_now_ns(eng));
 
-    resd_net_engine_destroy(eng);
+    dpdk_net_engine_destroy(eng);
     return 0;
 }
 ```
@@ -1761,14 +1761,14 @@ int main() {
 - [ ] **Step 3: Try to build**
 
 ```sh
-cargo build -p resd-net --release
-cmake -S examples/cpp-consumer -B examples/cpp-consumer/build -DRESD_NET_PROFILE=release
+cargo build -p dpdk-net --release
+cmake -S examples/cpp-consumer -B examples/cpp-consumer/build -DDPDK_NET_PROFILE=release
 cmake --build examples/cpp-consumer/build
 ```
 
 Expected: `cpp_consumer` binary appears at `examples/cpp-consumer/build/cpp_consumer`.
 
-Troubleshooting: if linking fails with "undefined symbol" for a DPDK function, ensure `pkg_check_modules(DPDK REQUIRED libdpdk)` is picking up the right `libdpdk.pc`. If atomic accessor syntax breaks, inspect `include/resd_net.h` to see how cbindgen emitted the AtomicU64 — adjust either `cbindgen.toml` (to treat AtomicU64 as plain `uint64_t` via a type rename) or the accessor in `main.cpp`.
+Troubleshooting: if linking fails with "undefined symbol" for a DPDK function, ensure `pkg_check_modules(DPDK REQUIRED libdpdk)` is picking up the right `libdpdk.pc`. If atomic accessor syntax breaks, inspect `include/dpdk_net.h` to see how cbindgen emitted the AtomicU64 — adjust either `cbindgen.toml` (to treat AtomicU64 as plain `uint64_t` via a type rename) or the accessor in `main.cpp`.
 
 - [ ] **Step 4: Commit**
 
@@ -1792,9 +1792,9 @@ Edit root `Cargo.toml` — update the `members` array:
 
 ```toml
 members = [
-    "crates/resd-net-sys",
-    "crates/resd-net-core",
-    "crates/resd-net",
+    "crates/dpdk-net-sys",
+    "crates/dpdk-net-core",
+    "crates/dpdk-net",
     "tests/ffi-test",
 ]
 ```
@@ -1809,7 +1809,7 @@ edition.workspace = true
 publish = false
 
 [dependencies]
-resd-net = { path = "../../crates/resd-net" }
+dpdk-net = { path = "../../crates/dpdk-net" }
 libc.workspace = true
 ```
 
@@ -1820,52 +1820,52 @@ libc.workspace = true
 //! extern "C" surface is usable, not just the Rust-native one.
 //!
 //! - `ffi_handles_null_safely` runs always (doesn't touch EAL/DPDK).
-//! - `ffi_eal_init_and_engine_lifecycle` runs only when RESD_NET_TEST_TAP=1
+//! - `ffi_eal_init_and_engine_lifecycle` runs only when DPDK_NET_TEST_TAP=1
 //!   because it actually initializes EAL against a DPDK TAP vdev.
 
 use std::ffi::CString;
 use std::ptr;
 
-#[link(name = "resd_net", kind = "static")]
+#[link(name = "dpdk_net", kind = "static")]
 extern "C" {
-    fn resd_net_eal_init(argc: i32, argv: *const *const libc::c_char) -> i32;
-    fn resd_net_engine_create(
+    fn dpdk_net_eal_init(argc: i32, argv: *const *const libc::c_char) -> i32;
+    fn dpdk_net_engine_create(
         lcore_id: u16,
         cfg: *const core::ffi::c_void,
     ) -> *mut core::ffi::c_void;
-    fn resd_net_engine_destroy(p: *mut core::ffi::c_void);
-    fn resd_net_poll(
+    fn dpdk_net_engine_destroy(p: *mut core::ffi::c_void);
+    fn dpdk_net_poll(
         p: *mut core::ffi::c_void,
         events_out: *mut core::ffi::c_void,
         max_events: u32,
         timeout_ns: u64,
     ) -> i32;
-    fn resd_net_now_ns(p: *mut core::ffi::c_void) -> u64;
+    fn dpdk_net_now_ns(p: *mut core::ffi::c_void) -> u64;
 }
 
 #[test]
 fn ffi_handles_null_safely() {
     unsafe {
-        resd_net_engine_destroy(ptr::null_mut());
-        let rc = resd_net_poll(ptr::null_mut(), ptr::null_mut(), 0, 0);
+        dpdk_net_engine_destroy(ptr::null_mut());
+        let rc = dpdk_net_poll(ptr::null_mut(), ptr::null_mut(), 0, 0);
         assert_eq!(rc, -libc::EINVAL);
-        let ts = resd_net_now_ns(ptr::null_mut());
+        let ts = dpdk_net_now_ns(ptr::null_mut());
         assert!(ts > 0);
     }
 }
 
 #[test]
 fn ffi_eal_init_and_engine_lifecycle() {
-    if std::env::var("RESD_NET_TEST_TAP").ok().as_deref() != Some("1") {
-        eprintln!("skipping; set RESD_NET_TEST_TAP=1 to run");
+    if std::env::var("DPDK_NET_TEST_TAP").ok().as_deref() != Some("1") {
+        eprintln!("skipping; set DPDK_NET_TEST_TAP=1 to run");
         return;
     }
 
     let args: Vec<CString> = [
-        "resd-net-ffi-test",
+        "dpdk-net-ffi-test",
         "--in-memory",
         "--no-pci",
-        "--vdev=net_tap0,iface=resdtap0",
+        "--vdev=net_tap0,iface=dpdktap0",
         "-l", "0-1",
         "--log-level=3",
     ]
@@ -1874,12 +1874,12 @@ fn ffi_eal_init_and_engine_lifecycle() {
     .collect();
     let argv: Vec<*const libc::c_char> = args.iter().map(|c| c.as_ptr()).collect();
 
-    let rc = unsafe { resd_net_eal_init(argv.len() as i32, argv.as_ptr()) };
-    assert_eq!(rc, 0, "resd_net_eal_init failed: {rc}");
+    let rc = unsafe { dpdk_net_eal_init(argv.len() as i32, argv.as_ptr()) };
+    assert_eq!(rc, 0, "dpdk_net_eal_init failed: {rc}");
 
-    // Minimum viable engine_config — matches the resd_net_engine_config_t layout
+    // Minimum viable engine_config — matches the dpdk_net_engine_config_t layout
     // from api.rs. Kept as a byte array here to avoid duplicating the struct
-    // definition; real consumers include resd_net.h and use the typed struct.
+    // definition; real consumers include dpdk_net.h and use the typed struct.
     #[repr(C)]
     struct Cfg {
         port_id: u16, rx_queue_id: u16, tx_queue_id: u16,
@@ -1904,20 +1904,20 @@ fn ffi_eal_init_and_engine_lifecycle() {
     };
 
     let eng = unsafe {
-        resd_net_engine_create(0, &cfg as *const Cfg as *const core::ffi::c_void)
+        dpdk_net_engine_create(0, &cfg as *const Cfg as *const core::ffi::c_void)
     };
-    assert!(!eng.is_null(), "resd_net_engine_create returned null");
+    assert!(!eng.is_null(), "dpdk_net_engine_create returned null");
 
     for _ in 0..10 {
-        let rc = unsafe { resd_net_poll(eng, ptr::null_mut(), 0, 0) };
+        let rc = unsafe { dpdk_net_poll(eng, ptr::null_mut(), 0, 0) };
         assert_eq!(rc, 0);
     }
 
-    unsafe { resd_net_engine_destroy(eng) };
+    unsafe { dpdk_net_engine_destroy(eng) };
 }
 ```
 
-Note: if cbindgen lays `resd_net_engine_config_t` out differently than the `Cfg` shim here (for example if Rust's field reordering happens despite `#[repr(C)]`), the test will detect it immediately — the engine_create call will mis-read the fields. The typed struct from `include/resd_net.h` is the source of truth; this shim must match it. Adjust field order to mirror `api.rs` exactly if the test fails.
+Note: if cbindgen lays `dpdk_net_engine_config_t` out differently than the `Cfg` shim here (for example if Rust's field reordering happens despite `#[repr(C)]`), the test will detect it immediately — the engine_create call will mis-read the fields. The typed struct from `include/dpdk_net.h` is the source of truth; this shim must match it. Adjust field order to mirror `api.rs` exactly if the test fails.
 
 - [ ] **Step 4: Run the non-TAP test**
 
@@ -1926,7 +1926,7 @@ Expected: PASS.
 
 - [ ] **Step 5: Run the TAP test (requires sudo + DPDK)**
 
-Run: `sudo -E RESD_NET_TEST_TAP=1 $(command -v cargo) test -p ffi-test ffi_eal_init_and_engine_lifecycle -- --nocapture`
+Run: `sudo -E DPDK_NET_TEST_TAP=1 $(command -v cargo) test -p ffi-test ffi_eal_init_and_engine_lifecycle -- --nocapture`
 Expected: PASS; poll returns 0 ten times.
 
 - [ ] **Step 6: Commit**
@@ -1958,12 +1958,12 @@ cargo build --workspace --all-targets
 # Unit tests pass
 cargo test --workspace
 # TAP integration test passes (requires sudo + DPDK)
-sudo -E RESD_NET_TEST_TAP=1 $(command -v cargo) test -p resd-net-core --test engine_smoke -- --nocapture
+sudo -E DPDK_NET_TEST_TAP=1 $(command -v cargo) test -p dpdk-net-core --test engine_smoke -- --nocapture
 # Header hasn't drifted
 ./scripts/check-header.sh
 # C++ consumer builds
-cargo build -p resd-net --release
-cmake -S examples/cpp-consumer -B examples/cpp-consumer/build -DRESD_NET_PROFILE=release
+cargo build -p dpdk-net --release
+cmake -S examples/cpp-consumer -B examples/cpp-consumer/build -DDPDK_NET_PROFILE=release
 cmake --build examples/cpp-consumer/build
 # No clippy warnings
 cargo clippy --workspace --all-targets -- -D warnings
@@ -1974,9 +1974,9 @@ All must succeed. If any fails, fix before claiming A1 complete.
 - [ ] **Step 2: Verify the spec references honored in Phase A1**
 
 Check manually:
-- §2 "Architecture" — Rust crate layout (`resd-net-sys`, `resd-net-core`, `resd-net`) + C++ consumer sample exists.
-- §2.2 "Build / language / FFI" — cargo workspace, bindgen for DPDK, cbindgen for `resd_net.h`, `extern "C"` + primitive/opaque types only.
-- §4 "Public API" — `resd_net_engine_create`, `resd_net_engine_destroy`, `resd_net_poll`, `resd_net_flush`, `resd_net_now_ns`, `resd_net_counters` exposed (stubbed; real logic in later phases).
+- §2 "Architecture" — Rust crate layout (`dpdk-net-sys`, `dpdk-net-core`, `dpdk-net`) + C++ consumer sample exists.
+- §2.2 "Build / language / FFI" — cargo workspace, bindgen for DPDK, cbindgen for `dpdk_net.h`, `extern "C"` + primitive/opaque types only.
+- §4 "Public API" — `dpdk_net_engine_create`, `dpdk_net_engine_destroy`, `dpdk_net_poll`, `dpdk_net_flush`, `dpdk_net_now_ns`, `dpdk_net_counters` exposed (stubbed; real logic in later phases).
 - §7.1 "Mempools" — three per-lcore mempools (`rx`, `tx_hdr`, `tx_data`) allocated at engine create.
 - §7.5 "Clock" — single process-wide TSC calibration via `OnceLock`; invariant-TSC check on first calibration.
 - §9.1 "Counters" — `AtomicU64` groups (`eth`, `ip`, `tcp`, `poll`), cacheline-aligned, lock-free readable.
@@ -2017,6 +2017,6 @@ Stage 1 items explicitly deferred to later phase plans:
 
 **Placeholder scan:** No "TBD"/"TODO"/"implement later" markers. All code blocks contain complete content for their steps. The note in Task 11 about AtomicU64-accessor syntax is guidance for integration, not a placeholder.
 
-**Type consistency:** `EngineConfig` in core and `resd_net_engine_config_t` in the public API have different field sets in Phase A1 — public is the full Stage 1 config (spec §4), core is the subset Phase A1 actually uses. Task 9 bridges them and ignores the public-only fields for now; later phases wire them through as real features land.
+**Type consistency:** `EngineConfig` in core and `dpdk_net_engine_config_t` in the public API have different field sets in Phase A1 — public is the full Stage 1 config (spec §4), core is the subset Phase A1 actually uses. Task 9 bridges them and ignores the public-only fields for now; later phases wire them through as real features land.
 
 **Next plan after A1 ships:** `docs/superpowers/plans/2026-XX-XX-stage1-phase-a2-l2-l3.md`.

@@ -42,7 +42,7 @@ Out of scope (Section 15 restates):
 
 ## 2. Module layout
 
-### 2.1 Modified modules (`crates/resd-net-core/src/`)
+### 2.1 Modified modules (`crates/dpdk-net-core/src/`)
 
 | Module | Change |
 |---|---|
@@ -55,14 +55,14 @@ Out of scope (Section 15 restates):
 | `counters.rs` | New `AtomicU64` fields on `EthCounters` per Section 11. Always allocated, regardless of feature flags (C-ABI stability). |
 | `lib.rs` | No change beyond anything picked up by `pub use` re-exports for the new counter field names. |
 
-### 2.2 Modified modules (`crates/resd-net/src/`)
+### 2.2 Modified modules (`crates/dpdk-net/src/`)
 
 | Module | Change |
 |---|---|
 | `lib.rs` | RX-origin forwarder at lines 175–191 already threads `rx_hw_ts_ns` through from the internal event struct — **no change** once `tcp_events.rs:164` populates the real value. Lines 203, 212, 224, 241, 263, 712, 719 — non-RX-origin events (timer fires, state changes, synthesized) — `rx_hw_ts_ns: 0` remains correct by definition and does not change. |
 | `api.rs` | No change. Public `rx_hw_ts_ns` field at line 171 stays — semantics match parent §9.2. |
 
-### 2.3 Modified modules (`crates/resd-net-core/` top-level)
+### 2.3 Modified modules (`crates/dpdk-net-core/` top-level)
 
 | File | Change |
 |---|---|
@@ -77,13 +77,13 @@ A-HW adds no new modules or files. Every change is in-place in an existing file.
 | File | Change |
 |---|---|
 | `tests/knob-coverage.rs` | New entries for each build configuration in the CI matrix (Section 14). |
-| `tests/ahw-smoke-*.rs` (new) | Three smoke tests per Section 12. May live under `crates/resd-net-core/tests/` or `tests/ffi-test/tests/` depending on whether they need the full FFI surface (leaning: Rust-side integration tests under `crates/resd-net-core/tests/` since none of them exercise the FFI boundary). Plan decides the final location. |
+| `tests/ahw-smoke-*.rs` (new) | Three smoke tests per Section 12. May live under `crates/dpdk-net-core/tests/` or `tests/ffi-test/tests/` depending on whether they need the full FFI surface (leaning: Rust-side integration tests under `crates/dpdk-net-core/tests/` since none of them exercise the FFI boundary). Plan decides the final location. |
 
 ---
 
 ## 3. Feature flag matrix
 
-`crates/resd-net-core/Cargo.toml` `[features]` additions:
+`crates/dpdk-net-core/Cargo.toml` `[features]` additions:
 
 | Feature flag | Default | Gates |
 |---|---|---|
@@ -114,7 +114,7 @@ default = [
 
 ### 3.3 Gate placement discipline
 
-Feature gates live at the **code site**, never on a public ABI struct field. The engine-internal `EngineState` is not C ABI — fields under `#[cfg(feature = "hw-offload-rx-timestamp")]` are acceptable there. Public structs exposed through `resd_net.h` (`resd_net_event_t`, counters snapshot) never gain conditional fields. `EthCounters` counter fields are always-allocated even when the feature that writes to them is off (see Section 11).
+Feature gates live at the **code site**, never on a public ABI struct field. The engine-internal `EngineState` is not C ABI — fields under `#[cfg(feature = "hw-offload-rx-timestamp")]` are acceptable there. Public structs exposed through `dpdk_net.h` (`dpdk_net_event_t`, counters snapshot) never gain conditional fields. `EthCounters` counter fields are always-allocated even when the feature that writes to them is off (see Section 11).
 
 A feature-off build compiles the offload code path away entirely — the binary is strictly smaller and does not execute offload-path instructions. This is what makes A10's A/B measurement valid (the "off" side genuinely does not pay the offload-setup cost).
 
@@ -125,7 +125,7 @@ A feature-off build compiles the offload code path away entirely — the binary 
 Replaces the current block at `engine.rs:422-450`. New flow at `engine_create`, in order:
 
 1. Call `rte_eth_dev_info_get(port_id, &mut dev_info)`. If rc != 0, return `Error::PortInfo`.
-2. Log one banner line: `resd_net: port {port_id} driver={driver_name} rx_offload_capa=0x{X} tx_offload_capa=0x{X} dev_flags=0x{X}`.
+2. Log one banner line: `dpdk_net: port {port_id} driver={driver_name} rx_offload_capa=0x{X} tx_offload_capa=0x{X} dev_flags=0x{X}`.
 3. Build `requested_tx_offloads: u64` by ORing compile-time-enabled TX offload bits. Always include `RTE_ETH_TX_OFFLOAD_MULTI_SEGS` (A5 retransmit prerequisite — unchanged).
 4. Build `requested_rx_offloads: u64` by ORing compile-time-enabled RX offload bits.
 5. For each compile-enabled offload bit:
@@ -141,7 +141,7 @@ Replaces the current block at `engine.rs:422-450`. New flow at `engine_create`, 
 12. `#[cfg(feature = "hw-verify-llq")]`: call `verify_llq_activation_from_global(port_id, driver_name, counters)` to read the LLQ verdict recorded earlier by `eal_init` (Section 5). Fail-hard with `Error::LlqActivationFailed` + bump `offload_missing_llq` if ENA advertised LLQ but the capture showed no activation marker or a failure marker. The LLQ log capture itself is installed inside `eal_init` because the ENA PMD emits LLQ markers during PCI probe (inside `rte_eal_init`) — not inside `rte_eth_dev_start`.
 13. `#[cfg(feature = "hw-offload-rss-hash")]` + RSS was in applied mask: call `rte_eth_dev_rss_reta_update` to program every reta slot to queue 0. (Single-queue no-op in practice but explicit for forward-compat.)
 14. `#[cfg(feature = "hw-offload-rx-timestamp")]`: perform the dynfield + dynflag lookups per Section 10; store on engine state; bump `offload_missing_rx_timestamp` if either lookup returned negative.
-15. Log the final negotiated offload banner: `resd_net: port {port_id} configured rx_offloads=0x{X} tx_offloads=0x{X}` per parent §8.5.
+15. Log the final negotiated offload banner: `dpdk_net: port {port_id} configured rx_offloads=0x{X} tx_offloads=0x{X}` per parent §8.5.
 
 Step 2 and step 15 are both informational — parent §8.5 mandates the startup log is the authoritative "what offload set is active" record.
 
@@ -204,7 +204,7 @@ therefore wraps `rte_eal_init`, not `rte_eth_dev_start`.
 
 ### 5.2 Fragility mitigation
 
-- Log format stability — DPDK 22.11 LTS and 23.11 LTS use the same ENA LLQ log lines. A future breakage fails the engine startup rather than silently running without LLQ — fail-safe direction. Comments in `crates/resd-net-core/src/llq_verify.rs` reference the exact ENA source lines, so a future DPDK upgrade surfaces the dependency.
+- Log format stability — DPDK 22.11 LTS and 23.11 LTS use the same ENA LLQ log lines. A future breakage fails the engine startup rather than silently running without LLQ — fail-safe direction. Comments in `crates/dpdk-net-core/src/llq_verify.rs` reference the exact ENA source lines, so a future DPDK upgrade surfaces the dependency.
 - Log-capture scope — the memstream captures only during `rte_eal_init`; other RTE log traffic before / after is unaffected.
 - Non-ENA drivers — `driver_name` check in step 5 short-circuits; `net_vdev` / `net_tap` / `net_af_packet` never hit the LLQ-verify branch.
 - Shared verdict across multi-engine hosts — `rte_eal_init` runs once per process, so a single `OnceLock<LlqVerdict>` suffices; every subsequent `Engine::new` reads the same stored verdict.
@@ -364,9 +364,9 @@ The internal `InternalEvent::Connected` / `InternalEvent::Readable` enum variant
 
 Other `rx_hw_ts_ns: 0` sites that stay unchanged:
 - `tcp_events.rs:164` — unit-test fixture inside `#[cfg(test)] mod tests`, not production code.
-- `crates/resd-net/src/lib.rs:175-191` — public-event forwarder, already threads from the internal event variant, no hardcoded zero.
-- `crates/resd-net/src/lib.rs:203, 212, 224, 241, 263, 712, 719` — non-RX-origin events (timer fires, state changes, synthesized ARP exchange events). They stay 0 by definition; the accessor is not called from those sites.
-- `crates/resd-net-core/tests/*.rs` — test fixtures, unchanged.
+- `crates/dpdk-net/src/lib.rs:175-191` — public-event forwarder, already threads from the internal event variant, no hardcoded zero.
+- `crates/dpdk-net/src/lib.rs:203, 212, 224, 241, 263, 712, 719` — non-RX-origin events (timer fires, state changes, synthesized ARP exchange events). They stay 0 by definition; the accessor is not called from those sites.
+- `crates/dpdk-net-core/tests/*.rs` — test fixtures, unchanged.
 
 ### 10.4 Feature-off branch
 
@@ -380,7 +380,7 @@ Both lookups return negative (ENA PMD does not register the dynfield). Accessor 
 
 ## 11. Counter surface
 
-Additions to `EthCounters` in `crates/resd-net-core/src/counters.rs`. All slow-path per parent §9.1.1. Fields are **always allocated** regardless of feature flags (C-ABI stability of the counters snapshot).
+Additions to `EthCounters` in `crates/dpdk-net-core/src/counters.rs`. All slow-path per parent §9.1.1. Fields are **always allocated** regardless of feature flags (C-ABI stability of the counters snapshot).
 
 | Counter | Fires when | Expected steady state |
 |---|---|---|
@@ -404,7 +404,7 @@ All `offload_missing_*` counters are one-shot bring-up counters — parent §9.1
 
 ### 11.2 C-ABI stability
 
-These fields appear on `EthCounters`, which is exposed through `resd_net_counters_snapshot` (follow-up: confirm the exact public snapshot struct layout during plan-writing). The struct layout must remain stable across all 8 builds in the CI matrix — a feature-off build must not change the field offsets. Implemented by making every new field `#[cfg]`-unconditional on the struct definition; only the **writes** to them are `#[cfg]`-gated.
+These fields appear on `EthCounters`, which is exposed through `dpdk_net_counters_snapshot` (follow-up: confirm the exact public snapshot struct layout during plan-writing). The struct layout must remain stable across all 8 builds in the CI matrix — a feature-off build must not change the field offsets. Implemented by making every new field `#[cfg]`-unconditional on the struct definition; only the **writes** to them are `#[cfg]`-gated.
 
 ---
 
@@ -477,7 +477,7 @@ Every `#[cfg(not(feature = "hw-*"))]` branch compiles in exactly one build. `obs
 
 ## 14. Knob-coverage audit
 
-New entries in `crates/resd-net-core/tests/knob-coverage.rs` for every row in Section 13's CI matrix. Each entry asserts the expected feature-gating outcome (e.g. which struct fields exist on the engine, whether the RX-timestamp accessor is `const fn`, whether the RSS-hash code path is present). Same pattern as A5.5 knob-coverage entries.
+New entries in `crates/dpdk-net-core/tests/knob-coverage.rs` for every row in Section 13's CI matrix. Each entry asserts the expected feature-gating outcome (e.g. which struct fields exist on the engine, whether the RX-timestamp accessor is `const fn`, whether the RSS-hash code path is present). Same pattern as A5.5 knob-coverage entries.
 
 ---
 
@@ -529,9 +529,9 @@ All parent-spec edits land in the same commit series as the A-HW implementation.
 - Exact ENA PMD log-line strings for LLQ activation / failure (Section 5.1 step 3). Plan inspects `drivers/net/ena/ena_ethdev.c` in the DPDK 23.11 source tree to lock the literal strings before implementation.
 - Whether `tcp_events.rs:164` receives the mbuf pointer directly or whether the timestamp must be read at the RX-decode boundary and threaded through the internal event struct (Section 10.3). Lean threaded-through.
 - UDP TX path presence at A-HW time (Section 6.3). If no UDP TX exists today, the UDP-cksum offload branch is not wired; `offload_missing_tx_cksum_udp` is only meaningful for RX.
-- Test harness location — `crates/resd-net-core/tests/` vs `tests/ffi-test/tests/` for the three smoke tests (Section 2.5). Plan picks; leaning core/tests since none need the FFI boundary.
+- Test harness location — `crates/dpdk-net-core/tests/` vs `tests/ffi-test/tests/` for the three smoke tests (Section 2.5). Plan picks; leaning core/tests since none need the FFI boundary.
 - Confirm `EthCounters` is the right home for `offload_missing_llq` (LLQ isn't an "eth-offload" conceptually; it's an ENA PMD-internal mode). Alternative: a new `HwCounters` group. Plan decides; leaning `EthCounters` for consistency with the other `offload_missing_*` counters.
-- Confirm the exact `resd_net_counters_snapshot` public struct layout the new `EthCounters` fields need to flow through (Section 11.2). Plan locks field ordering + gaps to maintain C-ABI stability against the A5.5-complete baseline.
+- Confirm the exact `dpdk_net_counters_snapshot` public struct layout the new `EthCounters` fields need to flow through (Section 11.2). Plan locks field ordering + gaps to maintain C-ABI stability against the A5.5-complete baseline.
 - Pinned exact expected counter values for Section 12.1 (SW-fallback on `net_tap`). Plan captures the advertised mask from a live `dev_info_get` and bakes the expected values into the smoke-test assertions.
 
 ---

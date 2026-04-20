@@ -8,19 +8,19 @@
 ## Scope
 
 - Our files reviewed:
-  - `crates/resd-net-core/src/tcp_seq.rs`
-  - `crates/resd-net-core/src/tcp_state.rs`
-  - `crates/resd-net-core/src/flow_table.rs`
-  - `crates/resd-net-core/src/iss.rs`
-  - `crates/resd-net-core/src/tcp_conn.rs`
-  - `crates/resd-net-core/src/tcp_output.rs`
-  - `crates/resd-net-core/src/tcp_events.rs`
-  - `crates/resd-net-core/src/tcp_input.rs`
-  - `crates/resd-net-core/src/engine.rs` (A3-added methods only)
-  - `crates/resd-net-core/src/counters.rs` (A3 fields)
-  - `crates/resd-net-core/tests/tcp_basic_tap.rs`
-  - `crates/resd-net/src/lib.rs` (A3 extern "C" additions)
-  - `crates/resd-net/src/api.rs` (A3 counter mirror)
+  - `crates/dpdk-net-core/src/tcp_seq.rs`
+  - `crates/dpdk-net-core/src/tcp_state.rs`
+  - `crates/dpdk-net-core/src/flow_table.rs`
+  - `crates/dpdk-net-core/src/iss.rs`
+  - `crates/dpdk-net-core/src/tcp_conn.rs`
+  - `crates/dpdk-net-core/src/tcp_output.rs`
+  - `crates/dpdk-net-core/src/tcp_events.rs`
+  - `crates/dpdk-net-core/src/tcp_input.rs`
+  - `crates/dpdk-net-core/src/engine.rs` (A3-added methods only)
+  - `crates/dpdk-net-core/src/counters.rs` (A3 fields)
+  - `crates/dpdk-net-core/tests/tcp_basic_tap.rs`
+  - `crates/dpdk-net/src/lib.rs` (A3 extern "C" additions)
+  - `crates/dpdk-net/src/api.rs` (A3 counter mirror)
 
 - mTCP files referenced:
   - `third_party/mtcp/mtcp/src/tcp_in.c` (ProcessTCPPacket, ValidateSequence, ProcessACK, ProcessTCPPayload, Handle_TCP_ST_*, CreateNewFlowHTEntry, ProcessRST)
@@ -31,7 +31,7 @@
   - `third_party/mtcp/mtcp/src/include/tcp_in.h` (TCP_SEQ_* macros, state enum)
 
 - Spec sections in scope:
-  - §4 (public API: `resd_net_connect`, `resd_net_send`, `resd_net_close`, `RESD_NET_EVT_CONNECTED/READABLE/CLOSED/TCP_STATE_CHANGE`)
+  - §4 (public API: `dpdk_net_connect`, `dpdk_net_send`, `dpdk_net_close`, `DPDK_NET_EVT_CONNECTED/READABLE/CLOSED/TCP_STATE_CHANGE`)
   - §5.2 (TX call chain)
   - §6.1 (RFC 9293 §3.3.2 eleven-state FSM, client-side)
   - §6.2 (`TcpConn` minimum fields)
@@ -62,17 +62,17 @@ The plan header lists seven pre-emptive accepted divergences. This review confir
 
 - **AD-1** — ISS via RFC 6528 (SipHash of 4-tuple + secret + monotonic µs clock) vs mTCP's `rand_r() % 2^32`.
   - mTCP: `third_party/mtcp/mtcp/src/tcp_stream.c:310` — `stream->sndvar->iss = rand_r(&next_seed) % TCP_MAX_SEQ` (pure PRNG, no keyed hash of tuple).
-  - Ours: `crates/resd-net-core/src/iss.rs:44-52` — SipHash of (per-engine secret, 4-tuple) + monotonic µs clock low-32, per RFC 6528 §3.
+  - Ours: `crates/dpdk-net-core/src/iss.rs:44-52` — SipHash of (per-engine secret, 4-tuple) + monotonic µs clock low-32, per RFC 6528 §3.
   - Rationale cited: spec §6.5 ISS formula.
 
 - **AD-2** — Sequence-window validation checks both edges; mTCP checks right edge only.
   - mTCP: `third_party/mtcp/mtcp/src/tcp_in.c:149` — `TCP_SEQ_BETWEEN(seq + payloadlen, rcv_nxt, rcv_nxt + rcv_wnd)` (right-edge-only).
-  - Ours: `crates/resd-net-core/src/tcp_input.rs:281-284` and `373-376` — both edges of segment must be in window.
+  - Ours: `crates/dpdk-net-core/src/tcp_input.rs:281-284` and `373-376` — both edges of segment must be in window.
   - Rationale cited: spec §6.1 / RFC 9293 §3.10.7.4. Related caveat in AD-11 below.
 
 - **AD-3** — `snd_una = seg.ack` on SYN-ACK processing (rather than mTCP's `snd_una++`).
   - mTCP: `third_party/mtcp/mtcp/src/tcp_in.c:784` — `cur_stream->sndvar->snd_una++` after ACK validation.
-  - Ours: `crates/resd-net-core/src/tcp_input.rs:238` — `conn.snd_una = seg.ack`.
+  - Ours: `crates/dpdk-net-core/src/tcp_input.rs:238` — `conn.snd_una = seg.ack`.
   - Rationale cited: plan header — cleaner / identical result on well-formed SYN-ACK; RFC 9293 §3.10.7.3 permits either form.
 
 - **AD-4** — Per-segment ACK rather than mTCP's aggregation.
@@ -82,27 +82,27 @@ The plan header lists seven pre-emptive accepted divergences. This review confir
 
 - **AD-5** — MSS-only SYN options (no WSCALE/TS/SACK-permitted).
   - mTCP: `tcp_out.c` builds SYN options via `GenerateTCPOptions` with all four when enabled.
-  - Ours: `crates/resd-net-core/src/tcp_output.rs:86-91` — only the MSS option is emitted.
+  - Ours: `crates/dpdk-net-core/src/tcp_output.rs:86-91` — only the MSS option is emitted.
   - Rationale cited: spec §6.3 A3 scope — WSCALE/TS/SACK-permitted are A4 work.
 
 - **AD-6** — Flow-table layout (`Vec<Option<TcpConn>>` + `HashMap<FourTuple, u32>` ≤100 conns) vs mTCP's Jenkins-hash chained buckets with `NUM_BINS_FLOWS=131072`.
   - mTCP: `third_party/mtcp/mtcp/src/fhash.c` — chained hash, constant-size bucket count.
-  - Ours: `crates/resd-net-core/src/flow_table.rs:31-45` — handle-indexed `Vec` + std `HashMap` for 4-tuple → slot lookup.
+  - Ours: `crates/dpdk-net-core/src/flow_table.rs:31-45` — handle-indexed `Vec` + std `HashMap` for 4-tuple → slot lookup.
   - Rationale cited: spec §6.5 "Flow table" implementation choice — ≤100 connections target.
 
 - **AD-7** — Recv buffer = `VecDeque<u8>` (true ring) vs mTCP's `memmove`-on-wrap buffer.
   - mTCP: `tcp_ring_buffer.c` (via `RBPut` plus merged-fragment tracking).
-  - Ours: `crates/resd-net-core/src/tcp_conn.rs:44-74` (`RecvQueue` backed by `VecDeque<u8>`).
+  - Ours: `crates/dpdk-net-core/src/tcp_conn.rs:44-74` (`RecvQueue` backed by `VecDeque<u8>`).
   - Rationale cited: plan header — A3 has no reassembly; `VecDeque` is a true O(1) ring, strictly better than mTCP's memmove.
 
 - **AD-8** — Unmatched-flow RST reply uses `ack = seq + payload + syn_flag + fin_flag` (correct per RFC 9293 §3.10.7.1); mTCP uses `ack = seq + payload` only, missing the flag-length component.
   - mTCP: `third_party/mtcp/mtcp/src/tcp_in.c:740-743` — sends `ack = seq + payloadlen` (omits +1 for SYN or +1 for FIN of the incoming segment).
-  - Ours: `crates/resd-net-core/src/engine.rs:700-709` — sums `payload_len + syn_len + fin_len` correctly.
+  - Ours: `crates/dpdk-net-core/src/engine.rs:700-709` — sums `payload_len + syn_len + fin_len` correctly.
   - Rationale cited: RFC 9293 §3.10.7.1 — we're strictly correct; mTCP has a latent bug here.
 
 - **AD-9** (promoted from E-1) — `rcv_wnd` does NOT shrink with recv buffer occupancy; we accept at full capacity and count drops.
   - mTCP: `third_party/mtcp/mtcp/src/tcp_in.c:653` — `rcvvar->rcv_wnd = rcvvar->rcvbuf->size - rcvvar->rcvbuf->merged_len` after each `RBPut`, keeping the validation window tight against the actual free ring-buffer space.
-  - Ours: `crates/resd-net-core/src/tcp_conn.rs:121-132` sets `rcv_wnd` at construction; seq-window check in `tcp_input.rs:281-284` + `373-376` uses this static value. `RecvQueue::append()` clamps to `free_space`, and the excess bytes are counted in `tcp.recv_buf_drops` (added 2026-04-18). Our *advertised* window in outbound ACKs (`engine.rs:641`) is `recv.free_space()` — so well-behaved peers still throttle per their advertised-window; our wider ingress check just avoids being doubly-conservative.
+  - Ours: `crates/dpdk-net-core/src/tcp_conn.rs:121-132` sets `rcv_wnd` at construction; seq-window check in `tcp_input.rs:281-284` + `373-376` uses this static value. `RecvQueue::append()` clamps to `free_space`, and the excess bytes are counted in `tcp.recv_buf_drops` (added 2026-04-18). Our *advertised* window in outbound ACKs (`engine.rs:641`) is `recv.free_space()` — so well-behaved peers still throttle per their advertised-window; our wider ingress check just avoids being doubly-conservative.
   - Rationale cited: spec §6.4 "Receive-window shrinkage vs. buffer occupancy" row (added 2026-04-18); `feedback_performance_first_flow_control.md`. The trading workload is market-data ingress at peer line-rate — throttling the peer masks a slow-consumer problem as a protocol-layer artifact.
 
 - **AD-10** (promoted from E-2) — SYN-in-ESTABLISHED handled implicitly via generic out-of-window challenge-ACK path rather than the explicit RFC 5961 §4 check.

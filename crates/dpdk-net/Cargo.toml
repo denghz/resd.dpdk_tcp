@@ -1,0 +1,17 @@
+[package]
+name = "dpdk-net"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "dpdk_net"
+# staticlib for static linking into C++; cdylib for dynamic.
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+dpdk-net-core = { path = "../dpdk-net-core" }
+libc.workspace = true
+
+[build-dependencies]
+cbindgen = "0.26"

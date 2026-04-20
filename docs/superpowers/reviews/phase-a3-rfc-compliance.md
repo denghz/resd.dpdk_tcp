@@ -8,17 +8,17 @@
 ## Scope
 
 - Our files reviewed:
-  - `crates/resd-net-core/src/tcp_seq.rs`
-  - `crates/resd-net-core/src/tcp_state.rs`
-  - `crates/resd-net-core/src/tcp_conn.rs`
-  - `crates/resd-net-core/src/flow_table.rs`
-  - `crates/resd-net-core/src/iss.rs`
-  - `crates/resd-net-core/src/tcp_output.rs`
-  - `crates/resd-net-core/src/tcp_events.rs`
-  - `crates/resd-net-core/src/tcp_input.rs`
-  - `crates/resd-net-core/src/engine.rs` (TCP-input / emit_ack / emit_rst / emit_rst_for_syn_sent_bad_ack / connect / send_bytes / close_conn / reap_time_wait / TIME_WAIT deadline refresh)
-  - `crates/resd-net-core/src/counters.rs` (TcpCounters + recv_buf_drops)
-  - `crates/resd-net/src/lib.rs` (resd_net_connect / _send / _close, resd_net_poll drain)
+  - `crates/dpdk-net-core/src/tcp_seq.rs`
+  - `crates/dpdk-net-core/src/tcp_state.rs`
+  - `crates/dpdk-net-core/src/tcp_conn.rs`
+  - `crates/dpdk-net-core/src/flow_table.rs`
+  - `crates/dpdk-net-core/src/iss.rs`
+  - `crates/dpdk-net-core/src/tcp_output.rs`
+  - `crates/dpdk-net-core/src/tcp_events.rs`
+  - `crates/dpdk-net-core/src/tcp_input.rs`
+  - `crates/dpdk-net-core/src/engine.rs` (TCP-input / emit_ack / emit_rst / emit_rst_for_syn_sent_bad_ack / connect / send_bytes / close_conn / reap_time_wait / TIME_WAIT deadline refresh)
+  - `crates/dpdk-net-core/src/counters.rs` (TcpCounters + recv_buf_drops)
+  - `crates/dpdk-net/src/lib.rs` (dpdk_net_connect / _send / _close, dpdk_net_poll drain)
 - Spec §6.3 rows verified: RFC 9293 (TCP client FSM complete), RFC 6691 (MSS, clamp to local MTU), RFC 6528 (ISS generation)
 - Spec §6.4 deviations touched:
   - Row 1 — Delayed ACK off (A3 per-segment baseline; burst-scope coalescing in A6) — amended 2026-04-18 to explicitly document the A3 → A6 evolution
@@ -45,7 +45,7 @@
 
 - [x] **S-1 → RESOLVED in commit `241e0e0`** — MSS advertised in SYN is clamped to NIC's actual MTU per RFC 6691 §5.1
   - RFC clause: `docs/rfcs/rfc6691.txt:259` — "TCP SHOULD use the smallest effective MTU of the interface to calculate the value to advertise in the MSS option". RFC 9293 §3.7.1 at `rfc9293.txt:1775`.
-  - Fix applied: added `resd_rte_eth_dev_get_mtu` shim in `resd-net-sys`; `Engine::connect` queries the NIC's MTU and clamps `our_mss = min(cfg.tcp_mss, nic_mtu - 40)` (40 = IP(20) + TCP(20)). Best-effort — falls back to 1500 if the DPDK query fails.
+  - Fix applied: added `shim_rte_eth_dev_get_mtu` shim in `dpdk-net-sys`; `Engine::connect` queries the NIC's MTU and clamps `our_mss = min(cfg.tcp_mss, nic_mtu - 40)` (40 = IP(20) + TCP(20)). Best-effort — falls back to 1500 if the DPDK query fails.
 
 ### Accepted deviation (covered by spec §6.4 / §6.5 / plan header)
 
@@ -62,7 +62,7 @@
 - **AD-3** — TCP keepalive off (MUST-24/-25 defaults satisfied by absence)
   - RFC clause: `docs/rfcs/rfc9293.txt:2043-2044` — MUST-24/-25.
   - Spec §6.4 line: `docs/superpowers/specs/2026-04-17-dpdk-tcp-design.md:375` — "TCP keepalive … off … exchanges close idle".
-  - Our code behavior: no keepalive timer. `idle_keepalive_sec` field on `resd_net_connect_opts_t` exists but unread in A3.
+  - Our code behavior: no keepalive timer. `idle_keepalive_sec` field on `dpdk_net_connect_opts_t` exists but unread in A3.
 
 - **AD-4** — SYN retransmit deferred to A5 (MUST-20 "retransmit lost segments" is A5 scope)
   - RFC clause: `docs/rfcs/rfc9293.txt:1964-1986` — retransmission required for reliability.
@@ -102,7 +102,7 @@
   - `docs/rfcs/rfc9293.txt:972-977` — RST/URG handling required even at zero window (MUST-66). RST handled before window check → satisfied. URG not implemented (A3 defer; no spec entry). A3 doesn't create zero-window scenarios under normal operation (256 KiB recv buffer default + trading-fast consumer); theoretical concern.
 
 - **I-4** — `cfg.tcp_nagle`, `cfg.tcp_initial_rto_ms`, `cfg.idle_keepalive_sec` config fields stored but unread
-  - Carry-through from `resd_net_engine_config_t`. These become active in A5 (RTO) and A6 (timer wheel). No RFC concern.
+  - Carry-through from `dpdk_net_engine_config_t`. These become active in A5 (RTO) and A6 (timer wheel). No RFC concern.
 
 - **I-5** — IPv4 TTL=64, ID=0, DF=1 matches spec §6.3 RFC 791 row ("DF always set") and is defensible per RFC 6864 (IPv4 ID only required for fragmentation; DF=1 inhibits fragmentation). `tcp_output.rs:60-64`.
 

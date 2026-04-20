@@ -4,9 +4,9 @@
 
 **Goal:** Wire RFC 8985 RACK-TLP loss detection + RFC 6298 RTO retransmission + mbuf-chained retransmit path + RFC 6528 SipHash-2-4 ISS on top of A4's option-negotiated SACK scoreboard. A5 introduces the internal §7.4 timer wheel (A6 exposes its public API later) and closes the A4 carry-over deferrals. Phase ends with the mandatory mTCP + RFC review gates and the `phase-a5-complete` tag.
 
-**Architecture:** Six new pure-Rust modules in `resd-net-core`: `siphash24` (hand-written SipHash-2-4 + 64 RFC test vectors, no new crate dep), `tcp_timer_wheel` (hashed 8-level × 256-bucket wheel with tombstone cancel + per-conn timer-id list, crate-internal only), `tcp_rtt` (Jacobson/Karels estimator), `tcp_rack` (RFC 8985 §6.2 state + detect-lost), `tcp_tlp` (RFC 8985 §7 PTO + probe selection), `tcp_retrans` (per-conn `SendRetrans` with mbuf-ref-holding `RetransEntry`). `iss.rs` is rewired to SipHash-2-4 + `/proc/sys/kernel/random/boot_id` + 4µs ticks. `tcp_conn.rs` grows `snd_retrans`, `rtt_est`, `rack`, `rto_timer_id`, `tlp_timer_id`, `syn_retrans_*`, `rack_aggressive`, `rto_no_backoff` fields. `tcp_input.rs` grows RTT sample extraction (TS + Karn's fallback), RACK detect-lost pass after every ACK, DSACK detection, strict RFC 5681 §2 dup_ack; `tcp_options.rs` grows parser-side WS clamp. `engine.rs` stops freeing TX data mbufs — clones the ref into `snd_retrans` instead; adds the `retransmit` primitive that chains a fresh `tx_hdr_mempool` header mbuf to the held data mbuf via `rte_pktmbuf_chain`; adds RTO / TLP / SYN-retrans fire handlers; wires the `free_space_total` A4 I-8 close. Port config enables `RTE_ETH_TX_OFFLOAD_MULTI_SEGS` (A-HW later folds this into its feature matrix). `counters.rs` gets 9 new slow-path counters + wires `tx_retrans`/`tx_rto`/`tx_tlp` (declared zero-referenced in A4). `tcp_events.rs` gains `RESD_NET_EVT_TCP_RETRANS`, `RESD_NET_EVT_TCP_LOSS_DETECTED`, `RESD_NET_EVT_ERROR{err=ETIMEDOUT}`. The C ABI grows 5 engine-config fields (`tcp_min_rto_us`, `tcp_initial_rto_us`, `tcp_max_rto_us`, `tcp_max_retrans_count`, `tcp_per_packet_events`) and 2 connect-opts fields (`rack_aggressive`, `rto_no_backoff`); `tcp_initial_rto_ms` is removed. cc_mode=reno is fully punted to A5.1.
+**Architecture:** Six new pure-Rust modules in `dpdk-net-core`: `siphash24` (hand-written SipHash-2-4 + 64 RFC test vectors, no new crate dep), `tcp_timer_wheel` (hashed 8-level × 256-bucket wheel with tombstone cancel + per-conn timer-id list, crate-internal only), `tcp_rtt` (Jacobson/Karels estimator), `tcp_rack` (RFC 8985 §6.2 state + detect-lost), `tcp_tlp` (RFC 8985 §7 PTO + probe selection), `tcp_retrans` (per-conn `SendRetrans` with mbuf-ref-holding `RetransEntry`). `iss.rs` is rewired to SipHash-2-4 + `/proc/sys/kernel/random/boot_id` + 4µs ticks. `tcp_conn.rs` grows `snd_retrans`, `rtt_est`, `rack`, `rto_timer_id`, `tlp_timer_id`, `syn_retrans_*`, `rack_aggressive`, `rto_no_backoff` fields. `tcp_input.rs` grows RTT sample extraction (TS + Karn's fallback), RACK detect-lost pass after every ACK, DSACK detection, strict RFC 5681 §2 dup_ack; `tcp_options.rs` grows parser-side WS clamp. `engine.rs` stops freeing TX data mbufs — clones the ref into `snd_retrans` instead; adds the `retransmit` primitive that chains a fresh `tx_hdr_mempool` header mbuf to the held data mbuf via `rte_pktmbuf_chain`; adds RTO / TLP / SYN-retrans fire handlers; wires the `free_space_total` A4 I-8 close. Port config enables `RTE_ETH_TX_OFFLOAD_MULTI_SEGS` (A-HW later folds this into its feature matrix). `counters.rs` gets 9 new slow-path counters + wires `tx_retrans`/`tx_rto`/`tx_tlp` (declared zero-referenced in A4). `tcp_events.rs` gains `DPDK_NET_EVT_TCP_RETRANS`, `DPDK_NET_EVT_TCP_LOSS_DETECTED`, `DPDK_NET_EVT_ERROR{err=ETIMEDOUT}`. The C ABI grows 5 engine-config fields (`tcp_min_rto_us`, `tcp_initial_rto_us`, `tcp_max_rto_us`, `tcp_max_retrans_count`, `tcp_per_packet_events`) and 2 connect-opts fields (`rack_aggressive`, `rto_no_backoff`); `tcp_initial_rto_ms` is removed. cc_mode=reno is fully punted to A5.1.
 
-**Tech Stack:** same as A4 — Rust stable, DPDK 23.11, bindgen, cbindgen. New stdlib: `std::fs` (read `/proc/sys/kernel/random/boot_id`). New DPDK: `rte_pktmbuf_chain`, `rte_mbuf_refcnt_update` (via `resd-net-sys` FFI wrappers — these may need adding). No new cargo crate dependencies. No new cargo features.
+**Tech Stack:** same as A4 — Rust stable, DPDK 23.11, bindgen, cbindgen. New stdlib: `std::fs` (read `/proc/sys/kernel/random/boot_id`). New DPDK: `rte_pktmbuf_chain`, `rte_mbuf_refcnt_update` (via `dpdk-net-sys` FFI wrappers — these may need adding). No new cargo crate dependencies. No new cargo features.
 
 **Spec reference:** design spec at `docs/superpowers/specs/2026-04-18-stage1-phase-a5-rack-rto-retransmit-iss-design.md` (this phase); parent spec at `docs/superpowers/specs/2026-04-17-dpdk-tcp-design.md` §§ 6.2 (new TcpConn fields), 6.3 matrix rows for **6298** (RTO), **8985** (RACK-TLP), **6528** (ISS), **5681** (dup_ack strict is A5 close), 6.4 (A5 updates minRTO default + adds `maxRTO_us` row), 6.5 (ISS formula + SYN retransmit + lazy RTO re-arm + fresh-header-mbuf retransmit policy), 7.2 (`snd_retrans` layout: `(seq, mbuf_ref, first_tx_ts)`), 7.4 (internal timer wheel), 9.1 (TCP counter group — 9 new slow-path + 3 wired), 9.1.1 (slow-path default, no hot-path additions in A5), 9.3 (events), 10.13 (mTCP review gate), 10.14 (RFC compliance review gate).
 
@@ -42,9 +42,9 @@ The `phase-a5-complete` tag is blocked while either report has an open `[ ]` in 
 - **Congestion control (Reno under `cc_mode`)** → A5.1 if/when needed in test. A5 does not introduce `cwnd` / `ssthresh` fields.
 - **RFC 5682 F-RTO** → out of Stage 1 scope per design doc.
 - **RFC 8985 dynamic reo_wnd adaptation** → Stage 2. DSACK counter is observable; the spec §6.3 adaptation formula stays unimplemented.
-- **Public `resd_net_timer_add` / `cancel` / `TIMER` event** → A6. A5 builds the internal wheel; A6 exposes the public layer.
+- **Public `dpdk_net_timer_add` / `cancel` / `TIMER` event** → A6. A5 builds the internal wheel; A6 exposes the public layer.
 - **RFC 7323 §5.5 24-day TS.Recent expiration** → A6 (needs public timer API).
-- **`resd_net_flush`, `WRITABLE` event on send-drain, `FORCE_TW_SKIP` + RFC 6191 guard, event-queue overflow** → A6.
+- **`dpdk_net_flush`, `WRITABLE` event on send-drain, `FORCE_TW_SKIP` + RFC 6191 guard, event-queue overflow** → A6.
 - **Per-packet events gated by `tcp_per_packet_events` configured at runtime via a setter** → A6 follow-up; A5 wires it via `engine_config_t` at `engine_create` only.
 
 ---
@@ -52,7 +52,7 @@ The `phase-a5-complete` tag is blocked while either report has an open `[ ]` in 
 ## File Structure Created or Modified in This Phase
 
 ```
-crates/resd-net-core/
+crates/dpdk-net-core/
 ├── src/
 │   ├── lib.rs                       (MODIFIED: expose siphash24, tcp_timer_wheel, tcp_rtt, tcp_rack, tcp_tlp, tcp_retrans)
 │   ├── iss.rs                       (MODIFIED: rewire to siphash24 + /proc/sys/kernel/random/boot_id + 4µs ticks)
@@ -72,14 +72,14 @@ crates/resd-net-core/
 └── tests/
     └── tcp_rack_rto_retrans_tap.rs  (NEW: 10 integration scenarios over TAP — RTO, RACK, TLP, aggressive, max-retrans, SYN-retrans, ISS-monotonicity, no-backoff, DSACK, mbuf-chain)
 
-crates/resd-net/src/
+crates/dpdk-net/src/
 ├── api.rs                           (MODIFIED: engine config + connect_opts new fields; counter struct mirrors)
-└── lib.rs                           (MODIFIED: RESD_NET_EVT_TCP_RETRANS / _LOSS_DETECTED dispatch; ETIMEDOUT err)
+└── lib.rs                           (MODIFIED: DPDK_NET_EVT_TCP_RETRANS / _LOSS_DETECTED dispatch; ETIMEDOUT err)
 
-crates/resd-net-sys/
+crates/dpdk-net-sys/
 └── build.rs                         (MODIFIED: ensure rte_pktmbuf_chain + rte_mbuf_refcnt_update are in the allowlist — check after A4 state)
 
-include/resd_net.h                   (REGENERATED via cbindgen: 5 engine-config fields + 2 connect-opts fields + 2 new event kinds + ETIMEDOUT err)
+include/dpdk_net.h                   (REGENERATED via cbindgen: 5 engine-config fields + 2 connect-opts fields + 2 new event kinds + ETIMEDOUT err)
 
 examples/cpp-consumer/main.cpp       (MODIFIED: set one reasonable value for each new config field; print a few A5 counters)
 
@@ -96,15 +96,15 @@ docs/superpowers/reviews/phase-a5-rfc-compliance.md    (NEW)
 ## Task 1: `siphash24.rs` — hand-written SipHash-2-4 primitive + RFC test vectors
 
 **Files:**
-- Create: `crates/resd-net-core/src/siphash24.rs`
-- Modify: `crates/resd-net-core/src/lib.rs` — add `pub mod siphash24;`
+- Create: `crates/dpdk-net-core/src/siphash24.rs`
+- Modify: `crates/dpdk-net-core/src/lib.rs` — add `pub mod siphash24;`
 
 **Context:** Spec §6.5 requires RFC 6528 §3 ISS construction with SipHash-2-4 as the keyed hash. Rust `std::collections::hash_map::DefaultHasher` is SipHash-1-3 (weaker); we hand-write SipHash-2-4 in the crate (~60 LOC) with the reference-C test vectors so the ISS primitive is cryptographically aligned with the RFC without a new crate dep. Takes a 128-bit key and an arbitrary byte message; returns a u64 hash.
 
 - [ ] **Step 1: Write the failing test file**
 
 ```rust
-// crates/resd-net-core/src/siphash24.rs
+// crates/dpdk-net-core/src/siphash24.rs
 //! SipHash-2-4 keyed hash (Aumasson/Bernstein 2012).
 //! Used by `iss.rs` to generate RFC 6528 §3-compliant Initial Sequence Numbers.
 //!
@@ -227,19 +227,19 @@ mod tests {
 }
 ```
 
-Also create `crates/resd-net-core/tests/siphash24_vectors.rs` with the full 64 reference vectors (from `https://131002.net/siphash/vectors.h` — public domain). Each line is one hex u64 for message length 0..64.
+Also create `crates/dpdk-net-core/tests/siphash24_vectors.rs` with the full 64 reference vectors (from `https://131002.net/siphash/vectors.h` — public domain). Each line is one hex u64 for message length 0..64.
 
 - [ ] **Step 2: Run test to verify it compiles and first-8 vectors pass**
 
-Run: `cargo test -p resd-net-core siphash24 -- --nocapture`
+Run: `cargo test -p dpdk-net-core siphash24 -- --nocapture`
 Expected: `siphash24_reference_vectors_first_8` PASS; other three tests PASS. If first-8 fails on some index, the `sipround` constants or endianness handling is off — re-check against the reference C.
 
 - [ ] **Step 3: Add the full 64-vector integration test**
 
-Create `crates/resd-net-core/tests/siphash24_full_vectors.rs` containing:
+Create `crates/dpdk-net-core/tests/siphash24_full_vectors.rs` containing:
 
 ```rust
-use resd_net_core::siphash24::siphash24;
+use dpdk_net_core::siphash24::siphash24;
 
 const FULL_VECTORS: [u64; 64] = [
     // Populate from https://131002.net/siphash/vectors.h — each element
@@ -277,28 +277,28 @@ fn full_64_reference_vectors() {
 }
 ```
 
-Run: `cargo test -p resd-net-core --test siphash24_full_vectors`
+Run: `cargo test -p dpdk-net-core --test siphash24_full_vectors`
 Expected: PASS on all 64.
 
 - [ ] **Step 4: Add `pub mod siphash24;` to `lib.rs`**
 
-Modify `crates/resd-net-core/src/lib.rs` to include the new module alongside the existing module declarations.
+Modify `crates/dpdk-net-core/src/lib.rs` to include the new module alongside the existing module declarations.
 
-Run: `cargo build -p resd-net-core`
+Run: `cargo build -p dpdk-net-core`
 Expected: compiles clean.
 
 - [ ] **Step 5: Spec-compliance + code-quality review (per `feedback_per_task_review_discipline.md`)**
 
 Dispatch two subagents (opus model per `feedback_subagent_model.md`) in parallel:
-- `general-purpose` with prompt: "Review `crates/resd-net-core/src/siphash24.rs` + `crates/resd-net-core/tests/siphash24_full_vectors.rs` against the SipHash-2-4 reference at `https://131002.net/siphash/siphash24.c`. Confirm: (1) the sipround constants match, (2) endianness is little-endian throughout (`from_le_bytes`), (3) the finalization byte is `0xff` XORed into v2, (4) the final-block length byte is in bit 56 of `last`, (5) all 64 reference vectors pass. Report any divergence with file:line."
-- `general-purpose` with prompt: "Code-quality review of `crates/resd-net-core/src/siphash24.rs`. Check: no `unsafe`; `#[inline(always)]` on `sipround` is justified; no allocations in the hot path; no panics on empty or oversized msg; `try_into().unwrap()` on slices is guarded by length check. Suggest tightenings that don't change the bit-exact output."
+- `general-purpose` with prompt: "Review `crates/dpdk-net-core/src/siphash24.rs` + `crates/dpdk-net-core/tests/siphash24_full_vectors.rs` against the SipHash-2-4 reference at `https://131002.net/siphash/siphash24.c`. Confirm: (1) the sipround constants match, (2) endianness is little-endian throughout (`from_le_bytes`), (3) the finalization byte is `0xff` XORed into v2, (4) the final-block length byte is in bit 56 of `last`, (5) all 64 reference vectors pass. Report any divergence with file:line."
+- `general-purpose` with prompt: "Code-quality review of `crates/dpdk-net-core/src/siphash24.rs`. Check: no `unsafe`; `#[inline(always)]` on `sipround` is justified; no allocations in the hot path; no panics on empty or oversized msg; `try_into().unwrap()` on slices is guarded by length check. Suggest tightenings that don't change the bit-exact output."
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/resd-net-core/src/siphash24.rs \
-        crates/resd-net-core/src/lib.rs \
-        crates/resd-net-core/tests/siphash24_full_vectors.rs
+git add crates/dpdk-net-core/src/siphash24.rs \
+        crates/dpdk-net-core/src/lib.rs \
+        crates/dpdk-net-core/tests/siphash24_full_vectors.rs
 git commit -m "$(cat <<'EOF'
 a5 task 1: siphash24 primitive + 64 RFC test vectors
 
@@ -316,7 +316,7 @@ EOF
 ## Task 2: `iss.rs` rewire — SipHash-2-4 + boot_nonce + 4µs ticks
 
 **Files:**
-- Modify: `crates/resd-net-core/src/iss.rs`
+- Modify: `crates/dpdk-net-core/src/iss.rs`
 
 **Context:** Spec §6.5 ISS formula:
 ```
@@ -332,7 +332,7 @@ Current `iss.rs` uses `DefaultHasher` (SipHash-1-3) + 1µs clock + TSC-seeded se
 
 - [ ] **Step 1: Write the failing test additions first**
 
-Add these tests to `crates/resd-net-core/src/iss.rs` (below the existing `mod tests`):
+Add these tests to `crates/dpdk-net-core/src/iss.rs` (below the existing `mod tests`):
 
 ```rust
 #[cfg(test)]
@@ -385,7 +385,7 @@ mod tests_a5 {
 
 - [ ] **Step 2: Run the tests to confirm they fail to compile**
 
-Run: `cargo test -p resd-net-core iss::tests_a5`
+Run: `cargo test -p dpdk-net-core iss::tests_a5`
 Expected: FAIL with "`IssGen::new_deterministic_for_test` not found", "`read_boot_id` not found".
 
 - [ ] **Step 3: Rewrite `iss.rs` to the A5 shape**
@@ -426,7 +426,7 @@ impl IssGen {
         let secret = read_process_secret();
         let boot_nonce = read_boot_id().unwrap_or_else(|| {
             eprintln!(
-                "resd_net: /proc/sys/kernel/random/boot_id unreadable; \
+                "dpdk_net: /proc/sys/kernel/random/boot_id unreadable; \
                  ISS boot_nonce falls back to per-engine random (degraded mode)"
             );
             read_process_secret() // independent random
@@ -576,29 +576,29 @@ Note the A4 `IssGen::new(seed: u64)` signature was only used by tests (engine co
 
 - [ ] **Step 4: Fix engine call site**
 
-Run: `grep -rn 'IssGen::new(' crates/resd-net-core/src/`
+Run: `grep -rn 'IssGen::new(' crates/dpdk-net-core/src/`
 Expected: one hit in `engine.rs`. Change `IssGen::new(0)` → `IssGen::new()`.
 
 - [ ] **Step 5: Run tests to verify pass**
 
-Run: `cargo test -p resd-net-core iss::`
+Run: `cargo test -p dpdk-net-core iss::`
 Expected: 4 existing tests PASS + 3 new A5 tests PASS.
 
 - [ ] **Step 6: Run full crate tests to ensure no regression**
 
-Run: `cargo test -p resd-net-core`
+Run: `cargo test -p dpdk-net-core`
 Expected: all existing tests still PASS (206 baseline per A4 review, minus the removed `iss::tests` that referenced the old seed).
 
 - [ ] **Step 7: Spec + code-quality review**
 
 Dispatch two subagents in parallel (opus):
-- Spec reviewer: "Verify `crates/resd-net-core/src/iss.rs` against spec §6.5 ISS formula. Confirm: (1) SipHash-2-4 is keyed on `secret`, not on `tuple`; (2) `boot_nonce` is in the message, not the key; (3) the 4µs clock is added OUTSIDE the hash via `wrapping_add`; (4) the boot_id parser handles the standard UUID format (8-4-4-4-12 hex-with-dashes); (5) `read_process_secret` degraded-mode fallback logs once and does not panic."
-- Code quality: "Review `crates/resd-net-core/src/iss.rs`. Check: no `unsafe`; no blocking I/O in `IssGen::next()`; `fs::read_to_string` on `/proc/sys/kernel/random/boot_id` happens once at `new()` only; test-only ctor is `#[cfg(test)]`-gated; fallback `read_process_secret` is unreachable in practice but cannot panic if `/dev/urandom` returns fewer than 16 bytes."
+- Spec reviewer: "Verify `crates/dpdk-net-core/src/iss.rs` against spec §6.5 ISS formula. Confirm: (1) SipHash-2-4 is keyed on `secret`, not on `tuple`; (2) `boot_nonce` is in the message, not the key; (3) the 4µs clock is added OUTSIDE the hash via `wrapping_add`; (4) the boot_id parser handles the standard UUID format (8-4-4-4-12 hex-with-dashes); (5) `read_process_secret` degraded-mode fallback logs once and does not panic."
+- Code quality: "Review `crates/dpdk-net-core/src/iss.rs`. Check: no `unsafe`; no blocking I/O in `IssGen::next()`; `fs::read_to_string` on `/proc/sys/kernel/random/boot_id` happens once at `new()` only; test-only ctor is `#[cfg(test)]`-gated; fallback `read_process_secret` is unreachable in practice but cannot panic if `/dev/urandom` returns fewer than 16 bytes."
 
 - [ ] **Step 8: Commit**
 
 ```bash
-git add crates/resd-net-core/src/iss.rs crates/resd-net-core/src/engine.rs
+git add crates/dpdk-net-core/src/iss.rs crates/dpdk-net-core/src/engine.rs
 git commit -m "$(cat <<'EOF'
 a5 task 2: iss finalize — SipHash-2-4 + boot_nonce + 4µs ticks
 
@@ -622,14 +622,14 @@ EOF
 ## Task 3: `tcp_rtt.rs` — RFC 6298 Jacobson/Karels RTT estimator
 
 **Files:**
-- Create: `crates/resd-net-core/src/tcp_rtt.rs`
-- Modify: `crates/resd-net-core/src/lib.rs` — add `pub mod tcp_rtt;`
+- Create: `crates/dpdk-net-core/src/tcp_rtt.rs`
+- Modify: `crates/dpdk-net-core/src/lib.rs` — add `pub mod tcp_rtt;`
 
 **Context:** RFC 6298 §2.2/§2.3 algorithm with α=1/8, β=1/4. Per spec §6.4, minRTO=5ms (trading-latency default). `apply_backoff()` doubles current RTO up to `max_rto_us` cap; no-ops when `rto_no_backoff` is true (caller's responsibility to gate). This module owns estimator state only; RTO timer arming/firing lives in the engine.
 
 - [ ] **Step 1: Write the failing tests**
 
-Create `crates/resd-net-core/src/tcp_rtt.rs`:
+Create `crates/dpdk-net-core/src/tcp_rtt.rs`:
 
 ```rust
 //! RFC 6298 Jacobson/Karels RTT estimator.
@@ -762,12 +762,12 @@ mod tests {
 
 - [ ] **Step 2: Run tests to verify they fail to compile**
 
-Run: `cargo test -p resd-net-core tcp_rtt`
+Run: `cargo test -p dpdk-net-core tcp_rtt`
 Expected: FAIL — module not exported.
 
 - [ ] **Step 3: Add `pub mod tcp_rtt;` to `lib.rs`**
 
-Run: `cargo test -p resd-net-core tcp_rtt`
+Run: `cargo test -p dpdk-net-core tcp_rtt`
 Expected: 6 tests PASS.
 
 - [ ] **Step 4: Spec + code-quality review (opus subagents)**
@@ -778,7 +778,7 @@ Expected: 6 tests PASS.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/resd-net-core/src/tcp_rtt.rs crates/resd-net-core/src/lib.rs
+git add crates/dpdk-net-core/src/tcp_rtt.rs crates/dpdk-net-core/src/lib.rs
 git commit -m "a5 task 3: tcp_rtt — RFC 6298 Jacobson/Karels estimator"
 ```
 
@@ -787,14 +787,14 @@ git commit -m "a5 task 3: tcp_rtt — RFC 6298 Jacobson/Karels estimator"
 ## Task 4: `tcp_timer_wheel.rs` — hashed 8-level × 256-bucket wheel (struct + add + advance)
 
 **Files:**
-- Create: `crates/resd-net-core/src/tcp_timer_wheel.rs`
-- Modify: `crates/resd-net-core/src/lib.rs` — add `pub(crate) mod tcp_timer_wheel;`
+- Create: `crates/dpdk-net-core/src/tcp_timer_wheel.rs`
+- Modify: `crates/dpdk-net-core/src/lib.rs` — add `pub(crate) mod tcp_timer_wheel;`
 
 **Context:** Spec §7.4 internal wheel. This task covers scheduling + firing; Task 5 adds tombstone cancel + per-conn list integration.
 
 - [ ] **Step 1: Write the failing tests**
 
-Create `crates/resd-net-core/src/tcp_timer_wheel.rs`:
+Create `crates/dpdk-net-core/src/tcp_timer_wheel.rs`:
 
 ```rust
 //! Internal hashed timing wheel (spec §7.4). 8 levels × 256 buckets,
@@ -815,7 +815,7 @@ pub enum TimerKind {
     Rto,
     Tlp,
     SynRetrans,
-    /// Reserved for A6 public `resd_net_timer_add`.
+    /// Reserved for A6 public `dpdk_net_timer_add`.
     ApiPublic,
 }
 
@@ -993,12 +993,12 @@ mod tests {
 
 - [ ] **Step 2: Run tests — expect fail to compile**
 
-Run: `cargo test -p resd-net-core tcp_timer_wheel`
+Run: `cargo test -p dpdk-net-core tcp_timer_wheel`
 Expected: FAIL — module not exported.
 
 - [ ] **Step 3: Add `pub(crate) mod tcp_timer_wheel;` to `lib.rs`**
 
-Run: `cargo test -p resd-net-core tcp_timer_wheel`
+Run: `cargo test -p dpdk-net-core tcp_timer_wheel`
 Expected: 4 tests PASS.
 
 - [ ] **Step 4: Spec + code-quality review (opus subagents)**
@@ -1009,7 +1009,7 @@ Expected: 4 tests PASS.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/resd-net-core/src/tcp_timer_wheel.rs crates/resd-net-core/src/lib.rs
+git add crates/dpdk-net-core/src/tcp_timer_wheel.rs crates/dpdk-net-core/src/lib.rs
 git commit -m "a5 task 4: tcp_timer_wheel — hashed 8×256 wheel, internal"
 ```
 
@@ -1018,8 +1018,8 @@ git commit -m "a5 task 4: tcp_timer_wheel — hashed 8×256 wheel, internal"
 ## Task 5: Timer wheel — tombstone cancel + per-conn timer-id list
 
 **Files:**
-- Modify: `crates/resd-net-core/src/tcp_timer_wheel.rs` — add `cancel()` method + test
-- Modify: `crates/resd-net-core/src/tcp_conn.rs` — add `pub timer_ids: Vec<TimerId>` field
+- Modify: `crates/dpdk-net-core/src/tcp_timer_wheel.rs` — add `cancel()` method + test
+- Modify: `crates/dpdk-net-core/src/tcp_conn.rs` — add `pub timer_ids: Vec<TimerId>` field
 
 **Context:** Spec §7.4 per-conn list. Task 7 wires the engine to walk the list on `close_conn`.
 
@@ -1063,7 +1063,7 @@ Add to `tcp_conn.rs` test module:
 
 - [ ] **Step 2: Run tests — expect fail**
 
-Run: `cargo test -p resd-net-core -- cancel_tombstones cancel_stale_id new_client_timer_ids`
+Run: `cargo test -p dpdk-net-core -- cancel_tombstones cancel_stale_id new_client_timer_ids`
 Expected: FAIL on `cancel` (not defined) and on `timer_ids` (field not found).
 
 - [ ] **Step 3: Implement `cancel`**
@@ -1085,7 +1085,7 @@ Append to `impl TimerWheel`:
 
 - [ ] **Step 4: Add `timer_ids` to `TcpConn`**
 
-Modify `crates/resd-net-core/src/tcp_conn.rs`:
+Modify `crates/dpdk-net-core/src/tcp_conn.rs`:
 
 ```rust
     /// A5: wheel-timer handles owned by this conn (RTO, TLP, SYN).
@@ -1101,7 +1101,7 @@ And `new_client`:
 
 - [ ] **Step 5: Run tests**
 
-Run: `cargo test -p resd-net-core`
+Run: `cargo test -p dpdk-net-core`
 Expected: all PASS (existing + 3 new).
 
 - [ ] **Step 6: Spec + code-quality review (opus)**
@@ -1112,8 +1112,8 @@ Expected: all PASS (existing + 3 new).
 - [ ] **Step 7: Commit**
 
 ```bash
-git add crates/resd-net-core/src/tcp_timer_wheel.rs \
-        crates/resd-net-core/src/tcp_conn.rs
+git add crates/dpdk-net-core/src/tcp_timer_wheel.rs \
+        crates/dpdk-net-core/src/tcp_conn.rs
 git commit -m "a5 task 5: tcp_timer_wheel cancel + TcpConn.timer_ids"
 ```
 
@@ -1122,8 +1122,8 @@ git commit -m "a5 task 5: tcp_timer_wheel cancel + TcpConn.timer_ids"
 ## Task 6: `tcp_retrans.rs` — `SendRetrans` + `RetransEntry` with mbuf ref
 
 **Files:**
-- Create: `crates/resd-net-core/src/tcp_retrans.rs`
-- Modify: `crates/resd-net-core/src/lib.rs` — add `pub mod tcp_retrans;`
+- Create: `crates/dpdk-net-core/src/tcp_retrans.rs`
+- Modify: `crates/dpdk-net-core/src/lib.rs` — add `pub mod tcp_retrans;`
 
 **Context:** Spec §7.2 `snd_retrans: (seq, mbuf_ref, first_tx_ts)` list. A5 makes this authoritative for in-flight tracking. Mbuf is a `crate::mempool::Mbuf` wrapper around a refcounted `rte_mbuf*` (existing from A3). On `push_after_tx`, we clone the ref (caller is responsible for `rte_mbuf_refcnt_update(+1)` before constructing the entry). `prune_below(snd_una)` drops fully-ACKed entries and returns the dropped mbufs to the caller for refcount-decrement (so all unsafe pointer work stays in one place). `mark_sacked(left, right)` marks overlapping entries' `sacked=true`.
 
@@ -1131,7 +1131,7 @@ This task uses a **mock `Mbuf`** for unit tests — the real `Mbuf` type exposes
 
 - [ ] **Step 1: Write the failing tests**
 
-Create `crates/resd-net-core/src/tcp_retrans.rs`:
+Create `crates/dpdk-net-core/src/tcp_retrans.rs`:
 
 ```rust
 //! Per-conn in-flight-segment tracker. Holds `Mbuf` ref per TX'd-but-unACKed
@@ -1303,11 +1303,11 @@ mod tests {
 
 - [ ] **Step 2: Ensure `Mbuf::null_for_test()` exists**
 
-Check `crates/resd-net-core/src/mempool.rs`. If it exists, good. If not, add a `#[cfg(test)]` constructor that wraps a null raw pointer — legal because the test code never dereferences it. If `Mbuf` is opaque and hard to instantiate for tests, introduce a trait `trait MbufRef { fn null_test() -> Self; ... }` or swap `Mbuf` for a generic type in `SendRetrans<M>` so tests use a test stub. Pick whichever is less invasive; document the choice in the module header comment.
+Check `crates/dpdk-net-core/src/mempool.rs`. If it exists, good. If not, add a `#[cfg(test)]` constructor that wraps a null raw pointer — legal because the test code never dereferences it. If `Mbuf` is opaque and hard to instantiate for tests, introduce a trait `trait MbufRef { fn null_test() -> Self; ... }` or swap `Mbuf` for a generic type in `SendRetrans<M>` so tests use a test stub. Pick whichever is less invasive; document the choice in the module header comment.
 
 - [ ] **Step 3: Add `pub mod tcp_retrans;` to `lib.rs`**
 
-Run: `cargo test -p resd-net-core tcp_retrans`
+Run: `cargo test -p dpdk-net-core tcp_retrans`
 Expected: 6 tests PASS.
 
 - [ ] **Step 4: Spec + code-quality review (opus)**
@@ -1318,9 +1318,9 @@ Expected: 6 tests PASS.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/resd-net-core/src/tcp_retrans.rs \
-        crates/resd-net-core/src/mempool.rs \
-        crates/resd-net-core/src/lib.rs
+git add crates/dpdk-net-core/src/tcp_retrans.rs \
+        crates/dpdk-net-core/src/mempool.rs \
+        crates/dpdk-net-core/src/lib.rs
 git commit -m "a5 task 6: tcp_retrans — SendRetrans + RetransEntry with mbuf ref"
 ```
 
@@ -1329,8 +1329,8 @@ git commit -m "a5 task 6: tcp_retrans — SendRetrans + RetransEntry with mbuf r
 ## Task 7: Extend `TcpConn` with A5 state + wire engine `TimerWheel`
 
 **Files:**
-- Modify: `crates/resd-net-core/src/tcp_conn.rs` — add A5 fields
-- Modify: `crates/resd-net-core/src/engine.rs` — add `timer_wheel: TimerWheel` field + walk `conn.timer_ids` on `close_conn`
+- Modify: `crates/dpdk-net-core/src/tcp_conn.rs` — add A5 fields
+- Modify: `crates/dpdk-net-core/src/engine.rs` — add `timer_wheel: TimerWheel` field + walk `conn.timer_ids` on `close_conn`
 
 **Context:** Bundle the A5 TcpConn field additions (all non-behavioral; Task 5 already added `timer_ids`):
 
@@ -1384,12 +1384,12 @@ Add to `engine.rs` tests (or a new test if none exists yet):
 
 - [ ] **Step 2: Run tests — expect fail**
 
-Run: `cargo test -p resd-net-core -- a5_conn_starts_with_empty_snd_retrans`
+Run: `cargo test -p dpdk-net-core -- a5_conn_starts_with_empty_snd_retrans`
 Expected: FAIL — fields not present.
 
 - [ ] **Step 3: Extend `TcpConn`**
 
-Modify `crates/resd-net-core/src/tcp_conn.rs` — add fields to the struct:
+Modify `crates/dpdk-net-core/src/tcp_conn.rs` — add fields to the struct:
 
 ```rust
     // Phase A5 additions:
@@ -1434,7 +1434,7 @@ And `new_client` defaults (use engine config values when available; default cons
 
 - [ ] **Step 4: Add `timer_wheel` to `Engine`**
 
-Modify `crates/resd-net-core/src/engine.rs` — add field:
+Modify `crates/dpdk-net-core/src/engine.rs` — add field:
 
 ```rust
     timer_wheel: crate::tcp_timer_wheel::TimerWheel,
@@ -1464,7 +1464,7 @@ Find `close_conn` (or the conn-reap path); add at the start:
 
 - [ ] **Step 6: Run tests**
 
-Run: `cargo test -p resd-net-core`
+Run: `cargo test -p dpdk-net-core`
 Expected: all tests PASS (existing + the A5 field-presence test).
 
 - [ ] **Step 7: Spec + code-quality review (opus)**
@@ -1475,8 +1475,8 @@ Expected: all tests PASS (existing + the A5 field-presence test).
 - [ ] **Step 8: Commit**
 
 ```bash
-git add crates/resd-net-core/src/tcp_conn.rs \
-        crates/resd-net-core/src/engine.rs
+git add crates/dpdk-net-core/src/tcp_conn.rs \
+        crates/dpdk-net-core/src/engine.rs
 git commit -m "a5 task 7: TcpConn A5 fields + engine timer_wheel"
 ```
 
@@ -1485,18 +1485,18 @@ git commit -m "a5 task 7: TcpConn A5 fields + engine timer_wheel"
 ## Task 8: Enable `RTE_ETH_TX_OFFLOAD_MULTI_SEGS` in port config
 
 **Files:**
-- Modify: `crates/resd-net-core/src/engine.rs` — port config initialization
+- Modify: `crates/dpdk-net-core/src/engine.rs` — port config initialization
 
 **Context:** A5's retransmit primitive chains a fresh header mbuf to the held data mbuf, so TX segments become multi-segment. ENA advertises `MULTI_SEGS` per spec §8.2. A-HW later folds this into its feature-flag matrix; A5 enables unconditionally.
 
 - [ ] **Step 1: Locate port config**
 
-Run: `grep -n 'rte_eth_conf\|txmode.offloads\|TX_OFFLOAD' crates/resd-net-core/src/engine.rs`
+Run: `grep -n 'rte_eth_conf\|txmode.offloads\|TX_OFFLOAD' crates/dpdk-net-core/src/engine.rs`
 Identify the `rte_eth_dev_configure` setup (A1).
 
 - [ ] **Step 2: Write a test (integration, TAP)**
 
-Add a smoke test to `crates/resd-net-core/tests/` (use the existing TAP harness pattern from A4):
+Add a smoke test to `crates/dpdk-net-core/tests/` (use the existing TAP harness pattern from A4):
 
 ```rust
 #[test]
@@ -1512,7 +1512,7 @@ fn tx_offload_multi_segs_bit_is_set_after_engine_create() {
 
 - [ ] **Step 3: Run test — expect fail**
 
-Run: `cargo test -p resd-net-core tx_offload_multi_segs`
+Run: `cargo test -p dpdk-net-core tx_offload_multi_segs`
 Expected: FAIL — bit not set.
 
 - [ ] **Step 4: Enable the bit in port config**
@@ -1527,14 +1527,14 @@ Also verify the `rte_eth_dev_info` advertises support — warn on a one-shot cou
 
 ```rust
         if dev_info.tx_offload_capa & sys::RTE_ETH_TX_OFFLOAD_MULTI_SEGS == 0 {
-            eprintln!("resd_net: MULTI_SEGS not advertised by PMD; retransmit \
+            eprintln!("dpdk_net: MULTI_SEGS not advertised by PMD; retransmit \
                        chain may fail — check NIC/PMD.");
         }
 ```
 
 - [ ] **Step 5: Run test — pass**
 
-Run: `cargo test -p resd-net-core tx_offload_multi_segs`
+Run: `cargo test -p dpdk-net-core tx_offload_multi_segs`
 Expected: PASS.
 
 - [ ] **Step 6: Spec + code-quality review (opus)**
@@ -1545,8 +1545,8 @@ Expected: PASS.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add crates/resd-net-core/src/engine.rs \
-        crates/resd-net-core/tests/
+git add crates/dpdk-net-core/src/engine.rs \
+        crates/dpdk-net-core/tests/
 git commit -m "a5 task 8: enable RTE_ETH_TX_OFFLOAD_MULTI_SEGS for retransmit mbuf chain"
 ```
 
@@ -1555,15 +1555,15 @@ git commit -m "a5 task 8: enable RTE_ETH_TX_OFFLOAD_MULTI_SEGS for retransmit mb
 ## Task 9: Retransmit primitive (fresh hdr mbuf + pktmbuf_chain)
 
 **Files:**
-- Modify: `crates/resd-net-core/src/engine.rs` — new `fn retransmit(&mut self, conn: &mut TcpConn, entry_index: usize)`
-- Modify: `crates/resd-net-sys/build.rs` or wrapper — ensure `rte_pktmbuf_chain` + `rte_mbuf_refcnt_update` are exposed via FFI
+- Modify: `crates/dpdk-net-core/src/engine.rs` — new `fn retransmit(&mut self, conn: &mut TcpConn, entry_index: usize)`
+- Modify: `crates/dpdk-net-sys/build.rs` or wrapper — ensure `rte_pktmbuf_chain` + `rte_mbuf_refcnt_update` are exposed via FFI
 
 **Context:** Spec §6.5: retransmit allocates fresh hdr mbuf from `tx_hdr_mempool`, writes L2+L3+TCP headers, `rte_pktmbuf_chain`s to the held data mbuf. Shared by RACK-loss (Task 15), RTO-fire (Task 12), TLP-fire (Task 17), SYN-retrans (Task 18).
 
 - [ ] **Step 1: Check FFI wrappers exist**
 
-Run: `grep -n 'rte_pktmbuf_chain\|rte_mbuf_refcnt_update' crates/resd-net-sys/`
-If not exposed, add them to the FFI allowlist + create wrapper `resd_rte_pktmbuf_chain(head: *mut rte_mbuf, tail: *mut rte_mbuf) -> i32` etc.
+Run: `grep -n 'rte_pktmbuf_chain\|rte_mbuf_refcnt_update' crates/dpdk-net-sys/`
+If not exposed, add them to the FFI allowlist + create wrapper `shim_rte_pktmbuf_chain(head: *mut rte_mbuf, tail: *mut rte_mbuf) -> i32` etc.
 
 - [ ] **Step 2: Write a failing test**
 
@@ -1594,7 +1594,7 @@ Add to `engine.rs` tests (unit — call the retransmit primitive directly with a
 
 - [ ] **Step 3: Run test — expect fail**
 
-Run: `cargo test -p resd-net-core retransmit_primitive_builds_multi_seg_frame`
+Run: `cargo test -p dpdk-net-core retransmit_primitive_builds_multi_seg_frame`
 Expected: FAIL — `retransmit` not defined.
 
 - [ ] **Step 4: Implement the primitive**
@@ -1618,7 +1618,7 @@ Add to `engine.rs`:
         };
 
         // Allocate hdr mbuf.
-        let hdr_mbuf = unsafe { sys::resd_rte_pktmbuf_alloc(self.tx_hdr_mempool.as_ptr()) };
+        let hdr_mbuf = unsafe { sys::shim_rte_pktmbuf_alloc(self.tx_hdr_mempool.as_ptr()) };
         if hdr_mbuf.is_null() {
             self.counters.eth.tx_drop_nomem.fetch_add(1, Ordering::Relaxed);
             return; // next RTO fire retries
@@ -1641,24 +1641,24 @@ Add to `engine.rs`:
 
         // Increment data-mbuf refcount so the chain holds another reference.
         unsafe {
-            sys::resd_rte_mbuf_refcnt_update(entry.mbuf.as_ptr(), 1);
+            sys::shim_rte_mbuf_refcnt_update(entry.mbuf.as_ptr(), 1);
         }
 
         // Chain hdr → data. Returns 0 on success, -1 on chain-segment-cap exceeded.
         let rc = unsafe {
-            sys::resd_rte_pktmbuf_chain(hdr_mbuf, entry.mbuf.as_ptr())
+            sys::shim_rte_pktmbuf_chain(hdr_mbuf, entry.mbuf.as_ptr())
         };
         if rc != 0 {
-            unsafe { sys::resd_rte_pktmbuf_free(hdr_mbuf) };
-            unsafe { sys::resd_rte_mbuf_refcnt_update(entry.mbuf.as_ptr(), -1) };
+            unsafe { sys::shim_rte_pktmbuf_free(hdr_mbuf) };
+            unsafe { sys::shim_rte_mbuf_refcnt_update(entry.mbuf.as_ptr(), -1) };
             return;
         }
 
         // TX the frame.
         let mut bufs = [hdr_mbuf];
-        let sent = unsafe { sys::resd_rte_eth_tx_burst(self.port_id, 0, bufs.as_mut_ptr(), 1) };
+        let sent = unsafe { sys::shim_rte_eth_tx_burst(self.port_id, 0, bufs.as_mut_ptr(), 1) };
         if sent == 0 {
-            unsafe { sys::resd_rte_pktmbuf_free(hdr_mbuf) };
+            unsafe { sys::shim_rte_pktmbuf_free(hdr_mbuf) };
             self.counters.eth.tx_drop_full_ring.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -1673,7 +1673,7 @@ Also add `tcp_output::build_retrans_header` as a thin wrapper around the existin
 
 - [ ] **Step 5: Run test — expect pass**
 
-Run: `cargo test -p resd-net-core retransmit_primitive_builds_multi_seg_frame`
+Run: `cargo test -p dpdk-net-core retransmit_primitive_builds_multi_seg_frame`
 Expected: PASS. `nb_segs >= 2` confirms the chain.
 
 - [ ] **Step 6: Spec + code-quality review (opus)**
@@ -1684,9 +1684,9 @@ Expected: PASS. `nb_segs >= 2` confirms the chain.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add crates/resd-net-core/src/engine.rs \
-        crates/resd-net-core/src/tcp_output.rs \
-        crates/resd-net-sys/
+git add crates/dpdk-net-core/src/engine.rs \
+        crates/dpdk-net-core/src/tcp_output.rs \
+        crates/dpdk-net-sys/
 git commit -m "a5 task 9: retransmit primitive — fresh hdr mbuf + pktmbuf_chain"
 ```
 
@@ -1695,8 +1695,8 @@ git commit -m "a5 task 9: retransmit primitive — fresh hdr mbuf + pktmbuf_chai
 ## Task 10: `send_bytes` rewire — hold mbuf ref in snd_retrans, drop from snd.pending at TX
 
 **Files:**
-- Modify: `crates/resd-net-core/src/engine.rs` — `send_bytes` function (from A3)
-- Modify: `crates/resd-net-core/src/tcp_conn.rs` — `SendQueue::drain(consumed)` helper (new)
+- Modify: `crates/dpdk-net-core/src/engine.rs` — `send_bytes` function (from A3)
+- Modify: `crates/dpdk-net-core/src/tcp_conn.rs` — `SendQueue::drain(consumed)` helper (new)
 
 **Context:** A3 stashed bytes in `snd.pending` at send time + left them there until ACK. A5 moves in-flight tracking to `snd_retrans`: bytes leave `snd.pending` when the TX mbuf is built (at `send_bytes` time), and the mbuf ref lives in `snd_retrans` until ACK. Prune happens via `snd_retrans.prune_below(snd.una)` in the ACK handler (Task 11+). Spec data-flow §3.1.
 
@@ -1730,7 +1730,7 @@ Add to `engine.rs` tests:
 
 - [ ] **Step 2: Run — expect fail**
 
-Run: `cargo test -p resd-net-core send_bytes_moves_bytes_from_pending_to_snd_retrans`
+Run: `cargo test -p dpdk-net-core send_bytes_moves_bytes_from_pending_to_snd_retrans`
 Expected: FAIL — current send_bytes still leaves bytes in pending.
 
 - [ ] **Step 3: Rewire `send_bytes`**
@@ -1742,7 +1742,7 @@ Find the current `send_bytes` implementation in `engine.rs`. The relevant sequen
     let take = bytes_len.min(pool_mbuf_size - HEADROOM);
     let payload_slice = conn.snd.pending.range(0..take);
     // memcpy payload_slice into mbuf data room.
-    unsafe { sys::resd_mbuf_write_data(m, HEADROOM, payload_slice); }
+    unsafe { sys::shim_mbuf_write_data(m, HEADROOM, payload_slice); }
     // (2) Build L2+L3+TCP header, TX burst.
     // (3) Bump tx counters.
 
@@ -1750,7 +1750,7 @@ Find the current `send_bytes` implementation in `engine.rs`. The relevant sequen
     // - drop the consumed bytes from snd.pending
     conn.snd.pending.drain(0..take);
     // - bump refcnt, push to snd_retrans
-    unsafe { sys::resd_rte_mbuf_refcnt_update(m, 1); }
+    unsafe { sys::shim_rte_mbuf_refcnt_update(m, 1); }
     let first_tx_ts_ns = crate::clock::now_ns();
     conn.snd_retrans.push_after_tx(crate::tcp_retrans::RetransEntry {
         seq: conn.snd_nxt,
@@ -1781,15 +1781,15 @@ Find the current `send_bytes` implementation in `engine.rs`. The relevant sequen
 
 - [ ] **Step 4: Run tests — expect pass**
 
-Run: `cargo test -p resd-net-core send_bytes_moves_bytes_from_pending_to_snd_retrans`
+Run: `cargo test -p dpdk-net-core send_bytes_moves_bytes_from_pending_to_snd_retrans`
 Expected: PASS.
 
-Run: `cargo test -p resd-net-core send_bytes_rto_timer_is_armed`
+Run: `cargo test -p dpdk-net-core send_bytes_rto_timer_is_armed`
 Expected: PASS.
 
 - [ ] **Step 5: Run full test suite — catch regressions**
 
-Run: `cargo test -p resd-net-core`
+Run: `cargo test -p dpdk-net-core`
 Expected: all existing A3/A4 tests still PASS. The A3 assertion that `snd.pending.len() > 0` during in-flight is specifically false after A5 — update any A3 test asserting the A3 semantic.
 
 - [ ] **Step 6: Spec + code-quality review (opus)**
@@ -1800,7 +1800,7 @@ Expected: all existing A3/A4 tests still PASS. The A3 assertion that `snd.pendin
 - [ ] **Step 7: Commit**
 
 ```bash
-git add crates/resd-net-core/src/engine.rs crates/resd-net-core/src/tcp_conn.rs
+git add crates/dpdk-net-core/src/engine.rs crates/dpdk-net-core/src/tcp_conn.rs
 git commit -m "a5 task 10: send_bytes rewire — snd_retrans holds mbuf ref, RTO armed"
 ```
 
@@ -1809,8 +1809,8 @@ git commit -m "a5 task 10: send_bytes rewire — snd_retrans holds mbuf ref, RTO
 ## Task 11: RTT sampling in `tcp_input` — TS source + Karn's fallback; prune snd_retrans
 
 **Files:**
-- Modify: `crates/resd-net-core/src/tcp_input.rs` — ACK handler RTT sample + prune_below
-- Modify: `crates/resd-net-core/src/engine.rs` — refcnt_dec on pruned mbufs; cancel RTO timer on empty
+- Modify: `crates/dpdk-net-core/src/tcp_input.rs` — ACK handler RTT sample + prune_below
+- Modify: `crates/dpdk-net-core/src/engine.rs` — refcnt_dec on pruned mbufs; cancel RTO timer on empty
 
 **Context:** Spec data-flow §3.2. On every ACK that advances `snd.una`:
 1. If `conn.ts_enabled` and seg has TSopt: `rtt_us = now_us - seg.tsopt.ecr` (TS-source sample).
@@ -1868,7 +1868,7 @@ Add to integration tests (or a new unit test file exercising the ACK branch):
 
 - [ ] **Step 2: Run — expect fail**
 
-Run: `cargo test -p resd-net-core ack_with_ts_samples_rtt`
+Run: `cargo test -p dpdk-net-core ack_with_ts_samples_rtt`
 Expected: FAIL.
 
 - [ ] **Step 3: Wire the ACK handler**
@@ -1917,7 +1917,7 @@ In the engine's post-`handle_established` path (where counters/events are proces
     if outcome.snd_una_advanced_to > old_snd_una {
         let dropped = conn.snd_retrans.prune_below(outcome.snd_una_advanced_to);
         for entry in dropped {
-            unsafe { sys::resd_rte_mbuf_refcnt_update(entry.mbuf.as_ptr(), -1); }
+            unsafe { sys::shim_rte_mbuf_refcnt_update(entry.mbuf.as_ptr(), -1); }
         }
         // If nothing in flight and snd.una caught up to snd.nxt, cancel RTO.
         if conn.snd_retrans.is_empty() && conn.snd_una == conn.snd_nxt {
@@ -1933,7 +1933,7 @@ Add a new field to `Outcome`: `snd_una_advanced_to: Option<u32>` (populated in `
 
 - [ ] **Step 5: Run tests — expect pass**
 
-Run: `cargo test -p resd-net-core ack_with_ts_samples_rtt ack_without_ts_uses_karns ack_prunes_snd_retrans`
+Run: `cargo test -p dpdk-net-core ack_with_ts_samples_rtt ack_without_ts_uses_karns ack_prunes_snd_retrans`
 Expected: PASS.
 
 - [ ] **Step 6: Spec + code-quality review (opus)**
@@ -1944,8 +1944,8 @@ Expected: PASS.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add crates/resd-net-core/src/tcp_input.rs \
-        crates/resd-net-core/src/engine.rs
+git add crates/dpdk-net-core/src/tcp_input.rs \
+        crates/dpdk-net-core/src/engine.rs
 git commit -m "a5 task 11: RTT sampling (TS + Karn's) + snd_retrans prune on ACK"
 ```
 
@@ -1954,7 +1954,7 @@ git commit -m "a5 task 11: RTT sampling (TS + Karn's) + snd_retrans prune on ACK
 ## Task 12: RTO fire handler — retransmit front, apply backoff, re-arm
 
 **Files:**
-- Modify: `crates/resd-net-core/src/engine.rs` — poll loop advances `timer_wheel` + dispatches fired timers
+- Modify: `crates/dpdk-net-core/src/engine.rs` — poll loop advances `timer_wheel` + dispatches fired timers
 
 **Context:** Spec data-flow §3.4. On RTO fire: if `snd.una >= snd.nxt`, no-op (conn idle). Else retransmit front entry, bump `tcp.tx_rto`, apply_backoff (gated by `conn.rto_no_backoff`), re-arm at `now + rto_us`. Task 13 handles the max-retrans-count exhaustion.
 
@@ -2051,7 +2051,7 @@ Add `on_rto_fire`:
 
 - [ ] **Step 4: Run test — expect pass**
 
-Run: `cargo test -p resd-net-core rto_fire_retransmits_front`
+Run: `cargo test -p dpdk-net-core rto_fire_retransmits_front`
 Expected: PASS.
 
 - [ ] **Step 5: Test `rto_no_backoff` opt-out**
@@ -2083,7 +2083,7 @@ Expected: PASS.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add crates/resd-net-core/src/engine.rs
+git add crates/dpdk-net-core/src/engine.rs
 git commit -m "a5 task 12: RTO fire handler — retransmit + backoff + re-arm"
 ```
 
@@ -2092,11 +2092,11 @@ git commit -m "a5 task 12: RTO fire handler — retransmit + backoff + re-arm"
 ## Task 13: `tcp_max_retrans_count` + ETIMEDOUT path
 
 **Files:**
-- Modify: `crates/resd-net-core/src/engine.rs` — insert count check in `on_rto_fire`
-- Modify: `crates/resd-net-core/src/tcp_events.rs` — add `err=ETIMEDOUT` variant
-- Modify: `crates/resd-net-core/src/counters.rs` — add `conn_timeout_retrans` field
+- Modify: `crates/dpdk-net-core/src/engine.rs` — insert count check in `on_rto_fire`
+- Modify: `crates/dpdk-net-core/src/tcp_events.rs` — add `err=ETIMEDOUT` variant
+- Modify: `crates/dpdk-net-core/src/counters.rs` — add `conn_timeout_retrans` field
 
-**Context:** Spec data-flow §3.3. When a retrans entry's `xmit_count > tcp_max_retrans_count` (default 15), conn fails with `RESD_NET_EVT_ERROR{err=ETIMEDOUT}`, state → CLOSED, `tcp.conn_timeout_retrans++`, all timers cancelled, snd_retrans drained.
+**Context:** Spec data-flow §3.3. When a retrans entry's `xmit_count > tcp_max_retrans_count` (default 15), conn fails with `DPDK_NET_EVT_ERROR{err=ETIMEDOUT}`, state → CLOSED, `tcp.conn_timeout_retrans++`, all timers cancelled, snd_retrans drained.
 
 - [ ] **Step 1: Write failing test**
 
@@ -2163,7 +2163,7 @@ In `on_rto_fire`, after `self.retransmit(handle, 0)`:
 
 - [ ] **Step 6: Run test — expect pass**
 
-Run: `cargo test -p resd-net-core max_retrans_exhausted`
+Run: `cargo test -p dpdk-net-core max_retrans_exhausted`
 Expected: PASS.
 
 - [ ] **Step 7: Spec + code-quality review (opus)**
@@ -2174,10 +2174,10 @@ Expected: PASS.
 - [ ] **Step 8: Commit**
 
 ```bash
-git add crates/resd-net-core/src/engine.rs \
-        crates/resd-net-core/src/counters.rs \
-        crates/resd-net-core/src/tcp_events.rs \
-        crates/resd-net-core/src/error.rs
+git add crates/dpdk-net-core/src/engine.rs \
+        crates/dpdk-net-core/src/counters.rs \
+        crates/dpdk-net-core/src/tcp_events.rs \
+        crates/dpdk-net-core/src/error.rs
 git commit -m "a5 task 13: max_retrans_count → ETIMEDOUT + conn_timeout_retrans counter"
 ```
 
@@ -2186,16 +2186,16 @@ git commit -m "a5 task 13: max_retrans_count → ETIMEDOUT + conn_timeout_retran
 ## Task 14: `tcp_rack.rs` — RackState + compute_reo_wnd + detect_lost
 
 **Files:**
-- Create: `crates/resd-net-core/src/tcp_rack.rs`
-- Modify: `crates/resd-net-core/src/lib.rs` — `pub mod tcp_rack;`
-- Modify: `crates/resd-net-core/src/tcp_conn.rs` — add `pub rack: RackState` field + init in `new_client`
+- Create: `crates/dpdk-net-core/src/tcp_rack.rs`
+- Modify: `crates/dpdk-net-core/src/lib.rs` — `pub mod tcp_rack;`
+- Modify: `crates/dpdk-net-core/src/tcp_conn.rs` — add `pub rack: RackState` field + init in `new_client`
 
 **Context:** RFC 8985 §6.1–6.2. State: `xmit_ts_ns`, `end_seq`, `reo_wnd_us`, `min_rtt_us`, `dsack_seen`. `update_on_ack(entry, now_ns)` updates xmit_ts/end_seq if entry is "newer" (later xmit_ts or same-xmit-ts with greater end_seq). `compute_reo_wnd(rack_aggressive, min_rtt_us, srtt_us)` returns 0 when aggressive, else `min(srtt/4, min_rtt/2)`. `detect_lost(entry, now_ns, reo_wnd_us)`: the RFC 8985 §6.2 rule.
 
 - [ ] **Step 1: Write failing tests**
 
 ```rust
-// crates/resd-net-core/src/tcp_rack.rs
+// crates/dpdk-net-core/src/tcp_rack.rs
 
 //! RFC 8985 RACK state + loss detection.
 
@@ -2309,7 +2309,7 @@ mod tests {
 
 - [ ] **Step 2: Run — expect fail**
 
-Run: `cargo test -p resd-net-core tcp_rack`
+Run: `cargo test -p dpdk-net-core tcp_rack`
 Expected: FAIL — module not exported.
 
 - [ ] **Step 3: Add `pub mod tcp_rack;` + `pub rack: RackState` field on TcpConn**
@@ -2323,7 +2323,7 @@ Add to `lib.rs`; add to `TcpConn`:
 
 Init in `new_client`: `rack: crate::tcp_rack::RackState::new(),`
 
-Run: `cargo test -p resd-net-core tcp_rack`
+Run: `cargo test -p dpdk-net-core tcp_rack`
 Expected: 5 tests PASS.
 
 - [ ] **Step 4: Spec + code-quality review (opus)**
@@ -2334,9 +2334,9 @@ Expected: 5 tests PASS.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/resd-net-core/src/tcp_rack.rs \
-        crates/resd-net-core/src/tcp_conn.rs \
-        crates/resd-net-core/src/lib.rs
+git add crates/dpdk-net-core/src/tcp_rack.rs \
+        crates/dpdk-net-core/src/tcp_conn.rs \
+        crates/dpdk-net-core/src/lib.rs
 git commit -m "a5 task 14: tcp_rack — RackState + compute_reo_wnd + detect_lost"
 ```
 
@@ -2345,8 +2345,8 @@ git commit -m "a5 task 14: tcp_rack — RackState + compute_reo_wnd + detect_los
 ## Task 15: RACK loss-detect pass in `tcp_input` ACK handler + retransmit on lost
 
 **Files:**
-- Modify: `crates/resd-net-core/src/tcp_input.rs` — in ACK branch, update rack, mark_sacked, compute reo_wnd, walk snd_retrans for lost
-- Modify: `crates/resd-net-core/src/engine.rs` — when input handler returns a "lost entries" list, invoke `retransmit` for each
+- Modify: `crates/dpdk-net-core/src/tcp_input.rs` — in ACK branch, update rack, mark_sacked, compute reo_wnd, walk snd_retrans for lost
+- Modify: `crates/dpdk-net-core/src/engine.rs` — when input handler returns a "lost entries" list, invoke `retransmit` for each
 
 **Context:** Spec data-flow §3.2 post-ACK steps. Walk `snd_retrans` for each non-sacked-non-lost entry; `rack.detect_lost(entry.xmit_ts_ns, entry.seq+entry.len, now, reo_wnd)` → mark lost + queue for retransmit. Bump `tcp.tx_rack_loss` per lost entry.
 
@@ -2431,7 +2431,7 @@ Also feed `mark_sacked` from `parsed_opts.sack_blocks[..sack_block_count]`:
 
 - [ ] **Step 4: Run test — expect pass**
 
-Run: `cargo test -p resd-net-core rack_detects_loss_from_sack`
+Run: `cargo test -p dpdk-net-core rack_detects_loss_from_sack`
 Expected: PASS.
 
 - [ ] **Step 5: Also test that non-lost entries are not retransmitted (reo_wnd grace)**
@@ -2461,7 +2461,7 @@ Expected: PASS.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add crates/resd-net-core/src/tcp_input.rs crates/resd-net-core/src/engine.rs
+git add crates/dpdk-net-core/src/tcp_input.rs crates/dpdk-net-core/src/engine.rs
 git commit -m "a5 task 15: RACK loss-detect pass + retransmit-on-lost in ACK handler"
 ```
 
@@ -2470,8 +2470,8 @@ git commit -m "a5 task 15: RACK loss-detect pass + retransmit-on-lost in ACK han
 ## Task 16: DSACK detection + `tcp.rx_dsack` counter (visibility only)
 
 **Files:**
-- Modify: `crates/resd-net-core/src/tcp_input.rs` — add `is_dsack_block(block, snd_una, sack_scoreboard)` + counter bump
-- Modify: `crates/resd-net-core/src/counters.rs` — `rx_dsack` field (if not already added in Task 13's batch)
+- Modify: `crates/dpdk-net-core/src/tcp_input.rs` — add `is_dsack_block(block, snd_una, sack_scoreboard)` + counter bump
+- Modify: `crates/dpdk-net-core/src/counters.rs` — `rx_dsack` field (if not already added in Task 13's batch)
 
 **Context:** RFC 2883 §4 DSACK detection: a SACK block is a D-SACK iff:
 - (a) `block.right ≤ snd.una` — block covers already-cumulatively-acked data, OR
@@ -2534,7 +2534,7 @@ In `tcp_input.rs` ACK branch, before `mark_sacked`:
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/resd-net-core/src/tcp_input.rs crates/resd-net-core/src/counters.rs
+git add crates/dpdk-net-core/src/tcp_input.rs crates/dpdk-net-core/src/counters.rs
 git commit -m "a5 task 16: DSACK detection + rx_dsack counter (visibility only)"
 ```
 
@@ -2543,8 +2543,8 @@ git commit -m "a5 task 16: DSACK detection + rx_dsack counter (visibility only)"
 ## Task 17: `tcp_tlp.rs` — PTO + probe selection + fire handler
 
 **Files:**
-- Create: `crates/resd-net-core/src/tcp_tlp.rs`
-- Modify: `crates/resd-net-core/src/engine.rs` — `on_tlp_fire` handler + TLP scheduling in ACK path
+- Create: `crates/dpdk-net-core/src/tcp_tlp.rs`
+- Modify: `crates/dpdk-net-core/src/engine.rs` — `on_tlp_fire` handler + TLP scheduling in ACK path
 
 **Context:** RFC 8985 §7. PTO = max(2·SRTT, `tcp_min_rto_us`). Schedule TLP at most once per tail; on fire, if `snd.pending` has bytes → probe with new data (send next MSS); else retransmit the `snd_retrans.back()` (last segment). Bump `tcp.tx_tlp`.
 
@@ -2689,10 +2689,10 @@ In the engine post-ACK code:
 
 - [ ] **Step 5: Run test — pass**
 
-Run: `cargo test -p resd-net-core tlp_fires_on_tail_loss`
+Run: `cargo test -p dpdk-net-core tlp_fires_on_tail_loss`
 Expected: PASS.
 
-Also: `cargo test -p resd-net-core tcp_tlp` → 6 unit tests PASS.
+Also: `cargo test -p dpdk-net-core tcp_tlp` → 6 unit tests PASS.
 
 - [ ] **Step 6: Spec + code-quality review (opus)**
 
@@ -2702,9 +2702,9 @@ Also: `cargo test -p resd-net-core tcp_tlp` → 6 unit tests PASS.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add crates/resd-net-core/src/tcp_tlp.rs \
-        crates/resd-net-core/src/engine.rs \
-        crates/resd-net-core/src/lib.rs
+git add crates/dpdk-net-core/src/tcp_tlp.rs \
+        crates/dpdk-net-core/src/engine.rs \
+        crates/dpdk-net-core/src/lib.rs
 git commit -m "a5 task 17: tcp_tlp — PTO + probe selection + fire handler"
 ```
 
@@ -2713,8 +2713,8 @@ git commit -m "a5 task 17: tcp_tlp — PTO + probe selection + fire handler"
 ## Task 18: SYN retransmit scheduler + budget → ETIMEDOUT
 
 **Files:**
-- Modify: `crates/resd-net-core/src/engine.rs` — arm SYN retrans timer on initial SYN TX; `on_syn_retrans_fire` handler
-- Modify: `crates/resd-net-core/src/counters.rs` — `conn_timeout_syn_sent` field (in Task 13 batch already)
+- Modify: `crates/dpdk-net-core/src/engine.rs` — arm SYN retrans timer on initial SYN TX; `on_syn_retrans_fire` handler
+- Modify: `crates/dpdk-net-core/src/counters.rs` — `conn_timeout_syn_sent` field (in Task 13 batch already)
 
 **Context:** Spec §6.5 SYN retransmit: 3 attempts with exponential backoff from `max(initial_rto_us, min_rto_us)`, total bounded by `connect_timeout_ms`. On SYN-ACK, cancel the timer. On budget exhausted, `tcp.conn_timeout_syn_sent++`, emit `ETIMEDOUT`, → CLOSED.
 
@@ -2813,7 +2813,7 @@ In `handle_syn_sent` post-SYN-ACK processing:
 - [ ] **Step 7: Commit**
 
 ```bash
-git add crates/resd-net-core/src/engine.rs
+git add crates/dpdk-net-core/src/engine.rs
 git commit -m "a5 task 18: SYN retransmit scheduler + 3-attempt budget → ETIMEDOUT"
 ```
 
@@ -2822,9 +2822,9 @@ git commit -m "a5 task 18: SYN retransmit scheduler + 3-attempt budget → ETIME
 ## Task 19: Connect opts — `rack_aggressive` + `rto_no_backoff` + related counters
 
 **Files:**
-- Modify: `crates/resd-net-core/src/engine.rs` — `ConnectOpts` grows two fields; `connect` propagates
-- Modify: `crates/resd-net/src/api.rs` — FFI `resd_net_connect_opts_t` grows two fields
-- Modify: `crates/resd-net-core/src/counters.rs` — `rack_reo_wnd_override_active`, `rto_no_backoff_active` (if not in Task 13 batch)
+- Modify: `crates/dpdk-net-core/src/engine.rs` — `ConnectOpts` grows two fields; `connect` propagates
+- Modify: `crates/dpdk-net/src/api.rs` — FFI `dpdk_net_connect_opts_t` grows two fields
+- Modify: `crates/dpdk-net-core/src/counters.rs` — `rack_reo_wnd_override_active`, `rto_no_backoff_active` (if not in Task 13 batch)
 
 - [ ] **Step 1: Write failing test**
 
@@ -2877,11 +2877,11 @@ Propagate in `connect` to `TcpConn`:
 
 - [ ] **Step 3: FFI**
 
-In `crates/resd-net/src/api.rs` (or the C-ABI struct def):
+In `crates/dpdk-net/src/api.rs` (or the C-ABI struct def):
 
 ```rust
 #[repr(C)]
-pub struct resd_net_connect_opts_t {
+pub struct dpdk_net_connect_opts_t {
     // ... existing fields ...
     pub rack_aggressive: bool,
     pub rto_no_backoff: bool,
@@ -2898,9 +2898,9 @@ pub struct resd_net_connect_opts_t {
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/resd-net-core/src/engine.rs \
-        crates/resd-net/src/api.rs \
-        crates/resd-net-core/src/counters.rs
+git add crates/dpdk-net-core/src/engine.rs \
+        crates/dpdk-net/src/api.rs \
+        crates/dpdk-net-core/src/counters.rs
 git commit -m "a5 task 19: connect_opts rack_aggressive + rto_no_backoff + counters"
 ```
 
@@ -2909,9 +2909,9 @@ git commit -m "a5 task 19: connect_opts rack_aggressive + rto_no_backoff + count
 ## Task 20: `tcp_per_packet_events` config + event emissions + `ETIMEDOUT` err
 
 **Files:**
-- Modify: `crates/resd-net-core/src/engine.rs` — `EngineConfig` gets `tcp_per_packet_events: bool`
-- Modify: `crates/resd-net-core/src/tcp_events.rs` — `TcpRetrans` and `TcpLossDetected` variants (also `LossCause`)
-- Modify: `crates/resd-net/src/lib.rs` — FFI dispatch of new events
+- Modify: `crates/dpdk-net-core/src/engine.rs` — `EngineConfig` gets `tcp_per_packet_events: bool`
+- Modify: `crates/dpdk-net-core/src/tcp_events.rs` — `TcpRetrans` and `TcpLossDetected` variants (also `LossCause`)
+- Modify: `crates/dpdk-net/src/lib.rs` — FFI dispatch of new events
 
 **Context:** Spec §9.3. Events already referenced in RTO (Task 12), RACK (Task 15), TLP (Task 17) behind `self.config.tcp_per_packet_events` gate — this task makes that gate real.
 
@@ -2961,7 +2961,7 @@ pub enum LossCause { Rack, Tlp, Rto }
 
 Add `ETIMEDOUT` to `ErrCode`.
 
-FFI (cbindgen-visible): ensure `RESD_NET_EVT_TCP_RETRANS`, `RESD_NET_EVT_TCP_LOSS_DETECTED`, `RESD_NET_EVT_ERROR` + `ETIMEDOUT` are emitted by the C-ABI layer with the right integer tags.
+FFI (cbindgen-visible): ensure `DPDK_NET_EVT_TCP_RETRANS`, `DPDK_NET_EVT_TCP_LOSS_DETECTED`, `DPDK_NET_EVT_ERROR` + `ETIMEDOUT` are emitted by the C-ABI layer with the right integer tags.
 
 - [ ] **Step 3: Run tests — pass**
 
@@ -2973,10 +2973,10 @@ FFI (cbindgen-visible): ensure `RESD_NET_EVT_TCP_RETRANS`, `RESD_NET_EVT_TCP_LOS
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/resd-net-core/src/engine.rs \
-        crates/resd-net-core/src/tcp_events.rs \
-        crates/resd-net-core/src/error.rs \
-        crates/resd-net/src/lib.rs
+git add crates/dpdk-net-core/src/engine.rs \
+        crates/dpdk-net-core/src/tcp_events.rs \
+        crates/dpdk-net-core/src/error.rs \
+        crates/dpdk-net/src/lib.rs
 git commit -m "a5 task 20: tcp_per_packet_events + new events + ETIMEDOUT err"
 ```
 
@@ -2985,9 +2985,9 @@ git commit -m "a5 task 20: tcp_per_packet_events + new events + ETIMEDOUT err"
 ## Task 21: Engine config RTO fields + remove `tcp_initial_rto_ms`
 
 **Files:**
-- Modify: `crates/resd-net-core/src/engine.rs` — `EngineConfig` struct
-- Modify: `crates/resd-net/src/api.rs` — FFI engine config mirror
-- Modify: `include/resd_net.h` — regenerated via cbindgen
+- Modify: `crates/dpdk-net-core/src/engine.rs` — `EngineConfig` struct
+- Modify: `crates/dpdk-net/src/api.rs` — FFI engine config mirror
+- Modify: `include/dpdk_net.h` — regenerated via cbindgen
 - Modify: `examples/cpp-consumer/main.cpp` — set reasonable values for the new fields
 
 **Context:** Add `tcp_min_rto_us: u32`, `tcp_initial_rto_us: u32`, `tcp_max_rto_us: u32`, `tcp_max_retrans_count: u32`. Remove `tcp_initial_rto_ms`.
@@ -3037,14 +3037,14 @@ impl Default for EngineConfig {
 
 - [ ] **Step 3: Mirror FFI + regenerate header**
 
-Edit `resd-net/src/api.rs` `resd_net_engine_config_t` with the same fields. Run cbindgen:
+Edit `dpdk-net/src/api.rs` `dpdk_net_engine_config_t` with the same fields. Run cbindgen:
 
 ```bash
-cargo run --bin resd-net-cbindgen  # or whatever the project uses
+cargo run --bin dpdk-net-cbindgen  # or whatever the project uses
 # OR manually re-run cbindgen against api.rs
 ```
 
-Confirm `include/resd_net.h` updates.
+Confirm `include/dpdk_net.h` updates.
 
 - [ ] **Step 4: Update `examples/cpp-consumer/main.cpp`**
 
@@ -3064,7 +3064,7 @@ Expected: no references to `tcp_initial_rto_ms`. If any tests or src reference t
 - [ ] **Step 7: Run tests**
 
 ```bash
-cargo test -p resd-net-core engine_config_default_rto_values
+cargo test -p dpdk-net-core engine_config_default_rto_values
 ```
 Expected: PASS.
 
@@ -3076,9 +3076,9 @@ Expected: PASS.
 - [ ] **Step 9: Commit**
 
 ```bash
-git add crates/resd-net-core/src/engine.rs \
-        crates/resd-net/src/api.rs \
-        include/resd_net.h \
+git add crates/dpdk-net-core/src/engine.rs \
+        crates/dpdk-net/src/api.rs \
+        include/dpdk_net.h \
         examples/cpp-consumer/main.cpp
 git commit -m "a5 task 21: engine config RTO fields; drop tcp_initial_rto_ms"
 ```
@@ -3088,8 +3088,8 @@ git commit -m "a5 task 21: engine config RTO fields; drop tcp_initial_rto_ms"
 ## Task 22: A4 carry-over — WS>14 SHOULD-log + parser-side clamp
 
 **Files:**
-- Modify: `crates/resd-net-core/src/tcp_options.rs` — parser clamps shift to 14, returns a clamp flag on the `TcpOpts` struct
-- Modify: `crates/resd-net-core/src/tcp_input.rs` — `handle_syn_sent` bumps `tcp.rx_ws_shift_clamped` when the parser flag is set AND emits a one-shot stderr log per-conn
+- Modify: `crates/dpdk-net-core/src/tcp_options.rs` — parser clamps shift to 14, returns a clamp flag on the `TcpOpts` struct
+- Modify: `crates/dpdk-net-core/src/tcp_input.rs` — `handle_syn_sent` bumps `tcp.rx_ws_shift_clamped` when the parser flag is set AND emits a one-shot stderr log per-conn
 
 **Context:** A4 RFC review I-9 + user callout. RFC 7323 §2.3: "If a Window Scale option is received with a shift.cnt value larger than 14, the TCP SHOULD log the error but MUST use 14 instead of the specified value." A4 clamps at the handshake site only; A5 adds (a) parser-layer clamp as defense-in-depth, (b) one-shot log, (c) counter.
 
@@ -3147,7 +3147,7 @@ Where A4 already clamps `ws_shift_in`:
         // One-shot log per conn. In the absence of a log facade, eprintln! is OK here;
         // fires only on an extremely rare path (peer sending WS>14 is not seen in the wild).
         eprintln!(
-            "resd_net: peer advertised WS shift > 14 on handshake; clamped to 14 per RFC 7323 §2.3"
+            "dpdk_net: peer advertised WS shift > 14 on handshake; clamped to 14 per RFC 7323 §2.3"
         );
     }
 ```
@@ -3162,7 +3162,7 @@ Where A4 already clamps `ws_shift_in`:
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/resd-net-core/src/tcp_options.rs crates/resd-net-core/src/tcp_input.rs
+git add crates/dpdk-net-core/src/tcp_options.rs crates/dpdk-net-core/src/tcp_input.rs
 git commit -m "a5 task 22: WS>14 parser clamp + SHOULD-log + rx_ws_shift_clamped counter"
 ```
 
@@ -3171,7 +3171,7 @@ git commit -m "a5 task 22: WS>14 parser clamp + SHOULD-log + rx_ws_shift_clamped
 ## Task 23: A4 carry-over — `dup_ack` strict RFC 5681 §2 5-condition definition
 
 **Files:**
-- Modify: `crates/resd-net-core/src/tcp_input.rs` — tighten the `dup_ack` detection
+- Modify: `crates/dpdk-net-core/src/tcp_input.rs` — tighten the `dup_ack` detection
 
 **Context:** A4 mTCP review I-10. RFC 5681 §2 defines a duplicate ACK as one that (1) ACK of largest ACK rcvd (i.e., seg.ack == snd.una), (2) no data, (3) no window update (seg.window == conn.snd_wnd), (4) outstanding data to be ACKed (snd.una != snd.nxt), (5) connection state allows it (ESTABLISHED/CLOSE_WAIT/FIN_WAIT_*). A4 uses a loose check; A5 tightens since RACK replaces the 3-dup-ACK trigger anyway.
 
@@ -3222,7 +3222,7 @@ Locate the current A3 `dup_ack` detection in `handle_established`. Replace with:
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/resd-net-core/src/tcp_input.rs
+git add crates/dpdk-net-core/src/tcp_input.rs
 git commit -m "a5 task 23: dup_ack strict RFC 5681 §2 five-condition check"
 ```
 
@@ -3231,15 +3231,15 @@ git commit -m "a5 task 23: dup_ack strict RFC 5681 §2 five-condition check"
 ## Task 24: A4 carry-over — `ooo_drop` legacy field removal
 
 **Files:**
-- Modify: `crates/resd-net-core/src/tcp_input.rs` — remove `Outcome.ooo_drop` field, three asserts, all matcher refs
-- Modify: `crates/resd-net-core/src/engine.rs` — remove any `ooo_drop` matcher reference
+- Modify: `crates/dpdk-net-core/src/tcp_input.rs` — remove `Outcome.ooo_drop` field, three asserts, all matcher refs
+- Modify: `crates/dpdk-net-core/src/engine.rs` — remove any `ooo_drop` matcher reference
 
 **Context:** User callout. A4 rewrote the OOO branch to push to reorder queue; `ooo_drop` stayed as always-zero for compatibility. A5 deletes it.
 
 - [ ] **Step 1: Grep and collect all references**
 
 ```bash
-grep -rn 'ooo_drop' crates/resd-net-core/src/
+grep -rn 'ooo_drop' crates/dpdk-net-core/src/
 ```
 
 Expected:
@@ -3255,7 +3255,7 @@ Remove from `Outcome` struct; remove from `Outcome::base()`; remove the three `a
 - [ ] **Step 3: Run workspace tests — no regressions**
 
 ```bash
-cargo test -p resd-net-core
+cargo test -p dpdk-net-core
 ```
 Expected: all pass (the removed asserts were already checking a zero field; removal is safe).
 
@@ -3267,7 +3267,7 @@ Expected: all pass (the removed asserts were already checking a zero field; remo
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/resd-net-core/src/tcp_input.rs crates/resd-net-core/src/engine.rs
+git add crates/dpdk-net-core/src/tcp_input.rs crates/dpdk-net-core/src/engine.rs
 git commit -m "a5 task 24: remove legacy ooo_drop field from Outcome"
 ```
 
@@ -3276,7 +3276,7 @@ git commit -m "a5 task 24: remove legacy ooo_drop field from Outcome"
 ## Task 25: A4 carry-over — use `free_space_total` in `send_bytes` advertised window (I-8)
 
 **Files:**
-- Modify: `crates/resd-net-core/src/engine.rs` — `send_bytes` advertised-window computation
+- Modify: `crates/dpdk-net-core/src/engine.rs` — `send_bytes` advertised-window computation
 
 **Context:** A4 RFC review I-8. A4 `emit_ack` uses `free_space_total`; `send_bytes` uses `rcv_wnd` (A3-clamped to u16::MAX). Divergence is RFC-safe but inconsistent; A5 aligns them.
 
@@ -3319,7 +3319,7 @@ Find the A4 F-4 line computing `advertised_window` in `send_bytes`; replace `rcv
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/resd-net-core/src/engine.rs
+git add crates/dpdk-net-core/src/engine.rs
 git commit -m "a5 task 25: send_bytes advertises free_space_total (A4 I-8 close)"
 ```
 
@@ -3328,10 +3328,10 @@ git commit -m "a5 task 25: send_bytes advertises free_space_total (A4 I-8 close)
 ## Task 26: Counter batch — new slow-path + wire existing `tx_retrans`/`tx_rto`/`tx_tlp`
 
 **Files:**
-- Modify: `crates/resd-net-core/src/counters.rs` — add any A5 counters not yet added in prior tasks
-- Modify: `crates/resd-net/src/api.rs` — FFI `resd_net_tcp_counters_t` mirror
-- Modify: `crates/resd-net-core/tests/deferred-counters.txt` — remove `tx_retrans`/`tx_rto`/`tx_tlp` entries (they're wired now)
-- Modify: `crates/resd-net-core/src/counters.rs` test — `deferred_tcp_counters_zero_at_construction` — remove those three
+- Modify: `crates/dpdk-net-core/src/counters.rs` — add any A5 counters not yet added in prior tasks
+- Modify: `crates/dpdk-net/src/api.rs` — FFI `dpdk_net_tcp_counters_t` mirror
+- Modify: `crates/dpdk-net-core/tests/deferred-counters.txt` — remove `tx_retrans`/`tx_rto`/`tx_tlp` entries (they're wired now)
+- Modify: `crates/dpdk-net-core/src/counters.rs` test — `deferred_tcp_counters_zero_at_construction` — remove those three
 
 **Context:** Consolidate the A5 counter surface. A5 introduces 9 new slow-path counters (some added en route in Tasks 13, 16, 19). Also wires 3 A4-declared-zero-referenced counters.
 
@@ -3352,17 +3352,17 @@ If any missing, add.
 
 - [ ] **Step 2: Remove `tx_retrans`/`tx_rto`/`tx_tlp` from the deferred-counters list**
 
-Edit `crates/resd-net-core/tests/deferred-counters.txt` and remove the three lines.
+Edit `crates/dpdk-net-core/tests/deferred-counters.txt` and remove the three lines.
 
 Edit the `deferred_tcp_counters_zero_at_construction` unit test in `counters.rs` and remove its assertion lines for `tx_retrans`, `tx_rto`, `tx_tlp`.
 
 - [ ] **Step 3: Extend FFI counter struct**
 
-Add the 8 new fields to `resd_net_tcp_counters_t` in `crates/resd-net/src/api.rs`. Preserve layout assertion; bump the `static_assertions::const_assert_eq!` expected size if needed.
+Add the 8 new fields to `dpdk_net_tcp_counters_t` in `crates/dpdk-net/src/api.rs`. Preserve layout assertion; bump the `static_assertions::const_assert_eq!` expected size if needed.
 
 - [ ] **Step 4: Regenerate header**
 
-Run cbindgen. Verify `include/resd_net.h` now exposes all 8 new counter fields.
+Run cbindgen. Verify `include/dpdk_net.h` now exposes all 8 new counter fields.
 
 - [ ] **Step 5: Run workspace tests**
 
@@ -3379,10 +3379,10 @@ Expected: all pass.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add crates/resd-net-core/src/counters.rs \
-        crates/resd-net/src/api.rs \
-        include/resd_net.h \
-        crates/resd-net-core/tests/deferred-counters.txt
+git add crates/dpdk-net-core/src/counters.rs \
+        crates/dpdk-net/src/api.rs \
+        include/dpdk_net.h \
+        crates/dpdk-net-core/tests/deferred-counters.txt
 git commit -m "a5 task 26: counter batch — A5 slow-path fields + tx_retrans/rto/tlp wired"
 ```
 
@@ -3391,8 +3391,8 @@ git commit -m "a5 task 26: counter batch — A5 slow-path fields + tx_retrans/rt
 ## Task 27: TAP harness extensions — drop-segment, SACK-past-N, blackhole modes
 
 **Files:**
-- Modify: `crates/resd-net-core/tests/common/mod.rs` (or wherever the A3/A4 TAP helpers live) — add fault-injection modes
-- Create (if not present): `crates/resd-net-core/tests/common/tap_injection.rs`
+- Modify: `crates/dpdk-net-core/tests/common/mod.rs` (or wherever the A3/A4 TAP helpers live) — add fault-injection modes
+- Create (if not present): `crates/dpdk-net-core/tests/common/tap_injection.rs`
 
 **Context:** A5 integration tests need synthetic peer misbehavior. Extend the TAP pair harness from A3/A4 with:
 - `drop_next_tx()` — the peer "drops" the next frame emitted by our stack (the TAP harness does not reply, simulating a lost segment).
@@ -3401,12 +3401,12 @@ git commit -m "a5 task 26: counter batch — A5 slow-path fields + tx_retrans/rt
 
 - [ ] **Step 1: Locate existing harness**
 
-Run: `find crates/resd-net-core/tests -name '*.rs' | xargs grep -l '_tap' | head`
+Run: `find crates/dpdk-net-core/tests -name '*.rs' | xargs grep -l '_tap' | head`
 
 - [ ] **Step 2: Add test helpers**
 
 ```rust
-// crates/resd-net-core/tests/common/tap_injection.rs
+// crates/dpdk-net-core/tests/common/tap_injection.rs
 
 pub struct TapPeerMode {
     pub drop_next_tx: bool,
@@ -3427,7 +3427,7 @@ Smoke test: construct a TapPair, set `drop_next_tx=true`, TX a frame from our si
 - [ ] **Step 4: Commit**
 
 ```bash
-git add crates/resd-net-core/tests/common/
+git add crates/dpdk-net-core/tests/common/
 git commit -m "a5 task 27: TAP harness — drop / sack-past / blackhole injection modes"
 ```
 
@@ -3436,7 +3436,7 @@ git commit -m "a5 task 27: TAP harness — drop / sack-past / blackhole injectio
 ## Task 28: Integration tests — RTO retransmit, RACK reorder detect, TLP tail-loss
 
 **Files:**
-- Create: `crates/resd-net-core/tests/tcp_rack_rto_retrans_tap.rs` (scenarios 1–3)
+- Create: `crates/dpdk-net-core/tests/tcp_rack_rto_retrans_tap.rs` (scenarios 1–3)
 
 **Context:** Spec §10.2 integration matrix. First three scenarios use the harness injection modes from Task 27.
 
@@ -3479,7 +3479,7 @@ fn tlp_fires_on_tail_loss_and_probes_last_segment() {
 - [ ] **Step 2: Run — expect pass**
 
 ```bash
-cargo test -p resd-net-core --test tcp_rack_rto_retrans_tap
+cargo test -p dpdk-net-core --test tcp_rack_rto_retrans_tap
 ```
 
 - [ ] **Step 3: Review (opus)**
@@ -3490,7 +3490,7 @@ cargo test -p resd-net-core --test tcp_rack_rto_retrans_tap
 - [ ] **Step 4: Commit**
 
 ```bash
-git add crates/resd-net-core/tests/tcp_rack_rto_retrans_tap.rs
+git add crates/dpdk-net-core/tests/tcp_rack_rto_retrans_tap.rs
 git commit -m "a5 task 28: integration — RTO + RACK + TLP TAP scenarios"
 ```
 
@@ -3499,7 +3499,7 @@ git commit -m "a5 task 28: integration — RTO + RACK + TLP TAP scenarios"
 ## Task 29: Integration tests — rack_aggressive, max-retrans, SYN retrans
 
 **Files:**
-- Modify: `crates/resd-net-core/tests/tcp_rack_rto_retrans_tap.rs` — scenarios 4–6
+- Modify: `crates/dpdk-net-core/tests/tcp_rack_rto_retrans_tap.rs` — scenarios 4–6
 
 - [ ] **Step 1: Write the three tests**
 
@@ -3537,7 +3537,7 @@ fn syn_retrans_budget_exhausted_emits_etimedout() { /* scenario 6 */ }
 - [ ] **Step 4: Commit**
 
 ```bash
-git add crates/resd-net-core/tests/tcp_rack_rto_retrans_tap.rs
+git add crates/dpdk-net-core/tests/tcp_rack_rto_retrans_tap.rs
 git commit -m "a5 task 29: integration — rack_aggressive + max-retrans + SYN retrans"
 ```
 
@@ -3546,7 +3546,7 @@ git commit -m "a5 task 29: integration — rack_aggressive + max-retrans + SYN r
 ## Task 30: Integration tests — ISS monotonicity, no-backoff, DSACK, mbuf-chain
 
 **Files:**
-- Modify: `crates/resd-net-core/tests/tcp_rack_rto_retrans_tap.rs` — scenarios 7–10
+- Modify: `crates/dpdk-net-core/tests/tcp_rack_rto_retrans_tap.rs` — scenarios 7–10
 
 - [ ] **Step 1: Write the four tests**
 
@@ -3584,7 +3584,7 @@ fn retransmit_tx_frame_is_multi_seg_mbuf_chain() {
 - [ ] **Step 4: Commit**
 
 ```bash
-git add crates/resd-net-core/tests/tcp_rack_rto_retrans_tap.rs
+git add crates/dpdk-net-core/tests/tcp_rack_rto_retrans_tap.rs
 git commit -m "a5 task 30: integration — ISS monotonic + no-backoff + DSACK + mbuf-chain"
 ```
 
@@ -3610,10 +3610,10 @@ git commit -m "a5 task 30: integration — ISS monotonic + no-backoff + DSACK + 
 - [ ] **Step 4: Edit §6.5** implementation choices — add bullet:
 
 ```
-- **Data retransmit budget**: `tcp_max_retrans_count` (default 15). After this many RTO-driven retransmits of a single segment with no ACK progress, connection fails with `RESD_NET_EVT_ERROR{err=ETIMEDOUT}`. With backoff + `tcp_max_rto_us=1s`, the total wall-clock budget is ≈8.3s. Opt-out of backoff per-connect (`rto_no_backoff=true`) makes the budget linear in count × `rto_us`.
+- **Data retransmit budget**: `tcp_max_retrans_count` (default 15). After this many RTO-driven retransmits of a single segment with no ACK progress, connection fails with `DPDK_NET_EVT_ERROR{err=ETIMEDOUT}`. With backoff + `tcp_max_rto_us=1s`, the total wall-clock budget is ≈8.3s. Opt-out of backoff per-connect (`rto_no_backoff=true`) makes the budget linear in count × `rto_us`.
 ```
 
-- [ ] **Step 5: Edit §9.1** — append the 9 new A5 counter names to the example list; add `err=ETIMEDOUT` to §9.3 `RESD_NET_EVT_ERROR` enum.
+- [ ] **Step 5: Edit §9.1** — append the 9 new A5 counter names to the example list; add `err=ETIMEDOUT` to §9.3 `DPDK_NET_EVT_ERROR` enum.
 
 - [ ] **Step 6: Edit §6.3** RFC 8985 row — clarify "RACK-TLP as primary; 3-dup-ACK disabled at Stage 1".
 
@@ -3661,9 +3661,9 @@ Expected: all pass. Count new tests added in A5 (should be ≥40 unit + 10 integ
 - [ ] **Step 4: Verify header drift**
 
 ```bash
-# Re-run cbindgen; compare to checked-in include/resd_net.h.
-cargo run -p resd-net --bin cbindgen-check || \
-  (diff include/resd_net.h /tmp/regen.h && echo "no drift")
+# Re-run cbindgen; compare to checked-in include/dpdk_net.h.
+cargo run -p dpdk-net --bin cbindgen-check || \
+  (diff include/dpdk_net.h /tmp/regen.h && echo "no drift")
 ```
 Expected: no diff.
 
@@ -3692,7 +3692,7 @@ Use the `Agent` tool with subagent_type `mtcp-comparison-reviewer`. Prompt:
 
 > "Run the phase-a5 mTCP comparison review per spec §10.13. Compare our A5 implementation (commit `<HEAD>` on branch `phase-a5`) against mTCP's retransmit + RTO + loss-detection path.
 >
-> Files we've added: `crates/resd-net-core/src/siphash24.rs`, `iss.rs` (rewritten), `tcp_rtt.rs`, `tcp_timer_wheel.rs`, `tcp_rack.rs`, `tcp_tlp.rs`, `tcp_retrans.rs`.
+> Files we've added: `crates/dpdk-net-core/src/siphash24.rs`, `iss.rs` (rewritten), `tcp_rtt.rs`, `tcp_timer_wheel.rs`, `tcp_rack.rs`, `tcp_tlp.rs`, `tcp_retrans.rs`.
 >
 > Files we've modified: `tcp_conn.rs`, `tcp_input.rs`, `tcp_options.rs`, `engine.rs`, `tcp_events.rs`, `counters.rs`.
 >

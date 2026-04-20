@@ -4,9 +4,9 @@
 
 **Goal:** Negotiate TCP options at handshake (MSS + Window Scale + Timestamps + SACK-permitted), enforce RFC 7323 PAWS on every inbound segment, reassemble out-of-order segments into the in-order recv stream via a per-connection reorder queue, and track SACK blocks in both directions — decode peer SACK blocks from incoming ACKs into a scoreboard (A5 retransmit consumes it), encode SACK blocks on outbound ACKs when we have recv-side gaps. No retransmit, no RTO, no RACK — those are A5. Phase ends with an integration-test matrix (option negotiation smoke, PAWS replay rejection, OOO reassembly delivery, SACK encode+decode round-trip) and the mandatory mTCP + RFC review gates.
 
-**Architecture:** Three new pure-Rust modules in `resd-net-core`: `tcp_options` (option encoder + decoder, full-set: MSS/WS/SACK-permitted/TS + SACK blocks; consolidates + replaces `tcp_input::parse_mss_option` and `tcp_output::SegmentTx.mss_option`), `tcp_reassembly` (`ReorderQueue` of `OooSegment { seq, payload }` sorted by wrap-aware seq, overlap-merge on insert, drain-on-gap-close), `tcp_sack` (`SackScoreboard` holding up to 4 peer-received SACK blocks; insert + merge + seq-is-sacked query for A5). `tcp_conn.rs` gains option-negotiated fields (`ws_shift_out`, `ws_shift_in`, `ts_enabled`, `ts_recent`, `ts_recent_age`, `sack_enabled`) + the reorder queue + the scoreboard; `RecvQueue` grows a `reorder: ReorderQueue` field. `tcp_input.rs` gains a PAWS check ahead of the seq-window check, rewrites `handle_established`'s OOO branch to push into the reorder queue + drain on gap-close, and decodes peer SACK blocks from inbound ACKs into the scoreboard. `tcp_output.rs` replaces the narrow `SegmentTx.mss_option: Option<u16>` with a `SegmentTx.options: TcpOptsBuilder` bundle that carries any combination of MSS/WS/SACK-permitted/TS/SACK-blocks, word-padded with NOPs. `engine.rs` emits full SYN options on `connect`, emits TS + WS-scaled window on every post-handshake ACK, emits SACK blocks on ACKs when `recv.reorder` is non-empty. `counters.rs` gains 15 new slow-path counters (6 A4-scope, 9 cross-phase backfill) + introduces two hot-path counters behind new cargo feature flags (`obs-byte-counters`, `obs-poll-saturation`). `api.rs` + the FFI `resd_net_tcp_counters_t` grow in lockstep under the layout assertion.
+**Architecture:** Three new pure-Rust modules in `dpdk-net-core`: `tcp_options` (option encoder + decoder, full-set: MSS/WS/SACK-permitted/TS + SACK blocks; consolidates + replaces `tcp_input::parse_mss_option` and `tcp_output::SegmentTx.mss_option`), `tcp_reassembly` (`ReorderQueue` of `OooSegment { seq, payload }` sorted by wrap-aware seq, overlap-merge on insert, drain-on-gap-close), `tcp_sack` (`SackScoreboard` holding up to 4 peer-received SACK blocks; insert + merge + seq-is-sacked query for A5). `tcp_conn.rs` gains option-negotiated fields (`ws_shift_out`, `ws_shift_in`, `ts_enabled`, `ts_recent`, `ts_recent_age`, `sack_enabled`) + the reorder queue + the scoreboard; `RecvQueue` grows a `reorder: ReorderQueue` field. `tcp_input.rs` gains a PAWS check ahead of the seq-window check, rewrites `handle_established`'s OOO branch to push into the reorder queue + drain on gap-close, and decodes peer SACK blocks from inbound ACKs into the scoreboard. `tcp_output.rs` replaces the narrow `SegmentTx.mss_option: Option<u16>` with a `SegmentTx.options: TcpOptsBuilder` bundle that carries any combination of MSS/WS/SACK-permitted/TS/SACK-blocks, word-padded with NOPs. `engine.rs` emits full SYN options on `connect`, emits TS + WS-scaled window on every post-handshake ACK, emits SACK blocks on ACKs when `recv.reorder` is non-empty. `counters.rs` gains 15 new slow-path counters (6 A4-scope, 9 cross-phase backfill) + introduces two hot-path counters behind new cargo feature flags (`obs-byte-counters`, `obs-poll-saturation`). `api.rs` + the FFI `dpdk_net_tcp_counters_t` grow in lockstep under the layout assertion.
 
-**Tech Stack:** same as A3 — Rust stable, DPDK 23.11, bindgen, cbindgen. New stdlib: none (the reorder queue uses `Vec`, the SACK scoreboard uses a small fixed array). New cargo features in `resd-net-core/Cargo.toml`: `obs-byte-counters` (default off), `obs-poll-saturation` (default on), and a meta-feature `obs-all` that turns both on for the A8 counter-coverage audit's `--all-features` run. The integration test crate uses the same `std::net::TcpListener` TAP-pair harness as A3.
+**Tech Stack:** same as A3 — Rust stable, DPDK 23.11, bindgen, cbindgen. New stdlib: none (the reorder queue uses `Vec`, the SACK scoreboard uses a small fixed array). New cargo features in `dpdk-net-core/Cargo.toml`: `obs-byte-counters` (default off), `obs-poll-saturation` (default on), and a meta-feature `obs-all` that turns both on for the A8 counter-coverage audit's `--all-features` run. The integration test crate uses the same `std::net::TcpListener` TAP-pair harness as A3.
 
 **Spec reference:** `docs/superpowers/specs/2026-04-17-dpdk-tcp-design.md` §§ 6.2 (`ws_shift_out`/`ws_shift_in`/`ts_enabled`/`ts_recent`/`ts_recent_age`/`sack_enabled` field set), 6.3 RFC matrix rows for **7323** (Timestamps + Window Scale + PAWS), **2018** (SACK), **6691** (MSS — revisited with WS interaction), 6.4 (A4 may add deviation rows if PAWS edge cases surface that diverge from RFC 7323 §5), 7.2 (`recv_reorder` mbuf-chain envisioned; A4 continues the copy-based model per AD-A4-reassembly below), 9.1 (TCP counter group — 15 new slow-path + 2 hot-path), 9.1.1 (counter-addition policy — fetch_add default, hot-path feature-gated with per-burst batching), 10.13 (mTCP review gate), 10.14 (RFC compliance review gate).
 
@@ -22,13 +22,13 @@ The `phase-a4-complete` tag is blocked while either report has an open `[ ]` in 
 - **Retransmit, RTO, RACK-TLP** → A5. A4 decodes peer SACK blocks into the scoreboard; actually **using** the scoreboard for selective retransmission is A5 RACK-TLP work.
 - **Congestion control** (Reno under `cc_mode=reno`) → A5 follow-up. A4 carries `cc_mode` through the config but doesn't gate send rate on cwnd.
 - **ECN** (on-path ECT/CE marking) → separate flag; no Stage 1 gate.
-- **`RESD_NET_EVT_WRITABLE`, real timer wheel, `resd_net_flush` actually flushing, `FORCE_TW_SKIP` + RFC 6191 guard** → A6.
+- **`DPDK_NET_EVT_WRITABLE`, real timer wheel, `dpdk_net_flush` actually flushing, `FORCE_TW_SKIP` + RFC 6191 guard** → A6.
 - **`preset=rfc_compliance` switch** (delayed-ACK on, Nagle on, `min_rto=200`, `initial_rto=1000`, `cc_mode=reno`, burst-scope ACK coalescing) → A6. A4 keeps A3's per-segment ACK baseline.
 - **Mbuf-pinning zero-copy delivery model** (spec §7.2 + §7.3) → a later phase (probably A10 perf work or the A6 API surface completion). A4 continues A3's copy-based model for both in-order and OOO — documented as AD-A4-reassembly below.
 
 **Design decisions recorded during planning (pre-plan):**
 
-1. **Spec §9.1 write model reconciliation (P3).** Spec §9.1 previously said "Hot-path writes are `store(val+1, Ordering::Relaxed)`", which is a load-modify-store pattern: safe only under the single-owner-lcore invariant, lost-update-fragile if the invariant ever slips in a future refactor. Actual code in `crates/resd-net-core/src/counters.rs:141,146` uses `fetch_add(1, Ordering::Relaxed)` universally. §9.1.1 (added in the prior session) assumes `fetch_add`'s `lock xadd` cost (~8-12 cycles). **Resolution committed before this plan:** spec §9.1 amended in the A4 planning-fixes commit to say "Counter writes are `fetch_add(1, Ordering::Relaxed)` (`lock xadd` on x86_64; ~8-12 cycles uncontended)" so the two sections agree. §9.1.1 batching guidance (per-burst stack-local accumulator + single aggregate `fetch_add`) stands as the hot-path policy. No code change — only spec text. This decision is frozen for A4; future perf work may revisit under §9.1.1 rule 3 (explicit exception) with a benchmark-backed spec amendment.
+1. **Spec §9.1 write model reconciliation (P3).** Spec §9.1 previously said "Hot-path writes are `store(val+1, Ordering::Relaxed)`", which is a load-modify-store pattern: safe only under the single-owner-lcore invariant, lost-update-fragile if the invariant ever slips in a future refactor. Actual code in `crates/dpdk-net-core/src/counters.rs:141,146` uses `fetch_add(1, Ordering::Relaxed)` universally. §9.1.1 (added in the prior session) assumes `fetch_add`'s `lock xadd` cost (~8-12 cycles). **Resolution committed before this plan:** spec §9.1 amended in the A4 planning-fixes commit to say "Counter writes are `fetch_add(1, Ordering::Relaxed)` (`lock xadd` on x86_64; ~8-12 cycles uncontended)" so the two sections agree. §9.1.1 batching guidance (per-burst stack-local accumulator + single aggregate `fetch_add`) stands as the hot-path policy. No code change — only spec text. This decision is frozen for A4; future perf work may revisit under §9.1.1 rule 3 (explicit exception) with a benchmark-backed spec amendment.
 
 2. **AD-2 revisit alongside PAWS.** Spec §6.4 AD-2 (both-edges seq-window check in `handle_established`) and A3's plan-header accepted divergence #2. PAWS (RFC 7323 §5) added in A4 rejects stale-TS-val segments before the seq-window check runs; it's a strictly stronger filter than AD-2 against wrapped-seq attacks (AD-2's original rationale). AD-2's remaining cost is marginal snd_una-advance delay on retransmits whose seq range straddles rcv_nxt — and A3 has no retransmit. **Resolution:** A4 keeps AD-2 (both-edges) as-is; PAWS is additive, not a replacement. Loosening AD-2 to mTCP's right-edge-only check deferred to A5 alongside RACK-TLP + retransmit, because the cost of rejecting in-flight retransmits only starts to bite once we generate them. A4 mTCP review documents "AD-2 persists + PAWS supersedes the anti-wrap rationale" as an annotation on AD-2.
 
@@ -48,7 +48,7 @@ The `phase-a4-complete` tag is blocked while either report has an open `[ ]` in 
 ## File Structure Created or Modified in This Phase
 
 ```
-crates/resd-net-core/
+crates/dpdk-net-core/
 ├── Cargo.toml              (MODIFIED: [features] obs-byte-counters / obs-poll-saturation / obs-all)
 ├── src/
 │   ├── lib.rs              (MODIFIED: expose tcp_options, tcp_reassembly, tcp_sack; remove pub-use of parse_mss_option)
@@ -63,11 +63,11 @@ crates/resd-net-core/
 └── tests/
     └── tcp_options_paws_reassembly_sack_tap.rs  (NEW: 4 integration tests over TAP)
 
-crates/resd-net/src/
-├── api.rs                  (MODIFIED: resd_net_tcp_counters_t mirrors the 15 slow-path + 2 hot-path additions; layout assertion covers them)
+crates/dpdk-net/src/
+├── api.rs                  (MODIFIED: dpdk_net_tcp_counters_t mirrors the 15 slow-path + 2 hot-path additions; layout assertion covers them)
 └── lib.rs                  (no change — no new extern "C" functions; A4 is purely internal / observability)
 
-include/resd_net.h          (REGENERATED via cbindgen)
+include/dpdk_net.h          (REGENERATED via cbindgen)
 
 examples/cpp-consumer/main.cpp
                             (MODIFIED: print the 6 A4-scope slow-path TCP counters + rx_sack_blocks)
@@ -89,11 +89,11 @@ docs/superpowers/reviews/phase-a4-rfc-compliance.md    (NEW: A4 RFC compliance r
 **Goal:** Land 15 new slow-path fields on `TcpCounters` — 6 A4-scope (`rx_paws_rejected`, `rx_bad_option`, `rx_reassembly_queued`, `rx_reassembly_hole_filled`, `tx_sack_blocks`, `rx_sack_blocks`) and 9 cross-phase backfill (`rx_bad_seq`, `rx_bad_ack`, `rx_dup_ack`, `rx_zero_window`, `rx_urgent_dropped`, `tx_zero_window`, `tx_window_update`, `conn_table_full`, `conn_time_wait_reaped`). Insert them between `recv_buf_drops` and `state_trans`; `_pad[3]` stays where it is and the struct grows by 15 u64 = 120 bytes (the `#[repr(C, align(64))]` absorbs the alignment round-up in implicit trailing padding). All fields zero at construction.
 
 **Files:**
-- Modify: `crates/resd-net-core/src/counters.rs`
+- Modify: `crates/dpdk-net-core/src/counters.rs`
 
 - [ ] **Step 1: Write the failing test**
 
-Append to `crates/resd-net-core/src/counters.rs` inside `mod tests`:
+Append to `crates/dpdk-net-core/src/counters.rs` inside `mod tests`:
 
 ```rust
     #[test]
@@ -121,12 +121,12 @@ Append to `crates/resd-net-core/src/counters.rs` inside `mod tests`:
 
 - [ ] **Step 2: Run — verify it fails**
 
-Run: `cargo test -p resd-net-core counters::tests::a4_new_tcp_counters_exist_and_zero -- --nocapture`
+Run: `cargo test -p dpdk-net-core counters::tests::a4_new_tcp_counters_exist_and_zero -- --nocapture`
 Expected: FAIL with "no field `rx_paws_rejected` on type `TcpCounters`".
 
 - [ ] **Step 3: Extend `TcpCounters` with the new fields**
 
-In `crates/resd-net-core/src/counters.rs`, replace the `TcpCounters` struct body — insert the new fields between `recv_buf_drops` and `state_trans`:
+In `crates/dpdk-net-core/src/counters.rs`, replace the `TcpCounters` struct body — insert the new fields between `recv_buf_drops` and `state_trans`:
 
 ```rust
 #[repr(C, align(64))]
@@ -193,7 +193,7 @@ pub struct TcpCounters {
     pub tx_zero_window: AtomicU64,
     /// We emitted a pure window-update segment.
     pub tx_window_update: AtomicU64,
-    /// `resd_net_connect` rejected because flow table at `max_connections`.
+    /// `dpdk_net_connect` rejected because flow table at `max_connections`.
     pub conn_table_full: AtomicU64,
     /// TIME_WAIT deadline expired, connection reclaimed.
     pub conn_time_wait_reaped: AtomicU64,
@@ -206,42 +206,42 @@ pub struct TcpCounters {
 
 - [ ] **Step 4: Run — verify it passes**
 
-Run: `cargo test -p resd-net-core counters::tests::a4_new_tcp_counters_exist_and_zero -- --nocapture`
+Run: `cargo test -p dpdk-net-core counters::tests::a4_new_tcp_counters_exist_and_zero -- --nocapture`
 Expected: PASS.
 
 - [ ] **Step 5: Run the full counters test module**
 
-Run: `cargo test -p resd-net-core counters::tests --`
+Run: `cargo test -p dpdk-net-core counters::tests --`
 Expected: all counter tests pass (including the A3 tests — we didn't change their semantics).
 
 - [ ] **Step 6: Commit**
 
 ```sh
-git add crates/resd-net-core/src/counters.rs
+git add crates/dpdk-net-core/src/counters.rs
 git commit -m "a4: extend TcpCounters — 6 A4-scope + 9 cross-phase slow-path fields"
 ```
 
 ---
 
-## Task 2: Mirror A4 counter fields in the FFI `resd_net_tcp_counters_t`
+## Task 2: Mirror A4 counter fields in the FFI `dpdk_net_tcp_counters_t`
 
-**Goal:** Keep `crates/resd-net/src/api.rs` `resd_net_tcp_counters_t` in lockstep with the core `TcpCounters`. The `const _: ()` layout assertion at the bottom of `api.rs` enforces size + alignment parity; Task 1's struct change will break that assertion until this task lands. Order + field names must match exactly so `resd_net_counters()`'s pointer cast is sound.
+**Goal:** Keep `crates/dpdk-net/src/api.rs` `dpdk_net_tcp_counters_t` in lockstep with the core `TcpCounters`. The `const _: ()` layout assertion at the bottom of `api.rs` enforces size + alignment parity; Task 1's struct change will break that assertion until this task lands. Order + field names must match exactly so `dpdk_net_counters()`'s pointer cast is sound.
 
 **Files:**
-- Modify: `crates/resd-net/src/api.rs`
+- Modify: `crates/dpdk-net/src/api.rs`
 
 - [ ] **Step 1: Run the layout assertion (expected to fail after Task 1)**
 
-Run: `cargo build -p resd-net`
-Expected: FAIL — `size_of::<resd_net_tcp_counters_t>() == size_of::<CoreTcp>()` const-eval asserts fires because we added 15 u64s to `CoreTcp` but not to the FFI mirror.
+Run: `cargo build -p dpdk-net`
+Expected: FAIL — `size_of::<dpdk_net_tcp_counters_t>() == size_of::<CoreTcp>()` const-eval asserts fires because we added 15 u64s to `CoreTcp` but not to the FFI mirror.
 
 - [ ] **Step 2: Mirror the fields on the FFI side**
 
-In `crates/resd-net/src/api.rs`, replace the `resd_net_tcp_counters_t` struct body — insert the same 15 fields between `recv_buf_drops` and `state_trans`:
+In `crates/dpdk-net/src/api.rs`, replace the `dpdk_net_tcp_counters_t` struct body — insert the same 15 fields between `recv_buf_drops` and `state_trans`:
 
 ```rust
 #[repr(C, align(64))]
-pub struct resd_net_tcp_counters_t {
+pub struct dpdk_net_tcp_counters_t {
     pub rx_syn_ack: u64,
     pub rx_data: u64,
     pub rx_ack: u64,
@@ -294,12 +294,12 @@ pub struct resd_net_tcp_counters_t {
 
 - [ ] **Step 3: Build — verify the layout assertion passes**
 
-Run: `cargo build -p resd-net`
+Run: `cargo build -p dpdk-net`
 Expected: PASS.
 
-- [ ] **Step 4: Regenerate `include/resd_net.h` and verify drift check**
+- [ ] **Step 4: Regenerate `include/dpdk_net.h` and verify drift check**
 
-Run: `cargo build -p resd-net --features cbindgen-gen && cargo test -p resd-net header_drift`
+Run: `cargo build -p dpdk-net --features cbindgen-gen && cargo test -p dpdk-net header_drift`
 Expected: PASS (header regenerated; drift test reads the same file just regenerated).
 
 If the repo uses a different drift-check command (look in `build.rs` or workspace `Cargo.toml` for a `[[test]]` named `header_drift` or similar), run that instead.
@@ -307,8 +307,8 @@ If the repo uses a different drift-check command (look in `build.rs` or workspac
 - [ ] **Step 5: Commit**
 
 ```sh
-git add crates/resd-net/src/api.rs include/resd_net.h
-git commit -m "a4: mirror new TcpCounters fields in resd_net_tcp_counters_t + regenerate header"
+git add crates/dpdk-net/src/api.rs include/dpdk_net.h
+git commit -m "a4: mirror new TcpCounters fields in dpdk_net_tcp_counters_t + regenerate header"
 ```
 
 ---
@@ -318,16 +318,16 @@ git commit -m "a4: mirror new TcpCounters fields in resd_net_tcp_counters_t + re
 **Goal:** Introduce a single-module option encoder covering all four Stage-1-relevant TCP options (MSS, WSCALE, SACK-permitted, Timestamps) plus SACK blocks for non-SYN ACKs. The types are a declarative `TcpOpts` snapshot + a `TcpOptsBuilder` that writes a canonical byte sequence into a caller-provided slice. Task 4 adds the decoder; Task 11 wires the builder into `SegmentTx`.
 
 **Files:**
-- Create: `crates/resd-net-core/src/tcp_options.rs`
-- Modify: `crates/resd-net-core/src/lib.rs` (expose `pub mod tcp_options;`)
+- Create: `crates/dpdk-net-core/src/tcp_options.rs`
+- Modify: `crates/dpdk-net-core/src/lib.rs` (expose `pub mod tcp_options;`)
 
 - [ ] **Step 1: Add module declaration to `lib.rs`**
 
-Insert the line `pub mod tcp_options;` alphabetically among the existing `pub mod` entries in `crates/resd-net-core/src/lib.rs`.
+Insert the line `pub mod tcp_options;` alphabetically among the existing `pub mod` entries in `crates/dpdk-net-core/src/lib.rs`.
 
 - [ ] **Step 2: Write the failing test first**
 
-Create `crates/resd-net-core/src/tcp_options.rs` with:
+Create `crates/dpdk-net-core/src/tcp_options.rs` with:
 
 ```rust
 //! TCP option encode + decode for Stage 1 A4 scope:
@@ -537,18 +537,18 @@ mod tests {
 
 - [ ] **Step 3: Run the tests**
 
-Run: `cargo test -p resd-net-core tcp_options::tests`
+Run: `cargo test -p dpdk-net-core tcp_options::tests`
 Expected: PASS (all 5 tests green).
 
 - [ ] **Step 4: Clippy clean**
 
-Run: `cargo clippy -p resd-net-core --all-targets -- -D warnings`
+Run: `cargo clippy -p dpdk-net-core --all-targets -- -D warnings`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
 ```sh
-git add crates/resd-net-core/src/lib.rs crates/resd-net-core/src/tcp_options.rs
+git add crates/dpdk-net-core/src/lib.rs crates/dpdk-net-core/src/tcp_options.rs
 git commit -m "a4: tcp_options.rs — TcpOpts + encoder (MSS/WS/SACK-perm/TS + SACK blocks)"
 ```
 
@@ -559,11 +559,11 @@ git commit -m "a4: tcp_options.rs — TcpOpts + encoder (MSS/WS/SACK-perm/TS + S
 **Goal:** Decode a byte slice of TCP options into a `TcpOpts` value. The parser must reject the mTCP I-6 infinite-loop on `optlen < 2` for unknown kinds, the invariance of known-option lengths (MSS = 4, WS = 3, SACK-permitted = 2, TS = 10, SACK = 2 + 8*N with N ∈ 1..=4), and truncation mid-option. On any rejection the parser returns `Err(OptionParseError)` and the caller bumps `tcp.rx_bad_option`. Normal parses ignore unknown kinds per RFC 9293 §3.1 "TCP Options" (advance by the option's `len`).
 
 **Files:**
-- Modify: `crates/resd-net-core/src/tcp_options.rs`
+- Modify: `crates/dpdk-net-core/src/tcp_options.rs`
 
 - [ ] **Step 1: Add the decoder + parser-error enum**
 
-Append to `crates/resd-net-core/src/tcp_options.rs` (below the `impl TcpOpts` block, above `#[cfg(test)]`):
+Append to `crates/dpdk-net-core/src/tcp_options.rs` (below the `impl TcpOpts` block, above `#[cfg(test)]`):
 
 ```rust
 /// Errors from `parse_options`. Every variant maps to one `tcp.rx_bad_option`
@@ -785,18 +785,18 @@ Append to the `#[cfg(test)] mod tests` block in `tcp_options.rs`:
 
 - [ ] **Step 3: Run the decoder tests**
 
-Run: `cargo test -p resd-net-core tcp_options::tests::parse_`
+Run: `cargo test -p dpdk-net-core tcp_options::tests::parse_`
 Expected: all `parse_*` tests green.
 
 - [ ] **Step 4: Run the full `tcp_options` test module**
 
-Run: `cargo test -p resd-net-core tcp_options::tests`
+Run: `cargo test -p dpdk-net-core tcp_options::tests`
 Expected: PASS (encoder + decoder tests).
 
 - [ ] **Step 5: Commit**
 
 ```sh
-git add crates/resd-net-core/src/tcp_options.rs
+git add crates/dpdk-net-core/src/tcp_options.rs
 git commit -m "a4: tcp_options.rs — decoder with defensive parse + round-trip tests"
 ```
 
@@ -807,11 +807,11 @@ git commit -m "a4: tcp_options.rs — decoder with defensive parse + round-trip 
 **Goal:** Add the fields spec §6.2 calls for: `ws_shift_out`, `ws_shift_in`, `ts_enabled`, `ts_recent`, `ts_recent_age`, `sack_enabled`. Defaults mean "not negotiated" (ws_shift_* = 0, ts_enabled = false, sack_enabled = false). Wiring the fields at handshake lands in Task 15; emitting them on TX lands in Task 12 and Task 13; PAWS lands in Task 16. This task is declaration + default-init only, so it stays small and the A3 tests that construct `TcpConn` don't break.
 
 **Files:**
-- Modify: `crates/resd-net-core/src/tcp_conn.rs`
+- Modify: `crates/dpdk-net-core/src/tcp_conn.rs`
 
 - [ ] **Step 1: Write the failing test first**
 
-Append to `crates/resd-net-core/src/tcp_conn.rs` inside `mod tests`:
+Append to `crates/dpdk-net-core/src/tcp_conn.rs` inside `mod tests`:
 
 ```rust
     #[test]
@@ -831,12 +831,12 @@ Append to `crates/resd-net-core/src/tcp_conn.rs` inside `mod tests`:
 
 - [ ] **Step 2: Run — verify it fails**
 
-Run: `cargo test -p resd-net-core tcp_conn::tests::a4_options_fields_default_to_not_negotiated`
+Run: `cargo test -p dpdk-net-core tcp_conn::tests::a4_options_fields_default_to_not_negotiated`
 Expected: FAIL — "no field `ws_shift_out` on type `TcpConn`".
 
 - [ ] **Step 3: Add the fields**
 
-In `crates/resd-net-core/src/tcp_conn.rs`, modify the `TcpConn` struct to insert the A4 fields and update `new_client` to default-init them. Replace the existing `TcpConn` struct with:
+In `crates/dpdk-net-core/src/tcp_conn.rs`, modify the `TcpConn` struct to insert the A4 fields and update `new_client` to default-init them. Replace the existing `TcpConn` struct with:
 
 ```rust
 pub struct TcpConn {
@@ -936,13 +936,13 @@ Then update `new_client` to default-init the new fields. In the `impl TcpConn` b
 
 - [ ] **Step 4: Run — verify it passes**
 
-Run: `cargo test -p resd-net-core tcp_conn::tests -- --nocapture`
+Run: `cargo test -p dpdk-net-core tcp_conn::tests -- --nocapture`
 Expected: PASS (new test + all existing A3 tests).
 
 - [ ] **Step 5: Commit**
 
 ```sh
-git add crates/resd-net-core/src/tcp_conn.rs
+git add crates/dpdk-net-core/src/tcp_conn.rs
 git commit -m "a4: TcpConn — add ws_shift_*, ts_enabled + ts_recent + ts_recent_age, sack_enabled"
 ```
 
@@ -953,16 +953,16 @@ git commit -m "a4: TcpConn — add ws_shift_*, ts_enabled + ts_recent + ts_recen
 **Goal:** Introduce the out-of-order segment queue. A `ReorderQueue` holds `Vec<OooSegment { seq, payload: Vec<u8> }>` sorted by wrap-aware seq order (`tcp_seq::seq_lt`). Inserts find the right position, merge overlapping/adjacent segments (mTCP `CanMerge` / `MergeFragments` semantics), and cap total buffered bytes at a construction-time limit (threaded in from the `RecvQueue` cap). This task lands the struct + insert; Task 7 lands `drain_contiguous_from_rcv_nxt`.
 
 **Files:**
-- Create: `crates/resd-net-core/src/tcp_reassembly.rs`
-- Modify: `crates/resd-net-core/src/lib.rs`
+- Create: `crates/dpdk-net-core/src/tcp_reassembly.rs`
+- Modify: `crates/dpdk-net-core/src/lib.rs`
 
 - [ ] **Step 1: Add module declaration to `lib.rs`**
 
-Add `pub mod tcp_reassembly;` alphabetically in `crates/resd-net-core/src/lib.rs`.
+Add `pub mod tcp_reassembly;` alphabetically in `crates/dpdk-net-core/src/lib.rs`.
 
 - [ ] **Step 2: Write the failing tests first**
 
-Create `crates/resd-net-core/src/tcp_reassembly.rs` with the struct + insert implementation:
+Create `crates/dpdk-net-core/src/tcp_reassembly.rs` with the struct + insert implementation:
 
 ```rust
 //! Out-of-order segment reassembly. Spec §7.2 envisions mbuf-chain
@@ -1209,18 +1209,18 @@ mod tests {
 
 - [ ] **Step 3: Run the tests**
 
-Run: `cargo test -p resd-net-core tcp_reassembly::tests`
+Run: `cargo test -p dpdk-net-core tcp_reassembly::tests`
 Expected: all 9 tests green.
 
 - [ ] **Step 4: Clippy clean**
 
-Run: `cargo clippy -p resd-net-core --all-targets -- -D warnings`
+Run: `cargo clippy -p dpdk-net-core --all-targets -- -D warnings`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
 ```sh
-git add crates/resd-net-core/src/lib.rs crates/resd-net-core/src/tcp_reassembly.rs
+git add crates/dpdk-net-core/src/lib.rs crates/dpdk-net-core/src/tcp_reassembly.rs
 git commit -m "a4: tcp_reassembly.rs — ReorderQueue insert + merge + cap"
 ```
 
@@ -1231,7 +1231,7 @@ git commit -m "a4: tcp_reassembly.rs — ReorderQueue insert + merge + cap"
 **Goal:** When an in-order segment at `rcv_nxt` arrives and extends `rcv_nxt` forward, drain any OOO segments whose seq range now sits at or before `rcv_nxt`. Returns their concatenated bytes and the number of segments drained (caller bumps `tcp.rx_reassembly_hole_filled` once per segment, matching mTCP's "one fragment-ctx removed per drain" event count).
 
 **Files:**
-- Modify: `crates/resd-net-core/src/tcp_reassembly.rs`
+- Modify: `crates/dpdk-net-core/src/tcp_reassembly.rs`
 
 - [ ] **Step 1: Add the drain method**
 
@@ -1337,13 +1337,13 @@ Append to the `#[cfg(test)] mod tests` block:
 
 - [ ] **Step 3: Run all reassembly tests**
 
-Run: `cargo test -p resd-net-core tcp_reassembly::tests`
+Run: `cargo test -p dpdk-net-core tcp_reassembly::tests`
 Expected: 15 tests PASS (9 insert + 6 drain).
 
 - [ ] **Step 4: Commit**
 
 ```sh
-git add crates/resd-net-core/src/tcp_reassembly.rs
+git add crates/dpdk-net-core/src/tcp_reassembly.rs
 git commit -m "a4: tcp_reassembly.rs — drain_contiguous_from for gap-close"
 ```
 
@@ -1354,11 +1354,11 @@ git commit -m "a4: tcp_reassembly.rs — drain_contiguous_from for gap-close"
 **Goal:** Hang the `ReorderQueue` off `RecvQueue`, keep in-order `bytes` alongside, and expose both `free_space` (in-order half only, matches A3) and `free_space_total` (combined — feeds the seq-window check in Task 17).
 
 **Files:**
-- Modify: `crates/resd-net-core/src/tcp_conn.rs`
+- Modify: `crates/dpdk-net-core/src/tcp_conn.rs`
 
 - [ ] **Step 1: Write the failing test**
 
-Append to `crates/resd-net-core/src/tcp_conn.rs` inside `mod tests`:
+Append to `crates/dpdk-net-core/src/tcp_conn.rs` inside `mod tests`:
 
 ```rust
     #[test]
@@ -1373,12 +1373,12 @@ Append to `crates/resd-net-core/src/tcp_conn.rs` inside `mod tests`:
 
 - [ ] **Step 2: Run — verify it fails**
 
-Run: `cargo test -p resd-net-core tcp_conn::tests::recv_queue_has_reorder_field_and_shares_cap`
+Run: `cargo test -p dpdk-net-core tcp_conn::tests::recv_queue_has_reorder_field_and_shares_cap`
 Expected: FAIL — "no field `reorder` on type `RecvQueue`".
 
 - [ ] **Step 3: Extend `RecvQueue`**
 
-In `crates/resd-net-core/src/tcp_conn.rs`, replace the `RecvQueue` struct + `impl` block with:
+In `crates/dpdk-net-core/src/tcp_conn.rs`, replace the `RecvQueue` struct + `impl` block with:
 
 ```rust
 pub struct RecvQueue {
@@ -1388,8 +1388,8 @@ pub struct RecvQueue {
     /// Shares `cap` with `bytes`; `free_space_total` reports combined room.
     pub reorder: crate::tcp_reassembly::ReorderQueue,
     /// Scratch buffer for the borrow-view exposed to
-    /// `RESD_NET_EVT_READABLE.data`. Cleared at the start of each
-    /// `resd_net_poll` on the owning engine (not here).
+    /// `DPDK_NET_EVT_READABLE.data`. Cleared at the start of each
+    /// `dpdk_net_poll` on the owning engine (not here).
     pub last_read_buf: Vec<u8>,
 }
 
@@ -1428,16 +1428,16 @@ impl RecvQueue {
 
 - [ ] **Step 4: Run**
 
-Run: `cargo test -p resd-net-core tcp_conn::tests`
+Run: `cargo test -p dpdk-net-core tcp_conn::tests`
 Expected: PASS (new test + all A3 tests).
 
-Run: `cargo test -p resd-net-core tcp_input::tests`
+Run: `cargo test -p dpdk-net-core tcp_input::tests`
 Expected: PASS — A3 tests in `tcp_input` use `recv.append` which is unchanged.
 
 - [ ] **Step 5: Commit**
 
 ```sh
-git add crates/resd-net-core/src/tcp_conn.rs
+git add crates/dpdk-net-core/src/tcp_conn.rs
 git commit -m "a4: RecvQueue — co-locate ReorderQueue, expose free_space_total"
 ```
 
@@ -1448,16 +1448,16 @@ git commit -m "a4: RecvQueue — co-locate ReorderQueue, expose free_space_total
 **Goal:** Received-side SACK scoreboard. Decoded peer SACK blocks insert + merge here; A5's RACK-TLP retransmit will consume `is_sacked(seq)`. Fixed 4-block capacity (RFC 2018 §3 per-ACK cap with Timestamps present). Merge semantics mirror mTCP's `_update_sack_table`.
 
 **Files:**
-- Create: `crates/resd-net-core/src/tcp_sack.rs`
-- Modify: `crates/resd-net-core/src/lib.rs`
+- Create: `crates/dpdk-net-core/src/tcp_sack.rs`
+- Modify: `crates/dpdk-net-core/src/lib.rs`
 
 - [ ] **Step 1: Add module declaration**
 
-Add `pub mod tcp_sack;` alphabetically in `crates/resd-net-core/src/lib.rs`.
+Add `pub mod tcp_sack;` alphabetically in `crates/dpdk-net-core/src/lib.rs`.
 
 - [ ] **Step 2: Write the tests first**
 
-Create `crates/resd-net-core/src/tcp_sack.rs`:
+Create `crates/dpdk-net-core/src/tcp_sack.rs`:
 
 ```rust
 //! Received-side SACK scoreboard (RFC 2018). Populated by tcp_input
@@ -1657,18 +1657,18 @@ mod tests {
 
 - [ ] **Step 3: Run the tests**
 
-Run: `cargo test -p resd-net-core tcp_sack::tests`
+Run: `cargo test -p dpdk-net-core tcp_sack::tests`
 Expected: 9 tests PASS.
 
 - [ ] **Step 4: Clippy clean**
 
-Run: `cargo clippy -p resd-net-core --all-targets -- -D warnings`
+Run: `cargo clippy -p dpdk-net-core --all-targets -- -D warnings`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
 ```sh
-git add crates/resd-net-core/src/lib.rs crates/resd-net-core/src/tcp_sack.rs
+git add crates/dpdk-net-core/src/lib.rs crates/dpdk-net-core/src/tcp_sack.rs
 git commit -m "a4: tcp_sack.rs — SackScoreboard insert + merge + is_sacked + prune"
 ```
 
@@ -1679,11 +1679,11 @@ git commit -m "a4: tcp_sack.rs — SackScoreboard insert + merge + is_sacked + p
 **Goal:** Hang the scoreboard off `TcpConn`. Task 18 wires inbound-ACK SACK-decode → scoreboard; Tasks 19+ use `prune_below(snd_una)` on snd_una advance.
 
 **Files:**
-- Modify: `crates/resd-net-core/src/tcp_conn.rs`
+- Modify: `crates/dpdk-net-core/src/tcp_conn.rs`
 
 - [ ] **Step 1: Write the failing test**
 
-Append to `crates/resd-net-core/src/tcp_conn.rs` inside `mod tests`:
+Append to `crates/dpdk-net-core/src/tcp_conn.rs` inside `mod tests`:
 
 ```rust
     #[test]
@@ -1696,12 +1696,12 @@ Append to `crates/resd-net-core/src/tcp_conn.rs` inside `mod tests`:
 
 - [ ] **Step 2: Run — verify it fails**
 
-Run: `cargo test -p resd-net-core tcp_conn::tests::a4_sack_scoreboard_starts_empty`
+Run: `cargo test -p dpdk-net-core tcp_conn::tests::a4_sack_scoreboard_starts_empty`
 Expected: FAIL — "no field `sack_scoreboard` on type `TcpConn`".
 
 - [ ] **Step 3: Add the field**
 
-In `crates/resd-net-core/src/tcp_conn.rs`, add to the `TcpConn` struct (after the option fields added in Task 5):
+In `crates/dpdk-net-core/src/tcp_conn.rs`, add to the `TcpConn` struct (after the option fields added in Task 5):
 
 ```rust
     /// A4: received-SACK scoreboard. Populated by `tcp_input` from
@@ -1718,13 +1718,13 @@ In `new_client`, append to the struct literal (before `snd: SendQueue::new(...)`
 
 - [ ] **Step 4: Run**
 
-Run: `cargo test -p resd-net-core tcp_conn::tests`
+Run: `cargo test -p dpdk-net-core tcp_conn::tests`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
 ```sh
-git add crates/resd-net-core/src/tcp_conn.rs
+git add crates/dpdk-net-core/src/tcp_conn.rs
 git commit -m "a4: TcpConn — add sack_scoreboard (populated by Task 18)"
 ```
 
@@ -1735,13 +1735,13 @@ git commit -m "a4: TcpConn — add sack_scoreboard (populated by Task 18)"
 **Goal:** Replace the narrow `SegmentTx.mss_option: Option<u16>` with an owned `options: TcpOpts` so callers declaratively attach any combination of MSS/WS/TS/SACK-permitted/SACK-blocks. `build_segment` delegates option encoding to `TcpOpts::encode`. A3's call sites in `engine.rs` and the `tcp_input.rs` test helper migrate to `TcpOpts { mss: Some(...), ..Default::default() }`.
 
 **Files:**
-- Modify: `crates/resd-net-core/src/tcp_output.rs`
-- Modify: `crates/resd-net-core/src/engine.rs` (call sites only)
-- Modify: `crates/resd-net-core/src/tcp_input.rs` (test helper only)
+- Modify: `crates/dpdk-net-core/src/tcp_output.rs`
+- Modify: `crates/dpdk-net-core/src/engine.rs` (call sites only)
+- Modify: `crates/dpdk-net-core/src/tcp_input.rs` (test helper only)
 
 - [ ] **Step 1: Update `SegmentTx` + `build_segment`**
 
-In `crates/resd-net-core/src/tcp_output.rs`, replace the top of the file (module doc + `SegmentTx` + `build_segment`) with:
+In `crates/dpdk-net-core/src/tcp_output.rs`, replace the top of the file (module doc + `SegmentTx` + `build_segment`) with:
 
 ```rust
 //! TCP segment builders. Every builder emits a complete Ethernet + IPv4 +
@@ -1887,11 +1887,11 @@ In `rst_frame_has_rst_flag_and_no_options`:
 
 - [ ] **Step 3: Migrate `engine.rs` call sites**
 
-In `crates/resd-net-core/src/engine.rs`, search and replace all `mss_option: Some(<expr>),` with `options: crate::tcp_options::TcpOpts { mss: Some(<expr>), ..Default::default() },` and all `mss_option: None,` with `options: crate::tcp_options::TcpOpts::default(),`. Verify every `SegmentTx { ... }` literal compiles.
+In `crates/dpdk-net-core/src/engine.rs`, search and replace all `mss_option: Some(<expr>),` with `options: crate::tcp_options::TcpOpts { mss: Some(<expr>), ..Default::default() },` and all `mss_option: None,` with `options: crate::tcp_options::TcpOpts::default(),`. Verify every `SegmentTx { ... }` literal compiles.
 
 - [ ] **Step 4: Migrate the `tcp_input.rs` test helper**
 
-In `crates/resd-net-core/src/tcp_input.rs` `#[cfg(test)] mod tests`, replace `build_test_segment`:
+In `crates/dpdk-net-core/src/tcp_input.rs` `#[cfg(test)] mod tests`, replace `build_test_segment`:
 
 ```rust
     fn build_test_segment(flags: u8, mss: Option<u16>, payload: &[u8]) -> Vec<u8> {
@@ -1920,13 +1920,13 @@ In `crates/resd-net-core/src/tcp_input.rs` `#[cfg(test)] mod tests`, replace `bu
 
 - [ ] **Step 5: Build + run all tests**
 
-Run: `cargo test -p resd-net-core --lib`
+Run: `cargo test -p dpdk-net-core --lib`
 Expected: PASS — every A3 test still green; tcp_output `syn_frame_has_mss_option_and_valid_sizes` still reports total=58 (4-byte MSS option, 0 pad).
 
 - [ ] **Step 6: Commit**
 
 ```sh
-git add crates/resd-net-core/src/tcp_output.rs crates/resd-net-core/src/engine.rs crates/resd-net-core/src/tcp_input.rs
+git add crates/dpdk-net-core/src/tcp_output.rs crates/dpdk-net-core/src/engine.rs crates/dpdk-net-core/src/tcp_input.rs
 git commit -m "a4: SegmentTx.options = TcpOpts bundle; migrate all A3 call sites"
 ```
 
@@ -1937,11 +1937,11 @@ git commit -m "a4: SegmentTx.options = TcpOpts bundle; migrate all A3 call sites
 **Goal:** Upgrade the SYN emission path from MSS-only to the full Stage-1 option set. Our advertised WS shift is computed from `recv_buffer_bytes` — for the 256 KiB default, WS=2 suffices (65535 << 2 = 262140 ≥ 256 KiB); we use `compute_ws_shift_for(recv_buffer_bytes)` that floor-log2's up to the RFC 7323 §2.3 cap of 14. TS initial TSval is `engine.clock.now_ns() / 1000` (microsecond ticks — monotonic, wraps after 24.8 days, per RFC 7323 §4.1 guidance). TSecr on SYN is 0 (no received TSval yet). SACK-permitted is always emitted; negotiated by the peer echoing it in SYN-ACK (Task 15).
 
 **Files:**
-- Modify: `crates/resd-net-core/src/engine.rs` (the SYN-build call site in `connect`)
+- Modify: `crates/dpdk-net-core/src/engine.rs` (the SYN-build call site in `connect`)
 
 - [ ] **Step 1: Write the failing test**
 
-Append to `crates/resd-net-core/src/engine.rs` `mod tests`:
+Append to `crates/dpdk-net-core/src/engine.rs` `mod tests`:
 
 ```rust
     #[test]
@@ -1971,12 +1971,12 @@ If the helpers `test_engine`, `default_connect_opts`, `default_our_mss`, `drain_
 
 - [ ] **Step 2: Run — verify it fails**
 
-Run: `cargo test -p resd-net-core engine::tests::connect_syn_carries_mss_ws_sack_perm_ts`
+Run: `cargo test -p dpdk-net-core engine::tests::connect_syn_carries_mss_ws_sack_perm_ts`
 Expected: FAIL — SYN options still MSS-only.
 
 - [ ] **Step 3: Wire the full SYN options in `connect`**
 
-Near the top of `crates/resd-net-core/src/engine.rs`, add:
+Near the top of `crates/dpdk-net-core/src/engine.rs`, add:
 
 ```rust
 /// RFC 7323 §2.3: WS shift chosen so (u16::MAX << ws) >= recv_buffer_bytes,
@@ -2029,16 +2029,16 @@ In the SYN build path inside `connect`, replace the `SegmentTx { ..., options: T
 
 - [ ] **Step 4: Run the tests**
 
-Run: `cargo test -p resd-net-core engine::tests::connect_syn_carries_mss_ws_sack_perm_ts`
+Run: `cargo test -p dpdk-net-core engine::tests::connect_syn_carries_mss_ws_sack_perm_ts`
 Expected: PASS.
 
-Run: `cargo test -p resd-net-core engine::tests`
+Run: `cargo test -p dpdk-net-core engine::tests`
 Expected: all A3 engine tests still pass — assertions target flag bits, not option bytes.
 
 - [ ] **Step 5: Commit**
 
 ```sh
-git add crates/resd-net-core/src/engine.rs
+git add crates/dpdk-net-core/src/engine.rs
 git commit -m "a4: engine::connect emits full SYN options (MSS + WS + SACK-perm + TS)"
 ```
 
@@ -2049,11 +2049,11 @@ git commit -m "a4: engine::connect emits full SYN options (MSS + WS + SACK-perm 
 **Goal:** When `ts_enabled`, every outbound non-SYN segment includes a Timestamps option with `TSval = now_us` and `TSecr = ts_recent`. When `ws_shift_out > 0`, the window field is `(recv.free_space() >> ws_shift_out).min(u16::MAX)`. When we end up advertising 0 (recv buffer full), bump `tcp.tx_zero_window` (slow-path backfill counter).
 
 **Files:**
-- Modify: `crates/resd-net-core/src/engine.rs` (`emit_ack` helper)
+- Modify: `crates/dpdk-net-core/src/engine.rs` (`emit_ack` helper)
 
 - [ ] **Step 1: Write the failing test**
 
-Append to `crates/resd-net-core/src/engine.rs` `mod tests`:
+Append to `crates/dpdk-net-core/src/engine.rs` `mod tests`:
 
 ```rust
     #[test]
@@ -2088,12 +2088,12 @@ Append to `crates/resd-net-core/src/engine.rs` `mod tests`:
 
 - [ ] **Step 2: Run — verify it fails**
 
-Run: `cargo test -p resd-net-core engine::tests::post_handshake_ack_carries_ts_and_ws_scaled_window`
+Run: `cargo test -p dpdk-net-core engine::tests::post_handshake_ack_carries_ts_and_ws_scaled_window`
 Expected: FAIL — no TS option emitted.
 
 - [ ] **Step 3: Wire TS + WS in `emit_ack`**
 
-In `crates/resd-net-core/src/engine.rs`, find `emit_ack` (the method that builds the pure-ACK `SegmentTx`). Replace its option + window computation with:
+In `crates/dpdk-net-core/src/engine.rs`, find `emit_ack` (the method that builds the pure-ACK `SegmentTx`). Replace its option + window computation with:
 
 ```rust
     fn emit_ack(&mut self, conn_idx: usize) {
@@ -2163,16 +2163,16 @@ In `crates/resd-net-core/src/engine.rs`, find `emit_ack` (the method that builds
 
 - [ ] **Step 4: Run the tests**
 
-Run: `cargo test -p resd-net-core engine::tests::post_handshake_ack_carries_ts_and_ws_scaled_window`
+Run: `cargo test -p dpdk-net-core engine::tests::post_handshake_ack_carries_ts_and_ws_scaled_window`
 Expected: PASS.
 
-Run: `cargo test -p resd-net-core engine::tests`
+Run: `cargo test -p dpdk-net-core engine::tests`
 Expected: all A3 tests still pass (pure ACKs with no TS/WS/SACK when `ts_enabled=false`, `ws_shift_out=0`, `sack_enabled=false` — A3 default state is still supported).
 
 - [ ] **Step 5: Commit**
 
 ```sh
-git add crates/resd-net-core/src/engine.rs
+git add crates/dpdk-net-core/src/engine.rs
 git commit -m "a4: emit_ack — TS option, WS-scaled window, SACK blocks on reorder, tx_zero_window bump"
 ```
 
@@ -2183,11 +2183,11 @@ git commit -m "a4: emit_ack — TS option, WS-scaled window, SACK blocks on reor
 **Goal:** A focused integration-style unit test that round-trips a handshake through `connect` → fake peer SYN-ACK → `handle_syn_sent` outcome, asserting that post-handshake `conn.ws_shift_in`, `conn.ts_enabled`, and `conn.sack_enabled` are set as expected. Bridges the gap between Task 12 (we emit options) and Task 15 (we parse them) BEFORE the TAP-based integration tests land.
 
 **Files:**
-- Modify: `crates/resd-net-core/src/engine.rs`
+- Modify: `crates/dpdk-net-core/src/engine.rs`
 
 - [ ] **Step 1: Write the test**
 
-Append to `crates/resd-net-core/src/engine.rs` `mod tests`:
+Append to `crates/dpdk-net-core/src/engine.rs` `mod tests`:
 
 ```rust
     #[test]
@@ -2228,13 +2228,13 @@ Append to `crates/resd-net-core/src/engine.rs` `mod tests`:
 
 - [ ] **Step 2: Run the test**
 
-Run: `cargo test -p resd-net-core engine::tests::handshake_option_negotiation_end_to_end`
+Run: `cargo test -p dpdk-net-core engine::tests::handshake_option_negotiation_end_to_end`
 Expected: PASS (Tasks 12 + 15 together make this pass; Task 15 lands before this task in the plan ordering so it should already be green when this test is added in final pass order).
 
 - [ ] **Step 3: Commit**
 
 ```sh
-git add crates/resd-net-core/src/engine.rs
+git add crates/dpdk-net-core/src/engine.rs
 git commit -m "a4: engine::tests — full handshake option-negotiation end-to-end"
 ```
 
@@ -2245,7 +2245,7 @@ git commit -m "a4: engine::tests — full handshake option-negotiation end-to-en
 **Goal:** On SYN-ACK, decode the peer's options via `tcp_options::parse_options` and populate `conn.peer_mss`, `conn.ws_shift_in` (peer's WS), `conn.ws_shift_out` (stays at our advertised value iff peer echoed WS; zeroed otherwise per RFC 7323 §1.3), `conn.sack_enabled` (peer echoed SACK-permitted), `conn.ts_enabled` (peer echoed TS) and `conn.ts_recent` (peer's TSval). Malformed options → `bad_option` drop.
 
 **Files:**
-- Modify: `crates/resd-net-core/src/tcp_input.rs`
+- Modify: `crates/dpdk-net-core/src/tcp_input.rs`
 
 - [ ] **Step 1: Update the failing tests**
 
@@ -2328,7 +2328,7 @@ Replace the existing `syn_sent_syn_ack_transitions_to_established` test with:
 
 - [ ] **Step 2: Extend the `Outcome` struct**
 
-In `crates/resd-net-core/src/tcp_input.rs`, replace the `Outcome` struct + `impl` with:
+In `crates/dpdk-net-core/src/tcp_input.rs`, replace the `Outcome` struct + `impl` with:
 
 ```rust
 #[derive(Debug, Clone, Copy)]
@@ -2400,7 +2400,7 @@ This is a repetitive but lossless rewrite — zero-defaults for new fields prese
 
 - [ ] **Step 3: Rewrite `handle_syn_sent`'s option parse**
 
-In `crates/resd-net-core/src/tcp_input.rs`, replace the A3 `conn.peer_mss = parse_mss_option(seg.options);` block and everything below it in `handle_syn_sent` with:
+In `crates/dpdk-net-core/src/tcp_input.rs`, replace the A3 `conn.peer_mss = parse_mss_option(seg.options);` block and everything below it in `handle_syn_sent` with:
 
 ```rust
     let parsed_opts = match crate::tcp_options::parse_options(seg.options) {
@@ -2450,16 +2450,16 @@ Also remove the `parse_mss_option` import at the top of `tcp_input.rs`; it's dea
 
 - [ ] **Step 4: Run the tests**
 
-Run: `cargo test -p resd-net-core tcp_input::tests::syn_sent_`
+Run: `cargo test -p dpdk-net-core tcp_input::tests::syn_sent_`
 Expected: PASS.
 
-Run full tcp_input tests: `cargo test -p resd-net-core tcp_input::tests`
+Run full tcp_input tests: `cargo test -p dpdk-net-core tcp_input::tests`
 Expected: all pass (the mechanical `..Outcome::base()` sweep preserves A3 semantics).
 
 - [ ] **Step 5: Commit**
 
 ```sh
-git add crates/resd-net-core/src/tcp_input.rs
+git add crates/dpdk-net-core/src/tcp_input.rs
 git commit -m "a4: handle_syn_sent parses full options; Outcome gains A4 accounting fields"
 ```
 
@@ -2470,11 +2470,11 @@ git commit -m "a4: handle_syn_sent parses full options; Outcome gains A4 account
 **Goal:** When `conn.ts_enabled`, every inbound non-RST segment must carry a Timestamps option; if the segment's TSval is strictly less than `conn.ts_recent` (wrap-aware via `tcp_seq::seq_lt`), drop + emit challenge ACK. Otherwise update `conn.ts_recent` iff the segment's seq is at or before `rcv_nxt` (RFC 7323 §4.3 MUST-25). Missing TS on a TS-enabled conn is a protocol violation → `bad_option` drop.
 
 **Files:**
-- Modify: `crates/resd-net-core/src/tcp_input.rs` (`handle_established`)
+- Modify: `crates/dpdk-net-core/src/tcp_input.rs` (`handle_established`)
 
 - [ ] **Step 1: Write failing tests**
 
-Append to `crates/resd-net-core/src/tcp_input.rs` `mod tests`:
+Append to `crates/dpdk-net-core/src/tcp_input.rs` `mod tests`:
 
 ```rust
     fn est_conn_ts(iss: u32, irs: u32, peer_wnd: u16, ts_recent: u32) -> crate::tcp_conn::TcpConn {
@@ -2545,12 +2545,12 @@ Append to `crates/resd-net-core/src/tcp_input.rs` `mod tests`:
 
 - [ ] **Step 2: Run — verify they fail**
 
-Run: `cargo test -p resd-net-core tcp_input::tests::paws_ tcp_input::tests::missing_ts_on_ts_enabled_conn_bumps_bad_option_and_drops`
+Run: `cargo test -p dpdk-net-core tcp_input::tests::paws_ tcp_input::tests::missing_ts_on_ts_enabled_conn_bumps_bad_option_and_drops`
 Expected: FAIL.
 
 - [ ] **Step 3: Add PAWS + options-parse in `handle_established`**
 
-In `crates/resd-net-core/src/tcp_input.rs` `handle_established`, right after the seq-window check and BEFORE the ACK processing block, insert:
+In `crates/dpdk-net-core/src/tcp_input.rs` `handle_established`, right after the seq-window check and BEFORE the ACK processing block, insert:
 
 ```rust
     // A4: parse options (TS + SACK blocks). Malformed → bad_option drop.
@@ -2588,16 +2588,16 @@ In `crates/resd-net-core/src/tcp_input.rs` `handle_established`, right after the
 
 - [ ] **Step 4: Run the tests**
 
-Run: `cargo test -p resd-net-core tcp_input::tests::paws_ tcp_input::tests::missing_ts_on_ts_enabled_conn_bumps_bad_option_and_drops`
+Run: `cargo test -p dpdk-net-core tcp_input::tests::paws_ tcp_input::tests::missing_ts_on_ts_enabled_conn_bumps_bad_option_and_drops`
 Expected: all PASS.
 
-Run full tcp_input tests: `cargo test -p resd-net-core tcp_input::tests`
+Run full tcp_input tests: `cargo test -p dpdk-net-core tcp_input::tests`
 Expected: all pass — A3 tests have `ts_enabled=false` by default, so the PAWS block is inert for them.
 
 - [ ] **Step 5: Commit**
 
 ```sh
-git add crates/resd-net-core/src/tcp_input.rs
+git add crates/dpdk-net-core/src/tcp_input.rs
 git commit -m "a4: handle_established — PAWS + bad-option drops (RFC 7323 §5)"
 ```
 
@@ -2608,7 +2608,7 @@ git commit -m "a4: handle_established — PAWS + bad-option drops (RFC 7323 §5)
 **Goal:** Replace the A3 OOO-drop branch with reassembly enqueue + drain. In-order arrival at `rcv_nxt` appends to `recv.bytes`, advances `rcv_nxt`, and drains contiguous OOO entries; OOO arrivals ahead of `rcv_nxt` insert into `recv.reorder`.
 
 **Files:**
-- Modify: `crates/resd-net-core/src/tcp_input.rs` (`handle_established`)
+- Modify: `crates/dpdk-net-core/src/tcp_input.rs` (`handle_established`)
 
 - [ ] **Step 1: Rewrite the failing A3 test**
 
@@ -2666,12 +2666,12 @@ Replace `established_ooo_segment_acked_but_not_delivered` in `tcp_input::tests` 
 
 - [ ] **Step 2: Run — verify it fails**
 
-Run: `cargo test -p resd-net-core tcp_input::tests::established_ooo_segment_queues_into_reassembly tcp_input::tests::inorder_arrival_closes_hole_and_drains_reassembly`
+Run: `cargo test -p dpdk-net-core tcp_input::tests::established_ooo_segment_queues_into_reassembly tcp_input::tests::inorder_arrival_closes_hole_and_drains_reassembly`
 Expected: FAIL — OOO still drops (A3 code path).
 
 - [ ] **Step 3: Rewrite the delivery block in `handle_established`**
 
-In `crates/resd-net-core/src/tcp_input.rs` `handle_established`, replace the A3 delivery block (the `if seg.seq == conn.rcv_nxt { ... } else { ooo_drop = ... }` section) with:
+In `crates/dpdk-net-core/src/tcp_input.rs` `handle_established`, replace the A3 delivery block (the `if seg.seq == conn.rcv_nxt { ... } else { ooo_drop = ... }` section) with:
 
 ```rust
     let mut delivered = 0u32;
@@ -2727,16 +2727,16 @@ Update the final `Outcome` return at the bottom of `handle_established` to inclu
 
 - [ ] **Step 4: Run the tests**
 
-Run: `cargo test -p resd-net-core tcp_input::tests::established_ooo tcp_input::tests::inorder_arrival_closes_hole_and_drains_reassembly tcp_input::tests::established_inorder tcp_input::tests::established_recv_buf_full_flags_buf_full_drop_not_ooo`
+Run: `cargo test -p dpdk-net-core tcp_input::tests::established_ooo tcp_input::tests::inorder_arrival_closes_hole_and_drains_reassembly tcp_input::tests::established_inorder tcp_input::tests::established_recv_buf_full_flags_buf_full_drop_not_ooo`
 Expected: all PASS.
 
-Run full tcp_input tests: `cargo test -p resd-net-core tcp_input::tests`
+Run full tcp_input tests: `cargo test -p dpdk-net-core tcp_input::tests`
 Expected: all pass.
 
 - [ ] **Step 5: Commit**
 
 ```sh
-git add crates/resd-net-core/src/tcp_input.rs
+git add crates/dpdk-net-core/src/tcp_input.rs
 git commit -m "a4: handle_established OOO → reassembly enqueue + drain on gap close"
 ```
 
@@ -2747,7 +2747,7 @@ git commit -m "a4: handle_established OOO → reassembly enqueue + drain on gap 
 **Goal:** When `conn.sack_enabled` AND the segment options include SACK blocks, feed them into `conn.sack_scoreboard.insert(...)` per block; `Outcome.sack_blocks_decoded` = the block count. After `snd_una` advance, `sack_scoreboard.prune_below(conn.snd_una)`.
 
 **Files:**
-- Modify: `crates/resd-net-core/src/tcp_input.rs` (`handle_established`)
+- Modify: `crates/dpdk-net-core/src/tcp_input.rs` (`handle_established`)
 
 - [ ] **Step 1: Write failing tests**
 
@@ -2812,7 +2812,7 @@ Append to `tcp_input::tests`:
 
 - [ ] **Step 2: Run — verify they fail**
 
-Run: `cargo test -p resd-net-core tcp_input::tests::established_decodes_peer_sack tcp_input::tests::established_prunes_scoreboard`
+Run: `cargo test -p dpdk-net-core tcp_input::tests::established_decodes_peer_sack tcp_input::tests::established_prunes_scoreboard`
 Expected: FAIL.
 
 - [ ] **Step 3: Wire SACK decode + prune**
@@ -2841,16 +2841,16 @@ Update the final `Outcome { ... ..Outcome::base() }` to include `sack_blocks_dec
 
 - [ ] **Step 4: Run the tests**
 
-Run: `cargo test -p resd-net-core tcp_input::tests::established_decodes_peer_sack tcp_input::tests::established_prunes_scoreboard`
+Run: `cargo test -p dpdk-net-core tcp_input::tests::established_decodes_peer_sack tcp_input::tests::established_prunes_scoreboard`
 Expected: PASS.
 
-Run full tcp_input tests: `cargo test -p resd-net-core tcp_input::tests`
+Run full tcp_input tests: `cargo test -p dpdk-net-core tcp_input::tests`
 Expected: all pass.
 
 - [ ] **Step 5: Commit**
 
 ```sh
-git add crates/resd-net-core/src/tcp_input.rs
+git add crates/dpdk-net-core/src/tcp_input.rs
 git commit -m "a4: handle_established decodes peer SACK blocks + prunes on snd_una advance"
 ```
 
@@ -2861,12 +2861,12 @@ git commit -m "a4: handle_established decodes peer SACK blocks + prunes on snd_u
 **Goal:** Connect the `Outcome` fields from Tasks 15-18 to the `TcpCounters` fields they correspond to, and wire the cross-phase backfill counters (`rx_bad_seq`, `rx_bad_ack`, `rx_dup_ack`, `rx_urgent_dropped`, `rx_zero_window`, `tx_window_update`, `conn_table_full`, `conn_time_wait_reaped`) at their natural slow-path increment sites. `tx_zero_window` was already wired in Task 13. Returns the engine to green with every new counter reachable by the test suite.
 
 **Files:**
-- Modify: `crates/resd-net-core/src/engine.rs`
-- Modify: `crates/resd-net-core/src/tcp_input.rs` (emit `rx_bad_seq`, `rx_bad_ack`, `rx_dup_ack`, `rx_urgent_dropped` flags on `Outcome` — minor extension)
+- Modify: `crates/dpdk-net-core/src/engine.rs`
+- Modify: `crates/dpdk-net-core/src/tcp_input.rs` (emit `rx_bad_seq`, `rx_bad_ack`, `rx_dup_ack`, `rx_urgent_dropped` flags on `Outcome` — minor extension)
 
 - [ ] **Step 1: Extend `Outcome` with the 4 new per-segment flags**
 
-In `crates/resd-net-core/src/tcp_input.rs`, add to `Outcome`:
+In `crates/dpdk-net-core/src/tcp_input.rs`, add to `Outcome`:
 
 ```rust
     /// A4 backfill: true iff the incoming segment's seq was outside
@@ -2903,7 +2903,7 @@ In `handle_established`, set the flags at their obvious sites:
 
 - [ ] **Step 3: Map `Outcome` fields → counter bumps in `engine.rs::tcp_input`**
 
-In `crates/resd-net-core/src/engine.rs`, find the block that dispatches `tcp_input::dispatch(conn, seg)` and processes the outcome. Right after the `let outcome = dispatch(...)` line, add:
+In `crates/dpdk-net-core/src/engine.rs`, find the block that dispatches `tcp_input::dispatch(conn, seg)` and processes the outcome. Right after the `let outcome = dispatch(...)` line, add:
 
 ```rust
         if outcome.paws_rejected {
@@ -2987,7 +2987,7 @@ Expected: all pass.
 - [ ] **Step 7: Commit**
 
 ```sh
-git add crates/resd-net-core/src/engine.rs crates/resd-net-core/src/tcp_input.rs
+git add crates/dpdk-net-core/src/engine.rs crates/dpdk-net-core/src/tcp_input.rs
 git commit -m "a4: wire outcome-sourced A4 counters + 8-counter cross-phase backfill"
 ```
 
@@ -2995,14 +2995,14 @@ git commit -m "a4: wire outcome-sourced A4 counters + 8-counter cross-phase back
 
 ## Task 20: Integration test — option negotiation smoke against kernel listener (TAP)
 
-**Goal:** End-to-end: `resd_net_connect` to a kernel `std::net::TcpListener` over a TAP pair. Verify the SYN we emit carries MSS + WS + SACK-permitted + TS; verify the SYN-ACK the kernel sends comes back with the same four options (Linux always negotiates all four by default); verify post-handshake `conn.ws_shift_*`, `conn.ts_enabled`, `conn.sack_enabled` all reflect the negotiation; verify one in-order data segment exchange succeeds; verify clean close.
+**Goal:** End-to-end: `dpdk_net_connect` to a kernel `std::net::TcpListener` over a TAP pair. Verify the SYN we emit carries MSS + WS + SACK-permitted + TS; verify the SYN-ACK the kernel sends comes back with the same four options (Linux always negotiates all four by default); verify post-handshake `conn.ws_shift_*`, `conn.ts_enabled`, `conn.sack_enabled` all reflect the negotiation; verify one in-order data segment exchange succeeds; verify clean close.
 
 **Files:**
-- Create: `crates/resd-net-core/tests/tcp_options_paws_reassembly_sack_tap.rs`
+- Create: `crates/dpdk-net-core/tests/tcp_options_paws_reassembly_sack_tap.rs`
 
 - [ ] **Step 1: Skeleton the test file**
 
-Create `crates/resd-net-core/tests/tcp_options_paws_reassembly_sack_tap.rs`:
+Create `crates/dpdk-net-core/tests/tcp_options_paws_reassembly_sack_tap.rs`:
 
 ```rust
 //! A4 integration tests over a TAP pair against a kernel-side listener.
@@ -3010,7 +3010,7 @@ Create `crates/resd-net-core/tests/tcp_options_paws_reassembly_sack_tap.rs`:
 //! engine + listener so failures stay isolated.
 
 mod tap_harness {
-    // Copy the relevant helpers from crates/resd-net-core/tests/tcp_basic_tap.rs
+    // Copy the relevant helpers from crates/dpdk-net-core/tests/tcp_basic_tap.rs
     // (tap_pair, with_engine_on_tap, kernel_listener, etc.) — they are the
     // same inputs A4 needs. If the A3 tests factored these into a
     // crate-local helper module, import that instead.
@@ -3057,7 +3057,7 @@ fn option_negotiation_smoke_against_kernel_listener() {
 
 - [ ] **Step 2: Run**
 
-Run: `cargo test -p resd-net-core --test tcp_options_paws_reassembly_sack_tap option_negotiation_smoke_against_kernel_listener -- --nocapture`
+Run: `cargo test -p dpdk-net-core --test tcp_options_paws_reassembly_sack_tap option_negotiation_smoke_against_kernel_listener -- --nocapture`
 Expected: PASS.
 
 If the TAP smoke fails with "peer didn't send SACK" on some kernels, check `/proc/sys/net/ipv4/tcp_sack` — it should be 1 by default. If the test host has it off, either skip with a feature flag or set it in the test harness.
@@ -3065,7 +3065,7 @@ If the TAP smoke fails with "peer didn't send SACK" on some kernels, check `/pro
 - [ ] **Step 3: Commit**
 
 ```sh
-git add crates/resd-net-core/tests/tcp_options_paws_reassembly_sack_tap.rs
+git add crates/dpdk-net-core/tests/tcp_options_paws_reassembly_sack_tap.rs
 git commit -m "a4: integration test — option negotiation smoke vs kernel listener"
 ```
 
@@ -3076,11 +3076,11 @@ git commit -m "a4: integration test — option negotiation smoke vs kernel liste
 **Goal:** Set up an established TS-enabled connection, then inject a hand-crafted inbound segment whose TSval is strictly less than the current `ts_recent`. Assert the engine drops the payload (no READABLE event), emits a challenge ACK, and bumps `tcp.rx_paws_rejected`.
 
 **Files:**
-- Modify: `crates/resd-net-core/tests/tcp_options_paws_reassembly_sack_tap.rs`
+- Modify: `crates/dpdk-net-core/tests/tcp_options_paws_reassembly_sack_tap.rs`
 
 - [ ] **Step 1: Add the test**
 
-Append to `crates/resd-net-core/tests/tcp_options_paws_reassembly_sack_tap.rs`:
+Append to `crates/dpdk-net-core/tests/tcp_options_paws_reassembly_sack_tap.rs`:
 
 ```rust
 #[test]
@@ -3121,13 +3121,13 @@ fn paws_drops_replayed_stale_tsval_segment() {
 
 - [ ] **Step 2: Run**
 
-Run: `cargo test -p resd-net-core --test tcp_options_paws_reassembly_sack_tap paws_drops_replayed_stale_tsval_segment`
+Run: `cargo test -p dpdk-net-core --test tcp_options_paws_reassembly_sack_tap paws_drops_replayed_stale_tsval_segment`
 Expected: PASS.
 
 - [ ] **Step 3: Commit**
 
 ```sh
-git add crates/resd-net-core/tests/tcp_options_paws_reassembly_sack_tap.rs
+git add crates/dpdk-net-core/tests/tcp_options_paws_reassembly_sack_tap.rs
 git commit -m "a4: integration test — PAWS rejects replayed stale-TSval segment"
 ```
 
@@ -3138,7 +3138,7 @@ git commit -m "a4: integration test — PAWS rejects replayed stale-TSval segmen
 **Goal:** Inject two data segments over TAP in reversed order: `seq=5010 "world"` first, then `seq=5001 "ninebytes"`. Verify the engine emits a single concatenated READABLE event of `b"ninebytesworld"` (14 bytes), `tcp.rx_reassembly_queued == 1`, `tcp.rx_reassembly_hole_filled == 1`.
 
 **Files:**
-- Modify: `crates/resd-net-core/tests/tcp_options_paws_reassembly_sack_tap.rs`
+- Modify: `crates/dpdk-net-core/tests/tcp_options_paws_reassembly_sack_tap.rs`
 
 - [ ] **Step 1: Add the test**
 
@@ -3182,13 +3182,13 @@ fn ooo_reassembly_delivers_on_gap_close() {
 
 - [ ] **Step 2: Run**
 
-Run: `cargo test -p resd-net-core --test tcp_options_paws_reassembly_sack_tap ooo_reassembly_delivers_on_gap_close`
+Run: `cargo test -p dpdk-net-core --test tcp_options_paws_reassembly_sack_tap ooo_reassembly_delivers_on_gap_close`
 Expected: PASS.
 
 - [ ] **Step 3: Commit**
 
 ```sh
-git add crates/resd-net-core/tests/tcp_options_paws_reassembly_sack_tap.rs
+git add crates/dpdk-net-core/tests/tcp_options_paws_reassembly_sack_tap.rs
 git commit -m "a4: integration test — OOO reassembly delivers on gap close"
 ```
 
@@ -3199,7 +3199,7 @@ git commit -m "a4: integration test — OOO reassembly delivers on gap close"
 **Goal:** Two sub-scenarios in one test. (1) Encode: set up an established SACK-enabled conn with an OOO segment in `recv.reorder`, force an ACK emission, verify the outbound frame's SACK option covers the OOO range. (2) Decode: inject an inbound ACK carrying two SACK blocks, verify `conn.sack_scoreboard.len() == 2` after, and verify `tcp.rx_sack_blocks` bumped by 2.
 
 **Files:**
-- Modify: `crates/resd-net-core/tests/tcp_options_paws_reassembly_sack_tap.rs`
+- Modify: `crates/dpdk-net-core/tests/tcp_options_paws_reassembly_sack_tap.rs`
 
 - [ ] **Step 1: Add the test**
 
@@ -3253,13 +3253,13 @@ fn sack_blocks_round_trip_on_tap() {
 
 - [ ] **Step 2: Run**
 
-Run: `cargo test -p resd-net-core --test tcp_options_paws_reassembly_sack_tap sack_blocks_round_trip_on_tap`
+Run: `cargo test -p dpdk-net-core --test tcp_options_paws_reassembly_sack_tap sack_blocks_round_trip_on_tap`
 Expected: PASS.
 
 - [ ] **Step 3: Commit**
 
 ```sh
-git add crates/resd-net-core/tests/tcp_options_paws_reassembly_sack_tap.rs
+git add crates/dpdk-net-core/tests/tcp_options_paws_reassembly_sack_tap.rs
 git commit -m "a4: integration test — SACK blocks encode + decode round-trip"
 ```
 
@@ -3267,16 +3267,16 @@ git commit -m "a4: integration test — SACK blocks encode + decode round-trip"
 
 ## Task 24: Cargo feature flags + hot-path counter field declarations
 
-**Goal:** Introduce `obs-byte-counters` (default OFF) and `obs-poll-saturation` (default ON) in `resd-net-core/Cargo.toml`. Declare the three hot-path counter fields (`tcp.tx_payload_bytes`, `tcp.rx_payload_bytes`, `poll.iters_with_rx_burst_max`) in `counters.rs` + `api.rs` — always present in the struct for ABI stability per spec §9.1.1. Declare the meta-feature `obs-all = ["obs-byte-counters", "obs-poll-saturation"]` for the A8 counter-coverage audit's `--features obs-all` run. Increment sites land in Tasks 25-26.
+**Goal:** Introduce `obs-byte-counters` (default OFF) and `obs-poll-saturation` (default ON) in `dpdk-net-core/Cargo.toml`. Declare the three hot-path counter fields (`tcp.tx_payload_bytes`, `tcp.rx_payload_bytes`, `poll.iters_with_rx_burst_max`) in `counters.rs` + `api.rs` — always present in the struct for ABI stability per spec §9.1.1. Declare the meta-feature `obs-all = ["obs-byte-counters", "obs-poll-saturation"]` for the A8 counter-coverage audit's `--features obs-all` run. Increment sites land in Tasks 25-26.
 
 **Files:**
-- Modify: `crates/resd-net-core/Cargo.toml`
-- Modify: `crates/resd-net-core/src/counters.rs`
-- Modify: `crates/resd-net/src/api.rs`
+- Modify: `crates/dpdk-net-core/Cargo.toml`
+- Modify: `crates/dpdk-net-core/src/counters.rs`
+- Modify: `crates/dpdk-net/src/api.rs`
 
 - [ ] **Step 1: Add the cargo features**
 
-In `crates/resd-net-core/Cargo.toml`, add (or extend) a `[features]` section:
+In `crates/dpdk-net-core/Cargo.toml`, add (or extend) a `[features]` section:
 
 ```toml
 [features]
@@ -3288,7 +3288,7 @@ obs-all = ["obs-byte-counters", "obs-poll-saturation"]
 
 - [ ] **Step 2: Declare the hot-path counter fields (unconditional)**
 
-In `crates/resd-net-core/src/counters.rs`, insert:
+In `crates/dpdk-net-core/src/counters.rs`, insert:
 
 ```rust
 // TcpCounters — add two hot-path fields *before* `state_trans` (so the
@@ -3319,7 +3319,7 @@ Adjust the `_pad` arrays: `TcpCounters._pad` shrinks by 2 u64s (currently 3, bec
 
 - [ ] **Step 3: Mirror in `api.rs`**
 
-In `crates/resd-net/src/api.rs`, insert the matching `u64` fields (same name, same order) before `state_trans` / `_pad` respectively. Rebuild `cargo build -p resd-net` to verify the layout assertion.
+In `crates/dpdk-net/src/api.rs`, insert the matching `u64` fields (same name, same order) before `state_trans` / `_pad` respectively. Rebuild `cargo build -p dpdk-net` to verify the layout assertion.
 
 - [ ] **Step 4: Default-zero test**
 
@@ -3339,16 +3339,16 @@ Append to `counters::tests`:
 
 Run:
 ```
-cargo build -p resd-net-core --no-default-features
-cargo build -p resd-net-core
-cargo build -p resd-net-core --features obs-all
+cargo build -p dpdk-net-core --no-default-features
+cargo build -p dpdk-net-core
+cargo build -p dpdk-net-core --features obs-all
 ```
 Expected: all three build clean (no increment sites yet, so no `#[cfg]` branching affects compilation).
 
 - [ ] **Step 6: Commit**
 
 ```sh
-git add crates/resd-net-core/Cargo.toml crates/resd-net-core/src/counters.rs crates/resd-net/src/api.rs include/resd_net.h
+git add crates/dpdk-net-core/Cargo.toml crates/dpdk-net-core/src/counters.rs crates/dpdk-net/src/api.rs include/dpdk_net.h
 git commit -m "a4: declare hot-path counter fields + obs-byte-counters / obs-poll-saturation cargo features"
 ```
 
@@ -3359,11 +3359,11 @@ git commit -m "a4: declare hot-path counter fields + obs-byte-counters / obs-pol
 **Goal:** Wire per-burst-batched increments for the two byte-counter fields, gated on `#[cfg(feature = "obs-byte-counters")]`. Increment pattern per spec §9.1.1 rule 2: stack-local `u64` accumulator inside the natural burst loop; single `fetch_add` after the burst drains. Default-off builds compile the counter field into the struct but the increment site disappears.
 
 **Files:**
-- Modify: `crates/resd-net-core/src/engine.rs`
+- Modify: `crates/dpdk-net-core/src/engine.rs`
 
 - [ ] **Step 1: Identify the RX and TX burst loop entry points**
 
-In `crates/resd-net-core/src/engine.rs`, locate:
+In `crates/dpdk-net-core/src/engine.rs`, locate:
 - The RX burst loop inside `poll_once` that iterates over `rx_burst`'s returned mbufs and dispatches into `tcp_input` — we know the incoming TCP payload length per segment from `outcome.delivered + outcome.reassembly_queued_bytes`.
 - The TX burst / per-segment TX in `engine.tx_frame`/`send_bytes` — `SegmentTx.payload.len()` is the byte-counter value per data segment. ACK-only segments have `payload.len() == 0` so they contribute nothing; retransmit (A5) will also count via the same pattern.
 
@@ -3449,16 +3449,16 @@ Append to `engine::tests`:
 - [ ] **Step 5: Run both feature sets**
 
 ```
-cargo test -p resd-net-core
-cargo test -p resd-net-core --features obs-byte-counters
-cargo test -p resd-net-core --features obs-all
+cargo test -p dpdk-net-core
+cargo test -p dpdk-net-core --features obs-byte-counters
+cargo test -p dpdk-net-core --features obs-all
 ```
 Expected: PASS in all three.
 
 - [ ] **Step 6: Commit**
 
 ```sh
-git add crates/resd-net-core/src/engine.rs
+git add crates/dpdk-net-core/src/engine.rs
 git commit -m "a4: obs-byte-counters — per-burst batched tx/rx_payload_bytes increments"
 ```
 
@@ -3469,11 +3469,11 @@ git commit -m "a4: obs-byte-counters — per-burst batched tx/rx_payload_bytes i
 **Goal:** Bump `poll.iters_with_rx_burst_max` on every poll iteration where the RX burst returned `max_burst` elements, gated on `#[cfg(feature = "obs-poll-saturation")]` (default ON). Single conditional `fetch_add` per poll — near-zero cost.
 
 **Files:**
-- Modify: `crates/resd-net-core/src/engine.rs`
+- Modify: `crates/dpdk-net-core/src/engine.rs`
 
 - [ ] **Step 1: Add the increment**
 
-In `crates/resd-net-core/src/engine.rs::poll_once`, inside the existing `if burst_size > 0` branch where `iters_with_rx` is bumped, add:
+In `crates/dpdk-net-core/src/engine.rs::poll_once`, inside the existing `if burst_size > 0` branch where `iters_with_rx` is bumped, add:
 
 ```rust
         #[cfg(feature = "obs-poll-saturation")]
@@ -3523,16 +3523,16 @@ Append to `engine::tests`:
 - [ ] **Step 3: Run across features**
 
 ```
-cargo test -p resd-net-core
-cargo test -p resd-net-core --no-default-features
-cargo test -p resd-net-core --features obs-all
+cargo test -p dpdk-net-core
+cargo test -p dpdk-net-core --no-default-features
+cargo test -p dpdk-net-core --features obs-all
 ```
 Expected: all PASS.
 
 - [ ] **Step 4: Commit**
 
 ```sh
-git add crates/resd-net-core/src/engine.rs
+git add crates/dpdk-net-core/src/engine.rs
 git commit -m "a4: obs-poll-saturation — iters_with_rx_burst_max bump (default-on feature)"
 ```
 
@@ -3568,7 +3568,7 @@ Expected: all pass.
 
 - [ ] **Step 4: Header drift check**
 
-Run: `cargo test -p resd-net header_drift` (or equivalent — see A3 Task 2 notes).
+Run: `cargo test -p dpdk-net header_drift` (or equivalent — see A3 Task 2 notes).
 Expected: PASS.
 
 - [ ] **Step 5: Commit fixes (if any)**
@@ -3722,7 +3722,7 @@ Next plan file to write: `docs/superpowers/plans/YYYY-MM-DD-stage1-phase-a5-rack
 **Explicitly deferred to later phases:**
 - RACK-TLP + RTO + retransmit → A5. A4 populates `sack_scoreboard`; A5 consumes.
 - Congestion control Reno → A5 follow-up.
-- `RESD_NET_EVT_WRITABLE`, real timer wheel, `resd_net_flush` actually flushing, `FORCE_TW_SKIP` + RFC 6191 guard → A6.
+- `DPDK_NET_EVT_WRITABLE`, real timer wheel, `dpdk_net_flush` actually flushing, `FORCE_TW_SKIP` + RFC 6191 guard → A6.
 - `preset=rfc_compliance` switch → A6.
 - `events_dropped_queue_full` / `events_error_enomem` / `events_error_eperm_tw_required` counters → A6 (depend on A6 infrastructure).
 - `conn_timeout_syn_sent` counter → A5 (depends on A5 RTO timer + `connect_timeout_ms`).
@@ -3737,7 +3737,7 @@ Next plan file to write: `docs/superpowers/plans/YYYY-MM-DD-stage1-phase-a5-rack
 - `SackScoreboard` / `MAX_SACK_SCOREBOARD_ENTRIES` defined in Task 9, used in Tasks 10, 18.
 - `Outcome` extended in Task 15 (options / PAWS / SACK fields) and again in Task 19 (bad_seq / bad_ack / dup_ack / urgent_dropped / rx_zero_window). Engine-side outcome mapping happens only in Task 19 — all A4 tasks that populate new `Outcome` fields rely on the Task 19 mapping block existing by the time the final integration tests (Tasks 20-23) run.
 - Counter field names match exactly between `counters.rs` (core) and `api.rs` (FFI); the `const _: ()` layout assertion enforces this.
-- Internal uses HBO throughout; FFI boundary at `resd_net_connect_opts_t` still does NBO→HBO via `u32::from_be` / `u16::from_be` as in A3.
+- Internal uses HBO throughout; FFI boundary at `dpdk_net_connect_opts_t` still does NBO→HBO via `u32::from_be` / `u16::from_be` as in A3.
 
 **Counter-assertion strategy:**
 - Task 19 Step 5 adds a reachability test that drives every new A4 counter > 0 via targeted scenarios. This primes the A8 counter-coverage dynamic-scenario table so A8's audit is lookup-only rather than scenario-design.

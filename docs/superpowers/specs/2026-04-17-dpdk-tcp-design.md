@@ -25,9 +25,9 @@ Non-goals: server-side TCP in production, IPv6, HTTP/1.1-parser-in-library (Stag
   ┌─────────────────────────────────────────────────────────────────┐
   │                 C++ Application (strategy, order mgr)           │
   └───────────────────────────┬─────────────────────────────────────┘
-                              │ cbindgen C ABI header (resd_net.h)
+                              │ cbindgen C ABI header (dpdk_net.h)
   ┌───────────────────────────▼─────────────────────────────────────┐
-  │  libresd_net  (Rust)                                             │
+  │  libdpdk_net  (Rust)                                             │
   │                                                                  │
   │  Public API (extern "C"):                                        │
   │    engine lifecycle, connection, send/recv (byte stream),        │
@@ -60,25 +60,25 @@ Stages 3–5 are flagged "if needed" because the application may prefer to run H
 ### 2.2 Build / language / FFI
 
 - Rust workspace, `cargo` build, pinning DPDK LTS 23.11 via `bindgen`.
-- `cbindgen` generates `resd_net.h` for C++ consumers.
+- `cbindgen` generates `dpdk_net.h` for C++ consumers.
 - Public API uses `extern "C"` with primitive / opaque-pointer types only — no Rust-only types leak.
 - C++ integration sample ships as a test consumer.
 
 ## 3. Threading and Runtime Model
 
-- **One engine per lcore.** Caller pins itself to an lcore before calling `resd_net_engine_create(lcore_id, &cfg)`.
-- **User code lives on the same lcore as the stack.** Run-to-completion: the user's event loop repeatedly calls `resd_net_poll`, which runs rx_burst → stack → emits events → user handles events inline → user-initiated sends batch into the next tx_burst.
+- **One engine per lcore.** Caller pins itself to an lcore before calling `dpdk_net_engine_create(lcore_id, &cfg)`.
+- **User code lives on the same lcore as the stack.** Run-to-completion: the user's event loop repeatedly calls `dpdk_net_poll`, which runs rx_burst → stack → emits events → user handles events inline → user-initiated sends batch into the next tx_burst.
 - **No cross-lcore rings on the hot path.** Connections are pinned to lcores at `connect()` time; the application chooses the assignment.
 - **Typical deployment**: one lcore for market-data ingress (one or a few high-pps inbound connections per venue), one lcore for order entry (few latency-critical outbound connections), plus strategy/business-logic cores communicating with the stack lcores via the application's own existing mechanisms.
 - **FFI safety contract**: the Rust implementation must not panic across the `extern "C"` boundary. Any Rust panic within the stack is a library bug; panics are converted to process abort via a global `panic = "abort"` policy in `Cargo.toml` (release profile). On the caller side, a C++ exception in user code stays in user code — the poll-style API has no upcall, so exceptions never cross back into Rust.
 
 ## 4. Public API (Stage 1)
 
-This section is **normative**. It defines the stable C ABI; `include/resd_net.h` is auto-generated from the Rust side via `cbindgen` and must match exactly. Error codes are negative `errno` values; success is `0` unless otherwise documented.
+This section is **normative**. It defines the stable C ABI; `include/dpdk_net.h` is auto-generated from the Rust side via `cbindgen` and must match exactly. Error codes are negative `errno` values; success is `0` unless otherwise documented.
 
 ```c
 /* ===== Engine ===== */
-typedef struct resd_net_engine resd_net_engine_t;
+typedef struct dpdk_net_engine dpdk_net_engine_t;
 
 typedef struct {
     uint16_t port_id;
@@ -107,34 +107,34 @@ typedef struct {
                                        increasing edges define 16 buckets for the
                                        per-connection RTT histogram. All-zero
                                        substitutes the DEFAULT edge set (see §4
-                                       resd_net_tcp_rtt_histogram_t). Non-monotonic
+                                       dpdk_net_tcp_rtt_histogram_t). Non-monotonic
                                        rejected at engine_create with a NULL return
                                        (-EINVAL to the caller). */
-} resd_net_engine_config_t;
+} dpdk_net_engine_config_t;
 
-resd_net_engine_t* resd_net_engine_create(uint16_t lcore_id,
-                                          const resd_net_engine_config_t* cfg);
-void resd_net_engine_destroy(resd_net_engine_t*);
+dpdk_net_engine_t* dpdk_net_engine_create(uint16_t lcore_id,
+                                          const dpdk_net_engine_config_t* cfg);
+void dpdk_net_engine_destroy(dpdk_net_engine_t*);
 
 /* ===== Connection ===== */
-typedef uint64_t resd_net_conn_t;    /* opaque handle; 0 = invalid */
+typedef uint64_t dpdk_net_conn_t;    /* opaque handle; 0 = invalid */
 
 typedef struct {
     struct sockaddr_in peer;
     struct sockaddr_in local;        /* 0.0.0.0:0 = pick */
     uint32_t connect_timeout_ms;
     uint32_t idle_keepalive_sec;     /* 0 = off (default) */
-} resd_net_connect_opts_t;
+} dpdk_net_connect_opts_t;
 
-int resd_net_connect(resd_net_engine_t*,
-                     const resd_net_connect_opts_t*,
-                     resd_net_conn_t* out);
+int dpdk_net_connect(dpdk_net_engine_t*,
+                     const dpdk_net_connect_opts_t*,
+                     dpdk_net_conn_t* out);
 
 /* Close flags. Bitmask. */
-#define RESD_NET_CLOSE_FORCE_TW_SKIP  (1u << 0)  /* honored only when RFC 6191 §4.2 conds met */
+#define DPDK_NET_CLOSE_FORCE_TW_SKIP  (1u << 0)  /* honored only when RFC 6191 §4.2 conds met */
 
-int resd_net_close(resd_net_engine_t*, resd_net_conn_t, uint32_t flags);
-int resd_net_shutdown(resd_net_engine_t*, resd_net_conn_t, int how);
+int dpdk_net_close(dpdk_net_engine_t*, dpdk_net_conn_t, uint32_t flags);
+int dpdk_net_shutdown(dpdk_net_engine_t*, dpdk_net_conn_t, int how);
 
 /* ===== Byte-stream send ===== */
 /* Enqueues bytes on the connection's send queue; copies into a tx mbuf chain
@@ -143,9 +143,9 @@ int resd_net_shutdown(resd_net_engine_t*, resd_net_conn_t, int how);
  * Return value (int32_t):
  *   >= 0  number of bytes accepted, in the range [0, len]. A value < len means
  *         the per-connection send buffer reached its cap; caller waits for
- *         RESD_NET_EVT_WRITABLE before retrying the remainder.
+ *         DPDK_NET_EVT_WRITABLE before retrying the remainder.
  *   < 0   negative errno:
- *           -ENOMEM  tx mempool exhausted; retry later; a RESD_NET_EVT_ERROR
+ *           -ENOMEM  tx mempool exhausted; retry later; a DPDK_NET_EVT_ERROR
  *                    {err=ENOMEM} is also emitted for visibility
  *           -ENOTCONN  connection not in a sending state
  *           -EINVAL  bad handle / null buf with nonzero len
@@ -153,29 +153,29 @@ int resd_net_shutdown(resd_net_engine_t*, resd_net_conn_t, int how);
  * Mempool exhaustion is surfaced as an error return (never as a silent short
  * accept); a short accept (0..len with no error) means backpressure from the
  * peer's receive window or our per-conn send buffer cap. */
-int32_t resd_net_send(resd_net_engine_t*,
-                      resd_net_conn_t,
+int32_t dpdk_net_send(dpdk_net_engine_t*,
+                      dpdk_net_conn_t,
                       const uint8_t* buf,
                       uint32_t len);
 
 /* ===== Poll ===== */
 typedef enum {
-    RESD_NET_EVT_CONNECTED = 1,
-    RESD_NET_EVT_READABLE,             /* raw bytes available; data/data_len set */
-    RESD_NET_EVT_WRITABLE,             /* send buffer has space again */
-    RESD_NET_EVT_CLOSED,               /* peer FIN or our close completed */
-    RESD_NET_EVT_ERROR,
-    RESD_NET_EVT_TIMER,
-    RESD_NET_EVT_TCP_RETRANS,          /* stability-visibility events */
-    RESD_NET_EVT_TCP_LOSS_DETECTED,
-    RESD_NET_EVT_TCP_STATE_CHANGE,
-} resd_net_event_kind_t;
+    DPDK_NET_EVT_CONNECTED = 1,
+    DPDK_NET_EVT_READABLE,             /* raw bytes available; data/data_len set */
+    DPDK_NET_EVT_WRITABLE,             /* send buffer has space again */
+    DPDK_NET_EVT_CLOSED,               /* peer FIN or our close completed */
+    DPDK_NET_EVT_ERROR,
+    DPDK_NET_EVT_TIMER,
+    DPDK_NET_EVT_TCP_RETRANS,          /* stability-visibility events */
+    DPDK_NET_EVT_TCP_LOSS_DETECTED,
+    DPDK_NET_EVT_TCP_STATE_CHANGE,
+} dpdk_net_event_kind_t;
 
 /* Per-kind event payload. The `kind` field selects which arm of the union is
  * meaningful; other arms are undefined. */
 typedef struct {
-    resd_net_event_kind_t kind;
-    resd_net_conn_t       conn;
+    dpdk_net_event_kind_t kind;
+    dpdk_net_conn_t       conn;
     uint64_t              rx_hw_ts_ns;     /* NIC HW timestamp when available; else 0 */
     uint64_t              enqueued_ts_ns;  /* TSC when event entered user-visible form */
 
@@ -192,22 +192,22 @@ typedef struct {
 
         /* empty arms for CONNECTED / WRITABLE — no payload */
     } u;
-} resd_net_event_t;
+} dpdk_net_event_t;
 
-int resd_net_poll(resd_net_engine_t*,
-                  resd_net_event_t* events_out,
+int dpdk_net_poll(dpdk_net_engine_t*,
+                  dpdk_net_event_t* events_out,
                   uint32_t max_events,
                   uint64_t timeout_ns);
 
-void resd_net_flush(resd_net_engine_t*);   /* force rte_eth_tx_burst now */
+void dpdk_net_flush(dpdk_net_engine_t*);   /* force rte_eth_tx_burst now */
 
 /* ===== Timers & clock ===== */
-uint64_t resd_net_now_ns(resd_net_engine_t*);
+uint64_t dpdk_net_now_ns(dpdk_net_engine_t*);
 
-/* Schedule a one-shot timer. On fire, emits RESD_NET_EVT_TIMER with the same
+/* Schedule a one-shot timer. On fire, emits DPDK_NET_EVT_TIMER with the same
  * timer_id echoed in events[i].u.timer.timer_id and user_data passed through.
  * Returns 0 on success and fills *timer_id_out; negative errno on failure. */
-int resd_net_timer_add(resd_net_engine_t*,
+int dpdk_net_timer_add(dpdk_net_engine_t*,
                        uint64_t deadline_ns,
                        uint64_t user_data,
                        uint64_t* timer_id_out);
@@ -216,12 +216,12 @@ int resd_net_timer_add(resd_net_engine_t*,
  * been cancelled or has already fired. Returns 0 if cancelled before fire,
  * -ENOENT otherwise (unknown / stale / already-fired id). A6 note: the
  * earlier `-EALREADY` case for "fire event already queued" collapses into
- * `-ENOENT` — callers must always drain any queued RESD_NET_EVT_TIMER
+ * `-ENOENT` — callers must always drain any queued DPDK_NET_EVT_TIMER
  * events regardless of this return. */
-int resd_net_timer_cancel(resd_net_engine_t*, uint64_t timer_id);
+int dpdk_net_timer_cancel(dpdk_net_engine_t*, uint64_t timer_id);
 
 /* ===== Observability primitives ===== */
-const resd_net_counters_t* resd_net_counters(resd_net_engine_t*);
+const dpdk_net_counters_t* dpdk_net_counters(dpdk_net_engine_t*);
 
 /* ===== Introspection (A5.5 + A6) ===== */
 /* Per-connection snapshot: send-path state + RTT estimator state in one call.
@@ -229,12 +229,12 @@ const resd_net_counters_t* resd_net_counters(resd_net_engine_t*);
  * args. Slow-path; safe to call per-order for forensics tagging but do not
  * call in a per-packet hot loop (per-call cost is a flow-table lookup + nine
  * u32 loads). */
-int resd_net_conn_stats(resd_net_engine_t*,
-                        resd_net_conn_t,
-                        resd_net_conn_stats_t* out);
+int dpdk_net_conn_stats(dpdk_net_engine_t*,
+                        dpdk_net_conn_t,
+                        dpdk_net_conn_stats_t* out);
 
 /* A6: per-connection RTT histogram snapshot. 16 × u32 buckets, layout
- * determined by `resd_net_engine_config_t.rtt_histogram_bucket_edges_us`
+ * determined by `dpdk_net_engine_config_t.rtt_histogram_bucket_edges_us`
  * (default edges below). `memcpy`s the current bucket array out to caller
  * memory. Slow-path; one flow-table lookup + 64-byte copy per call.
  * Returns 0 on success, -ENOENT if conn is not a live handle, -EINVAL on
@@ -248,19 +248,19 @@ typedef struct {
     uint32_t buckets[16]; /* indexes 0..=15, bucket[i] = count(rtt ∈
                              (edges[i-1], edges[i]]) with edges[-1]=0
                              and bucket[15] = count(rtt > edges[14]). */
-} resd_net_tcp_rtt_histogram_t;
+} dpdk_net_tcp_rtt_histogram_t;
 
-int resd_net_conn_rtt_histogram(resd_net_engine_t*,
-                                resd_net_conn_t,
-                                resd_net_tcp_rtt_histogram_t* out);
+int dpdk_net_conn_rtt_histogram(dpdk_net_engine_t*,
+                                dpdk_net_conn_t,
+                                dpdk_net_tcp_rtt_histogram_t* out);
 ```
 
 **A6 default RTT histogram edges** (when `rtt_histogram_bucket_edges_us` is all-zero):
 `[50, 100, 200, 300, 500, 750, 1000, 2000, 3000, 5000, 10000, 25000, 50000, 100000, 500000]` µs. Covers a typical trading WAN distribution in 16 buckets with tight resolution at the sub-millisecond end and a coarse tail out to half a second before the catch-all.
 
-**Introspection API (A5.5 + A6).** `resd_net_conn_stats(engine, conn, out)` returns a 9-field `u32` POD (`snd_una`, `snd_nxt`, `snd_wnd`, `send_buf_bytes_pending`, `send_buf_bytes_free`, `srtt_us`, `rttvar_us`, `min_rtt_us`, `rto_us`) in one call. Designed for per-order forensics tagging: diffs between consecutive snapshots answer "was the order sitting in `snd.pending` under peer-rwnd backpressure?" and "was the path's `srtt_us` / `rttvar_us` steady or spiking at send time?". Slow-path; safe per order, not safe per packet. See A5.5 design spec §3.3 for the full field semantics and usage pattern. `resd_net_conn_rtt_histogram(engine, conn, out)` (A6) returns the connection's 16-bucket RTT histogram; edges are set engine-wide via `resd_net_engine_config_t.rtt_histogram_bucket_edges_us` and default to the 15-edge ladder listed above. Per-conn RTT histogram lives on `TcpConn` (one cacheline per conn), not in `resd_net_counters_t`. Slow-path; one flow-table lookup + 64-byte `memcpy` per call.
+**Introspection API (A5.5 + A6).** `dpdk_net_conn_stats(engine, conn, out)` returns a 9-field `u32` POD (`snd_una`, `snd_nxt`, `snd_wnd`, `send_buf_bytes_pending`, `send_buf_bytes_free`, `srtt_us`, `rttvar_us`, `min_rtt_us`, `rto_us`) in one call. Designed for per-order forensics tagging: diffs between consecutive snapshots answer "was the order sitting in `snd.pending` under peer-rwnd backpressure?" and "was the path's `srtt_us` / `rttvar_us` steady or spiking at send time?". Slow-path; safe per order, not safe per packet. See A5.5 design spec §3.3 for the full field semantics and usage pattern. `dpdk_net_conn_rtt_histogram(engine, conn, out)` (A6) returns the connection's 16-bucket RTT histogram; edges are set engine-wide via `dpdk_net_engine_config_t.rtt_histogram_bucket_edges_us` and default to the 15-edge ladder listed above. Per-conn RTT histogram lives on `TcpConn` (one cacheline per conn), not in `dpdk_net_counters_t`. Slow-path; one flow-table lookup + 64-byte `memcpy` per call.
 
-**Per-connect TLP tuning fields (A5.5).** `resd_net_connect_opts_t` carries five TLP knobs below the existing A5 `rack_aggressive` / `rto_no_backoff` entries; defaults preserve RFC 8985 exactly:
+**Per-connect TLP tuning fields (A5.5).** `dpdk_net_connect_opts_t` carries five TLP knobs below the existing A5 `rack_aggressive` / `rto_no_backoff` entries; defaults preserve RFC 8985 exactly:
 
 - `tlp_pto_min_floor_us: u32` — `0` inherits engine `tcp_min_rto_us` (default); `u32::MAX` = explicit no-floor; otherwise bounded to `[0, tcp_max_rto_us]`.
 - `tlp_pto_srtt_multiplier_x100: u16` — integer ×100 (100 = 1.0×, 200 = 2.0× default); valid range `[100, 200]`.
@@ -268,33 +268,33 @@ int resd_net_conn_rtt_histogram(resd_net_engine_t*,
 - `tlp_max_consecutive_probes: u8` — TLP probes fired consecutively before RTO takes over; default `1` (A5 behavior); valid `[1, 5]`.
 - `tlp_skip_rtt_sample_gate: bool` — when `true`, disable RFC 8985 §7.3 step 2 "no new RTT sample since last TLP" suppression. Required alongside `tlp_max_consecutive_probes > 1` for multi-probe cadence.
 
-See A5.5 design spec §5.5 for valid-range table, rejection semantics at `resd_net_connect`, and the aggressive-preset composition example.
+See A5.5 design spec §5.5 for valid-range table, rejection semantics at `dpdk_net_connect`, and the aggressive-preset composition example.
 
 ### 4.1 Usage pattern
 
 ```c
-engine = resd_net_engine_create(my_lcore, &cfg);
-resd_net_connect(engine, &opts, &conn);
+engine = dpdk_net_engine_create(my_lcore, &cfg);
+dpdk_net_connect(engine, &opts, &conn);
 
-resd_net_event_t events[64];
+dpdk_net_event_t events[64];
 while (running) {
-    int n = resd_net_poll(engine, events, 64, 0);  /* 0 = busy-poll */
+    int n = dpdk_net_poll(engine, events, 64, 0);  /* 0 = busy-poll */
     for (int i = 0; i < n; i++) {
         switch (events[i].kind) {
-        case RESD_NET_EVT_CONNECTED:
-            resd_net_send(engine, conn, request_bytes, request_len);
-            resd_net_flush(engine);
+        case DPDK_NET_EVT_CONNECTED:
+            dpdk_net_send(engine, conn, request_bytes, request_len);
+            dpdk_net_flush(engine);
             break;
-        case RESD_NET_EVT_READABLE:
+        case DPDK_NET_EVT_READABLE:
             /* application parses the bytes (HTTP, WS, custom wire format, ...) */
             app_consume(conn, events[i].u.readable.data,
                                events[i].u.readable.data_len);
             break;
-        case RESD_NET_EVT_WRITABLE:
+        case DPDK_NET_EVT_WRITABLE:
             /* retry any bytes that were refused earlier */
             app_drain_pending(conn);
             break;
-        case RESD_NET_EVT_CLOSED:
+        case DPDK_NET_EVT_CLOSED:
             app_on_close(conn, events[i].u.closed.err);
             break;
         }
@@ -304,15 +304,15 @@ while (running) {
 
 ### 4.2 API contracts
 
-- `resd_net_send` is synchronous: it copies bytes into the stack's tx mbuf chain and returns. No borrow-across-poll semantics for the send buffer; the caller may reuse `buf` immediately. Return contract: `>= 0` bytes accepted (possibly partial under backpressure); `< 0` is `-errno` (mempool exhaustion `-ENOMEM`, bad handle `-EINVAL`, not-connected `-ENOTCONN`). A short accept under backpressure is not an error; `-ENOMEM` is an error.
-- `RESD_NET_EVT_READABLE.u.readable.data` is a **borrowed view** into mbuf memory, valid from the moment `resd_net_poll` returns until the next `resd_net_poll` call on the same engine. The stack refcount-pins every mbuf referenced by any event in `events_out[0..n]` for that window; internal stack processing (including later bursts within the same poll) must not free those mbufs. Caller must `memcpy` out if they need bytes to outlive the poll.
-- Multiple `RESD_NET_EVT_READABLE` events may fire per poll iteration if received bytes span multiple mbufs; they deliver in-order, each with one contiguous mbuf-data region.
-- `RESD_NET_EVT_WRITABLE` fires when the per-connection send buffer has drained by at least half its capacity after a prior full/partial send refusal.
-- `resd_net_flush` drains the pending data-segment TX batch via exactly one `rte_eth_tx_burst`; no-op when empty. Control frames (ACK, SYN, FIN, RST) are emitted inline at their emit site and do NOT participate in the flush batch — `resd_net_flush` only pushes out the data segments that `send_bytes` / internal retransmit queued onto `tx_pending_data`. Safe to call multiple times per poll iteration; idempotent — a follow-up call with nothing newly queued is a no-op.
-- `resd_net_close` accepts a `flags` bitmask. Currently defined: `RESD_NET_CLOSE_FORCE_TW_SKIP` (bit 0), which requests that the TIME_WAIT 2×MSL wait be skipped. The flag is honored only when `c.ts_enabled == true` at close time (the connection negotiated RFC 7323 timestamps). When the prerequisite is met, the close path sets the per-conn `force_tw_skip` bit; `reap_time_wait` then short-circuits the 2×MSL wait. When the prerequisite is NOT met, the flag is silently dropped, a `RESD_NET_EVT_ERROR{err=-EPERM}` event is emitted for visibility (the "EPERM_TW_REQUIRED" condition), and the normal FIN + 2×MSL TIME_WAIT sequence proceeds. Other bits in `flags` are reserved for future extension and currently ignored.
+- `dpdk_net_send` is synchronous: it copies bytes into the stack's tx mbuf chain and returns. No borrow-across-poll semantics for the send buffer; the caller may reuse `buf` immediately. Return contract: `>= 0` bytes accepted (possibly partial under backpressure); `< 0` is `-errno` (mempool exhaustion `-ENOMEM`, bad handle `-EINVAL`, not-connected `-ENOTCONN`). A short accept under backpressure is not an error; `-ENOMEM` is an error.
+- `DPDK_NET_EVT_READABLE.u.readable.data` is a **borrowed view** into mbuf memory, valid from the moment `dpdk_net_poll` returns until the next `dpdk_net_poll` call on the same engine. The stack refcount-pins every mbuf referenced by any event in `events_out[0..n]` for that window; internal stack processing (including later bursts within the same poll) must not free those mbufs. Caller must `memcpy` out if they need bytes to outlive the poll.
+- Multiple `DPDK_NET_EVT_READABLE` events may fire per poll iteration if received bytes span multiple mbufs; they deliver in-order, each with one contiguous mbuf-data region.
+- `DPDK_NET_EVT_WRITABLE` fires when the per-connection send buffer has drained by at least half its capacity after a prior full/partial send refusal.
+- `dpdk_net_flush` drains the pending data-segment TX batch via exactly one `rte_eth_tx_burst`; no-op when empty. Control frames (ACK, SYN, FIN, RST) are emitted inline at their emit site and do NOT participate in the flush batch — `dpdk_net_flush` only pushes out the data segments that `send_bytes` / internal retransmit queued onto `tx_pending_data`. Safe to call multiple times per poll iteration; idempotent — a follow-up call with nothing newly queued is a no-op.
+- `dpdk_net_close` accepts a `flags` bitmask. Currently defined: `DPDK_NET_CLOSE_FORCE_TW_SKIP` (bit 0), which requests that the TIME_WAIT 2×MSL wait be skipped. The flag is honored only when `c.ts_enabled == true` at close time (the connection negotiated RFC 7323 timestamps). When the prerequisite is met, the close path sets the per-conn `force_tw_skip` bit; `reap_time_wait` then short-circuits the 2×MSL wait. When the prerequisite is NOT met, the flag is silently dropped, a `DPDK_NET_EVT_ERROR{err=-EPERM}` event is emitted for visibility (the "EPERM_TW_REQUIRED" condition), and the normal FIN + 2×MSL TIME_WAIT sequence proceeds. Other bits in `flags` are reserved for future extension and currently ignored.
 - `rx_hw_ts_ns` is 0 when the NIC/PMD does not fill hardware timestamps; callers fall back to `enqueued_ts_ns`.
-- **`resd_net_poll` event-overflow policy**: if more events are ready than `max_events`, the stack fills `events_out[0..max_events]` with events in FIFO enqueue order, stops further RX-burst processing for this iteration, and leaves the overflow + any unprocessed RX packets queued inside the engine. The next `resd_net_poll` call drains the queue before processing new RX. Per-connection event ordering is preserved across poll boundaries; no event kind is preempted or prioritized. Callers size `max_events` at least to `(NIC_BURST × 2)` so steady-state traffic fits; smaller sizes are valid but cause additional poll round-trips.
-- **Event-queue soft-cap contract (A5.5).** The per-engine internal event queue has a configurable soft cap (`resd_net_engine_config_t.event_queue_soft_cap`, default `4096`, minimum `64` — smaller configs rejected at `engine_create` with `-EINVAL`). When `push` would exceed the cap, the **oldest** queued event is dropped (`pop_front`), `obs.events_dropped` increments, and the new event is pushed. `obs.events_queue_high_water` latches the maximum observed queue depth since engine start (does not decrement). The pair tells a clean story: high-water near cap with `events_dropped == 0` is a close call; `events_dropped > 0` is actual loss and the app's poll cadence is falling behind. Drop-oldest preserves the most recent events (most useful for immediate-past forensics), matching the Linux `dmesg` ring-buffer mental model. Both counters are slow-path (`AtomicU64`, fire only on event-push boundaries). See A5.5 design spec §3.2 for the full push-path pseudocode and rationale.
+- **`dpdk_net_poll` event-overflow policy**: if more events are ready than `max_events`, the stack fills `events_out[0..max_events]` with events in FIFO enqueue order, stops further RX-burst processing for this iteration, and leaves the overflow + any unprocessed RX packets queued inside the engine. The next `dpdk_net_poll` call drains the queue before processing new RX. Per-connection event ordering is preserved across poll boundaries; no event kind is preempted or prioritized. Callers size `max_events` at least to `(NIC_BURST × 2)` so steady-state traffic fits; smaller sizes are valid but cause additional poll round-trips.
+- **Event-queue soft-cap contract (A5.5).** The per-engine internal event queue has a configurable soft cap (`dpdk_net_engine_config_t.event_queue_soft_cap`, default `4096`, minimum `64` — smaller configs rejected at `engine_create` with `-EINVAL`). When `push` would exceed the cap, the **oldest** queued event is dropped (`pop_front`), `obs.events_dropped` increments, and the new event is pushed. `obs.events_queue_high_water` latches the maximum observed queue depth since engine start (does not decrement). The pair tells a clean story: high-water near cap with `events_dropped == 0` is a close call; `events_dropped > 0` is actual loss and the app's poll cadence is falling behind. Drop-oldest preserves the most recent events (most useful for immediate-past forensics), matching the Linux `dmesg` ring-buffer mental model. Both counters are slow-path (`AtomicU64`, fire only on event-push boundaries). See A5.5 design spec §3.2 for the full push-path pseudocode and rationale.
 
 ## 5. Data Flow
 
@@ -329,7 +329,7 @@ while (!stop) {
         if (!conn) { reply_rst(pkt); free(pkt); continue; }
         tcp_input(conn, pkt);          /* advances FSM; in-order data appended to
                                           conn->recv_queue as mbuf chain */
-        /* on conn->recv_queue delta: emit one or more RESD_NET_EVT_READABLE events
+        /* on conn->recv_queue delta: emit one or more DPDK_NET_EVT_READABLE events
            referencing each mbuf's data region (zero-copy view for user) */
     }
     tcp_tick(now);                     /* retransmit, RTO, TLP, keepalive; delayed-ACK off by default */
@@ -337,10 +337,10 @@ while (!stop) {
 }
 ```
 
-### 5.2 `resd_net_send` call chain (synchronous, in-line)
+### 5.2 `dpdk_net_send` call chain (synchronous, in-line)
 
 ```
-resd_net_send(conn, buf, len)
+dpdk_net_send(conn, buf, len)
   → copy buf[0..len] into tx mbuf chain (single mbuf when len fits MSS-headroom;
                                          chain across tx_data_mempool otherwise)
   → tcp_output      (segment to MSS-aligned chunks; prepend TCP hdr in reserved
@@ -353,7 +353,7 @@ resd_net_send(conn, buf, len)
 
 ### 5.3 Buffer ownership
 
-- RX mbufs owned by stack; delivered to user as `&[u8]` view via `RESD_NET_EVT_READABLE.data`. Any mbuf referenced by a delivered event is refcount-pinned from `resd_net_poll` return to the next `resd_net_poll` entry; internal stack processing (including later bursts within the same poll iteration) does not free these mbufs until the caller hands the poll back.
+- RX mbufs owned by stack; delivered to user as `&[u8]` view via `DPDK_NET_EVT_READABLE.data`. Any mbuf referenced by a delivered event is refcount-pinned from `dpdk_net_poll` return to the next `dpdk_net_poll` entry; internal stack processing (including later bursts within the same poll iteration) does not free these mbufs until the caller hands the poll back.
 - TX mbufs allocated from per-lcore mempool, filled bottom-up with pre-reserved headroom for eth+IP+TCP headers, pushed to next tx_burst. Bytes larger than one mbuf's payload are sent as an mbuf chain (DPDK segmented mbuf).
 - Retransmit queue holds mbuf pointers with bumped refcount; on ACK the ref drops and the mbuf returns to the mempool.
 - **Retransmit mbuf policy**: a retransmit allocates a fresh mbuf from `tx_hdr_mempool` (header-only, chained back to the original data mbuf) rather than editing the original in place. This costs one allocation per retransmit (rare; negligible aggregate) and eliminates the race where an mbuf currently queued for or in-flight via `rte_eth_tx_burst` would have its TCP options edited under the NIC's DMA. The original data mbuf's refcount is held for the duration; only the TCP/IP/eth header mbuf is fresh. RFC 7323 timestamp-option refresh is done by writing the new `TSval` into the fresh header mbuf.
@@ -427,7 +427,7 @@ struct TcpConn {
 
 | Default | RFC stance | Our default | Rationale |
 |---|---|---|---|
-| Delayed ACK | RFC 1122 SHOULD (§4.2.3.2 ≤500ms, ≥1/2 full-size segments); RFC 9293 MUST-58/-59 aggregate ACKs within an RX burst | **off + per-segment ACK in A3; burst-scope coalescing in A6** | 200ms ACK delay is catastrophic for trading. The spec-intent end state is: within each `resd_net_poll` iteration the stack emits at most one ACK per connection covering the in-order RX delta (burst-scope coalescing, not time-based delay). **Phase A3 ships a simpler per-segment-ACK baseline** — each inbound in-order data segment triggers one ACK in the same poll iteration. This over-ACKs relative to MUST-58 but never causes correctness issues (each ACK is individually valid). Burst-scope coalescing is finalized in A6 alongside the `preset=rfc_compliance` switch. This bounds ACK rate at `(conn_count × poll_rate × inbound_segs_per_poll)` Hz under A3 and `(conn_count × poll_rate)` Hz under A6 — acceptable in both modes because the TX path to the exchange is low-volume and not bandwidth-starved. |
+| Delayed ACK | RFC 1122 SHOULD (§4.2.3.2 ≤500ms, ≥1/2 full-size segments); RFC 9293 MUST-58/-59 aggregate ACKs within an RX burst | **off + per-segment ACK in A3; burst-scope coalescing in A6** | 200ms ACK delay is catastrophic for trading. The spec-intent end state is: within each `dpdk_net_poll` iteration the stack emits at most one ACK per connection covering the in-order RX delta (burst-scope coalescing, not time-based delay). **Phase A3 ships a simpler per-segment-ACK baseline** — each inbound in-order data segment triggers one ACK in the same poll iteration. This over-ACKs relative to MUST-58 but never causes correctness issues (each ACK is individually valid). Burst-scope coalescing is finalized in A6 alongside the `preset=rfc_compliance` switch. This bounds ACK rate at `(conn_count × poll_rate × inbound_segs_per_poll)` Hz under A3 and `(conn_count × poll_rate)` Hz under A6 — acceptable in both modes because the TX path to the exchange is low-volume and not bandwidth-starved. |
 | Receive-window shrinkage vs. buffer occupancy | RFC 9293 §3.10.7.4 (implicit: advertise `rcv_wnd = recv-buffer free space` and use the same value for ingress acceptance) | **advertise free_space; accept at full capacity** | Trading workload is market-data ingress at peer line-rate. Shrinking the ingress-acceptance window to match local buffer occupancy would throttle the peer's send rate — masking a real upstream "slow application consumer" problem as a protocol-layer artifact. We keep the ingress seq-window check at initial capacity (`recv_buffer_bytes`, default 256 KiB) so we accept everything the peer sends, and expose the drop condition via `tcp.recv_buf_drops` (bytes dropped because `recv.append` clamped at `free_space`). The peer's retransmit path recovers the dropped bytes; the application sees the counter climb and knows to speed up its consumer. The ACK we emit always advertises the real free space so well-behaved peers still throttle themselves based on *advertised* window; our wider ingress check just avoids being doubly-conservative. See `feedback_performance_first_flow_control.md`. |
 | Nagle (`TCP_NODELAY` inverse) | RFC 896 | **off** | user sends complete requests; coalescing is their choice |
 | TCP keepalive | optional | **off** | exchanges close idle; application heartbeats are preferred |
@@ -440,7 +440,7 @@ struct TcpConn {
 
 | AD tag | RFC stance | Our behavior | Rationale |
 |---|---|---|---|
-| `AD-A5-5-srtt-from-syn` | RFC 6298 §2.2 (first-RTT seeding) + §3 (Karn's rule) | **applied** — first SRTT sample drawn from SYN handshake round-trip on the first SYN's ACK. Karn's rule (§3) honored via `syn_retransmit_count == 0` guard. | Trader-latency use case requires trustworthy RTT state from the moment ESTABLISHED fires (for `resd_net_conn_stats` forensics and so AD-18's arm-TLP-on-send has a valid PTO basis). Bounds-checked `[1, 60_000_000) µs`. Net-conservative under the cited §2.2. Applies to every connection (not opt-in). See A5.5 design spec §3.5. |
+| `AD-A5-5-srtt-from-syn` | RFC 6298 §2.2 (first-RTT seeding) + §3 (Karn's rule) | **applied** — first SRTT sample drawn from SYN handshake round-trip on the first SYN's ACK. Karn's rule (§3) honored via `syn_retransmit_count == 0` guard. | Trader-latency use case requires trustworthy RTT state from the moment ESTABLISHED fires (for `dpdk_net_conn_stats` forensics and so AD-18's arm-TLP-on-send has a valid PTO basis). Bounds-checked `[1, 60_000_000) µs`. Net-conservative under the cited §2.2. Applies to every connection (not opt-in). See A5.5 design spec §3.5. |
 | `AD-A5-5-rack-mark-losses-on-rto` | RFC 8985 §6.3 SHOULD-equivalent (`RACK_mark_losses_on_RTO` pass) | **applied** — `on_rto_fire` Phase 3 walks `snd_retrans.entries` and marks lost any entry where `seq == snd.una` OR `(xmit_ts/1000) + rack.rtt_us + rack.reo_wnd_us <= now_us` before retransmitting the batch through the existing `rack_lost_indexes` loop. | Closes AD-17 (from A5 RFC review S-1 promotion). Single RTO fire now retransmits the entire §6.3-eligible tail in one burst (one `tcp.tx_rto` increment, `tcp.tx_retrans` one-per-segment). Fewer aggregate cycles than A5's one-segment-per-ACK amortization. Applies to every connection. See A5.5 design spec §3.6. |
 | `AD-A5-5-tlp-arm-on-send` | RFC 8985 §7.2 SHOULD ("the sender SHOULD start or restart a loss probe PTO timer after transmitting new data") | **applied** — new `arm_tlp_pto` helper invoked from `Engine::send_bytes` TX path after the new-data segment enters `snd_retrans`. Gated on SRTT-available + no-TLP-armed + probe-budget-not-exhausted. | Closes AD-18 (from A5 RFC review + mTCP E-2). Covers the pre-first-data-ACK tail-loss window that A5 left to RTO fallback. Combined with `AD-A5-5-srtt-from-syn`, SRTT is available at every arm site post-ESTABLISHED. Applies to every connection. See A5.5 design spec §3.7. |
 | `AD-A5-5-tlp-pto-floor-zero` | RFC 8985 §7.2 silent on PTO minimum; many implementations use 10 ms | **per-conn opt-in** via `tlp_pto_min_floor_us`. `0` inherits engine `tcp_min_rto_us` (default); `u32::MAX` = explicit no-floor; otherwise `[0, tcp_max_rto_us]`. | On a tight-jitter intra-region link the 10 ms floor is multiple RTTs of wasted budget. Risk: spurious probes if jitter exceeds `SRTT/4`; `tcp.tx_tlp_spurious` counter lets the app self-correct the floor upward. Defaults preserve A5 behavior exactly. See A5.5 design spec §5.5. |
@@ -448,7 +448,7 @@ struct TcpConn {
 | `AD-A5-5-tlp-skip-flight-size-gate` | RFC 8985 §7.2 adds `+max(WCDelAckT, RTT/4)` to PTO when FlightSize == 1 | **per-conn opt-in** via `tlp_skip_flight_size_gate`. When `true`, skip the penalty regardless of FlightSize. | `WCDelAckT` default of 200 ms is four orders of magnitude larger than our target order-entry RTT; the penalty blows any latency budget. Risk: if peer has delayed-ACK on, probe fires before peer's ACK (detected as spurious via DSACK). Companion-segment mitigation tracked as §12 follow-on in A5.5 spec. |
 | `AD-A5-5-tlp-multi-probe` | RFC 8985 §7.3 step 2 allows at most one pending probe at a time; silent on consecutive schedules post-probe-ACK | **per-conn opt-in** via `tlp_max_consecutive_probes`. Default `1` (A5 behavior); valid `[1, 5]`. Budget resets on any new RTT sample or newly-ACKed data. | On clean probe-ACK arrival, a second probe at PTO cadence is often cheaper than a full RTO wait for a separate tail-loss. Risk: probe amplification bounded by the `[1, 5]` cap and budget reset. See A5.5 design spec §3.4. |
 | `AD-A5-5-tlp-skip-rtt-sample-gate` | RFC 8985 §7.3 step 2 suppresses TLP when no new RTT sample has been seen since the last probe | **per-conn opt-in** via `tlp_skip_rtt_sample_gate`. When `true`, disable the suppression. | Required alongside `tlp_max_consecutive_probes > 1` for multi-probe cadence. On a quiescent path with occasional lost segments, consecutive probes without intervening samples is the recovery we want. Risk: runaway probing if path is persistently broken; bounded by `tlp_max_consecutive_probes` and RTO takeover. |
-| `AD-A6-force-tw-skip` | RFC 9293 §3.5 MUST-13 requires an actively-closing side to linger in TIME_WAIT for 2×MSL; §3.5 MAY-2 permits reduction per RFC 6191, whose algorithm is stated server-side | **per-close opt-in** via `resd_net_close(conn, RESD_NET_CLOSE_FORCE_TW_SKIP)`, honored only when `c.ts_enabled == true` at close time. Under that prerequisite, `c.force_tw_skip` is set and `reap_time_wait` drains the TIME_WAIT conn as soon as the FIN handshake completes rather than waiting 2×MSL. When the prerequisite is NOT met, the flag is silently dropped, a `RESD_NET_EVT_ERROR{err=-EPERM}` event (the "EPERM_TW_REQUIRED" condition per §9.3) is emitted, and normal 2×MSL behavior proceeds. Default (no flag) is RFC 9293 MUST-13 exact. | Stage 1 is client-only (no LISTEN/accept) and exchanges reopen a 4-tuple faster than 2×MSL would permit. The combination of PAWS on the peer (RFC 7323 §5) + monotonic ISS on our side (RFC 6528 §3, via `(ticks_since_boot_at_4µs) + SipHash(…)`) is the client-side analog of RFC 6191 §4.2's protections: any in-flight segment from the prior incarnation is rejected either by the peer's TSval check (PAWS) or by our ISS-monotonicity gate. Opt-in + `ts_enabled` gate + EPERM-on-prereq-fail make the deviation caller-observable and RFC-default-preserving for unguarded callers. Full rationale in §6.5 "TIME_WAIT shortening". |
+| `AD-A6-force-tw-skip` | RFC 9293 §3.5 MUST-13 requires an actively-closing side to linger in TIME_WAIT for 2×MSL; §3.5 MAY-2 permits reduction per RFC 6191, whose algorithm is stated server-side | **per-close opt-in** via `dpdk_net_close(conn, DPDK_NET_CLOSE_FORCE_TW_SKIP)`, honored only when `c.ts_enabled == true` at close time. Under that prerequisite, `c.force_tw_skip` is set and `reap_time_wait` drains the TIME_WAIT conn as soon as the FIN handshake completes rather than waiting 2×MSL. When the prerequisite is NOT met, the flag is silently dropped, a `DPDK_NET_EVT_ERROR{err=-EPERM}` event (the "EPERM_TW_REQUIRED" condition per §9.3) is emitted, and normal 2×MSL behavior proceeds. Default (no flag) is RFC 9293 MUST-13 exact. | Stage 1 is client-only (no LISTEN/accept) and exchanges reopen a 4-tuple faster than 2×MSL would permit. The combination of PAWS on the peer (RFC 7323 §5) + monotonic ISS on our side (RFC 6528 §3, via `(ticks_since_boot_at_4µs) + SipHash(…)`) is the client-side analog of RFC 6191 §4.2's protections: any in-flight segment from the prior incarnation is rejected either by the peer's TSval check (PAWS) or by our ISS-monotonicity gate. Opt-in + `ts_enabled` gate + EPERM-on-prereq-fail make the deviation caller-observable and RFC-default-preserving for unguarded callers. Full rationale in §6.5 "TIME_WAIT shortening". |
 
 **A5.5 retirements:** `AD-15` (TLP pre-fire state machine) superseded by the `tlp_recent_probes` ring + `tlp_consecutive_probes_fired` budget data structures — retirement note on `docs/superpowers/reviews/phase-a5-rfc-compliance.md`. `AD-17` and `AD-18` (A5 RFC review promotions) absorbed into the two `AD-A5-5-rack-mark-losses-on-rto` / `AD-A5-5-tlp-arm-on-send` closure rows above.
 
@@ -457,10 +457,10 @@ struct TcpConn {
 - **Flow table**: flat `Vec<Option<TcpConn>>` indexed by handle id + a hash map `(4-tuple) → handle` for RX lookup. Expected cost: ~40ns hot, ~200ns cold due to bucket cacheline miss; acceptable at ≤100 connections. If per-connection latency budget tightens, switch to a small pre-warmed array (≤8 candidates per RSS-bucket) with linear scan — faster under cache pressure at this scale.
 - **Segment-level mbuf tracking**: every TX segment holds an mbuf refcount until ACK or RST. **Retransmit allocates a fresh header mbuf** chained to the original data mbuf (see §5.3) — never edits an in-flight mbuf in place.
 - **ISS**: `ISS = (monotonic_time_4µs_ticks_low_32) + SipHash64(local_ip || local_port || remote_ip || remote_port || secret || boot_nonce)` per RFC 6528 §3. Clock value is added outside the hash so reconnects to the same 4-tuple within MSL yield monotonically-increasing ISS. `secret` is a 128-bit per-process random constant; `boot_nonce` survives reboots via `/proc/sys/kernel/random/boot_id` or equivalent.
-- **SYN retransmit**: schedule respects `connect_timeout_ms` from `resd_net_connect_opts_t`. Default: 3 attempts with initial backoff `max(initial_rto_ms, minRTO)` (config default: `initial_rto_ms=50`), exponential up to the total budget. Never exceed `connect_timeout_ms` in total; the connection fails fast for trading, not per RFC 6298's 1s recommendation.
-- **Data retransmit budget**: `tcp_max_retrans_count` (default 15). After this many RTO-driven retransmits of a single segment with no ACK progress, the connection fails with `RESD_NET_EVT_ERROR{err=ETIMEDOUT}`. With backoff + `tcp_max_rto_us=1s`, the total wall-clock budget is ≈8.3s (5 + 10 + 20 + 40 + ...). Opt-out of backoff per-connect (`rto_no_backoff=true`) makes the budget linear in `count × rto_us`.
+- **SYN retransmit**: schedule respects `connect_timeout_ms` from `dpdk_net_connect_opts_t`. Default: 3 attempts with initial backoff `max(initial_rto_ms, minRTO)` (config default: `initial_rto_ms=50`), exponential up to the total budget. Never exceed `connect_timeout_ms` in total; the connection fails fast for trading, not per RFC 6298's 1s recommendation.
+- **Data retransmit budget**: `tcp_max_retrans_count` (default 15). After this many RTO-driven retransmits of a single segment with no ACK progress, the connection fails with `DPDK_NET_EVT_ERROR{err=ETIMEDOUT}`. With backoff + `tcp_max_rto_us=1s`, the total wall-clock budget is ≈8.3s (5 + 10 + 20 + 40 + ...). Opt-out of backoff per-connect (`rto_no_backoff=true`) makes the budget linear in `count × rto_us`.
 - **RTO timer re-arm**: lazy. On ACK, update `snd.una`; the existing wheel entry fires at its originally-scheduled deadline. When it fires, the handler re-checks `snd.una` vs `snd.nxt` — if fully ACKed, the timer cancels itself; otherwise it retransmits and re-arms. Avoids remove+insert on every ACK.
-- **TIME_WAIT shortening**: `resd_net_close(engine, conn, RESD_NET_CLOSE_FORCE_TW_SKIP)` is honored only when `c.ts_enabled == true` at close time (the connection negotiated RFC 7323 timestamps). Under that prerequisite the close path sets `c.force_tw_skip`; `reap_time_wait` then drains the TIME_WAIT conn as soon as the FIN handshake completes rather than sitting for 2×MSL. When the prerequisite is NOT met, the flag is silently dropped, a `RESD_NET_EVT_ERROR{err=-EPERM}` event (the "EPERM_TW_REQUIRED" condition) is emitted for visibility, and the normal FIN + 2×MSL TIME_WAIT sequence proceeds. The combination of PAWS on the peer (RFC 7323 §5) plus monotonic ISS on our side (RFC 6528; see `ISS` implementation choice above) is the client-side analog of RFC 6191 §4.2's protections: any in-flight segment from the prior incarnation is rejected either by PAWS (peer-side TSval check) or by the ISS-monotonicity gate we maintain via the `(ticks_since_boot_at_4µs) + SipHash(…)` construction. Note this is a deliberate deviation from RFC 6191 §4.2's server-side wording — the RFC's conditions address the server incarnation reopening a passive listener, whereas our client-side construction relies on the peer's own PAWS + our ISS monotonicity to achieve the same protection without waiting 2×MSL on the client side.
+- **TIME_WAIT shortening**: `dpdk_net_close(engine, conn, DPDK_NET_CLOSE_FORCE_TW_SKIP)` is honored only when `c.ts_enabled == true` at close time (the connection negotiated RFC 7323 timestamps). Under that prerequisite the close path sets `c.force_tw_skip`; `reap_time_wait` then drains the TIME_WAIT conn as soon as the FIN handshake completes rather than sitting for 2×MSL. When the prerequisite is NOT met, the flag is silently dropped, a `DPDK_NET_EVT_ERROR{err=-EPERM}` event (the "EPERM_TW_REQUIRED" condition) is emitted for visibility, and the normal FIN + 2×MSL TIME_WAIT sequence proceeds. The combination of PAWS on the peer (RFC 7323 §5) plus monotonic ISS on our side (RFC 6528; see `ISS` implementation choice above) is the client-side analog of RFC 6191 §4.2's protections: any in-flight segment from the prior incarnation is rejected either by PAWS (peer-side TSval check) or by the ISS-monotonicity gate we maintain via the `(ticks_since_boot_at_4µs) + SipHash(…)` construction. Note this is a deliberate deviation from RFC 6191 §4.2's server-side wording — the RFC's conditions address the server incarnation reopening a passive listener, whereas our client-side construction relies on the peer's own PAWS + our ISS monotonicity to achieve the same protection without waiting 2×MSL on the client side.
 
 ## 7. Memory and Buffer Model
 
@@ -477,13 +477,13 @@ timer_mempool    : fixed-object pool for timer nodes
 
 Stage 1 reserves no TLS/HTTP headroom or tailroom; if Stage 3/4 adds those layers, mempool sizing is revisited and headroom/tailroom extended.
 
-On mempool exhaustion: `rx_mempool` alloc failure drops the inbound packet and increments `eth.rx_drop_nomem`. `tx_*_mempool` failure causes `resd_net_send` (or internal retransmit scheduling) to return `-ENOMEM` / accept fewer bytes than requested, emits `RESD_NET_EVT_ERROR{err=ENOMEM}` when the caller would otherwise not learn of it, and does not corrupt the in-flight connection state. A CI test pins mempool size to a tiny value and verifies surfacing.
+On mempool exhaustion: `rx_mempool` alloc failure drops the inbound packet and increments `eth.rx_drop_nomem`. `tx_*_mempool` failure causes `dpdk_net_send` (or internal retransmit scheduling) to return `-ENOMEM` / accept fewer bytes than requested, emits `DPDK_NET_EVT_ERROR{err=ENOMEM}` when the caller would otherwise not learn of it, and does not corrupt the in-flight connection state. A CI test pins mempool size to a tiny value and verifies surfacing.
 
 ### 7.2 Per-connection buffers
 
 - `recv_reorder`: out-of-order segment list, each element holds `(seq_range, mbuf_ref)`. Merged into `recv_queue` as gaps fill. Capped at `recv_buffer_bytes`.
-- `recv_queue`: in-order mbuf chain delivered to user via `RESD_NET_EVT_READABLE`.
-- `snd_pending`: bytes the user has asked to send but not yet handed to `rte_eth_tx_burst`. Flushed at poll end or on `resd_net_flush`.
+- `recv_queue`: in-order mbuf chain delivered to user via `DPDK_NET_EVT_READABLE`.
+- `snd_pending`: bytes the user has asked to send but not yet handed to `rte_eth_tx_burst`. Flushed at poll end or on `dpdk_net_flush`.
 - `snd_retrans`: `(seq, mbuf_ref, first_tx_ts)` list. Capped at `send_buffer_bytes`.
 
 ### 7.3 Zero-copy path
@@ -491,7 +491,7 @@ On mempool exhaustion: `rx_mempool` alloc failure drops the inbound packet and i
 ```
 RX:  NIC DMA → mbuf.data
                → tcp_input reassembly (mbuf chain for out-of-order; no copy)
-                 → RESD_NET_EVT_READABLE.data points directly into mbuf
+                 → DPDK_NET_EVT_READABLE.data points directly into mbuf
                    → user sees zero-copy view
 
 TX:  user buf  → memcpy into tx mbuf.data at headroom offset
@@ -514,8 +514,8 @@ Copies on Stage 1:
 ### 7.5 Clock
 
 - TSC-based; invariant TSC required (`CPUID.80000007H.EDX.InvariantTSC[bit 8]` set). Check at engine creation; fail fast otherwise.
-- **Single calibration shared across all engines on the host**: the first `resd_net_engine_create` call performs `(tsc0, t0) = calibrate_against(CLOCK_MONOTONIC_RAW)`; subsequent engines reuse the same epoch via a process-global atomic-init. All engines therefore share one `ns_per_tsc` conversion; cross-lcore event correlation has bounded skew (only the per-core invariant-TSC startup offset, <100ns typical on bare metal; measured and reported in WAN A/B harness).
-- `resd_net_now_ns` uses `rdtsc` (not `rdtscp`) — serialization is unnecessary for ms/µs-scale latency attribution. An inline variant `resd_net_now_ns_inline()` is exposed as a `static inline` in `resd_net.h` (reads TSC via compiler intrinsic, applies `(tsc-tsc0)*ns_per_tsc + t0` with engine-calibrated constants) so users can avoid the FFI call on tight hot-paths.
+- **Single calibration shared across all engines on the host**: the first `dpdk_net_engine_create` call performs `(tsc0, t0) = calibrate_against(CLOCK_MONOTONIC_RAW)`; subsequent engines reuse the same epoch via a process-global atomic-init. All engines therefore share one `ns_per_tsc` conversion; cross-lcore event correlation has bounded skew (only the per-core invariant-TSC startup offset, <100ns typical on bare metal; measured and reported in WAN A/B harness).
+- `dpdk_net_now_ns` uses `rdtsc` (not `rdtscp`) — serialization is unnecessary for ms/µs-scale latency attribution. An inline variant `dpdk_net_now_ns_inline()` is exposed as a `static inline` in `dpdk_net.h` (reads TSC via compiler intrinsic, applies `(tsc-tsc0)*ns_per_tsc + t0` with engine-calibrated constants) so users can avoid the FFI call on tight hot-paths.
 - NIC hardware timestamp: dyn-field offset and flag are resolved **once** at `engine_create` via `rte_mbuf_dynfield_lookup("rte_dynfield_timestamp")` and `rte_mbuf_dynflag_lookup("rte_dynflag_rx_timestamp")`. Hot-path reads are a direct `*(uint64_t*)((char*)mbuf + ts_offset)` behind an always-inline accessor. When the NIC/PMD doesn't register the dynfield, the accessor returns 0 and `rx_hw_ts_ns` in every event is 0; callers fall back to `enqueued_ts_ns`.
 
 ## 8. Hardware Assumptions
@@ -565,7 +565,7 @@ The MBUF_FAST_FREE and RSS_HASH gaps are the most operationally significant: A-H
 
 The ENA PMD does **not** offer:
 
-- **No hardware RX timestamps.** ENA does not expose the `rte_mbuf_dynfield_timestamp` dynfield; `rte_mbuf_dynflag_lookup("rte_dynflag_rx_timestamp")` returns negative at startup. `resd_net_event_t.rx_hw_ts_ns` falls back to the TSC read captured at `rx_burst` return, per the §7.5 / §4.2 dynfield-miss path. The field stays in the ABI for future portability to hardware with PTP / per-packet timestamps.
+- **No hardware RX timestamps.** ENA does not expose the `rte_mbuf_dynfield_timestamp` dynfield; `rte_mbuf_dynflag_lookup("rte_dynflag_rx_timestamp")` returns negative at startup. `dpdk_net_event_t.rx_hw_ts_ns` falls back to the TSC read captured at `rx_burst` return, per the §7.5 / §4.2 dynfield-miss path. The field stays in the ABI for future portability to hardware with PTP / per-packet timestamps.
 - **No LRO.** Software GRO via `librte_gro` is available but deliberately off for trading (coalescing obscures per-segment timing attribution).
 - **No `rte_flow` / Flow Director beyond the RSS indirection table.** 5-tuple → specific queue steering is available only through reprogramming the RSS indirection table, not precise rule-based steering.
 - **No inline crypto / IPsec / TLS.** If TLS arrives in Stage 4 it is software-only.
@@ -584,7 +584,7 @@ Design consequences:
 
 **Runtime capability gate.** Separately from the compile-time gate, every offload that is compile-time-enabled is also AND-ed against `rte_eth_dev_info_get`'s `*_offload_capa` at `engine_create`. A requested-but-unadvertised capability degrades to the software path for that engine instance, logs WARN, and bumps a one-shot counter (`eth.offload_missing_<name>`). This preserves portability to non-ENA hardware (including `net_vdev` / `net_tap` in tests) without a separate build.
 
-**Evidence gate.** Tier 1 is the **proposed** production default — each offload only stays as a default feature if A10's offload A/B measurement harness (`tools/bench-offload-ab/`) shows a reproducible p99 improvement on this specific host/NIC beyond the measurement noise floor. An offload that does not clear the noise floor is either removed from the default feature set or kept with a rationale committed alongside the CSV evidence (for example: correctness defense-in-depth for `hw-offload-mbuf-fast-free`). The final committed default set is recorded in `docs/superpowers/reports/offload-ab.md` and reflected in `crates/resd-net-core/Cargo.toml`'s `default = [...]` list. The text below lists the proposed set; the source of truth post-A10 is the report.
+**Evidence gate.** Tier 1 is the **proposed** production default — each offload only stays as a default feature if A10's offload A/B measurement harness (`tools/bench-offload-ab/`) shows a reproducible p99 improvement on this specific host/NIC beyond the measurement noise floor. An offload that does not clear the noise floor is either removed from the default feature set or kept with a rationale committed alongside the CSV evidence (for example: correctness defense-in-depth for `hw-offload-mbuf-fast-free`). The final committed default set is recorded in `docs/superpowers/reports/offload-ab.md` and reflected in `crates/dpdk-net-core/Cargo.toml`'s `default = [...]` list. The text below lists the proposed set; the source of truth post-A10 is the report.
 
 **Tier 1 (proposed) — enable at port-config bring-up (phase A-HW adds the code + gates; phase A10 measures + decides):**
 
@@ -613,7 +613,7 @@ A startup banner logs the negotiated offload set (one line per direction) so ope
 ### 8.6 Other assumptions (carry-over from Stage 1 initial draft)
 
 - ARP: static gateway MAC seeded at startup via netlink helper (one-shot), refreshed via gratuitous ARP every N seconds. No dynamic ARP resolution on the data path.
-- DNS: resolved out-of-band via `getaddrinfo()` on a control thread before `resd_net_connect`.
+- DNS: resolved out-of-band via `getaddrinfo()` on a control thread before `dpdk_net_connect`.
 
 ## 9. Observability (Primitives Only)
 
@@ -624,7 +624,7 @@ Stack emits primitives; application computes histograms, routes logs, runs expor
 Per-lcore struct of `AtomicU64` counts, cacheline-grouped, lock-free-readable via:
 
 ```c
-const resd_net_counters_t* resd_net_counters(resd_net_engine_t*);
+const dpdk_net_counters_t* dpdk_net_counters(dpdk_net_engine_t*);
 ```
 
 Counter groups (Stage 1): `eth`, `ip`, `tcp`, `poll`, `obs` (A5.5). Examples in `eth`: `rx_pkts`, `rx_bytes`, `rx_drop_miss_mac`, `rx_drop_nomem`, `tx_pkts`, `tx_bytes`, `tx_drop_full_ring`, `tx_drop_nomem`. In `tcp`: `rx_syn_ack`, `rx_data`, `rx_out_of_order`, `tx_retrans`, `tx_rto`, `tx_tlp`, `tx_tlp_spurious` (A5.5), `state_trans[11][11]`, `conn_open`, `conn_close`, `conn_rst`, `send_buf_full`, `recv_buf_delivered`. In `obs` (A5.5, engine-internal observability signals): `events_dropped` (incremented once per event dropped from the internal event queue on soft-cap overflow), `events_queue_high_water` (latched max observed queue depth since engine start — does not decrement). The `obs` group is introduced alongside `poll`/`eth`/`ip`/`tcp` for engine-internal observability that does not fit the packet-path groups; new entries like `obs.poll_idle_ratio` or similar may land in later phases.
@@ -651,12 +651,12 @@ Counter groups (Stage 1): `eth`, `ip`, `tcp`, `poll`, `obs` (A5.5). Examples in 
 
 **A6 additions** (all slow-path counters per §9.1.1 — timer fire, lazy-expiration, flush-drain):
 
-- `tcp.tx_api_timers_fired` — incremented once per `RESD_NET_EVT_TIMER` emission (i.e. per public-timer fire from `resd_net_timer_add`). Paired with `resd_net_timer_add` return counts (observed externally by the caller) to answer "did my timer actually fire, or was it cancelled / stale?". Slow-path; fires at timer-fire rate, not per-segment.
+- `tcp.tx_api_timers_fired` — incremented once per `DPDK_NET_EVT_TIMER` emission (i.e. per public-timer fire from `dpdk_net_timer_add`). Paired with `dpdk_net_timer_add` return counts (observed externally by the caller) to answer "did my timer actually fire, or was it cancelled / stale?". Slow-path; fires at timer-fire rate, not per-segment.
 - `tcp.ts_recent_expired` — incremented when the RFC 7323 §5.5 24-day `TS.Recent` lazy expiration fires on a received TS-carrying segment. Nonzero values indicate a connection that has been idle for > 24 days and is re-adopting a fresh TSval rather than PAWS-rejecting the segment. Rare on short-lived exchange connections; informational for long-held keepalive paths.
-- `tcp.tx_flush_bursts` — incremented once per `rte_eth_tx_burst` call made by `drain_tx_pending_data` (via `resd_net_flush` or the end-of-poll drain). Paired with `tcp.tx_flush_batched_pkts` to compute the average batch size (`batched_pkts / bursts`); higher ratios indicate better amortization of the per-burst doorbell cost.
+- `tcp.tx_flush_bursts` — incremented once per `rte_eth_tx_burst` call made by `drain_tx_pending_data` (via `dpdk_net_flush` or the end-of-poll drain). Paired with `tcp.tx_flush_batched_pkts` to compute the average batch size (`batched_pkts / bursts`); higher ratios indicate better amortization of the per-burst doorbell cost.
 - `tcp.tx_flush_batched_pkts` — incremented by the number of mbufs actually handed to the single `rte_eth_tx_burst` inside each drain. Sum over an interval vs. `tx_pkts` tells you what fraction of TX went through the batched data-segment path vs. the inline control-frame path.
 
-Per-connection RTT histogram is intentionally NOT in `resd_net_counters_t` — see `resd_net_conn_rtt_histogram` under the §4 Introspection API. The histogram lives on each `TcpConn` (one cacheline per conn) rather than in the engine counter struct; snapshot-delta semantics give the caller control over the aggregation interval without engine-wide contention.
+Per-connection RTT histogram is intentionally NOT in `dpdk_net_counters_t` — see `dpdk_net_conn_rtt_histogram` under the §4 Introspection API. The histogram lives on each `TcpConn` (one cacheline per conn) rather than in the engine counter struct; snapshot-delta semantics give the caller control over the aggregation interval without engine-wide contention.
 
 Counter writes are `fetch_add(1, Ordering::Relaxed)` (`lock xadd` on x86_64; ~8-12 cycles uncontended). Cross-lcore snapshot readers use `load(Ordering::Relaxed)` — no torn reads. `Relaxed` is sufficient because counters are non-ordering observability data, not synchronization primitives. The alternative — `load(Relaxed)` + `store(val+1, Relaxed)` — is cheaper by a few cycles under the single-owner-lcore invariant but drops increments if that invariant ever slips (e.g., a future refactor moves a counter to a shared path); `fetch_add` is robust under any producer layout. The additional alternative — "plain `u64` + `memcpy`" — is a data race by the Rust / C++ abstract machine and is rejected. Slow-path counters pay the `fetch_add` cost unconditionally (see §9.1.1); hot-path counters follow the §9.1.1 policy (feature-gated + per-burst batched into a stack-local accumulator + single aggregate `fetch_add`).
 
@@ -674,7 +674,7 @@ Counters are not free. Every `fetch_add` on the hot path costs cycles (~8–12 c
 
 **Implication for new-counter PRs:** if the increment site is inside `tcp_input`, `tcp_output`, `engine::poll_once`, or any RX/TX burst loop, it is hot-path and rule 2 or 3 applies. Default counters-coverage audit (§10 A8) treats feature-gated counters as optional — the audit runs twice, once with default features and once with all observability features enabled, and each declared counter must be reachable in at least one of the two runs.
 
-**ABI stability:** the `#[cfg(feature = ...)]` gate applies to the **increment site**, not the struct field. Every counter field is always allocated and exposed via `resd_net_counters_t`. Feature-off builds still expose the field in the C ABI but leave it at zero. This keeps the C header stable across feature sets at the cost of ~8 bytes per counter, which is acceptable given counters are cacheline-grouped and sparse.
+**ABI stability:** the `#[cfg(feature = ...)]` gate applies to the **increment site**, not the struct field. Every counter field is always allocated and exposed via `dpdk_net_counters_t`. Feature-off builds still expose the field in the C ABI but leave it at zero. This keeps the C header stable across feature sets at the cost of ~8 bytes per counter, which is acceptable given counters are cacheline-grouped and sparse.
 
 **Canonical observability feature flags** (Stage 1):
 
@@ -688,29 +688,29 @@ Each hot-path counter must be documented inline at its declaration with: (1) the
 
 ### 9.2 Timestamps on events
 
-Every `resd_net_event_t` carries:
+Every `dpdk_net_event_t` carries:
 - `rx_hw_ts_ns` — NIC hardware timestamp when the PMD registers the `rte_dynflag_rx_timestamp` dynfield; 0 otherwise. On the Stage 1 deployment target (ENA, per §8.3) this dynfield is not exposed, so the field is 0 in the reference configuration and callers use `enqueued_ts_ns` as the ground-truth RX time per §7.5. The field stays in the ABI for future portability to hardware with PTP / per-packet timestamps.
-- `enqueued_ts_ns` — TSC when the event entered user-visible form (set inside `resd_net_poll`). On ENA this is the RX ground truth.
+- `enqueued_ts_ns` — TSC when the event entered user-visible form (set inside `dpdk_net_poll`). On ENA this is the RX ground truth.
 
-For TX: `resd_net_send` returns after pushing to the TX batch; the application records its own wall-clock at that moment if it cares. `resd_net_flush` is where the NIC actually sees the packet; applications that want ground-truth TX timing can read `resd_net_now_ns()` (or the inline variant) immediately before/after flush.
+For TX: `dpdk_net_send` returns after pushing to the TX batch; the application records its own wall-clock at that moment if it cares. `dpdk_net_flush` is where the NIC actually sees the packet; applications that want ground-truth TX timing can read `dpdk_net_now_ns()` (or the inline variant) immediately before/after flush.
 
 ### 9.3 Stability-visibility events
 
-Delivered through the normal `resd_net_poll` interface:
-- `RESD_NET_EVT_TCP_RETRANS {seq, rtx_count}` — gated by `tcp_per_packet_events`.
-- `RESD_NET_EVT_TCP_LOSS_DETECTED {cause: Rack|Tlp|Rto}` — gated by `tcp_per_packet_events`.
-- `RESD_NET_EVT_TCP_STATE_CHANGE` — from/to state.
-- `RESD_NET_EVT_ERROR` with `err=ENOMEM` — mempool exhaustion on TX or internal allocation; with `err=EPERM_TW_REQUIRED` — `FORCE_TW_SKIP` flag ignored because RFC 6191 conditions not met; with `err=ETIMEDOUT` — SYN retransmit budget exhausted (4th SYN attempt) or data retransmit budget exhausted (`tcp_max_retrans_count`+1).
+Delivered through the normal `dpdk_net_poll` interface:
+- `DPDK_NET_EVT_TCP_RETRANS {seq, rtx_count}` — gated by `tcp_per_packet_events`.
+- `DPDK_NET_EVT_TCP_LOSS_DETECTED {cause: Rack|Tlp|Rto}` — gated by `tcp_per_packet_events`.
+- `DPDK_NET_EVT_TCP_STATE_CHANGE` — from/to state.
+- `DPDK_NET_EVT_ERROR` with `err=ENOMEM` — mempool exhaustion on TX or internal allocation; with `err=EPERM_TW_REQUIRED` — `FORCE_TW_SKIP` flag ignored because RFC 6191 conditions not met; with `err=ETIMEDOUT` — SYN retransmit budget exhausted (4th SYN attempt) or data retransmit budget exhausted (`tcp_max_retrans_count`+1).
 
-State changes and ERROR events are always emitted. Per-packet TCP trace events (`TCP_RETRANS`, `TCP_LOSS_DETECTED`) are gated by the `tcp_per_packet_events` config flag so they don't clutter `resd_net_poll` results when not wanted.
+State changes and ERROR events are always emitted. Per-packet TCP trace events (`TCP_RETRANS`, `TCP_LOSS_DETECTED`) are gated by the `tcp_per_packet_events` config flag so they don't clutter `dpdk_net_poll` results when not wanted.
 
-**A6 `RESD_NET_EVT_ERROR{err=-ENOMEM}` emission sites.** ENOMEM (tx / rx mempool exhaustion) is surfaced through three distinct sites with different cadences so the caller always has actionable visibility without event-storm risk:
+**A6 `DPDK_NET_EVT_ERROR{err=-ENOMEM}` emission sites.** ENOMEM (tx / rx mempool exhaustion) is surfaced through three distinct sites with different cadences so the caller always has actionable visibility without event-storm risk:
 
-1. **`send_bytes` synchronous return.** When `resd_net_send` cannot allocate a header mbuf from `tx_hdr_mempool`, the call returns `-ENOMEM` synchronously AND emits one `RESD_NET_EVT_ERROR{conn, err=-ENOMEM}` event per call site. The redundant event makes the condition visible to callers whose error-handling wrapper only looks at poll events (and for symmetry with the internal-retransmit path below where no sync return exists).
-2. **Internal retransmit per-occurrence.** When `retransmit` (called from RTO / RACK / TLP fire handlers) cannot allocate a fresh header mbuf or the subsequent `rte_pktmbuf_chain` fails, one `RESD_NET_EVT_ERROR{conn, err=-ENOMEM}` is emitted per occurrence. No rate limiting — retransmit failures are already rare (mempool exhaustion under persistent pressure) and each occurrence is actionable.
-3. **RX mempool edge-triggered per poll iteration.** The RX path's mempool-drop counter (`eth.rx_drop_nomem`) increments per dropped packet, but the RX ENOMEM event is edge-triggered: `poll_once` snapshots `eth.rx_drop_nomem` at the top and compares against the post-RX-burst value; if `post > pre`, exactly ONE `RESD_NET_EVT_ERROR{conn=0, err=-ENOMEM}` event is emitted for that poll iteration, regardless of how many packets were dropped. This caps the event rate at one per poll under a runaway RX-mempool-exhaustion condition, leaving `eth.rx_drop_nomem` as the ground-truth per-packet counter.
+1. **`send_bytes` synchronous return.** When `dpdk_net_send` cannot allocate a header mbuf from `tx_hdr_mempool`, the call returns `-ENOMEM` synchronously AND emits one `DPDK_NET_EVT_ERROR{conn, err=-ENOMEM}` event per call site. The redundant event makes the condition visible to callers whose error-handling wrapper only looks at poll events (and for symmetry with the internal-retransmit path below where no sync return exists).
+2. **Internal retransmit per-occurrence.** When `retransmit` (called from RTO / RACK / TLP fire handlers) cannot allocate a fresh header mbuf or the subsequent `rte_pktmbuf_chain` fails, one `DPDK_NET_EVT_ERROR{conn, err=-ENOMEM}` is emitted per occurrence. No rate limiting — retransmit failures are already rare (mempool exhaustion under persistent pressure) and each occurrence is actionable.
+3. **RX mempool edge-triggered per poll iteration.** The RX path's mempool-drop counter (`eth.rx_drop_nomem`) increments per dropped packet, but the RX ENOMEM event is edge-triggered: `poll_once` snapshots `eth.rx_drop_nomem` at the top and compares against the post-RX-burst value; if `post > pre`, exactly ONE `DPDK_NET_EVT_ERROR{conn=0, err=-ENOMEM}` event is emitted for that poll iteration, regardless of how many packets were dropped. This caps the event rate at one per poll under a runaway RX-mempool-exhaustion condition, leaving `eth.rx_drop_nomem` as the ground-truth per-packet counter.
 
-**`enqueued_ts_ns` semantic (A5.5 correction).** The `resd_net_event_t.enqueued_ts_ns` field is sampled at **event emission** inside the stack, **not** at `resd_net_poll` drain. For packet-triggered events, emission time is when the stack processed the triggering packet (not when the NIC received it — use `rx_hw_ts_ns` for NIC-arrival). For timer-triggered events (RTO fire, loss-detected), emission time is the fire instant. This eliminates the ±poll-interval skew (tens of µs at 10–100 kHz poll rates) that the pre-A5.5 drain-time sampling introduced. Field name and layout on the public ABI are unchanged; only the sampling site moves. See A5.5 design spec §3.1 for the rationale; `rx_hw_ts_ns` semantics are unchanged.
+**`enqueued_ts_ns` semantic (A5.5 correction).** The `dpdk_net_event_t.enqueued_ts_ns` field is sampled at **event emission** inside the stack, **not** at `dpdk_net_poll` drain. For packet-triggered events, emission time is when the stack processed the triggering packet (not when the NIC received it — use `rx_hw_ts_ns` for NIC-arrival). For timer-triggered events (RTO fire, loss-detected), emission time is the fire instant. This eliminates the ±poll-interval skew (tens of µs at 10–100 kHz poll rates) that the pre-A5.5 drain-time sampling introduced. Field name and layout on the public ABI are unchanged; only the sampling site moves. See A5.5 design spec §3.1 for the rationale; `rx_hw_ts_ns` semantics are unchanged.
 
 ### 9.4 What the stack explicitly does NOT provide
 
@@ -734,11 +734,11 @@ Layered testing, phased so Stage 1 ships with a defensible test story and later 
 - TCP options encoder/decoder: window scale, timestamps, SACK, MSS, unknown-option handling.
 - Reassembly / SACK scoreboard tests with constructed segment sequences.
 - Timer wheel, flow table, mempool wrappers.
-- API contract tests: `resd_net_send` partial-accept + `WRITABLE` event, multi-burst `READABLE` delivery, borrowed-view lifetime, `FORCE_TW_SKIP` guardrails.
+- API contract tests: `dpdk_net_send` partial-accept + `WRITABLE` event, multi-burst `READABLE` delivery, borrowed-view lifetime, `FORCE_TW_SKIP` guardrails.
 
 ### 10.2 Layer B — RFC conformance via packetdrill (Luna-pattern shim)
 
-- `tools/packetdrill-shim`: links against libresd_net, redirects packetdrill's TUN read/write to stack rx/tx hooks, and provides a **synchronous socket-shim wrapper** that drives `resd_net_poll` internally to fake blocking-syscall semantics for `connect`/`write`/`read`/`close`. With Stage 1's byte-stream API, `write` maps straight to `resd_net_send` and `read` maps to a wait-loop over `RESD_NET_EVT_READABLE`.
+- `tools/packetdrill-shim`: links against libdpdk_net, redirects packetdrill's TUN read/write to stack rx/tx hooks, and provides a **synchronous socket-shim wrapper** that drives `dpdk_net_poll` internally to fake blocking-syscall semantics for `connect`/`write`/`read`/`close`. With Stage 1's byte-stream API, `write` maps straight to `dpdk_net_send` and `read` maps to a wait-loop over `DPDK_NET_EVT_READABLE`.
 - **Honest scope**: this exercises our wire-level TCP FSM, not our real asynchronous API. Packetdrill tests that depend on specific socket semantics we don't implement are not runnable:
   - Anything using `SIGIO`, `FIONREAD`, `SO_RCVLOWAT`, `MSG_PEEK`, `TCP_DEFER_ACCEPT`, `TCP_CORK`, or similar socket options.
   - Tests that assert partial-`read()` return values at specific buffer boundaries.
@@ -752,7 +752,7 @@ Layered testing, phased so Stage 1 ships with a defensible test story and later 
 
 ### 10.3 Layer C — RFC 793bis MUST/SHOULD via tcpreq
 
-`tcpreq` probes a TCP endpoint (typically a server) for conformance. Since `resd_net` is client-only in production, this layer requires the **stage-1 loopback-test-server** (see §10.12): a minimal server-side build of the stack behind a cargo feature flag, used only by the test harness. `tcpreq` is pointed at the loopback server and produces a pass/fail table aligned to RFC 793bis / RFC 9293 requirements (checksum validation, RST processing, MSS, illegal/unknown option handling). Output feeds the RFC compliance matrix automatically.
+`tcpreq` probes a TCP endpoint (typically a server) for conformance. Since `dpdk_net` is client-only in production, this layer requires the **stage-1 loopback-test-server** (see §10.12): a minimal server-side build of the stack behind a cargo feature flag, used only by the test harness. `tcpreq` is pointed at the loopback server and produces a pass/fail table aligned to RFC 793bis / RFC 9293 requirements (checksum validation, RST processing, MSS, illegal/unknown option handling). Output feeds the RFC compliance matrix automatically.
 
 Client-side conformance is covered indirectly by packetdrill-shim scripts that assert on the SYN/ACK/options *we emit* given specific peer behaviors.
 
@@ -762,7 +762,7 @@ Black-box mode for bring-up; white-box mode (JSON protocol) when enough internal
 
 ### 10.5 Layer E — Differential fuzzing via TCP-Fuzz
 
-- `github.com/zouyonghao/TCP-Fuzz` in differential mode: identical packet+syscall sequences fed to `libresd_net` and Linux TCP; divergence is a bug.
+- `github.com/zouyonghao/TCP-Fuzz` in differential mode: identical packet+syscall sequences fed to `libdpdk_net` and Linux TCP; divergence is a bug.
 - **Configuration requirement**: differential-vs-Linux is meaningful only in **RFC-compliance preset** — i.e., `cc_mode=reno`, delayed-ACK on (Linux-equivalent 40ms timer), `minRTO=200ms`, Nagle default. In this mode the two stacks should produce byte-identical wire behavior for equivalent inputs. Production-config differential fuzzing would produce false-positive divergences on every documented deviation (§6.4) and is explicitly **not** a useful test.
 - A second fuzz track regresses against **our own previous release**: same input → same output across versions. Catches unintended behavior changes that differential-vs-Linux misses (anything where both our old and new code diverge from Linux).
 - Motivation from prior work: TCP-Fuzz found semantic bugs across multiple userspace TCP stacks that sanitizer-based fuzzing does not catch, per USENIX ATC '22 reporting.
@@ -778,7 +778,7 @@ Black-box mode for bring-up; white-box mode (JSON protocol) when enough internal
 ### 10.7 Layer G — WAN A/B vs Linux (Stage 2 hardening)
 
 ```
-Producer(strategy) ─► [lcore: resd_net stack]  ─┐
+Producer(strategy) ─► [lcore: dpdk_net stack]  ─┐
                                                  ├─► exchange testnet
 Producer(strategy) ─► [kernel Linux socket   ]  ─┘
 ```
@@ -786,8 +786,8 @@ Producer(strategy) ─► [kernel Linux socket   ]  ─┘
 - Inbound market data replayed from a captured pcap via fan-out to both stacks, preserving inter-arrival timing via HW timestamping.
 - Identical outbound order sequences.
 - Comparison: wire-level captures via **hardware tap** (NOT switch mirror port; tap insertion jitter <100ns documented and quantified via a loopback calibration run before each comparison session); end-to-end `tx_req → rx_resp` latency distributions (p50/p99/p999/max) per exchange; retransmit rate, dup-ACK rate, SACK-block usage; send-window utilization vs RTT.
-- Measurement protocol: tap jitter baseline is subtracted from measured deltas; reported latency parity is `(resd_net_p999 − Linux_p999) − tap_jitter_p999`.
-- Pass gate: `resd_net` p999 latency ≤ Linux p999 latency (after jitter subtraction) on all tested venues; zero RFC-conformance deltas from replay through the packetdrill shim.
+- Measurement protocol: tap jitter baseline is subtracted from measured deltas; reported latency parity is `(dpdk_net_p999 − Linux_p999) − tap_jitter_p999`.
+- Pass gate: `dpdk_net` p999 latency ≤ Linux p999 latency (after jitter subtraction) on all tested venues; zero RFC-conformance deltas from replay through the packetdrill shim.
 
 ### 10.8 Layer H — WAN-condition fault injection (Stage 2 hardening)
 
@@ -800,7 +800,7 @@ Via `tc netem` on an intermediate Linux box inline between stack NIC and exchang
 
 ### 10.9 Layer I — Online shadow mode (Stage 2 hardening)
 
-Run `resd_net` alongside the Linux-stack path in production. The application mirrors the same byte-stream workload onto both stacks (application-side responsibility). Gate promotion on zero byte-stream divergence and p99/p999 latency parity for 7 days.
+Run `dpdk_net` alongside the Linux-stack path in production. The application mirrors the same byte-stream workload onto both stacks (application-side responsibility). Gate promotion on zero byte-stream divergence and p99/p999 latency parity for 7 days.
 
 ### 10.10 Stage gates
 
@@ -868,18 +868,18 @@ Each measures one unit of work in isolation; target is the function call cost, n
 
 | Benchmark | What it measures | Expected order of magnitude |
 |---|---|---|
-| `bench_poll_empty` | `resd_net_poll` iteration with no RX and no timers | tens of ns |
-| `bench_poll_idle_with_timers` | `resd_net_poll` iteration with `tcp_tick` walking an empty wheel bucket | tens of ns |
-| `bench_tsc_read_ffi` | `resd_net_now_ns` via FFI | ~5 ns |
-| `bench_tsc_read_inline` | `resd_net_now_ns_inline` (header-inline) | ~1 ns |
+| `bench_poll_empty` | `dpdk_net_poll` iteration with no RX and no timers | tens of ns |
+| `bench_poll_idle_with_timers` | `dpdk_net_poll` iteration with `tcp_tick` walking an empty wheel bucket | tens of ns |
+| `bench_tsc_read_ffi` | `dpdk_net_now_ns` via FFI | ~5 ns |
+| `bench_tsc_read_inline` | `dpdk_net_now_ns_inline` (header-inline) | ~1 ns |
 | `bench_flow_lookup_hot` | 4-tuple hash lookup, all connections hot in cache | ~40 ns |
 | `bench_flow_lookup_cold` | 4-tuple hash lookup, flow-table cacheline flushed | ~200 ns |
 | `bench_tcp_input_data_segment` | `tcp_input` for a single in-order data segment, PAWS+SACK enabled | ~100-200 ns |
 | `bench_tcp_input_ooo_segment` | `tcp_input` for an out-of-order segment that fills a hole | ~200-400 ns |
-| `bench_send_small` | `resd_net_send` of 128 bytes (fits single mbuf) | ~150 ns |
-| `bench_send_large_chain` | `resd_net_send` of 64KiB (mbuf chain) | ~1-5 µs |
-| `bench_timer_add_cancel` | `resd_net_timer_add` followed by `resd_net_timer_cancel` | ~50 ns |
-| `bench_counters_read` | `resd_net_counters` + read of all counter groups | ~100 ns |
+| `bench_send_small` | `dpdk_net_send` of 128 bytes (fits single mbuf) | ~150 ns |
+| `bench_send_large_chain` | `dpdk_net_send` of 64KiB (mbuf chain) | ~1-5 µs |
+| `bench_timer_add_cancel` | `dpdk_net_timer_add` followed by `dpdk_net_timer_cancel` | ~50 ns |
+| `bench_counters_read` | `dpdk_net_counters` + read of all counter groups | ~100 ns |
 
 ### 11.3 End-to-end latency benchmarks (`tools/bench-e2e`)
 
@@ -902,8 +902,8 @@ Conducted via `tc netem` on an intermediate Linux box, or via `smoltcp`'s `Fault
 | Reordering depth 3 | same | RACK detects reorder, no spurious retransmit per `tcp.tx_retrans` delta |
 | PMTU blackhole (drop ICMP frag-needed) — **Stage 2 only** | time-to-detect via PLPMTUD | requires RFC 8899; out of Stage 1 scope (use ICMP-driven PMTUD, RFC 1191) |
 | Duplication (2x) | request-response latency | no observable degradation at p99 |
-| Receiver zero-window stall then recovery | time to resume | `RESD_NET_EVT_WRITABLE` fires within 1 RTT of window open |
-| Send-buffer-full under slow peer | backpressure signaling | `resd_net_send` returns partial; `WRITABLE` fires on drain |
+| Receiver zero-window stall then recovery | time to resume | `DPDK_NET_EVT_WRITABLE` fires within 1 RTT of window open |
+| Send-buffer-full under slow peer | backpressure signaling | `dpdk_net_send` returns partial; `WRITABLE` fires on drain |
 
 ### 11.5 Comparative benchmarks vs. Linux TCP
 
@@ -912,9 +912,9 @@ Same hardware, same traffic, two stacks. Linux run uses `AF_PACKET` mmap sockets
 - RTT distribution comparison at p50/p99/p999 across idle, loss, and reorder conditions.
 - Connection-establishment time (SYN to `CONNECTED` event) distribution.
 - Time-to-first-byte on fresh connections.
-- Wire-level behavior equivalence when `resd_net` is in RFC-compliance preset (`cc_mode=reno`, delayed-ACK on, `minRTO=200ms`): segment-level diff via `pcap` capture should be byte-identical on identical inputs.
+- Wire-level behavior equivalence when `dpdk_net` is in RFC-compliance preset (`cc_mode=reno`, delayed-ACK on, `minRTO=200ms`): segment-level diff via `pcap` capture should be byte-identical on identical inputs.
 
-Publish as "latency at 95% confidence interval, resd_net vs. Linux, N=100k measurements per bucket" with machine-readable CSV output so the comparison is reproducible.
+Publish as "latency at 95% confidence interval, dpdk_net vs. Linux, N=100k measurements per bucket" with machine-readable CSV output so the comparison is reproducible.
 
 ### 11.5.1 Comparative benchmark vs. mTCP (burst throughput on reused connections)
 
@@ -928,7 +928,7 @@ Workload grid (product = 20 buckets):
 - `cc_mode=off` on both stacks (comparison axis is the fast-path stack, not congestion control); documented in CSV header.
 
 Measurement contract (identical instrumentation on both stacks):
-- `t0` = inline TSC read immediately before the first `resd_net_send` / `mtcp_write` of the burst.
+- `t0` = inline TSC read immediately before the first `dpdk_net_send` / `mtcp_write` of the burst.
 - `t1` = NIC HW TX timestamp on the **last segment** of the burst (read from `rte_mbuf::tx_timestamp` once the burst drains).
 - `throughput_per_burst = K / (t1 − t0)`. One sample per burst; aggregate into p50/p99/p999.
 - Secondary decomposition: `t_first_wire` = HW TX timestamp on segment 1 → `initiation = t_first_wire − t0`, `steady = K / (t1 − t_first_wire)`. Surfaces whether we are losing on spin-up or sustained rate.
@@ -938,7 +938,7 @@ Measurement contract (identical instrumentation on both stacks):
 
 Aggregation: p50, p99, p999 of `throughput_per_burst` across ≥10k bursts per bucket. CSV schema matches §11.5 so `tools/bench-report` feeds it into the same dashboard.
 
-Rationale: mTCP is the natural userspace-DPDK comparator, designed for sustained-flow throughput. The {K, G} grid spans the pattern we actually care about, from short intense bursts through to near-continuous high-rate delivery, and exposes whether `resd_net`'s small-connection-count / latency-oriented design concedes meaningful ground on burst throughput.
+Rationale: mTCP is the natural userspace-DPDK comparator, designed for sustained-flow throughput. The {K, G} grid spans the pattern we actually care about, from short intense bursts through to near-continuous high-rate delivery, and exposes whether `dpdk_net`'s small-connection-count / latency-oriented design concedes meaningful ground on burst throughput.
 
 ### 11.5.2 Comparative max sustained throughput vs. mTCP, varied application write size
 
@@ -988,7 +988,7 @@ Pass criteria: within 20% of Linux single-connection goodput (Linux has years of
 ### 11.9 Stage gates tied to benchmarks
 
 - **Stage 1 ship**: §11.2 microbenchmarks meet order-of-magnitude targets; §11.3 e2e p999 latency on loopback is within a small constant (documented) of the idle HW-timestamp RTT; §11.4 stress scenarios all pass criteria; no regression vs. first-merge baseline.
-- **Stage 2 (hardening) ship**: §11.5 comparative benchmarks show `resd_net` p999 ≤ Linux p999 under all tested conditions; PMU counters within acceptable deltas from the Stage-1 baseline.
+- **Stage 2 (hardening) ship**: §11.5 comparative benchmarks show `dpdk_net` p999 ≤ Linux p999 under all tested conditions; PMU counters within acceptable deltas from the Stage-1 baseline.
 
 ## 12. Out of Scope for Stage 1
 

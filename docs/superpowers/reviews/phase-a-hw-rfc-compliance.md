@@ -8,11 +8,11 @@
 ## Scope
 
 - Our files reviewed:
-  - `/home/ubuntu/resd.dpdk_tcp-a-hw/crates/resd-net-core/src/tcp_output.rs` (pseudo-header helper + offload finalizer)
-  - `/home/ubuntu/resd.dpdk_tcp-a-hw/crates/resd-net-core/src/l3_ip.rs` (IP offload-aware RX decode + `classify_ip_rx_cksum` / `classify_l4_rx_cksum`)
-  - `/home/ubuntu/resd.dpdk_tcp-a-hw/crates/resd-net-core/src/tcp_input.rs` (TCP RX software-fold path; `nic_csum_ok` passthrough)
-  - `/home/ubuntu/resd.dpdk_tcp-a-hw/crates/resd-net-core/src/engine.rs` (TX offload call sites + TCP L4-cksum classification + runtime latches)
-  - `/home/ubuntu/resd.dpdk_tcp-a-hw/crates/resd-net-core/src/counters.rs` (`rx_drop_cksum_bad` + `offload_missing_*` fields)
+  - `/home/ubuntu/resd.dpdk_tcp-a-hw/crates/dpdk-net-core/src/tcp_output.rs` (pseudo-header helper + offload finalizer)
+  - `/home/ubuntu/resd.dpdk_tcp-a-hw/crates/dpdk-net-core/src/l3_ip.rs` (IP offload-aware RX decode + `classify_ip_rx_cksum` / `classify_l4_rx_cksum`)
+  - `/home/ubuntu/resd.dpdk_tcp-a-hw/crates/dpdk-net-core/src/tcp_input.rs` (TCP RX software-fold path; `nic_csum_ok` passthrough)
+  - `/home/ubuntu/resd.dpdk_tcp-a-hw/crates/dpdk-net-core/src/engine.rs` (TX offload call sites + TCP L4-cksum classification + runtime latches)
+  - `/home/ubuntu/resd.dpdk_tcp-a-hw/crates/dpdk-net-core/src/counters.rs` (`rx_drop_cksum_bad` + `offload_missing_*` fields)
 - Spec §6.3 rows verified: RFC 9293 row ("TCP / client FSM complete"). No matrix row claim changes in A-HW — offload enablement is wire-transparent.
 - Spec §6.4 deviations touched: none. A-HW adds no new ADs. The parent spec §6.4 block and the A5.5 additions block are both unchanged.
 
@@ -45,7 +45,7 @@ None new in A-HW. Existing §6.4 deviations (delayed-ACK off, Nagle off, minRTO=
 
 ### FYI (informational — no action)
 
-- **I-1**: **RFC 9293 §3.1 pseudo-header byte layout is exact.** `tcp_pseudo_header_checksum` at `crates/resd-net-core/src/tcp_output.rs:223-235` constructs the 12-byte pseudo-header as `src_ip.to_be_bytes() (4) || dst_ip.to_be_bytes() (4) || 0 (1) || IPPROTO_TCP (1) || (tcp_seg_len as u16).to_be_bytes() (2)` — byte-for-byte matches RFC 9293 §3.1 Figure 2 (`docs/rfcs/rfc9293.txt:425-433`). The `debug_assert!` at lines 224-227 also guards the u16 bound on `tcp_length`, matching the IPv4 total-length implicit constraint called out in `docs/rfcs/rfc9293.txt:445-448`.
+- **I-1**: **RFC 9293 §3.1 pseudo-header byte layout is exact.** `tcp_pseudo_header_checksum` at `crates/dpdk-net-core/src/tcp_output.rs:223-235` constructs the 12-byte pseudo-header as `src_ip.to_be_bytes() (4) || dst_ip.to_be_bytes() (4) || 0 (1) || IPPROTO_TCP (1) || (tcp_seg_len as u16).to_be_bytes() (2)` — byte-for-byte matches RFC 9293 §3.1 Figure 2 (`docs/rfcs/rfc9293.txt:425-433`). The `debug_assert!` at lines 224-227 also guards the u16 bound on `tcp_length`, matching the IPv4 total-length implicit constraint called out in `docs/rfcs/rfc9293.txt:445-448`.
 
 - **I-2**: **On-wire equivalence between software-fold and offload paths is asserted by test.** `pseudo_header_only_cksum_matches_manual_fold` (`tcp_output.rs:552-570`) proves the helper matches a manually-folded 12-byte pseudo-header. `tx_offload_rewrite_cksums_writes_pseudo_and_zeroes_ip` (`tcp_output.rs:583-616`) proves the mbuf-rewrite path emits that helper's output into the TCP cksum field and zeroes the IPv4 cksum field. The PMD's fold-completion is a hardware contract (DPDK ethdev offload spec); given the shared pseudo-header seed, the on-wire result is bit-identical to the full software fold. No RFC-visible behavior change.
 

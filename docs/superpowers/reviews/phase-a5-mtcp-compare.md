@@ -8,17 +8,17 @@
 ## Scope
 
 Our files reviewed:
-- `crates/resd-net-core/src/tcp_rtt.rs`
-- `crates/resd-net-core/src/tcp_rack.rs`
-- `crates/resd-net-core/src/tcp_tlp.rs`
-- `crates/resd-net-core/src/tcp_retrans.rs`
-- `crates/resd-net-core/src/tcp_timer_wheel.rs`
-- `crates/resd-net-core/src/iss.rs`
-- `crates/resd-net-core/src/engine.rs` (on_rto_fire, on_tlp_fire, on_syn_retrans_fire, retransmit, send_bytes, ACK handler, TLP-arm block)
-- `crates/resd-net-core/src/tcp_input.rs` (RTT sampling, strict dup-ACK, RACK detect-lost pass, DSACK detection)
-- `crates/resd-net-core/src/tcp_options.rs` (WS clamp, optlen defense)
-- `crates/resd-net-core/src/tcp_conn.rs` (state touched by retrans/RTO/TLP)
-- `crates/resd-net-core/src/counters.rs` (new A5 counters)
+- `crates/dpdk-net-core/src/tcp_rtt.rs`
+- `crates/dpdk-net-core/src/tcp_rack.rs`
+- `crates/dpdk-net-core/src/tcp_tlp.rs`
+- `crates/dpdk-net-core/src/tcp_retrans.rs`
+- `crates/dpdk-net-core/src/tcp_timer_wheel.rs`
+- `crates/dpdk-net-core/src/iss.rs`
+- `crates/dpdk-net-core/src/engine.rs` (on_rto_fire, on_tlp_fire, on_syn_retrans_fire, retransmit, send_bytes, ACK handler, TLP-arm block)
+- `crates/dpdk-net-core/src/tcp_input.rs` (RTT sampling, strict dup-ACK, RACK detect-lost pass, DSACK detection)
+- `crates/dpdk-net-core/src/tcp_options.rs` (WS clamp, optlen defense)
+- `crates/dpdk-net-core/src/tcp_conn.rs` (state touched by retrans/RTO/TLP)
+- `crates/dpdk-net-core/src/counters.rs` (new A5 counters)
 
 mTCP files referenced:
 - `third_party/mtcp/mtcp/src/tcp_in.c` (EstimateRTT, ProcessACK, dup-ACK, fast-retransmit)

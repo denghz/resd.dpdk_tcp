@@ -11,15 +11,15 @@
 A-HW flips DPDK port configuration from Phase A1's zeroed `rte_eth_conf` (plus A5's `MULTI_SEGS` bit) to Stage 1's production-shape offloads. Every enablement gated by a cargo feature flag (all default ON) and capability-checked against `rte_eth_dev_info_get`. LLQ activation is verified via PMD-log-scrape around `rte_eal_init`. TX checksum uses pseudo-header-only fold when offload latches true; software full-fold otherwise. RX classification consumes `mbuf.ol_flags` with CKSUM_GOOD / CKSUM_BAD / CKSUM_NONE / CKSUM_UNKNOWN distinct branches. RSS is wired with `RTE_ETH_MQ_RX_RSS` mq_mode, `NONFRAG_IPV4_TCP | NONFRAG_IPV6_TCP` rss_hf, and explicit reta-program to queue 0 for forward-compat. RX timestamp uses `rte_mbuf_dynfield_lookup` / `rte_mbuf_dynflag_lookup` at engine_create; always-inline `hw_rx_ts_ns` accessor; threaded through the two production RX-origin event sites.
 
 Our files reviewed:
-- `crates/resd-net-core/Cargo.toml` — six `hw-*` features + `hw-offloads-all` meta + default list.
-- `crates/resd-net-core/src/dpdk_consts.rs` — DPDK 23.11 bit-position constants (pinned).
-- `crates/resd-net-core/src/engine.rs` — `configure_port_offloads`, `program_rss_reta_single_queue`, `hw_rx_ts_ns` accessor, LLQ verify call site, ol_flags + rss_hash + ts read at RX boundary, TX finalizer call sites in `tx_tcp_frame` + retrans chain.
-- `crates/resd-net-core/src/llq_verify.rs` — `fmemopen` / `rte_openlog_stream` log-capture scaffolding, marker scanners, process-global `OnceLock<LlqVerdict>`.
-- `crates/resd-net-core/src/tcp_output.rs` — `tcp_pseudo_header_checksum`, `tx_offload_rewrite_cksums`, `tx_offload_finalize` (feature-on + feature-off twin).
-- `crates/resd-net-core/src/l3_ip.rs` — `classify_ip_rx_cksum`, `classify_l4_rx_cksum`, `ip_decode_offload_aware`, `CksumOutcome` enum.
-- `crates/resd-net-core/src/flow_table.rs` — `hash_bucket_for_lookup` (feature-on + feature-off twin), `lookup_by_hash` forward-compat wrapper.
-- `crates/resd-net-core/src/counters.rs` — 11 new `AtomicU64` fields on `EthCounters` (always allocated regardless of feature flags, for C-ABI stability).
-- `crates/resd-net/src/api.rs` — 11 `u64` fields mirrored into `resd_net_eth_counters_t`; `_pad` shrunk to match.
+- `crates/dpdk-net-core/Cargo.toml` — six `hw-*` features + `hw-offloads-all` meta + default list.
+- `crates/dpdk-net-core/src/dpdk_consts.rs` — DPDK 23.11 bit-position constants (pinned).
+- `crates/dpdk-net-core/src/engine.rs` — `configure_port_offloads`, `program_rss_reta_single_queue`, `hw_rx_ts_ns` accessor, LLQ verify call site, ol_flags + rss_hash + ts read at RX boundary, TX finalizer call sites in `tx_tcp_frame` + retrans chain.
+- `crates/dpdk-net-core/src/llq_verify.rs` — `fmemopen` / `rte_openlog_stream` log-capture scaffolding, marker scanners, process-global `OnceLock<LlqVerdict>`.
+- `crates/dpdk-net-core/src/tcp_output.rs` — `tcp_pseudo_header_checksum`, `tx_offload_rewrite_cksums`, `tx_offload_finalize` (feature-on + feature-off twin).
+- `crates/dpdk-net-core/src/l3_ip.rs` — `classify_ip_rx_cksum`, `classify_l4_rx_cksum`, `ip_decode_offload_aware`, `CksumOutcome` enum.
+- `crates/dpdk-net-core/src/flow_table.rs` — `hash_bucket_for_lookup` (feature-on + feature-off twin), `lookup_by_hash` forward-compat wrapper.
+- `crates/dpdk-net-core/src/counters.rs` — 11 new `AtomicU64` fields on `EthCounters` (always allocated regardless of feature flags, for C-ABI stability).
+- `crates/dpdk-net/src/api.rs` — 11 `u64` fields mirrored into `dpdk_net_eth_counters_t`; `_pad` shrunk to match.
 
 mTCP files referenced:
 - `third_party/mtcp/mtcp/src/dpdk_module.c` — port config (`port_conf` at lines 110-156), `dpdk_load_module` (643-803), `dpdk_get_rptr` with RX checksum drop (517-548), `dpdk_dev_ioctl` with TX checksum ioctls (805-928).
@@ -91,7 +91,7 @@ Specifically examined and confirmed we either handle or have an explicit superio
   - No action.
 
 - **I-5** — **Per-ioctl dispatch (mTCP) vs direct mbuf manipulation (us).**
-  - mTCP abstracts DPDK offload calls behind `iom->dev_ioctl(ctx, nif, PKT_TX_*_CSUM, iph)` (`dpdk_module.c:805-928`) which sets `m->ol_flags`, `m->l2_len`, `m->l3_len`, `m->l4_len`, and writes `rte_ipv4_phdr_cksum` into the TCP cksum field. Our `tx_offload_finalize` (`tcp_output.rs:310-365`) does the same work inline through our own `resd_rte_mbuf_or_ol_flags` + `resd_rte_mbuf_set_tx_lens` shims (bindgen can't expose `rte_mbuf` directly because of packed anonymous unions) and a hand-rolled `tcp_pseudo_header_checksum` helper. Result on the wire is bit-identical for the default single-queue IPv4-TCP path.
+  - mTCP abstracts DPDK offload calls behind `iom->dev_ioctl(ctx, nif, PKT_TX_*_CSUM, iph)` (`dpdk_module.c:805-928`) which sets `m->ol_flags`, `m->l2_len`, `m->l3_len`, `m->l4_len`, and writes `rte_ipv4_phdr_cksum` into the TCP cksum field. Our `tx_offload_finalize` (`tcp_output.rs:310-365`) does the same work inline through our own `shim_rte_mbuf_or_ol_flags` + `shim_rte_mbuf_set_tx_lens` shims (bindgen can't expose `rte_mbuf` directly because of packed anonymous unions) and a hand-rolled `tcp_pseudo_header_checksum` helper. Result on the wire is bit-identical for the default single-queue IPv4-TCP path.
   - mTCP uses `rte_ipv4_phdr_cksum` (DPDK helper) which reads `ol_flags` to pick proto (TCP/UDP/SCTP) and zero-fills `tot_len` for TSO. Ours is TCP-only by construction; that is consistent with our no-TSO, no-UDP-TX-in-Stage-1 scope.
   - No action.
 
@@ -109,7 +109,7 @@ Specifically examined and confirmed we either handle or have an explicit superio
   - No action.
 
 - **I-9** — **Counter-snapshot layout vs mTCP's stats ioctl.**
-  - mTCP ships `rte_eth_stats` via an ioctl to a custom kernel module (`dpdk_module.c:291-372`, `ENABLE_STATS_IOCTL`). Its counter surface is host-OS-side; no concept of per-offload miss counters. Our `EthCounters.offload_missing_*` are in-process atomics exposed via `resd_net_counters_snapshot_t`. Different model per project scope; not a divergence to reconcile. We added 11 fields; the `_pad` on `EthCounters` shrunk from 20 to 9 to preserve the cacheline layout + struct size. No C-ABI break.
+  - mTCP ships `rte_eth_stats` via an ioctl to a custom kernel module (`dpdk_module.c:291-372`, `ENABLE_STATS_IOCTL`). Its counter surface is host-OS-side; no concept of per-offload miss counters. Our `EthCounters.offload_missing_*` are in-process atomics exposed via `dpdk_net_counters_snapshot_t`. Different model per project scope; not a divergence to reconcile. We added 11 fields; the `_pad` on `EthCounters` shrunk from 20 to 9 to preserve the cacheline layout + struct size. No C-ABI break.
   - No action.
 
 ## Verdict (draft)

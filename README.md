@@ -23,17 +23,17 @@ cargo test
 ## Integration tests (require DPDK TAP and root)
 
 ```sh
-sudo -E RESD_NET_TEST_TAP=1 cargo test -p resd-net-core --test engine_smoke -- --nocapture
+sudo -E DPDK_NET_TEST_TAP=1 cargo test -p dpdk-net-core --test engine_smoke -- --nocapture
 ```
 
 ## L2/L3 integration tests (require DPDK TAP and root)
 
 ```sh
-sudo -E RESD_NET_TEST_TAP=1 cargo test -p resd-net-core --test l2_l3_tap -- --nocapture
+sudo -E DPDK_NET_TEST_TAP=1 cargo test -p dpdk-net-core --test l2_l3_tap -- --nocapture
 ```
 
 ## TCP handshake + echo integration test (requires DPDK TAP + root)
 
 ```sh
-sudo -E RESD_NET_TEST_TAP=1 cargo test -p resd-net-core --test tcp_basic_tap -- --nocapture
+sudo -E DPDK_NET_TEST_TAP=1 cargo test -p dpdk-net-core --test tcp_basic_tap -- --nocapture
 ```

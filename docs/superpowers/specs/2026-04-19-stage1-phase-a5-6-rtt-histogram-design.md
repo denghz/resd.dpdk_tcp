@@ -12,18 +12,18 @@
 
 A5.6 adds a per-connection RTT histogram so the application can observe RTT distribution shape over any window size it chooses, without per-sample event overhead and without lossy scalar aggregation.
 
-**Motivation**: A5.5's `resd_net_conn_stats()` exposes current smoothed SRTT / RTTVAR / min_RTT — good for per-order tagging, but RTTVAR collapses spike variance into one number and SRTT loses distribution tail shape. Full per-sample event streaming (gated by a flag) was considered and rejected as too expensive at trading segment rates. A coarse lifetime histogram captures distribution shape while remaining bounded-cost at any sample rate.
+**Motivation**: A5.5's `dpdk_net_conn_stats()` exposes current smoothed SRTT / RTTVAR / min_RTT — good for per-order tagging, but RTTVAR collapses spike variance into one number and SRTT loses distribution tail shape. Full per-sample event streaming (gated by a flag) was considered and rejected as too expensive at trading segment rates. A coarse lifetime histogram captures distribution shape while remaining bounded-cost at any sample rate.
 
 **Use case**: app polls the histogram at its own cadence (typically 1-minute windows for session-health monitoring, finer for incident forensics). Delta between two snapshots = RTT distribution over that window. Sample-rate-independent: a window with 10 samples or 10 million samples still costs 64 bytes to read.
 
 In scope:
 - **16 log-spaced `u32` buckets per `TcpConn`** (exactly 64 B — one cacheline).
-- **Runtime-configurable bucket edges** via a new `resd_net_engine_config_t` field.
-- **New extern "C" getter** `resd_net_conn_rtt_histogram`.
+- **Runtime-configurable bucket edges** via a new `dpdk_net_engine_config_t` field.
+- **New extern "C" getter** `dpdk_net_conn_rtt_histogram`.
 - **Wraparound semantics** documented: app takes delta via `wrapping_sub` on a per-bucket basis. Correct as long as a single bucket does not accumulate > 2³² samples between app polls — trivially satisfied for any realistic polling cadence.
 
 Out of scope:
-- Per-sample RTT events (`RESD_NET_EVT_RTT_SAMPLE`) — deferred; histogram covers the stated minute-to-hour-scale use case more cheaply.
+- Per-sample RTT events (`DPDK_NET_EVT_RTT_SAMPLE`) — deferred; histogram covers the stated minute-to-hour-scale use case more cheaply.
 - Raw-samples ring — deferred; the user-facing analytical need (distribution shape over time windows) is met by the histogram without per-sample storage.
 - Engine-wide / global histogram — per-conn is the useful granularity; engine-wide can be computed by summing per-conn if ever needed.
 - Bucket-edge changes mid-session — edges are fixed at `engine_create`; changing them would invalidate accumulated counts.
@@ -33,21 +33,21 @@ Out of scope:
 
 ## 2. Module layout
 
-### 2.1 Modified modules (`crates/resd-net-core/src/`)
+### 2.1 Modified modules (`crates/dpdk-net-core/src/`)
 
 | Module | Change |
 |---|---|
 | `tcp_conn.rs` | Add `rtt_histogram: [u32; 16]` field on `TcpConn` (64 B inline; zero-init). Add `rtt_histogram_update(&mut self, rtt_us: u32, edges: &[u32; 15])` method that selects the bucket via a 15-comparison ladder (or binary search — equivalent at N=16 for the branch predictor) and `wrapping_add(1)` the chosen `u32`. `wrapping_add` is used so each bucket silently rolls over without panicking; the application's differencing of two snapshots via `wrapping_sub` is correct as long as no bucket sees > 2³² samples between polls. |
 | `tcp_input.rs` | One-line addition inside the existing `rtt_est.sample(rtt_us)` call site (A5): immediately after the existing `tcp.rtt_samples++`, call `conn.rtt_histogram_update(rtt_us, &engine.rtt_histogram_edges)`. Cost: 15-comparison ladder + one `wrapping_add`. No atomics (per-conn state, single-lcore RTC model). |
-| `engine.rs` | Store `rtt_histogram_edges: [u32; 15]` on the `Engine` struct, initialized from `resd_net_engine_config_t::rtt_histogram_bucket_edges_us[15]` at `engine_create`. Validation: all-zero input means "use defaults"; otherwise require strictly monotonically increasing edges (each `edges[i] < edges[i+1]`), reject with `-EINVAL` at `engine_create`. |
+| `engine.rs` | Store `rtt_histogram_edges: [u32; 15]` on the `Engine` struct, initialized from `dpdk_net_engine_config_t::rtt_histogram_bucket_edges_us[15]` at `engine_create`. Validation: all-zero input means "use defaults"; otherwise require strictly monotonically increasing edges (each `edges[i] < edges[i+1]`), reject with `-EINVAL` at `engine_create`. |
 
-### 2.2 Modified modules (`crates/resd-net/src/`)
+### 2.2 Modified modules (`crates/dpdk-net/src/`)
 
 | Module | Change |
 |---|---|
-| `api.rs` | Add `resd_net_engine_config_t::rtt_histogram_bucket_edges_us[15]` (15 × `uint32_t`, 60 B; all-zero = use defaults). Add POD struct `resd_net_tcp_rtt_histogram_t { uint32_t bucket[16] }` (64 B, one cacheline). Add extern "C" function `resd_net_conn_rtt_histogram(engine, conn, out) → i32` returning 0 on success, `-ENOENT` on unknown handle. |
-| `lib.rs` | Implement `resd_net_conn_rtt_histogram`: flow-table lookup, `std::ptr::write` the 16-entry array into the caller's out struct. Slow-path — safe per-order for forensic tagging, safe per-minute for session-health polling; do not call in a per-segment loop. |
-| `include/resd_net.h` (cbindgen-regenerated) | New struct `resd_net_tcp_rtt_histogram_t`. New function `resd_net_conn_rtt_histogram`. New engine config field `rtt_histogram_bucket_edges_us[15]`. |
+| `api.rs` | Add `dpdk_net_engine_config_t::rtt_histogram_bucket_edges_us[15]` (15 × `uint32_t`, 60 B; all-zero = use defaults). Add POD struct `dpdk_net_tcp_rtt_histogram_t { uint32_t bucket[16] }` (64 B, one cacheline). Add extern "C" function `dpdk_net_conn_rtt_histogram(engine, conn, out) → i32` returning 0 on success, `-ENOENT` on unknown handle. |
+| `lib.rs` | Implement `dpdk_net_conn_rtt_histogram`: flow-table lookup, `std::ptr::write` the 16-entry array into the caller's out struct. Slow-path — safe per-order for forensic tagging, safe per-minute for session-health polling; do not call in a per-segment loop. |
+| `include/dpdk_net.h` (cbindgen-regenerated) | New struct `dpdk_net_tcp_rtt_histogram_t`. New function `dpdk_net_conn_rtt_histogram`. New engine config field `rtt_histogram_bucket_edges_us[15]`. |
 
 ### 2.3 Dependencies introduced
 
@@ -117,21 +117,21 @@ Documented contract in the cbindgen-emitted header's doc-comment on the struct:
 /// x86_64 (single-lcore engine model; the application reads from the same
 /// thread that writes). Do not read from a different thread than the engine's
 /// poll thread.
-typedef struct resd_net_tcp_rtt_histogram {
+typedef struct dpdk_net_tcp_rtt_histogram {
     uint32_t bucket[16];
-} resd_net_tcp_rtt_histogram_t;
+} dpdk_net_tcp_rtt_histogram_t;
 ```
 
 ### 3.4 Application use pattern
 
 ```c
 // Once at startup:
-resd_net_tcp_rtt_histogram_t prev;
-resd_net_conn_rtt_histogram(engine, conn, &prev);
+dpdk_net_tcp_rtt_histogram_t prev;
+dpdk_net_conn_rtt_histogram(engine, conn, &prev);
 
 // Periodic (e.g., every 60 s):
-resd_net_tcp_rtt_histogram_t cur;
-resd_net_conn_rtt_histogram(engine, conn, &cur);
+dpdk_net_tcp_rtt_histogram_t cur;
+dpdk_net_conn_rtt_histogram(engine, conn, &cur);
 uint32_t delta[16];
 for (int i = 0; i < 16; ++i) {
     delta[i] = cur.bucket[i] - prev.bucket[i];   // wrapping_sub, correct under overflow
@@ -144,15 +144,15 @@ prev = cur;
 
 ## 4. Counter surface
 
-The histogram lives on `TcpConn` and is read via the new getter — it does NOT extend `resd_net_counters_t`. Rationale: `resd_net_counters_t` is engine-wide; the histogram is per-connection. Mixing per-conn data into the engine-wide counter struct would break the model. The getter-based access pattern matches A5.5's `resd_net_conn_stats()`.
+The histogram lives on `TcpConn` and is read via the new getter — it does NOT extend `dpdk_net_counters_t`. Rationale: `dpdk_net_counters_t` is engine-wide; the histogram is per-connection. Mixing per-conn data into the engine-wide counter struct would break the model. The getter-based access pattern matches A5.5's `dpdk_net_conn_stats()`.
 
-No new fields on `resd_net_counters_t`.
+No new fields on `dpdk_net_counters_t`.
 
 ---
 
 ## 5. Config / API surface changes
 
-### 5.1 `resd_net_engine_config_t` (additions)
+### 5.1 `dpdk_net_engine_config_t` (additions)
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
@@ -161,18 +161,18 @@ No new fields on `resd_net_counters_t`.
 ### 5.2 New POD struct
 
 ```c
-typedef struct resd_net_tcp_rtt_histogram {
+typedef struct dpdk_net_tcp_rtt_histogram {
     uint32_t bucket[16];    // exactly 64 B / one cacheline
-} resd_net_tcp_rtt_histogram_t;
+} dpdk_net_tcp_rtt_histogram_t;
 ```
 
 ### 5.3 New extern "C" function
 
 ```c
-int resd_net_conn_rtt_histogram(
-    resd_net_engine* engine,
+int dpdk_net_conn_rtt_histogram(
+    dpdk_net_engine* engine,
     uint64_t conn,
-    resd_net_tcp_rtt_histogram_t* out
+    dpdk_net_tcp_rtt_histogram_t* out
 );
 ```
 
@@ -199,14 +199,14 @@ None. A5.6 adds observability only; no RFC clauses are touched. mTCP does not ex
 
 1. **Distribution shape** — establish a connection, drive N RTT samples with controlled values spanning three buckets; poll histogram; assert exact sample counts in the three expected buckets and zero elsewhere.
 2. **Minute-window delta** — poll histogram at t=0, drive M samples, poll at t=60s; assert `cur[i] - prev[i]` (wrapping) matches the generated distribution for each bucket.
-3. **Unknown handle** — `resd_net_conn_rtt_histogram(engine, 0xdead_beef, &out)` returns `-ENOENT`, `out` unchanged.
+3. **Unknown handle** — `dpdk_net_conn_rtt_histogram(engine, 0xdead_beef, &out)` returns `-ENOENT`, `out` unchanged.
 4. **Null out** — returns `-EINVAL`, no crash.
 5. **Overlapped histograms** — two concurrent connections accumulate independent histograms; polling one does not affect the other's counts.
 6. **Post-A5.5 integration** — `stats().srtt_us` and `rtt_histogram` are both populated from the same sample path; after N samples, `srtt_us > 0` implies at least one `bucket[i] > 0`.
 
 ### 7.3 A8 counter-coverage + knob-coverage entries
 
-- Counter-coverage: the 16 histogram buckets are *not* in `resd_net_counters_t` (they're per-conn, not engine-wide), so the existing counter-coverage audit does not reach them. Add a sibling audit in `tests/per-conn-histogram-coverage.rs`: require at least one scenario that drives each of the 16 buckets > 0 (achievable with a single test that sweeps RTT across the bucket range).
+- Counter-coverage: the 16 histogram buckets are *not* in `dpdk_net_counters_t` (they're per-conn, not engine-wide), so the existing counter-coverage audit does not reach them. Add a sibling audit in `tests/per-conn-histogram-coverage.rs`: require at least one scenario that drives each of the 16 buckets > 0 (achievable with a single test that sweeps RTT across the bucket range).
 - Knob-coverage: `rtt_histogram_bucket_edges_us` (engine-wide) — scenario: override defaults with a tight custom edge set, assert distribution lands in the custom buckets (not the defaults).
 
 ---
@@ -224,7 +224,7 @@ None. A5.6 adds observability only; no RFC clauses are touched. mTCP does not ex
 
 1. `rtt_histogram: [u32; 16]` field on `TcpConn` + `rtt_histogram_update` method + unit tests (bucket selection + wraparound). (1)
 2. `Engine::rtt_histogram_edges` + `engine_create` validation + integration into `rtt_est.sample()` call site in `tcp_input.rs`. (1)
-3. `resd_net_tcp_rtt_histogram_t` POD + extern "C" `resd_net_conn_rtt_histogram` + integration tests 7.2.1–7.2.6 + mTCP + RFC review reports + A8 audit entries. (1)
+3. `dpdk_net_tcp_rtt_histogram_t` POD + extern "C" `dpdk_net_conn_rtt_histogram` + integration tests 7.2.1–7.2.6 + mTCP + RFC review reports + A8 audit entries. (1)
 
 Each task is surgical, touches one concern, carries its own tests.
 
@@ -234,8 +234,8 @@ Each task is surgical, touches one concern, carries its own tests.
 
 Small edits in the same commit as A5.6's final task:
 
-- §4 API: add `resd_net_conn_rtt_histogram` under the introspection paragraph (alongside `resd_net_conn_stats` from A5.5).
-- §9.1 counter examples: note that per-conn RTT histogram lives on `TcpConn` read via the getter, not in `resd_net_counters_t`.
+- §4 API: add `dpdk_net_conn_rtt_histogram` under the introspection paragraph (alongside `dpdk_net_conn_stats` from A5.5).
+- §9.1 counter examples: note that per-conn RTT histogram lives on `TcpConn` read via the getter, not in `dpdk_net_counters_t`.
 
 ---
 
@@ -252,5 +252,5 @@ Small edits in the same commit as A5.6's final task:
 
 - **Default edge set** (§3.2): 15 edges chosen for trading-exchange RTT ranges. If profiling on a real workload shows mass outside the chosen buckets, edges can be tuned at the default level before A5.6 ships. Users override via the config field regardless.
 - **`TcpConn` cacheline placement**: decide during implementation whether to align `rtt_histogram` on its own cacheline or accept co-location with nearby fields. Depends on post-A5.5 `TcpConn` layout and which fields are hot on the ACK path vs the histogram-write path.
-- **Engine-wide summary** (optional): if applications commonly want engine-wide RTT distribution (sum across all conns), a helper `resd_net_engine_rtt_histogram` could sum the 16 buckets across all live conns on demand. Out of A5.6 scope; revisit if requested.
-- **Post-A5.6 sibling `RESD_NET_EVT_RTT_SAMPLE` event**: still deferred. A5.6's histogram covers the minute-to-hour observability need; per-sample events stay in the "add if a specific use case surfaces" bucket.
+- **Engine-wide summary** (optional): if applications commonly want engine-wide RTT distribution (sum across all conns), a helper `dpdk_net_engine_rtt_histogram` could sum the 16 buckets across all live conns on demand. Out of A5.6 scope; revisit if requested.
+- **Post-A5.6 sibling `DPDK_NET_EVT_RTT_SAMPLE` event**: still deferred. A5.6's histogram covers the minute-to-hour observability need; per-sample events stay in the "add if a specific use case surfaces" bucket.

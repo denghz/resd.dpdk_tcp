@@ -8,15 +8,15 @@
 ## Scope
 
 Our files reviewed:
-- `crates/resd-net-core/src/tcp_events.rs` (soft-cap + drop-oldest queue, `emitted_ts_ns` on every variant, counter wiring)
-- `crates/resd-net-core/src/counters.rs` (`ObsCounters` group; `tcp.tx_tlp_spurious`)
-- `crates/resd-net-core/src/tcp_tlp.rs` (`TlpConfig` POD; `pto_us(srtt, &cfg, flight_size)` with FlightSize-1 penalty per RFC 8985 §7.2)
-- `crates/resd-net-core/src/tcp_conn.rs` (5 TLP knob fields; 4 runtime state fields; `syn_tx_ts_ns`; `ConnStats` POD + `stats()`; `tlp_arm_gate_passes`; `tlp_config`; `maybe_seed_srtt_from_syn`; `attribute_dsack_to_recent_tlp_probe`)
-- `crates/resd-net-core/src/engine.rs` (`on_rto_fire` §6.3 `RACK_mark_losses_on_RTO` pass; `send_bytes` calls `arm_tlp_pto`; emission-time push wiring; `syn_tx_ts_ns` stamp in `emit_syn` gated by `syn_retrans_count == 0`)
-- `crates/resd-net-core/src/tcp_input.rs` (`handle_syn_sent` seeds SRTT-from-SYN; DSACK path attributes to recent TLP probes)
-- `crates/resd-net-core/src/tcp_rack.rs` (new `rack_mark_losses_on_rto` pure helper)
-- `crates/resd-net-core/src/flow_table.rs` (`get_stats(handle, send_buffer_bytes)` slow-path getter)
-- `crates/resd-net/src/api.rs` + `crates/resd-net/src/lib.rs` (`event_queue_soft_cap` validation; 5 `tlp_*` connect opts validation; `resd_net_conn_stats` extern + `resd_net_conn_stats_t` POD)
+- `crates/dpdk-net-core/src/tcp_events.rs` (soft-cap + drop-oldest queue, `emitted_ts_ns` on every variant, counter wiring)
+- `crates/dpdk-net-core/src/counters.rs` (`ObsCounters` group; `tcp.tx_tlp_spurious`)
+- `crates/dpdk-net-core/src/tcp_tlp.rs` (`TlpConfig` POD; `pto_us(srtt, &cfg, flight_size)` with FlightSize-1 penalty per RFC 8985 §7.2)
+- `crates/dpdk-net-core/src/tcp_conn.rs` (5 TLP knob fields; 4 runtime state fields; `syn_tx_ts_ns`; `ConnStats` POD + `stats()`; `tlp_arm_gate_passes`; `tlp_config`; `maybe_seed_srtt_from_syn`; `attribute_dsack_to_recent_tlp_probe`)
+- `crates/dpdk-net-core/src/engine.rs` (`on_rto_fire` §6.3 `RACK_mark_losses_on_RTO` pass; `send_bytes` calls `arm_tlp_pto`; emission-time push wiring; `syn_tx_ts_ns` stamp in `emit_syn` gated by `syn_retrans_count == 0`)
+- `crates/dpdk-net-core/src/tcp_input.rs` (`handle_syn_sent` seeds SRTT-from-SYN; DSACK path attributes to recent TLP probes)
+- `crates/dpdk-net-core/src/tcp_rack.rs` (new `rack_mark_losses_on_rto` pure helper)
+- `crates/dpdk-net-core/src/flow_table.rs` (`get_stats(handle, send_buffer_bytes)` slow-path getter)
+- `crates/dpdk-net/src/api.rs` + `crates/dpdk-net/src/lib.rs` (`event_queue_soft_cap` validation; 5 `tlp_*` connect opts validation; `dpdk_net_conn_stats` extern + `dpdk_net_conn_stats_t` POD)
 
 mTCP files referenced (for scope-comparison; no behavioral analog expected):
 - `third_party/mtcp/mtcp/src/eventpoll.c` — fixed-size epoll event queue; overflow prints `TRACE_ERROR` and returns `-1` (no drop-oldest, no counter)
@@ -30,13 +30,13 @@ Spec sections in scope: design spec §3.1 (emission-time events), §3.2 (queue s
 ### Topic 1 — Event-queue overflow accounting (A5.5 tasks 3-4-5)
 
 - mTCP `eventpoll.c:596-602` (`raise_pending_streams`): on `eq->num_events >= eq->size`, emits `TRACE_ERROR` to stderr and returns `-1`. No drop-oldest, no counter, no high-water gauge.
-- Ours `tcp_events.rs:121-132` (`EventQueue::push`): drops oldest event on overflow, bumps `obs.events_dropped`, latches `obs.events_queue_high_water` via `fetch_max`. `with_cap` asserts `cap >= 64` (mirrored by `-EINVAL` at `resd_net_engine_create` entry).
+- Ours `tcp_events.rs:121-132` (`EventQueue::push`): drops oldest event on overflow, bumps `obs.events_dropped`, latches `obs.events_queue_high_water` via `fetch_max`. `with_cap` asserts `cap >= 64` (mirrored by `-EINVAL` at `dpdk_net_engine_create` entry).
 - **Classification: scope-difference.** mTCP has no analog; its overflow behaviour (hard error, fail the push, silent stderr line) is a known limitation of the reference code. No behavioral divergence finding; no AD needed — this is a net-positive addition in our stack.
 
 ### Topic 2 — Per-connection stats getter (A5.5 tasks 6-7)
 
 - mTCP has no per-connection stats projection API. Introspection is confined to `TRACE_*` macros compiled out at release builds.
-- Ours `flow_table.rs:87-89` + `resd-net/src/lib.rs:353-` (`resd_net_conn_stats`): slow-path 9-field POD (`snd_una`, `snd_nxt`, `snd_wnd`, `send_buf_bytes_pending`, `send_buf_bytes_free`, `srtt_us`, `rttvar_us`, `min_rtt_us`, `rto_us`). `-EINVAL` on null engine/out, `-ENOENT` on unknown handle, `0` on success.
+- Ours `flow_table.rs:87-89` + `dpdk-net/src/lib.rs:353-` (`dpdk_net_conn_stats`): slow-path 9-field POD (`snd_una`, `snd_nxt`, `snd_wnd`, `send_buf_bytes_pending`, `send_buf_bytes_free`, `srtt_us`, `rttvar_us`, `min_rtt_us`, `rto_us`). `-EINVAL` on null engine/out, `-ENOENT` on unknown handle, `0` on success.
 - **Classification: scope-difference.** No AD needed.
 
 ### Topic 3 — TLP tuning knobs + multi-probe budget + DSACK spurious-probe attribution (A5.5 tasks 9-12)

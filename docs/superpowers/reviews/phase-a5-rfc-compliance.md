@@ -8,18 +8,18 @@
 ## Scope
 
 - Our files reviewed:
-  - `crates/resd-net-core/src/siphash24.rs`
-  - `crates/resd-net-core/src/iss.rs`
-  - `crates/resd-net-core/src/tcp_rtt.rs`
-  - `crates/resd-net-core/src/tcp_rack.rs`
-  - `crates/resd-net-core/src/tcp_tlp.rs`
-  - `crates/resd-net-core/src/tcp_retrans.rs`
-  - `crates/resd-net-core/src/tcp_timer_wheel.rs`
-  - `crates/resd-net-core/src/tcp_input.rs` (RTT sampling, RACK/DSACK passes, strict dup_ack, WS-clamp log)
-  - `crates/resd-net-core/src/tcp_options.rs` (WS>14 parser clamp)
-  - `crates/resd-net-core/src/tcp_conn.rs` (new A5 fields)
-  - `crates/resd-net-core/src/engine.rs` (send_bytes retrans-list, retransmit primitive, RTO/TLP/SYN-retrans fire handlers, force_close_etimedout, MULTI_SEGS offload wiring)
-  - `crates/resd-net-core/src/counters.rs` (new slow-path counters)
+  - `crates/dpdk-net-core/src/siphash24.rs`
+  - `crates/dpdk-net-core/src/iss.rs`
+  - `crates/dpdk-net-core/src/tcp_rtt.rs`
+  - `crates/dpdk-net-core/src/tcp_rack.rs`
+  - `crates/dpdk-net-core/src/tcp_tlp.rs`
+  - `crates/dpdk-net-core/src/tcp_retrans.rs`
+  - `crates/dpdk-net-core/src/tcp_timer_wheel.rs`
+  - `crates/dpdk-net-core/src/tcp_input.rs` (RTT sampling, RACK/DSACK passes, strict dup_ack, WS-clamp log)
+  - `crates/dpdk-net-core/src/tcp_options.rs` (WS>14 parser clamp)
+  - `crates/dpdk-net-core/src/tcp_conn.rs` (new A5 fields)
+  - `crates/dpdk-net-core/src/engine.rs` (send_bytes retrans-list, retransmit primitive, RTO/TLP/SYN-retrans fire handlers, force_close_etimedout, MULTI_SEGS offload wiring)
+  - `crates/dpdk-net-core/src/counters.rs` (new slow-path counters)
 - Spec §6.3 rows verified: RFC 6298 (RTO), RFC 8985 (RACK-TLP), RFC 6528 (ISS), RFC 5681 (dup_ack strict close), RFC 2883 (DSACK visibility), RFC 7323 (WS carry-over close).
 - Spec §6.4 deviations touched:
   - minRTO 5 ms row (trading latency)
@@ -35,21 +35,21 @@
 
 - [x] **F-1** — RACK.min_RTT is never updated — RFC 8985 §6.2 Step 1 MUST is elided, not deviated
   - RFC clause: `docs/rfcs/rfc8985.txt:638-644` — "Step 1: Update RACK.min_RTT. Use the RTT measurements obtained via [RFC6298] or [RFC7323] to update the estimated minimum RTT in RACK.min_RTT."
-  - Our code: `crates/resd-net-core/src/tcp_rack.rs:41-45` defines `update_min_rtt()` but `crates/resd-net-core/src/tcp_input.rs:645-691` never calls it from the ACK-processing RACK pass. `rack.min_rtt_us` is initialized to 0 in `RackState::default()` and stays 0 for the entire connection lifetime.
+  - Our code: `crates/dpdk-net-core/src/tcp_rack.rs:41-45` defines `update_min_rtt()` but `crates/dpdk-net-core/src/tcp_input.rs:645-691` never calls it from the ACK-processing RACK pass. `rack.min_rtt_us` is initialized to 0 in `RackState::default()` and stays 0 for the entire connection lifetime.
   - Why this violates: Step 1 is a MUST-worded procedural step in the RACK algorithm. Independently, the downstream consequence is that `compute_reo_wnd_us(false, 0, Some(srtt))` in `tcp_rack.rs:77-84` computes `min(srtt/4, 0/2).max(1_000) = 0.max(1_000) = 1_000`, so `reo_wnd_us` is pinned at the 1 ms floor regardless of SRTT, defeating the adaptive aspect of RACK the spec §6.3 row for RFC 8985 claims to implement. This is not the pre-declared "compute_reo_wnd formula deviation" — that accepted deviation assumed `min_rtt` was populated.
   - Proposed fix: In `tcp_input.rs` RACK block, after the cum-ACK advance and RTT sampling, call `conn.rack.update_min_rtt(rtt_us)` using the same `rtt_us` that was fed into `conn.rtt_est.sample(rtt_us)` (either TS-derived or Karn's-derived). A single call per ACK that produced `rtt_sample_taken == true`.
   - **Closed in commit `eb5467b`** — `conn.rack.update_min_rtt(rtt)` now wired in both TS-source and Karn's RTT sampling branches.
 
 - [x] **F-2** — TLP §7.3 pre-fire MUST conditions skipped; TLP.end_seq / TLP.is_retrans never tracked
   - RFC clause: `docs/rfcs/rfc8985.txt:984-1003` — "When the PTO timer expires, the sender MUST check whether both of the following conditions are met before sending a loss probe: 1. First, there is no other previous loss probe still in flight… 2. Second, the sender has obtained an RTT measurement since the last loss probe transmission… If either one of these two conditions is not met, then the sender MUST skip sending a loss probe and MUST proceed to re-arm the RTO timer."
-  - Our code: `crates/resd-net-core/src/engine.rs:940-1005` `on_tlp_fire` checks `fired_id` currency + non-empty `snd_retrans` only. `TLP.end_seq` and `TLP.is_retrans` fields (RFC §5.3) are not present on `TcpConn` (see `tcp_conn.rs:174-253` A5 additions). No RTT-sample-since-last-probe guard.
+  - Our code: `crates/dpdk-net-core/src/engine.rs:940-1005` `on_tlp_fire` checks `fired_id` currency + non-empty `snd_retrans` only. `TLP.end_seq` and `TLP.is_retrans` fields (RFC §5.3) are not present on `TcpConn` (see `tcp_conn.rs:174-253` A5 additions). No RTT-sample-since-last-probe guard.
   - Why this violates: Both §7.3 condition checks are MUST-worded. The `tlp_timer_id.is_none()` schedule-time gate at `engine.rs:1555-1584` partially covers condition 1 (we won't have two PTO timers armed simultaneously) but does not guarantee "no previous probe in flight" — a probe can be in flight awaiting its ACK while we schedule another PTO after a subsequent send.
   - Proposed fix: Add `tlp_end_seq: Option<u32>` and `tlp_is_retrans: bool` to `TcpConn`. In `on_tlp_fire` Phase 1, gate the probe on `tlp_end_seq.is_none() && rtt_sample_since_last_probe`. On ACK (tcp_input.rs), clear `tlp_end_seq` per §7.4 `TLP_process_ack`. Track `rtt_sample_since_last_probe` via a per-conn counter/flag reset on TLP send.
   - **Promoted to Accepted Deviation (Stage 2)** — see AD-15 below. Justification: TLP pre-fire state (TLP.end_seq, TLP.is_retrans per RFC 8985 §7.3 steps 4-6) is deferred to Stage 2. Stage 1 implements the PTO + probe-selection + basic fire flow but not the full ACK-coalesce interlocks. Pragmatic impact: occasional redundant probe on overlapping ACK; no correctness issue.
 
 - [x] **F-3** — RACK Step 2 spurious-retransmit guard is missing — RFC 8985 §6.2 Step 2 MUST
   - RFC clause: `docs/rfcs/rfc8985.txt:656-669` — "To avoid spurious inferences, ignore a segment as invalid if any of its sequence range has been retransmitted before and if either of two conditions is true: 1. The Timestamp Echo Reply field (TSecr) of the ACK's timestamp option [RFC7323], if available, indicates the ACK was not acknowledging the last retransmission of the segment. 2. The segment was last retransmitted less than RACK.min_rtt ago."
-  - Our code: `crates/resd-net-core/src/tcp_input.rs:650-656` iterates `snd_retrans` and calls `conn.rack.update_on_ack(e_.xmit_ts_ns, end_seq)` for every sacked/cum-acked entry unconditionally. `RetransEntry.xmit_count` is available to detect retransmits (`xmit_count > 1`) but is not consulted, nor is the ACK's TSecr vs `xmit_ts` or the `min_rtt` age check.
+  - Our code: `crates/dpdk-net-core/src/tcp_input.rs:650-656` iterates `snd_retrans` and calls `conn.rack.update_on_ack(e_.xmit_ts_ns, end_seq)` for every sacked/cum-acked entry unconditionally. `RetransEntry.xmit_count` is available to detect retransmits (`xmit_count > 1`) but is not consulted, nor is the ACK's TSecr vs `xmit_ts` or the `min_rtt` age check.
   - Why this violates: RFC §6.2 Step 2 explicitly enumerates this as a MUST-guarded invariant on `RACK_update()`. Without it, an ACK for an original transmission of a retransmitted segment will push the retransmit's `xmit_ts_ns` into `rack.xmit_ts_ns`, which then causes all genuinely older segments to be declared lost when §6.2 Step 5 runs. In trading RTTs (sub-ms) the practical risk is low, but the MUST is literal.
   - Proposed fix: In `tcp_input.rs:650-656`, gate `update_on_ack` behind `e_.xmit_count == 1 || (tsecr_valid && tsecr >= (e_.xmit_ts_ns / ts_granularity)) || (now_ns - e_.xmit_ts_ns >= rack.min_rtt_us * 1000)`. The simplest Stage-1 approximation is `e_.xmit_count == 1` — the timestamp / min-rtt branches are extra conservatism for retransmitted segments.
   - **Promoted to Accepted Deviation (Stage 2)** — see AD-16 below. Justification: RFC 8985 §6.2 Step 2 TSecr/DSACK guard is deferred to Stage 2 alongside the full DSACK adaptation. Currently `rack.xmit_ts/end_seq` is updated on any newly-acked-or-sacked segment without the spurious-retrans filter. Impact: false-positive RACK marks possible on peer-reorder or retransmit races; conservative impact in a Stage 1 trading client where reordering is rare.
@@ -58,14 +58,14 @@
 
 - [x] **S-1** — RFC 8985 §6.3 `RACK_mark_losses_on_RTO` not implemented on RTO fire
   - RFC clause: `docs/rfcs/rfc8985.txt:907-919` — "RACK_mark_losses_on_RTO(): For each segment, Segment, not acknowledged yet: If SEG.SEQ == SND.UNA OR Segment.xmit_ts + RACK.rtt + RACK.reo_wnd - Now() <= 0: Segment.lost = TRUE"
-  - Our code: `crates/resd-net-core/src/engine.rs:803-922` `on_rto_fire` retransmits only the single front entry (index 0) and does not walk the remaining `snd_retrans` entries marking them lost per §6.3.
+  - Our code: `crates/dpdk-net-core/src/engine.rs:803-922` `on_rto_fire` retransmits only the single front entry (index 0) and does not walk the remaining `snd_retrans` entries marking them lost per §6.3.
   - Why not deferred: This is a documented RFC 8985 step that complements RFC 6298 §5.4 ("retransmit the earliest segment"). Subsequent ACKs will catch the lost-flag propagation via §6.2 Step 5, so the observable behavior recovers eventually, but the spec §6.3 compliance matrix row for RFC 8985 claims "primary loss-detection path" which implies §6.3 is covered. Not in spec §6.4.
   - Proposed fix: Add a §6.3 pass at the top of `on_rto_fire` Phase 3 before `self.retransmit(handle, 0)` — iterate `snd_retrans` entries and for each unacked, unsacked segment, set `entry.lost = true` if `entry.seq == snd.una` or the age check passes. The engine loop at `engine.rs:1467-1491` already handles retransmit-per-lost-index via `outcome.rack_lost_indexes`; either route the RTO-phase lost-index list through a similar code path or retransmit inline here.
   - **Promoted to Accepted Deviation (Stage 2)** — see AD-17 below. Justification: RFC 8985 §6.3 RACK mark-losses-on-RTO pass not invoked in `on_rto_fire`. Rationale: Stage 1 RTO retransmits the front segment; RACK's detect-lost pass on the next ACK covers the rest. Functional equivalence with slightly more retransmit traffic under pathological loss bursts; spec §6.5 deviation acknowledged.
 
 - [x] **S-2** — RFC 6298 §5.3 RTO restart on partial-ACK (lazy re-arm policy) deviation
   - RFC clause: `docs/rfcs/rfc6298.txt:252-254` — "(5.3) When an ACK is received that acknowledges new data, restart the retransmission timer so that it will expire after RTO seconds (for the current value of RTO)."
-  - Our code: `crates/resd-net-core/src/engine.rs:1505-1547` — on ACK that advances `snd_una`, we prune `snd_retrans` and cancel the RTO timer ONLY when both `snd_retrans.is_empty()` AND `snd_una == snd_nxt`. A partial-ACK keeps the existing RTO timer running at its pre-ACK deadline; we never cancel+rearm.
+  - Our code: `crates/dpdk-net-core/src/engine.rs:1505-1547` — on ACK that advances `snd_una`, we prune `snd_retrans` and cancel the RTO timer ONLY when both `snd_retrans.is_empty()` AND `snd_una == snd_nxt`. A partial-ACK keeps the existing RTO timer running at its pre-ACK deadline; we never cancel+rearm.
   - Why not deferred: §5.3 sits in the "RECOMMENDED algorithm for managing the retransmission timer" (§5 preamble at `rfc6298.txt:241`), so it's effectively a strong SHOULD. The plan spec §6.5 says: "RTO timer re-arm: lazy. On ACK, update snd.una; the existing wheel entry fires at its originally-scheduled deadline." This implementation choice is explicitly articulated in spec §6.5 as a lazy policy — aligning with Linux TCP practice — but the spec §6.4 deviations table does NOT have a row for it.
   - Proposed fix: **Promote to an Accepted-deviation entry in spec §6.4** with rationale: "Lazy re-arm avoids remove+insert on every ACK; the existing deadline provides the RFC 6298 §5 MUST lower bound (never retransmit earlier than one RTO after previous transmission of that segment); behavior matches Linux TCP. Stage 2 may revisit if spurious retransmits show up in production traces." No code change required if accepted.
   - **Closed in commit `eb5467b`** — RTO now restarts on any ACK advancing snd_una while snd_retrans remains non-empty, per RFC 6298 §5.3 step 5.3.
@@ -75,7 +75,7 @@
 - **AD-1** — RFC 6298 §2.1 initial RTO 1 s → 5 ms default (`tcp_initial_rto_us = 5_000`)
   - RFC clause: `docs/rfcs/rfc6298.txt:122-125` — "Until a round-trip time (RTT) measurement has been made for a segment sent between the sender and receiver, the sender SHOULD set RTO <- 1 second."
   - Spec §6.4 line: `docs/superpowers/specs/2026-04-17-dpdk-tcp-design.md:376` — "minRTO | RFC 6298 RECOMMENDS 1s | **5ms** (tunable)"
-  - Our code behavior: `crates/resd-net-core/src/tcp_rtt.rs:13` `DEFAULT_INITIAL_RTO_US = 5_000`; `engine.rs:239` sets `tcp_initial_rto_us: 5_000` as engine default.
+  - Our code behavior: `crates/dpdk-net-core/src/tcp_rtt.rs:13` `DEFAULT_INITIAL_RTO_US = 5_000`; `engine.rs:239` sets `tcp_initial_rto_us: 5_000` as engine default.
 
 - **AD-2** — RFC 6298 §2.4 minimum RTO 1 s → 5 ms floor (`tcp_min_rto_us = 5_000`)
   - RFC clause: `docs/rfcs/rfc6298.txt:157-158` — "Whenever RTO is computed, if it is less than 1 second, then the RTO SHOULD be rounded up to 1 second."
@@ -94,7 +94,7 @@
 
 - **AD-5** — RFC 9293 MUST-23 R2 ≥3 min for SYN — SYN retrans budget is 4 TXes ≈75 ms
   - RFC clause: `docs/rfcs/rfc9293.txt:2023-2026` — "R2 for a SYN segment MUST be set large enough to provide retransmission of the segment for at least 3 minutes (MUST-23)."
-  - Spec §6.4/§6.5 coverage: `docs/superpowers/specs/2026-04-17-dpdk-tcp-design.md:386` — "SYN retransmit: schedule respects `connect_timeout_ms` from `resd_net_connect_opts_t`. Default: 3 attempts... Never exceed `connect_timeout_ms` in total; the connection fails fast for trading, not per RFC 6298's 1s recommendation." The RFC 9293 MUST-23 note ("application can close the connection sooner") allows caller override; our default is aggressive, but `connect_timeout_ms` is always ≥ our default and upper-bounded only by the caller.
+  - Spec §6.4/§6.5 coverage: `docs/superpowers/specs/2026-04-17-dpdk-tcp-design.md:386` — "SYN retransmit: schedule respects `connect_timeout_ms` from `dpdk_net_connect_opts_t`. Default: 3 attempts... Never exceed `connect_timeout_ms` in total; the connection fails fast for trading, not per RFC 6298's 1s recommendation." The RFC 9293 MUST-23 note ("application can close the connection sooner") allows caller override; our default is aggressive, but `connect_timeout_ms` is always ≥ our default and upper-bounded only by the caller.
   - Our code behavior: `engine.rs:1063-1066` fails with ETIMEDOUT after `syn_retrans_count > 3`; `engine.rs:1077-1082` exponential backoff from `max(initial_rto_us, min_rto_us)`.
 
 - **AD-6** — RFC 6298 §5.7 re-init to 3 s after SYN timer expiration
@@ -105,12 +105,12 @@
 - **AD-7** — RFC 8985 §6.2 Step 5 uses `now - xmit_ts > reo_wnd` (drops `+ RACK.rtt` term)
   - RFC clause: `docs/rfcs/rfc8985.txt:853-858` — "now >= Segment.xmit_ts + RACK.reo_wnd + RACK.rtt" equivalent to "Segment.xmit_ts + RACK.rtt + RACK.reo_wnd - now <= 0"
   - Pre-declared in A5 plan header: "RACK detect_lost uses `now - xmit_ts > reo_wnd` — RFC 8985 §6.2 Step 5 uses `+ RACK.rtt` additive term. Our simplification is more aggressive (declares loss sooner). For sub-ms trading RTTs the impact is minimal."
-  - Our code behavior: `crates/resd-net-core/src/tcp_rack.rs:51-66` `detect_lost` computes `age_ns = now - entry.xmit_ts_ns` and returns `age_ns > reo_wnd_us * 1000`, without adding the RACK.rtt term.
+  - Our code behavior: `crates/dpdk-net-core/src/tcp_rack.rs:51-66` `detect_lost` computes `age_ns = now - entry.xmit_ts_ns` and returns `age_ns > reo_wnd_us * 1000`, without adding the RACK.rtt term.
 
 - **AD-8** — RFC 8985 §6.2 Step 5 `compute_reo_wnd_us` formula deviation (min(srtt/4, min_rtt/2) vs. min(mult·min_RTT/4, SRTT)) + 1 ms floor
   - RFC clause: `docs/rfcs/rfc8985.txt:820` — "Return min(RACK.reo_wnd_mult * RACK.min_RTT / 4, SRTT)"
   - Pre-declared in A5 plan header.
-  - Our code behavior: `crates/resd-net-core/src/tcp_rack.rs:73-85`. (Note: with F-1 open, the reo_wnd is effectively pinned at 1 ms; this AD assumes F-1 is fixed.)
+  - Our code behavior: `crates/dpdk-net-core/src/tcp_rack.rs:73-85`. (Note: with F-1 open, the reo_wnd is effectively pinned at 1 ms; this AD assumes F-1 is fixed.)
 
 - **AD-9** — RFC 8985 §7.2 TLP arm during RACK/SACK recovery
   - RFC clause: `docs/rfcs/rfc8985.txt:935-942` — "the sender SHOULD start or restart a loss probe PTO timer after transmitting new data… unless it is already in fast recovery, RTO recovery, or segments have been SACKed (i.e., RACK.segs_sacked is not zero)."
@@ -135,11 +135,11 @@
 - **AD-13** — RFC 2883 DSACK visibility-only (receiver-side DSACK generation deferred to Stage 2)
   - RFC clause: `docs/rfcs/rfc2018.txt` (referenced from RFC 2883; RFC 2883 is not vendored but is referenced by spec §6.3 SACK row and plan A5 inputs).
   - Pre-declared in A5 plan header: "DSACK detected but no behavioral adaptation (RFC 2883 receive-side; we count via `tcp.rx_dsack` but do not adjust reo_wnd dynamically or run reneging-safe pruning — documented as 'visibility only, adaptation deferred' in §6.5)."
-  - Our code behavior: `crates/resd-net-core/src/tcp_input.rs:389-401` `is_dsack` classifies incoming SACK blocks as DSACK; `tcp_input.rs:530-534` increments `rx_dsack_count` and latches `conn.rack.dsack_seen = true`. No DSACK is emitted in our ACKs (the receiver-side SACK builder in `emit_ack` only reports newly-buffered OOO ranges). No reo_wnd adaptation per RFC 8985 §6.2 Step 4 DSACK path.
+  - Our code behavior: `crates/dpdk-net-core/src/tcp_input.rs:389-401` `is_dsack` classifies incoming SACK blocks as DSACK; `tcp_input.rs:530-534` increments `rx_dsack_count` and latches `conn.rack.dsack_seen = true`. No DSACK is emitted in our ACKs (the receiver-side SACK builder in `emit_ack` only reports newly-buffered OOO ranges). No reo_wnd adaptation per RFC 8985 §6.2 Step 4 DSACK path.
 
 - **AD-14** — Data retransmit budget `tcp_max_retrans_count = 15` (ETIMEDOUT after 15 RTO fires)
   - RFC clause: Not an RFC deviation per se — RFC 6298 uses total-time-budget (R2) not a count; RFC 9293 MUST-20 sets thresholds R1/R2 without specific counts beyond SHLD-10 ("R1 SHOULD correspond to at least 3 retransmissions") and SHLD-11 ("R2 SHOULD correspond to at least 100 seconds").
-  - Spec §6.5 coverage: `docs/superpowers/specs/2026-04-17-dpdk-tcp-design.md:387` — "Data retransmit budget: `tcp_max_retrans_count` (default 15). After this many RTO-driven retransmits of a single segment with no ACK progress, the connection fails with `RESD_NET_EVT_ERROR{err=ETIMEDOUT}`. With backoff + `tcp_max_rto_us=1s`, the total wall-clock budget is ≈8.3s."
+  - Spec §6.5 coverage: `docs/superpowers/specs/2026-04-17-dpdk-tcp-design.md:387` — "Data retransmit budget: `tcp_max_retrans_count` (default 15). After this many RTO-driven retransmits of a single segment with no ACK progress, the connection fails with `DPDK_NET_EVT_ERROR{err=ETIMEDOUT}`. With backoff + `tcp_max_rto_us=1s`, the total wall-clock budget is ≈8.3s."
   - Our code behavior: `engine.rs:878-882` — `xmit_count > tcp_max_retrans_count → force_close_etimedout`.
 
 - **AD-15 (from F-2 promotion)** — TLP pre-fire state machine (TLP.end_seq / TLP.is_retrans) deferred to Stage 2

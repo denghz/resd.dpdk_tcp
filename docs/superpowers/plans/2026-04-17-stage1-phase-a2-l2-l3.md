@@ -4,9 +4,9 @@
 
 **Goal:** Replace the Phase A1 "rx-burst then drop everything" poll loop with real Ethernet + IPv4 decoding, a static-gateway ARP module (with ARP-reply and gratuitous-ARP emission), and ICMP frag-needed handling that drives a per-peer PMTU table. Non-TCP IPv4 packets are counted and dropped; TCP packets are handed to a `tcp_input_stub` that only bumps a counter (real TCP arrives in A3). After this phase the stack is a working L2+L3+ICMP decoder against a TAP pair with counters proving each code path.
 
-**Architecture:** Four new pure-Rust modules in `resd-net-core`: `l2` (Ethernet decode + dst-MAC filter), `l3_ip` (IPv4 decode + checksum verification + fragment drop), `icmp` (type 3/code 4 frag-needed → PMTU update; everything else silently dropped), `arp` (ARP packet decode, ARP-reply build, gratuitous-ARP build, `/proc/net/arp` resolver helper). The `poll_once` loop dispatches `l2_decode → {arp_input, ip_decode → {icmp_input, tcp_input_stub}}`. Gratuitous-ARP emission runs periodically (naïve `last_tsc + interval` check at end of `poll_once` — the real timer wheel arrives in A6). DPDK shim is extended with `rte_pktmbuf_alloc` / `rte_pktmbuf_append` wrappers so Rust can build and transmit our own frames.
+**Architecture:** Four new pure-Rust modules in `dpdk-net-core`: `l2` (Ethernet decode + dst-MAC filter), `l3_ip` (IPv4 decode + checksum verification + fragment drop), `icmp` (type 3/code 4 frag-needed → PMTU update; everything else silently dropped), `arp` (ARP packet decode, ARP-reply build, gratuitous-ARP build, `/proc/net/arp` resolver helper). The `poll_once` loop dispatches `l2_decode → {arp_input, ip_decode → {icmp_input, tcp_input_stub}}`. Gratuitous-ARP emission runs periodically (naïve `last_tsc + interval` check at end of `poll_once` — the real timer wheel arrives in A6). DPDK shim is extended with `rte_pktmbuf_alloc` / `rte_pktmbuf_append` wrappers so Rust can build and transmit our own frames.
 
-**Tech Stack:** same as A1 — Rust stable, DPDK 23.11, bindgen, cbindgen. New: `std::fs` for `/proc/net/arp` parsing; `libc::AF_PACKET` + `SOCK_RAW` in the integration test for crafting frames into `resdtap0`.
+**Tech Stack:** same as A1 — Rust stable, DPDK 23.11, bindgen, cbindgen. New: `std::fs` for `/proc/net/arp` parsing; `libc::AF_PACKET` + `SOCK_RAW` in the integration test for crafting frames into `dpdktap0`.
 
 **Spec reference:** `docs/superpowers/specs/2026-04-17-dpdk-tcp-design.md` §§ 5.1, 6.3 (matrix rows for RFC 791 / 792 / 1122 / 1191), §8 (ARP bullet), §9.1 (IP counter group).
 
@@ -19,7 +19,7 @@
 ## File Structure Created or Modified in This Phase
 
 ```
-crates/resd-net-core/src/
+crates/dpdk-net-core/src/
 ├── lib.rs           (MODIFIED: expose l2, l3_ip, icmp, arp modules)
 ├── counters.rs      (MODIFIED: extend EthCounters + IpCounters)
 ├── engine.rs        (MODIFIED: our_mac/our_ip/gateway fields, new poll_once dispatch)
@@ -29,19 +29,19 @@ crates/resd-net-core/src/
 ├── icmp.rs          (NEW)
 └── arp.rs           (NEW)
 
-crates/resd-net-core/tests/
+crates/dpdk-net-core/tests/
 ├── engine_smoke.rs  (no change — A1 lifecycle test still valid)
 └── l2_l3_tap.rs     (NEW: crafted-frame integration test over TAP pair)
 
-crates/resd-net/src/
-├── lib.rs           (MODIFIED: resd_net_resolve_gateway_mac extern "C")
-└── api.rs           (MODIFIED: extend resd_net_engine_config_t + counter structs)
+crates/dpdk-net/src/
+├── lib.rs           (MODIFIED: dpdk_net_resolve_gateway_mac extern "C")
+└── api.rs           (MODIFIED: extend dpdk_net_engine_config_t + counter structs)
 
-crates/resd-net-sys/
+crates/dpdk-net-sys/
 ├── shim.c           (MODIFIED: rte_pktmbuf_alloc + rte_pktmbuf_append wrappers)
 └── wrapper.h        (MODIFIED: shim prototypes)
 
-include/resd_net.h   (REGENERATED via cbindgen)
+include/dpdk_net.h   (REGENERATED via cbindgen)
 
 examples/cpp-consumer/main.cpp  (MODIFIED: print IP counters)
 
@@ -55,12 +55,12 @@ docs/superpowers/plans/stage1-phase-roadmap.md  (MODIFIED: status update at A2 s
 **Goal:** Add the new counters Phase A2 will write. Reuse `_pad` slots so the ABI size is unchanged; the layout-assertion `const _: ()` in `api.rs` will enforce exact match between core and public structs.
 
 **Files:**
-- Modify: `crates/resd-net-core/src/counters.rs`
-- Modify: `crates/resd-net/src/api.rs`
+- Modify: `crates/dpdk-net-core/src/counters.rs`
+- Modify: `crates/dpdk-net/src/api.rs`
 
 - [ ] **Step 1: Write the failing test**
 
-Append to `crates/resd-net-core/src/counters.rs` (inside `mod tests`):
+Append to `crates/dpdk-net-core/src/counters.rs` (inside `mod tests`):
 
 ```rust
     #[test]
@@ -84,10 +84,10 @@ Append to `crates/resd-net-core/src/counters.rs` (inside `mod tests`):
 
 - [ ] **Step 2: Run the test — verify it fails**
 
-Run: `cargo test -p resd-net-core counters::tests::a2_new_counters_exist_and_zero`
+Run: `cargo test -p dpdk-net-core counters::tests::a2_new_counters_exist_and_zero`
 Expected: FAIL at compile: "no field `rx_drop_short` on `EthCounters`" (and similar for other fields).
 
-- [ ] **Step 3: Extend `EthCounters` and `IpCounters` in `crates/resd-net-core/src/counters.rs`**
+- [ ] **Step 3: Extend `EthCounters` and `IpCounters` in `crates/dpdk-net-core/src/counters.rs`**
 
 Replace the existing `EthCounters` struct:
 
@@ -133,13 +133,13 @@ pub struct IpCounters {
 }
 ```
 
-- [ ] **Step 4: Mirror into public API** — modify `crates/resd-net/src/api.rs`
+- [ ] **Step 4: Mirror into public API** — modify `crates/dpdk-net/src/api.rs`
 
-Replace `resd_net_eth_counters_t`:
+Replace `dpdk_net_eth_counters_t`:
 
 ```rust
 #[repr(C, align(64))]
-pub struct resd_net_eth_counters_t {
+pub struct dpdk_net_eth_counters_t {
     pub rx_pkts: u64,
     pub rx_bytes: u64,
     pub rx_drop_miss_mac: u64,
@@ -157,11 +157,11 @@ pub struct resd_net_eth_counters_t {
 }
 ```
 
-Replace `resd_net_ip_counters_t`:
+Replace `dpdk_net_ip_counters_t`:
 
 ```rust
 #[repr(C, align(64))]
-pub struct resd_net_ip_counters_t {
+pub struct dpdk_net_ip_counters_t {
     pub rx_csum_bad: u64,
     pub rx_ttl_zero: u64,
     pub rx_frag: u64,
@@ -181,13 +181,13 @@ pub struct resd_net_ip_counters_t {
 
 - [ ] **Step 5: Run both crates' tests**
 
-Run: `cargo test -p resd-net-core counters::tests && cargo test -p resd-net api`
+Run: `cargo test -p dpdk-net-core counters::tests && cargo test -p dpdk-net api`
 Expected: PASS. The layout-assertion `const _: ()` in `api.rs` guarantees size/alignment parity; if it fails, recheck `_pad` counts.
 
 - [ ] **Step 6: Commit**
 
 ```sh
-git add crates/resd-net-core/src/counters.rs crates/resd-net/src/api.rs
+git add crates/dpdk-net-core/src/counters.rs crates/dpdk-net/src/api.rs
 git commit -m "extend eth + ip counter groups for phase a2 drop/accept reasons"
 ```
 
@@ -198,11 +198,11 @@ git commit -m "extend eth + ip counter groups for phase a2 drop/accept reasons"
 **Goal:** Carry `local_ip`, `gateway_ip`, `gateway_mac`, and `garp_interval_sec` from caller to engine. Config is in **host byte order** for integers; MAC is a plain 6-byte array.
 
 **Files:**
-- Modify: `crates/resd-net-core/src/engine.rs`
+- Modify: `crates/dpdk-net-core/src/engine.rs`
 
 - [ ] **Step 1: Write the failing test**
 
-Append to the bottom of `crates/resd-net-core/src/engine.rs`:
+Append to the bottom of `crates/dpdk-net-core/src/engine.rs`:
 
 ```rust
 #[cfg(test)]
@@ -224,12 +224,12 @@ mod tests {
 
 - [ ] **Step 2: Run — verify it fails**
 
-Run: `cargo test -p resd-net-core engine::tests::default_engine_config_has_a2_fields`
+Run: `cargo test -p dpdk-net-core engine::tests::default_engine_config_has_a2_fields`
 Expected: FAIL at compile: "no field `local_ip` on type `EngineConfig`".
 
 - [ ] **Step 3: Edit the `EngineConfig` struct**
 
-Replace the existing `EngineConfig` in `crates/resd-net-core/src/engine.rs`:
+Replace the existing `EngineConfig` in `crates/dpdk-net-core/src/engine.rs`:
 
 ```rust
 /// Config passed to Engine::new.
@@ -277,13 +277,13 @@ impl Default for EngineConfig {
 
 - [ ] **Step 4: Run test — verify PASS**
 
-Run: `cargo test -p resd-net-core engine::tests::default_engine_config_has_a2_fields`
+Run: `cargo test -p dpdk-net-core engine::tests::default_engine_config_has_a2_fields`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
 ```sh
-git add crates/resd-net-core/src/engine.rs
+git add crates/dpdk-net-core/src/engine.rs
 git commit -m "add local_ip, gateway_ip, gateway_mac, garp_interval_sec to EngineConfig"
 ```
 
@@ -291,22 +291,22 @@ git commit -m "add local_ip, gateway_ip, gateway_mac, garp_interval_sec to Engin
 
 ## Task 3: Mirror A2 config fields into the public C ABI
 
-**Goal:** Same fields on the public `resd_net_engine_config_t`. Keep the field order matching `EngineConfig` for consistency. The bridging function in `resd-net/src/lib.rs` copies them through.
+**Goal:** Same fields on the public `dpdk_net_engine_config_t`. Keep the field order matching `EngineConfig` for consistency. The bridging function in `dpdk-net/src/lib.rs` copies them through.
 
 **Files:**
-- Modify: `crates/resd-net/src/api.rs`
-- Modify: `crates/resd-net/src/lib.rs`
+- Modify: `crates/dpdk-net/src/api.rs`
+- Modify: `crates/dpdk-net/src/lib.rs`
 
 - [ ] **Step 1: Write the failing test**
 
-Append to `crates/resd-net/src/lib.rs` inside `#[cfg(test)] mod tests`:
+Append to `crates/dpdk-net/src/lib.rs` inside `#[cfg(test)] mod tests`:
 
 ```rust
     #[test]
     fn a2_config_fields_pass_through() {
-        // We don't actually call resd_net_engine_create here (no EAL).
+        // We don't actually call dpdk_net_engine_create here (no EAL).
         // Just assert the types are laid out as we expect.
-        let cfg = resd_net_engine_config_t {
+        let cfg = dpdk_net_engine_config_t {
             port_id: 0,
             rx_queue_id: 0,
             tx_queue_id: 0,
@@ -338,16 +338,16 @@ Append to `crates/resd-net/src/lib.rs` inside `#[cfg(test)] mod tests`:
 
 - [ ] **Step 2: Run — verify it fails**
 
-Run: `cargo test -p resd-net tests::a2_config_fields_pass_through`
-Expected: FAIL at compile: "struct `resd_net_engine_config_t` has no field `local_ip`".
+Run: `cargo test -p dpdk-net tests::a2_config_fields_pass_through`
+Expected: FAIL at compile: "struct `dpdk_net_engine_config_t` has no field `local_ip`".
 
-- [ ] **Step 3: Extend the public config in `crates/resd-net/src/api.rs`**
+- [ ] **Step 3: Extend the public config in `crates/dpdk-net/src/api.rs`**
 
-Replace `resd_net_engine_config_t`:
+Replace `dpdk_net_engine_config_t`:
 
 ```rust
 #[repr(C)]
-pub struct resd_net_engine_config_t {
+pub struct dpdk_net_engine_config_t {
     pub port_id: u16,
     pub rx_queue_id: u16,
     pub tx_queue_id: u16,
@@ -374,16 +374,16 @@ pub struct resd_net_engine_config_t {
 }
 ```
 
-- [ ] **Step 4: Bridge the new fields in `crates/resd-net/src/lib.rs`**
+- [ ] **Step 4: Bridge the new fields in `crates/dpdk-net/src/lib.rs`**
 
-Replace the body of `resd_net_engine_create`:
+Replace the body of `dpdk_net_engine_create`:
 
 ```rust
 #[no_mangle]
-pub unsafe extern "C" fn resd_net_engine_create(
+pub unsafe extern "C" fn dpdk_net_engine_create(
     lcore_id: u16,
-    cfg: *const resd_net_engine_config_t,
-) -> *mut resd_net_engine {
+    cfg: *const dpdk_net_engine_config_t,
+) -> *mut dpdk_net_engine {
     if cfg.is_null() {
         return ptr::null_mut();
     }
@@ -411,7 +411,7 @@ pub unsafe extern "C" fn resd_net_engine_create(
 
 - [ ] **Step 5: Run tests**
 
-Run: `cargo test -p resd-net`
+Run: `cargo test -p dpdk-net`
 Expected: PASS on all.
 
 - [ ] **Step 6: Update the existing FFI smoke test struct layout**
@@ -489,7 +489,7 @@ Expected: PASS.
 - [ ] **Step 8: Commit**
 
 ```sh
-git add crates/resd-net/src/api.rs crates/resd-net/src/lib.rs tests/ffi-test/tests/ffi_smoke.rs
+git add crates/dpdk-net/src/api.rs crates/dpdk-net/src/lib.rs tests/ffi-test/tests/ffi_smoke.rs
 git commit -m "add local_ip, gateway_ip, gateway_mac, garp_interval_sec to public config"
 ```
 
@@ -500,12 +500,12 @@ git commit -m "add local_ip, gateway_ip, gateway_mac, garp_interval_sec to publi
 **Goal:** Pure-function Ethernet header parser operating on a `&[u8]` view. No DPDK dependency. Returns a typed `L2Decoded` with the ethertype + payload slice offset, or a typed drop reason the caller maps to a counter.
 
 **Files:**
-- Create: `crates/resd-net-core/src/l2.rs`
-- Modify: `crates/resd-net-core/src/lib.rs`
+- Create: `crates/dpdk-net-core/src/l2.rs`
+- Modify: `crates/dpdk-net-core/src/lib.rs`
 
 - [ ] **Step 1: Write failing tests**
 
-Create `crates/resd-net-core/src/l2.rs`:
+Create `crates/dpdk-net-core/src/l2.rs`:
 
 ```rust
 //! L2 Ethernet frame decoder. Operates on a raw byte slice (typically the
@@ -622,7 +622,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Expose the module** in `crates/resd-net-core/src/lib.rs` (prepend inside module list):
+- [ ] **Step 2: Expose the module** in `crates/dpdk-net-core/src/lib.rs` (prepend inside module list):
 
 ```rust
 pub mod l2;
@@ -630,13 +630,13 @@ pub mod l2;
 
 - [ ] **Step 3: Run — verify PASS**
 
-Run: `cargo test -p resd-net-core l2::`
+Run: `cargo test -p dpdk-net-core l2::`
 Expected: 6 PASS.
 
 - [ ] **Step 4: Commit**
 
 ```sh
-git add crates/resd-net-core/src/l2.rs crates/resd-net-core/src/lib.rs
+git add crates/dpdk-net-core/src/l2.rs crates/dpdk-net-core/src/lib.rs
 git commit -m "add l2.rs Ethernet decoder + unit tests for drop reasons"
 ```
 
@@ -647,12 +647,12 @@ git commit -m "add l2.rs Ethernet decoder + unit tests for drop reasons"
 **Goal:** Parse IPv4 headers from a byte slice. Verify the header checksum when the caller signals the NIC didn't. Drop fragments and count them. Drop non-our destination unless `our_ip == 0` (test mode).
 
 **Files:**
-- Create: `crates/resd-net-core/src/l3_ip.rs`
-- Modify: `crates/resd-net-core/src/lib.rs`
+- Create: `crates/dpdk-net-core/src/l3_ip.rs`
+- Modify: `crates/dpdk-net-core/src/lib.rs`
 
 - [ ] **Step 1: Write failing tests**
 
-Create `crates/resd-net-core/src/l3_ip.rs`:
+Create `crates/dpdk-net-core/src/l3_ip.rs`:
 
 ```rust
 //! IPv4 decode. Operates on the Ethernet payload (slice starting at the IP
@@ -905,7 +905,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Expose the module** — in `crates/resd-net-core/src/lib.rs`:
+- [ ] **Step 2: Expose the module** — in `crates/dpdk-net-core/src/lib.rs`:
 
 ```rust
 pub mod l3_ip;
@@ -913,13 +913,13 @@ pub mod l3_ip;
 
 - [ ] **Step 3: Run — verify PASS**
 
-Run: `cargo test -p resd-net-core l3_ip::`
+Run: `cargo test -p dpdk-net-core l3_ip::`
 Expected: 13 PASS.
 
 - [ ] **Step 4: Commit**
 
 ```sh
-git add crates/resd-net-core/src/l3_ip.rs crates/resd-net-core/src/lib.rs
+git add crates/dpdk-net-core/src/l3_ip.rs crates/dpdk-net-core/src/lib.rs
 git commit -m "add l3_ip.rs IPv4 decoder + RFC 1071 checksum + fragment/TTL handling"
 ```
 
@@ -930,12 +930,12 @@ git commit -m "add l3_ip.rs IPv4 decoder + RFC 1071 checksum + fragment/TTL hand
 **Goal:** Parse ICMP Type 3 Code 4 (Destination Unreachable / Fragmentation Needed, RFC 1191). Extract the "Next-Hop MTU" from the ICMP header and store in a per-peer-IP PMTU table. Drop all other ICMP types silently (spec §6.3 RFC 792 row).
 
 **Files:**
-- Create: `crates/resd-net-core/src/icmp.rs`
-- Modify: `crates/resd-net-core/src/lib.rs`
+- Create: `crates/dpdk-net-core/src/icmp.rs`
+- Modify: `crates/dpdk-net-core/src/lib.rs`
 
 - [ ] **Step 1: Write failing tests**
 
-Create `crates/resd-net-core/src/icmp.rs`:
+Create `crates/dpdk-net-core/src/icmp.rs`:
 
 ```rust
 //! ICMP input — we only react to Type 3 Code 4 (Fragmentation Needed /
@@ -1117,7 +1117,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Expose the module** — in `crates/resd-net-core/src/lib.rs`:
+- [ ] **Step 2: Expose the module** — in `crates/dpdk-net-core/src/lib.rs`:
 
 ```rust
 pub mod icmp;
@@ -1125,13 +1125,13 @@ pub mod icmp;
 
 - [ ] **Step 3: Run — verify PASS**
 
-Run: `cargo test -p resd-net-core icmp::`
+Run: `cargo test -p dpdk-net-core icmp::`
 Expected: 7 PASS.
 
 - [ ] **Step 4: Commit**
 
 ```sh
-git add crates/resd-net-core/src/icmp.rs crates/resd-net-core/src/lib.rs
+git add crates/dpdk-net-core/src/icmp.rs crates/dpdk-net-core/src/lib.rs
 git commit -m "add icmp.rs frag-needed parser + per-peer PMTU table"
 ```
 
@@ -1142,12 +1142,12 @@ git commit -m "add icmp.rs frag-needed parser + per-peer PMTU table"
 **Goal:** ARP packet decoding (request + reply); builder for an ARP reply given our MAC/IP and the inbound request's sender; builder for a gratuitous ARP (announces our IP→MAC mapping so gateways pin their cache).
 
 **Files:**
-- Create: `crates/resd-net-core/src/arp.rs`
-- Modify: `crates/resd-net-core/src/lib.rs`
+- Create: `crates/dpdk-net-core/src/arp.rs`
+- Modify: `crates/dpdk-net-core/src/lib.rs`
 
 - [ ] **Step 1: Write failing tests**
 
-Create `crates/resd-net-core/src/arp.rs`:
+Create `crates/dpdk-net-core/src/arp.rs`:
 
 ```rust
 //! ARP (RFC 826) — static-gateway mode. We don't run a dynamic resolver on
@@ -1363,7 +1363,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Expose the module** — in `crates/resd-net-core/src/lib.rs`:
+- [ ] **Step 2: Expose the module** — in `crates/dpdk-net-core/src/lib.rs`:
 
 ```rust
 pub mod arp;
@@ -1371,13 +1371,13 @@ pub mod arp;
 
 - [ ] **Step 3: Run — verify PASS**
 
-Run: `cargo test -p resd-net-core arp::`
+Run: `cargo test -p dpdk-net-core arp::`
 Expected: 6 PASS.
 
 - [ ] **Step 4: Commit**
 
 ```sh
-git add crates/resd-net-core/src/arp.rs crates/resd-net-core/src/lib.rs
+git add crates/dpdk-net-core/src/arp.rs crates/dpdk-net-core/src/lib.rs
 git commit -m "add arp.rs packet decode + ARP reply + gratuitous ARP builders"
 ```
 
@@ -1388,12 +1388,12 @@ git commit -m "add arp.rs packet decode + ARP reply + gratuitous ARP builders"
 **Goal:** Optional helper that parses `/proc/net/arp` to discover the MAC address for a given IPv4 (in host byte order). Allows the application to supply `gateway_mac` without knowing it up front — only works when the kernel has that ARP entry (TAP device or kernel-visible NIC). For production vfio-pci setups the application supplies `gateway_mac` directly.
 
 **Files:**
-- Modify: `crates/resd-net-core/src/arp.rs`
-- Modify: `crates/resd-net-core/src/error.rs`
+- Modify: `crates/dpdk-net-core/src/arp.rs`
+- Modify: `crates/dpdk-net-core/src/error.rs`
 
 - [ ] **Step 1: Write failing test**
 
-Append to `crates/resd-net-core/src/arp.rs` inside `mod tests`:
+Append to `crates/dpdk-net-core/src/arp.rs` inside `mod tests`:
 
 ```rust
     #[test]
@@ -1422,10 +1422,10 @@ Append to `crates/resd-net-core/src/arp.rs` inside `mod tests`:
 
 - [ ] **Step 2: Run — verify FAIL**
 
-Run: `cargo test -p resd-net-core arp::tests::parse_proc_arp`
+Run: `cargo test -p dpdk-net-core arp::tests::parse_proc_arp`
 Expected: FAIL at compile: "cannot find function `parse_proc_arp_line`".
 
-- [ ] **Step 3: Extend `crates/resd-net-core/src/error.rs`**
+- [ ] **Step 3: Extend `crates/dpdk-net-core/src/error.rs`**
 
 Add to the `Error` enum:
 
@@ -1438,7 +1438,7 @@ Add to the `Error` enum:
     MacAddrLookup(u16, i32),
 ```
 
-- [ ] **Step 4: Implement the resolver** — append to `crates/resd-net-core/src/arp.rs` above `#[cfg(test)]`:
+- [ ] **Step 4: Implement the resolver** — append to `crates/dpdk-net-core/src/arp.rs` above `#[cfg(test)]`:
 
 ```rust
 /// Parse one line of `/proc/net/arp` into (ip_host_order, mac_bytes).
@@ -1493,13 +1493,13 @@ pub fn resolve_from_proc_arp(ip: u32) -> Result<[u8; 6], crate::Error> {
 
 - [ ] **Step 5: Run — verify PASS**
 
-Run: `cargo test -p resd-net-core arp::`
+Run: `cargo test -p dpdk-net-core arp::`
 Expected: 9 PASS (6 from Task 7 + 3 new).
 
 - [ ] **Step 6: Commit**
 
 ```sh
-git add crates/resd-net-core/src/arp.rs crates/resd-net-core/src/error.rs
+git add crates/dpdk-net-core/src/arp.rs crates/dpdk-net-core/src/error.rs
 git commit -m "add /proc/net/arp resolver helper + error variants"
 ```
 
@@ -1507,56 +1507,56 @@ git commit -m "add /proc/net/arp resolver helper + error variants"
 
 ## Task 9: Extend DPDK shim + sys crate for packet building + mbuf field access
 
-**Goal:** Add C-shim wrappers for `rte_pktmbuf_alloc`, `rte_pktmbuf_append`, `rte_eth_macaddr_get`, plus mbuf-field accessors (`resd_rte_pktmbuf_data`, `resd_rte_pktmbuf_data_len`). **`rte_mbuf` is opaque to bindgen** because DPDK's `rte_mbuf` contains anonymous unions with packed+aligned attributes that bindgen cannot lay out — the generated struct is just `{ _address: u8 }`. This means we cannot read `buf_addr` / `data_off` / `data_len` from Rust directly; every mbuf-field access must go through a C shim.
+**Goal:** Add C-shim wrappers for `rte_pktmbuf_alloc`, `rte_pktmbuf_append`, `rte_eth_macaddr_get`, plus mbuf-field accessors (`shim_rte_pktmbuf_data`, `shim_rte_pktmbuf_data_len`). **`rte_mbuf` is opaque to bindgen** because DPDK's `rte_mbuf` contains anonymous unions with packed+aligned attributes that bindgen cannot lay out — the generated struct is just `{ _address: u8 }`. This means we cannot read `buf_addr` / `data_off` / `data_len` from Rust directly; every mbuf-field access must go through a C shim.
 
-`rte_pktmbuf_alloc`, `rte_pktmbuf_append`, and the macros `rte_pktmbuf_mtod` / `rte_pktmbuf_data_len` are `static inline` in DPDK headers; bindgen skips them. `rte_eth_macaddr_get` is a real extern, but we expose it with a `resd_` prefix for consistency.
+`rte_pktmbuf_alloc`, `rte_pktmbuf_append`, and the macros `rte_pktmbuf_mtod` / `rte_pktmbuf_data_len` are `static inline` in DPDK headers; bindgen skips them. `rte_eth_macaddr_get` is a real extern, but we expose it with a `shim_rte_` prefix for consistency.
 
 **Files:**
-- Modify: `crates/resd-net-sys/shim.c`
-- Modify: `crates/resd-net-sys/wrapper.h`
+- Modify: `crates/dpdk-net-sys/shim.c`
+- Modify: `crates/dpdk-net-sys/wrapper.h`
 
 - [ ] **Step 1: Write the failing test**
 
-Append to `crates/resd-net-sys/src/lib.rs` inside `mod tests`:
+Append to `crates/dpdk-net-sys/src/lib.rs` inside `mod tests`:
 
 ```rust
     #[test]
-    fn resd_mbuf_shim_symbols_linkable() {
+    fn shim_mbuf_symbols_linkable() {
         // Just prove the symbols link — actually calling them needs EAL.
-        let _a: unsafe extern "C" fn(*mut rte_mempool) -> *mut rte_mbuf = resd_rte_pktmbuf_alloc;
+        let _a: unsafe extern "C" fn(*mut rte_mempool) -> *mut rte_mbuf = shim_rte_pktmbuf_alloc;
         let _b: unsafe extern "C" fn(*mut rte_mbuf, u16) -> *mut std::os::raw::c_char =
-            resd_rte_pktmbuf_append;
-        let _c: unsafe extern "C" fn(u16, *mut rte_ether_addr) -> i32 = resd_rte_eth_macaddr_get;
+            shim_rte_pktmbuf_append;
+        let _c: unsafe extern "C" fn(u16, *mut rte_ether_addr) -> i32 = shim_rte_eth_macaddr_get;
         let _d: unsafe extern "C" fn(*const rte_mbuf) -> *mut std::os::raw::c_void =
-            resd_rte_pktmbuf_data;
-        let _e: unsafe extern "C" fn(*const rte_mbuf) -> u16 = resd_rte_pktmbuf_data_len;
+            shim_rte_pktmbuf_data;
+        let _e: unsafe extern "C" fn(*const rte_mbuf) -> u16 = shim_rte_pktmbuf_data_len;
     }
 ```
 
 - [ ] **Step 2: Run — verify FAIL**
 
-Run: `cargo test -p resd-net-sys tests::resd_mbuf_shim_symbols_linkable`
+Run: `cargo test -p dpdk-net-sys tests::shim_mbuf_symbols_linkable`
 Expected: FAIL at compile — symbols not defined.
 
-- [ ] **Step 3: Extend `crates/resd-net-sys/shim.c`**
+- [ ] **Step 3: Extend `crates/dpdk-net-sys/shim.c`**
 
 Append:
 
 ```c
 /* rte_pktmbuf_alloc is static inline; re-export. */
-struct rte_mbuf *resd_rte_pktmbuf_alloc(struct rte_mempool *mp) {
+struct rte_mbuf *shim_rte_pktmbuf_alloc(struct rte_mempool *mp) {
     return rte_pktmbuf_alloc(mp);
 }
 
 /* rte_pktmbuf_append is static inline; re-export.
  * Returns a pointer to the appended region, or NULL on overflow. */
-char *resd_rte_pktmbuf_append(struct rte_mbuf *m, uint16_t len) {
+char *shim_rte_pktmbuf_append(struct rte_mbuf *m, uint16_t len) {
     return rte_pktmbuf_append(m, len);
 }
 
 /* rte_eth_macaddr_get is a real extern but we re-export for shim-prefix
  * consistency. Returns 0 on success, negative errno on failure. */
-int resd_rte_eth_macaddr_get(uint16_t port_id, struct rte_ether_addr *mac_addr) {
+int shim_rte_eth_macaddr_get(uint16_t port_id, struct rte_ether_addr *mac_addr) {
     return rte_eth_macaddr_get(port_id, mac_addr);
 }
 
@@ -1564,39 +1564,39 @@ int resd_rte_eth_macaddr_get(uint16_t port_id, struct rte_ether_addr *mac_addr) 
  * anonymous unions defeat its layout engine), so expose the two fields
  * our hot path needs as real C functions.
  *
- *   resd_rte_pktmbuf_data     — pointer to the first byte of packet data
- *   resd_rte_pktmbuf_data_len — length of the first (only, in Phase A2) segment
+ *   shim_rte_pktmbuf_data     — pointer to the first byte of packet data
+ *   shim_rte_pktmbuf_data_len — length of the first (only, in Phase A2) segment
  */
-void *resd_rte_pktmbuf_data(const struct rte_mbuf *m) {
+void *shim_rte_pktmbuf_data(const struct rte_mbuf *m) {
     return rte_pktmbuf_mtod(m, void *);
 }
 
-uint16_t resd_rte_pktmbuf_data_len(const struct rte_mbuf *m) {
+uint16_t shim_rte_pktmbuf_data_len(const struct rte_mbuf *m) {
     return rte_pktmbuf_data_len(m);
 }
 ```
 
-- [ ] **Step 4: Extend `crates/resd-net-sys/wrapper.h`**
+- [ ] **Step 4: Extend `crates/dpdk-net-sys/wrapper.h`**
 
 Append before the final comment:
 
 ```c
-struct rte_mbuf *resd_rte_pktmbuf_alloc(struct rte_mempool *mp);
-char *resd_rte_pktmbuf_append(struct rte_mbuf *m, uint16_t len);
-int resd_rte_eth_macaddr_get(uint16_t port_id, struct rte_ether_addr *mac_addr);
-void *resd_rte_pktmbuf_data(const struct rte_mbuf *m);
-uint16_t resd_rte_pktmbuf_data_len(const struct rte_mbuf *m);
+struct rte_mbuf *shim_rte_pktmbuf_alloc(struct rte_mempool *mp);
+char *shim_rte_pktmbuf_append(struct rte_mbuf *m, uint16_t len);
+int shim_rte_eth_macaddr_get(uint16_t port_id, struct rte_ether_addr *mac_addr);
+void *shim_rte_pktmbuf_data(const struct rte_mbuf *m);
+uint16_t shim_rte_pktmbuf_data_len(const struct rte_mbuf *m);
 ```
 
 - [ ] **Step 5: Run — verify PASS**
 
-Run: `cargo test -p resd-net-sys tests::resd_mbuf_shim_symbols_linkable`
+Run: `cargo test -p dpdk-net-sys tests::shim_mbuf_symbols_linkable`
 Expected: PASS.
 
 - [ ] **Step 6: Commit**
 
 ```sh
-git add crates/resd-net-sys/shim.c crates/resd-net-sys/wrapper.h crates/resd-net-sys/src/lib.rs
+git add crates/dpdk-net-sys/shim.c crates/dpdk-net-sys/wrapper.h crates/dpdk-net-sys/src/lib.rs
 git commit -m "extend DPDK shim: mbuf alloc/append/data/len + mac getter"
 ```
 
@@ -1604,14 +1604,14 @@ git commit -m "extend DPDK shim: mbuf alloc/append/data/len + mac getter"
 
 ## Task 10: Engine wiring — our_mac, our_ip, PMTU table, TX helpers
 
-**Goal:** Store our MAC (read from the NIC) and our IP (from config) on the `Engine`. Initialize the PMTU table. Add a helper `tx_frame(bytes: &[u8])` that allocates an mbuf from `tx_hdr_mempool`, copies the bytes in, and submits via `resd_rte_eth_tx_burst`. This helper is the one place where mbuf-lifecycle shenanigans happen for Phase A2.
+**Goal:** Store our MAC (read from the NIC) and our IP (from config) on the `Engine`. Initialize the PMTU table. Add a helper `tx_frame(bytes: &[u8])` that allocates an mbuf from `tx_hdr_mempool`, copies the bytes in, and submits via `shim_rte_eth_tx_burst`. This helper is the one place where mbuf-lifecycle shenanigans happen for Phase A2.
 
 **Files:**
-- Modify: `crates/resd-net-core/src/engine.rs`
+- Modify: `crates/dpdk-net-core/src/engine.rs`
 
 - [ ] **Step 1: Write the failing test**
 
-Add to the `tests` module at the bottom of `crates/resd-net-core/src/engine.rs`:
+Add to the `tests` module at the bottom of `crates/dpdk-net-core/src/engine.rs`:
 
 ```rust
     #[test]
@@ -1631,10 +1631,10 @@ Add to the `tests` module at the bottom of `crates/resd-net-core/src/engine.rs`:
 
 - [ ] **Step 2: Run — verify FAIL**
 
-Run: `cargo test -p resd-net-core engine::tests::engine_exposes_addressing_and_pmtu`
+Run: `cargo test -p dpdk-net-core engine::tests::engine_exposes_addressing_and_pmtu`
 Expected: FAIL at compile — methods don't exist.
 
-- [ ] **Step 3: Extend `Engine`** — edit `crates/resd-net-core/src/engine.rs`
+- [ ] **Step 3: Extend `Engine`** — edit `crates/dpdk-net-core/src/engine.rs`
 
 First, add imports at the top (right after the existing `use` lines):
 
@@ -1648,7 +1648,7 @@ use crate::icmp::PmtuTable;
 Replace the `Engine` struct definition with:
 
 ```rust
-/// A resd-net engine. One per lcore; owns the NIC queues, mempools, and
+/// A dpdk-net engine. One per lcore; owns the NIC queues, mempools, and
 /// L2/L3 state for that lcore.
 pub struct Engine {
     cfg: EngineConfig,
@@ -1669,9 +1669,9 @@ Inside `Engine::new`, after `rte_eth_dev_start` succeeds, replace the `Ok(Self {
 ```rust
         // Read NIC MAC via the shim. `rte_ether_addr` is a 6-byte packed struct.
         let mut mac_addr: sys::rte_ether_addr = unsafe { std::mem::zeroed() };
-        let rc = unsafe { sys::resd_rte_eth_macaddr_get(cfg.port_id, &mut mac_addr) };
+        let rc = unsafe { sys::shim_rte_eth_macaddr_get(cfg.port_id, &mut mac_addr) };
         if rc != 0 {
-            return Err(Error::MacAddrLookup(cfg.port_id, unsafe { sys::resd_rte_errno() }));
+            return Err(Error::MacAddrLookup(cfg.port_id, unsafe { sys::shim_rte_errno() }));
         }
         // bindgen names the field `addr_bytes` on rte_ether_addr.
         let our_mac = mac_addr.addr_bytes;
@@ -1709,16 +1709,16 @@ Below `pub fn counters`, add accessors:
     pub(crate) fn tx_frame(&self, bytes: &[u8]) -> bool {
         use crate::counters::{add, inc};
         // Safety: tx_hdr_mempool was created in Engine::new and is alive.
-        let m = unsafe { sys::resd_rte_pktmbuf_alloc(self.tx_hdr_mempool.as_ptr()) };
+        let m = unsafe { sys::shim_rte_pktmbuf_alloc(self.tx_hdr_mempool.as_ptr()) };
         if m.is_null() {
             inc(&self.counters.eth.tx_drop_nomem);
             return false;
         }
         // Safety: append writes into the mbuf's data room. Returns NULL if
         // the mbuf's tailroom is < len.
-        let dst = unsafe { sys::resd_rte_pktmbuf_append(m, bytes.len() as u16) };
+        let dst = unsafe { sys::shim_rte_pktmbuf_append(m, bytes.len() as u16) };
         if dst.is_null() {
-            unsafe { sys::resd_rte_pktmbuf_free(m) };
+            unsafe { sys::shim_rte_pktmbuf_free(m) };
             inc(&self.counters.eth.tx_drop_nomem);
             return false;
         }
@@ -1728,7 +1728,7 @@ Below `pub fn counters`, add accessors:
         }
         let mut pkts = [m];
         let sent = unsafe {
-            sys::resd_rte_eth_tx_burst(
+            sys::shim_rte_eth_tx_burst(
                 self.cfg.port_id,
                 self.cfg.tx_queue_id,
                 pkts.as_mut_ptr(),
@@ -1741,7 +1741,7 @@ Below `pub fn counters`, add accessors:
             true
         } else {
             // TX ring full; driver did not take the mbuf. Free it ourselves.
-            unsafe { sys::resd_rte_pktmbuf_free(m) };
+            unsafe { sys::shim_rte_pktmbuf_free(m) };
             inc(&self.counters.eth.tx_drop_full_ring);
             false
         }
@@ -1750,13 +1750,13 @@ Below `pub fn counters`, add accessors:
 
 - [ ] **Step 4: Run — verify PASS**
 
-Run: `cargo build -p resd-net-core && cargo test -p resd-net-core engine::tests`
+Run: `cargo build -p dpdk-net-core && cargo test -p dpdk-net-core engine::tests`
 Expected: PASS (compile-only test succeeds).
 
 - [ ] **Step 5: Commit**
 
 ```sh
-git add crates/resd-net-core/src/engine.rs
+git add crates/dpdk-net-core/src/engine.rs
 git commit -m "engine: read NIC MAC, hold PMTU table, add tx_frame helper"
 ```
 
@@ -1767,12 +1767,12 @@ git commit -m "engine: read NIC MAC, hold PMTU table, add tx_frame helper"
 **Goal:** Replace the Phase A1 "rx-burst then free everything" loop with real decoding + dispatch. Each drop path bumps the appropriate counter. TCP packets hit a stub that only increments `ip.rx_tcp`; real TCP arrives in A3.
 
 **Files:**
-- Modify: `crates/resd-net-core/src/engine.rs`
-- Modify: `crates/resd-net-core/src/lib.rs`
+- Modify: `crates/dpdk-net-core/src/engine.rs`
+- Modify: `crates/dpdk-net-core/src/lib.rs`
 
 - [ ] **Step 1: Write helper to extract mbuf data slice**
 
-Append to `crates/resd-net-core/src/lib.rs`:
+Append to `crates/dpdk-net-core/src/lib.rs`:
 
 ```rust
 /// Helper exposed for unit tests and the poll loop.
@@ -1780,16 +1780,16 @@ Append to `crates/resd-net-core/src/lib.rs`:
 /// segment. The caller must not outlive the mbuf.
 ///
 /// Safety: `m` must be a valid non-null mbuf pointer. Uses the C-shim
-/// accessors from `resd-net-sys` because `rte_mbuf` is opaque to bindgen
+/// accessors from `dpdk-net-sys` because `rte_mbuf` is opaque to bindgen
 /// (packed anonymous unions) — see Task 9 for the shim wiring.
-pub unsafe fn mbuf_data_slice<'a>(m: *mut resd_net_sys::rte_mbuf) -> &'a [u8] {
-    let ptr = unsafe { resd_net_sys::resd_rte_pktmbuf_data(m) } as *const u8;
-    let len = unsafe { resd_net_sys::resd_rte_pktmbuf_data_len(m) } as usize;
+pub unsafe fn mbuf_data_slice<'a>(m: *mut dpdk_net_sys::rte_mbuf) -> &'a [u8] {
+    let ptr = unsafe { dpdk_net_sys::shim_rte_pktmbuf_data(m) } as *const u8;
+    let len = unsafe { dpdk_net_sys::shim_rte_pktmbuf_data_len(m) } as usize;
     unsafe { std::slice::from_raw_parts(ptr, len) }
 }
 ```
 
-- [ ] **Step 2: Write the new `poll_once`** — in `crates/resd-net-core/src/engine.rs`
+- [ ] **Step 2: Write the new `poll_once`** — in `crates/dpdk-net-core/src/engine.rs`
 
 Replace the body of `Engine::poll_once` with:
 
@@ -1804,7 +1804,7 @@ Replace the body of `Engine::poll_once` with:
         const BURST: usize = 32;
         let mut mbufs: [*mut sys::rte_mbuf; BURST] = [std::ptr::null_mut(); BURST];
         let n = unsafe {
-            sys::resd_rte_eth_rx_burst(
+            sys::shim_rte_eth_rx_burst(
                 self.cfg.port_id,
                 self.cfg.rx_queue_id,
                 mbufs.as_mut_ptr(),
@@ -1830,7 +1830,7 @@ Replace the body of `Engine::poll_once` with:
 
             // Phase A2: we free every packet at the end of the iteration.
             // Phase A3 will transfer ownership to recv_queues for TCP pkts.
-            unsafe { sys::resd_rte_pktmbuf_free(m) };
+            unsafe { sys::shim_rte_pktmbuf_free(m) };
         }
 
         self.maybe_emit_gratuitous_arp();
@@ -1952,33 +1952,33 @@ Replace the body of `Engine::poll_once` with:
 
 - [ ] **Step 3: Build the crate**
 
-Run: `cargo build -p resd-net-core`
+Run: `cargo build -p dpdk-net-core`
 Expected: compiles.
 
 - [ ] **Step 4: Run unit tests**
 
-Run: `cargo test -p resd-net-core`
+Run: `cargo test -p dpdk-net-core`
 Expected: all prior tests still pass (engine struct recompiles; l2/l3/icmp/arp tests independent).
 
 - [ ] **Step 5: Commit**
 
 ```sh
-git add crates/resd-net-core/src/engine.rs crates/resd-net-core/src/lib.rs
+git add crates/dpdk-net-core/src/engine.rs crates/dpdk-net-core/src/lib.rs
 git commit -m "wire l2/l3/icmp/arp into poll_once; add gratuitous-arp emit"
 ```
 
 ---
 
-## Task 12: Public C ABI for `resd_net_resolve_gateway_mac`
+## Task 12: Public C ABI for `dpdk_net_resolve_gateway_mac`
 
-**Goal:** Expose the `/proc/net/arp` resolver as an `extern "C"` helper so C++ callers can discover the gateway MAC before calling `resd_net_engine_create`.
+**Goal:** Expose the `/proc/net/arp` resolver as an `extern "C"` helper so C++ callers can discover the gateway MAC before calling `dpdk_net_engine_create`.
 
 **Files:**
-- Modify: `crates/resd-net/src/lib.rs`
+- Modify: `crates/dpdk-net/src/lib.rs`
 
 - [ ] **Step 1: Add the FFI wrapper**
 
-Insert into `crates/resd-net/src/lib.rs` after the existing extern "C" functions (before the `#[cfg(test)]` block):
+Insert into `crates/dpdk-net/src/lib.rs` after the existing extern "C" functions (before the `#[cfg(test)]` block):
 
 ```rust
 /// Resolve the MAC address for `gateway_ip_host_order` by reading
@@ -1986,19 +1986,19 @@ Insert into `crates/resd-net/src/lib.rs` after the existing extern "C" functions
 /// Returns 0 on success, -ENOENT if no entry, -EIO on /proc/net/arp read error,
 /// -EINVAL on null out_mac.
 #[no_mangle]
-pub unsafe extern "C" fn resd_net_resolve_gateway_mac(
+pub unsafe extern "C" fn dpdk_net_resolve_gateway_mac(
     gateway_ip_host_order: u32,
     out_mac: *mut u8,
 ) -> i32 {
     if out_mac.is_null() {
         return -libc::EINVAL;
     }
-    match resd_net_core::arp::resolve_from_proc_arp(gateway_ip_host_order) {
+    match dpdk_net_core::arp::resolve_from_proc_arp(gateway_ip_host_order) {
         Ok(mac) => {
             std::ptr::copy_nonoverlapping(mac.as_ptr(), out_mac, 6);
             0
         }
-        Err(resd_net_core::Error::GatewayMacNotFound(_)) => -libc::ENOENT,
+        Err(dpdk_net_core::Error::GatewayMacNotFound(_)) => -libc::ENOENT,
         Err(_) => -libc::EIO,
     }
 }
@@ -2011,7 +2011,7 @@ Append:
 ```rust
     #[test]
     fn resolve_null_out_mac_returns_einval() {
-        let rc = unsafe { resd_net_resolve_gateway_mac(0x0a_00_00_01, std::ptr::null_mut()) };
+        let rc = unsafe { dpdk_net_resolve_gateway_mac(0x0a_00_00_01, std::ptr::null_mut()) };
         assert_eq!(rc, -libc::EINVAL);
     }
 
@@ -2019,41 +2019,41 @@ Append:
     fn resolve_unreachable_ip_returns_enoent() {
         let mut mac = [0u8; 6];
         // 0.0.0.1 will not be in any /proc/net/arp.
-        let rc = unsafe { resd_net_resolve_gateway_mac(0x0000_0001, mac.as_mut_ptr()) };
+        let rc = unsafe { dpdk_net_resolve_gateway_mac(0x0000_0001, mac.as_mut_ptr()) };
         assert_eq!(rc, -libc::ENOENT);
     }
 ```
 
 - [ ] **Step 3: Build + test**
 
-Run: `cargo test -p resd-net`
+Run: `cargo test -p dpdk-net`
 Expected: PASS on all.
 
 - [ ] **Step 4: Commit**
 
 ```sh
-git add crates/resd-net/src/lib.rs
-git commit -m "add resd_net_resolve_gateway_mac extern C wrapper"
+git add crates/dpdk-net/src/lib.rs
+git commit -m "add dpdk_net_resolve_gateway_mac extern C wrapper"
 ```
 
 ---
 
 ## Task 13: Regenerate public header + verify no drift
 
-**Goal:** Run `cargo build -p resd-net` so cbindgen regenerates `include/resd_net.h` with the new config fields, counter fields, and `resd_net_resolve_gateway_mac` declaration. Verify the header compiles under C and C++.
+**Goal:** Run `cargo build -p dpdk-net` so cbindgen regenerates `include/dpdk_net.h` with the new config fields, counter fields, and `dpdk_net_resolve_gateway_mac` declaration. Verify the header compiles under C and C++.
 
 **Files:**
-- Modify: `include/resd_net.h` (generated)
-- Modify: `crates/resd-net/cbindgen.toml` (if needed — only if cbindgen skips a newly-reachable type; most changes should be picked up automatically)
+- Modify: `include/dpdk_net.h` (generated)
+- Modify: `crates/dpdk-net/cbindgen.toml` (if needed — only if cbindgen skips a newly-reachable type; most changes should be picked up automatically)
 
 - [ ] **Step 1: Regenerate**
 
-Run: `cargo build -p resd-net`
-Expected: succeeds; `include/resd_net.h` updates. If cbindgen fails to see `resd_net_resolve_gateway_mac` (it should be reachable because it's `#[no_mangle] pub unsafe extern "C"`), double-check the signature.
+Run: `cargo build -p dpdk-net`
+Expected: succeeds; `include/dpdk_net.h` updates. If cbindgen fails to see `dpdk_net_resolve_gateway_mac` (it should be reachable because it's `#[no_mangle] pub unsafe extern "C"`), double-check the signature.
 
 - [ ] **Step 2: Grep the header for the new symbols**
 
-Run: `grep -E '(local_ip|gateway_ip|gateway_mac|garp_interval_sec|resd_net_resolve_gateway_mac|rx_drop_short|rx_drop_bad_version|rx_tcp|rx_icmp)' include/resd_net.h`
+Run: `grep -E '(local_ip|gateway_ip|gateway_mac|garp_interval_sec|dpdk_net_resolve_gateway_mac|rx_drop_short|rx_drop_bad_version|rx_tcp|rx_icmp)' include/dpdk_net.h`
 Expected: every term appears at least once.
 
 - [ ] **Step 3: Run the drift-check script**
@@ -2064,29 +2064,29 @@ Expected: PASS (header matches cbindgen output). If it reports drift, it's becau
 - [ ] **Step 4: Commit the regenerated header**
 
 ```sh
-git add include/resd_net.h
-git commit -m "regenerate resd_net.h for phase a2 config + counter + resolve_gateway_mac additions"
+git add include/dpdk_net.h
+git commit -m "regenerate dpdk_net.h for phase a2 config + counter + resolve_gateway_mac additions"
 ```
 
 ---
 
 ## Task 14: Integration test — crafted frames through TAP pair
 
-**Goal:** Bring up a DPDK TAP vdev engine, configure the kernel side of the TAP (`resdtap0`), send a sequence of hand-crafted Ethernet frames via AF_PACKET from the test process, poll the engine, and assert exact counter deltas for each case. Gated by `RESD_NET_TEST_TAP=1`.
+**Goal:** Bring up a DPDK TAP vdev engine, configure the kernel side of the TAP (`dpdktap0`), send a sequence of hand-crafted Ethernet frames via AF_PACKET from the test process, poll the engine, and assert exact counter deltas for each case. Gated by `DPDK_NET_TEST_TAP=1`.
 
 **Files:**
-- Create: `crates/resd-net-core/tests/l2_l3_tap.rs`
+- Create: `crates/dpdk-net-core/tests/l2_l3_tap.rs`
 
 - [ ] **Step 1: Write the test file**
 
-Create `crates/resd-net-core/tests/l2_l3_tap.rs`:
+Create `crates/dpdk-net-core/tests/l2_l3_tap.rs`:
 
 ```rust
-//! L2/L3 crafted-frame integration test. Requires RESD_NET_TEST_TAP=1 and
+//! L2/L3 crafted-frame integration test. Requires DPDK_NET_TEST_TAP=1 and
 //! root (DPDK TAP vdev + raw AF_PACKET socket). The test:
-//!   1. boots EAL + engine against a DPDK TAP vdev (iface `resdtap1` so
-//!      it doesn't collide with engine_smoke.rs's `resdtap0`)
-//!   2. brings `resdtap1` UP and assigns kernel-side addressing
+//!   1. boots EAL + engine against a DPDK TAP vdev (iface `dpdktap1` so
+//!      it doesn't collide with engine_smoke.rs's `dpdktap0`)
+//!   2. brings `dpdktap1` UP and assigns kernel-side addressing
 //!   3. sends a sequence of L2/L3 frames via AF_PACKET/SOCK_RAW
 //!   4. polls the engine and asserts counter deltas per case
 
@@ -2095,22 +2095,22 @@ use std::os::raw::{c_int, c_void};
 use std::process::Command;
 use std::sync::atomic::Ordering;
 
-use resd_net_core::counters::Counters;
-use resd_net_core::engine::{eal_init, Engine, EngineConfig};
-use resd_net_core::l3_ip::internet_checksum;
+use dpdk_net_core::counters::Counters;
+use dpdk_net_core::engine::{eal_init, Engine, EngineConfig};
+use dpdk_net_core::l3_ip::internet_checksum;
 
-const TAP_IFACE: &str = "resdtap1";
+const TAP_IFACE: &str = "dpdktap1";
 const DPDK_PORT: u16 = 0;
 const OUR_IP: u32 = 0x0a_63_00_02; // 10.99.0.2 (host byte order)
 const PEER_IP: u32 = 0x0a_63_00_01; // 10.99.0.1 on the kernel side of the tap
 
 fn want_tap() -> bool {
-    std::env::var("RESD_NET_TEST_TAP").ok().as_deref() == Some("1")
+    std::env::var("DPDK_NET_TEST_TAP").ok().as_deref() == Some("1")
 }
 
 fn skip_if_not_tap() -> bool {
     if !want_tap() {
-        eprintln!("skipping; set RESD_NET_TEST_TAP=1 to run");
+        eprintln!("skipping; set DPDK_NET_TEST_TAP=1 to run");
         return true;
     }
     false
@@ -2231,10 +2231,10 @@ fn crafted_frames_through_tap_pair() {
     if skip_if_not_tap() { return; }
 
     let args = [
-        "resd-net-a2-test",
+        "dpdk-net-a2-test",
         "--in-memory",
         "--no-pci",
-        "--vdev=net_tap0,iface=resdtap1",
+        "--vdev=net_tap0,iface=dpdktap1",
         "-l", "0-1",
         "--log-level=3",
     ];
@@ -2371,10 +2371,10 @@ fn crafted_frames_through_tap_pair() {
 - [ ] **Step 2: Run the test** (requires root + DPDK TAP)
 
 ```sh
-sudo -E RESD_NET_TEST_TAP=1 $(command -v cargo) test -p resd-net-core --test l2_l3_tap -- --nocapture
+sudo -E DPDK_NET_TEST_TAP=1 $(command -v cargo) test -p dpdk-net-core --test l2_l3_tap -- --nocapture
 ```
 
-Expected: PASS. If the test fails on a specific case, the counter delta assertion will pinpoint which module broke. Troubleshooting: if cases 3–7 report "delta 0" while case 1 passes, the most common cause is that `resdtap1` came up AFTER the frame was sent; increase the `sleep(100)` after `bring_up_tap` to 500ms.
+Expected: PASS. If the test fails on a specific case, the counter delta assertion will pinpoint which module broke. Troubleshooting: if cases 3–7 report "delta 0" while case 1 passes, the most common cause is that `dpdktap1` came up AFTER the frame was sent; increase the `sleep(100)` after `bring_up_tap` to 500ms.
 
 - [ ] **Step 3: Document running it in README**
 
@@ -2385,14 +2385,14 @@ Append to `README.md`:
 ## L2/L3 integration tests (require DPDK TAP and root)
 
 ```sh
-sudo -E RESD_NET_TEST_TAP=1 cargo test -p resd-net-core --test l2_l3_tap -- --nocapture
+sudo -E DPDK_NET_TEST_TAP=1 cargo test -p dpdk-net-core --test l2_l3_tap -- --nocapture
 ```
 ```
 
 - [ ] **Step 4: Commit**
 
 ```sh
-git add crates/resd-net-core/tests/l2_l3_tap.rs README.md
+git add crates/dpdk-net-core/tests/l2_l3_tap.rs README.md
 git commit -m "add L2/L3 crafted-frame integration test over TAP pair"
 ```
 
@@ -2406,7 +2406,7 @@ git commit -m "add L2/L3 crafted-frame integration test over TAP pair"
 - Modify: `examples/cpp-consumer/main.cpp`
 - Modify: `docs/superpowers/plans/stage1-phase-roadmap.md`
 
-- [ ] **Step 1: Extend `examples/cpp-consumer/main.cpp`** — add IP-counter prints before the final `resd_net_engine_destroy`. Locate the existing `poll iters` and `now_ns` printouts; immediately after them, insert:
+- [ ] **Step 1: Extend `examples/cpp-consumer/main.cpp`** — add IP-counter prints before the final `dpdk_net_engine_destroy`. Locate the existing `poll iters` and `now_ns` printouts; immediately after them, insert:
 
 ```cpp
     // Phase A2: print IP counters to confirm they are accessible from C++.
@@ -2422,7 +2422,7 @@ git commit -m "add L2/L3 crafted-frame integration test over TAP pair"
         (unsigned long long)__atomic_load_n(&c->eth.rx_arp, __ATOMIC_RELAXED));
 ```
 
-Also update the cfg initializer block to set the A2 fields (just inside `main`, before `resd_net_eal_init`):
+Also update the cfg initializer block to set the A2 fields (just inside `main`, before `dpdk_net_eal_init`):
 
 ```cpp
     // Phase A2 addressing (left at zero — the TAP sample isn't doing real
@@ -2436,8 +2436,8 @@ Also update the cfg initializer block to set the A2 fields (just inside `main`, 
 - [ ] **Step 2: Build the C++ consumer**
 
 ```sh
-cargo build -p resd-net --release
-cmake -S examples/cpp-consumer -B examples/cpp-consumer/build -DRESD_NET_PROFILE=release
+cargo build -p dpdk-net --release
+cmake -S examples/cpp-consumer -B examples/cpp-consumer/build -DDPDK_NET_PROFILE=release
 cmake --build examples/cpp-consumer/build
 ```
 
@@ -2451,13 +2451,13 @@ cargo build --workspace --all-targets
 # All unit tests pass
 cargo test --workspace
 # TAP integration tests pass (sudo + DPDK required)
-sudo -E RESD_NET_TEST_TAP=1 $(command -v cargo) test -p resd-net-core --test engine_smoke -- --nocapture
-sudo -E RESD_NET_TEST_TAP=1 $(command -v cargo) test -p resd-net-core --test l2_l3_tap -- --nocapture
+sudo -E DPDK_NET_TEST_TAP=1 $(command -v cargo) test -p dpdk-net-core --test engine_smoke -- --nocapture
+sudo -E DPDK_NET_TEST_TAP=1 $(command -v cargo) test -p dpdk-net-core --test l2_l3_tap -- --nocapture
 # Header hasn't drifted
 ./scripts/check-header.sh
 # C++ consumer builds
-cargo build -p resd-net --release
-cmake -S examples/cpp-consumer -B examples/cpp-consumer/build -DRESD_NET_PROFILE=release
+cargo build -p dpdk-net --release
+cmake -S examples/cpp-consumer -B examples/cpp-consumer/build -DDPDK_NET_PROFILE=release
 cmake --build examples/cpp-consumer/build
 # No clippy warnings
 cargo clippy --workspace --all-targets -- -D warnings
@@ -2473,7 +2473,7 @@ Manual check of these spec sections mapped to code:
 - **§6.3 RFC 792 (ICMP)** — `icmp::icmp_input` handles type 3 code 4 only; all other ICMP silently dropped.
 - **§6.3 RFC 1191 (PMTUD)** — `PmtuTable::update` stores next-hop MTU keyed by inner destination; only shrinks.
 - **§6.3 RFC 1122 (IPv4 reassembly not implemented)** — fragments dropped with `ip.rx_frag` bump.
-- **§8 "static gateway MAC"** — `arp::resolve_from_proc_arp` + `resd_net_resolve_gateway_mac` FFI; `build_gratuitous_arp` for the refresh path; `handle_arp` responds to inbound ARP requests.
+- **§8 "static gateway MAC"** — `arp::resolve_from_proc_arp` + `dpdk_net_resolve_gateway_mac` FFI; `build_gratuitous_arp` for the refresh path; `handle_arp` responds to inbound ARP requests.
 
 - [ ] **Step 5: Run mTCP comparison review (first phase to do this — see spec §10.13)**
 
@@ -2545,7 +2545,7 @@ The next plan file to write is `docs/superpowers/plans/YYYY-MM-DD-stage1-phase-a
 **Placeholder scan:** Every code block contains complete content. No "TODO"/"TBD"/"implement later". The `tcp_input_stub` is intentional — the stub IS the implementation for Phase A2.
 
 **Type consistency cross-check:**
-- `EngineConfig.local_ip` (Rust) ↔ `resd_net_engine_config_t.local_ip` (public API) ↔ `Cfg.local_ip` (ffi_smoke.rs) — all `u32` host-byte-order.
+- `EngineConfig.local_ip` (Rust) ↔ `dpdk_net_engine_config_t.local_ip` (public API) ↔ `Cfg.local_ip` (ffi_smoke.rs) — all `u32` host-byte-order.
 - `EthCounters` / `IpCounters` field lists match exactly between core and public versions; layout assertion in `api.rs` enforces size + alignment.
 - `L2Decoded.payload_offset: usize` — consistently indexed by the same `bytes[l2.payload_offset..]` slice in `handle_arp`/`handle_ipv4`.
 - `PmtuTable::get → Option<u16>` exposed through `Engine::pmtu_for` — same return type.

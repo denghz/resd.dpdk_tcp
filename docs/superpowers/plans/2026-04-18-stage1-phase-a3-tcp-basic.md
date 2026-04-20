@@ -2,13 +2,13 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Replace the Phase A2 `tcp_input_stub` with a real client-side TCP path: `resd_net_connect` issues a SYN, the stack processes SYN-ACK and emits ACK, `resd_net_send` enqueues bytes that TX out as MSS-sized segments, inbound data segments deliver via `RESD_NET_EVT_READABLE`, and `resd_net_close` performs a clean FIN exchange ending in TIME_WAIT → CLOSED. No retransmit, no TCP options beyond MSS, no SACK, no PAWS, no reassembly — all deferred to A4/A5. The phase ends with an end-to-end integration test that handshakes, echoes bytes, and closes cleanly against a kernel-side TCP listener over a TAP pair, plus the mandatory mTCP comparison review.
+**Goal:** Replace the Phase A2 `tcp_input_stub` with a real client-side TCP path: `dpdk_net_connect` issues a SYN, the stack processes SYN-ACK and emits ACK, `dpdk_net_send` enqueues bytes that TX out as MSS-sized segments, inbound data segments deliver via `DPDK_NET_EVT_READABLE`, and `dpdk_net_close` performs a clean FIN exchange ending in TIME_WAIT → CLOSED. No retransmit, no TCP options beyond MSS, no SACK, no PAWS, no reassembly — all deferred to A4/A5. The phase ends with an end-to-end integration test that handshakes, echoes bytes, and closes cleanly against a kernel-side TCP listener over a TAP pair, plus the mandatory mTCP comparison review.
 
-**Architecture:** Eight new pure-Rust modules in `resd-net-core`: `tcp_seq` (wrap-safe seq comparisons), `tcp_state` (11-state enum per RFC 9293 §3.3.2), `flow_table` (handle-indexed slot array + 4-tuple hash for RX lookup), `iss` (RFC 6528 SipHash-based ISS generator — skeleton; A5 finalizes), `tcp_conn` (per-connection state with minimum A3 fields from spec §6.2), `tcp_output` (SYN / ACK / data / FIN / RST frame builders + TCP+IP pseudo-header checksum), `tcp_events` (internal FIFO event queue consumed by `resd_net_poll`), and `tcp_input` (header parser + per-state segment handler). `engine.rs` gains a flow table, an event queue, an ISS generator, and three application-facing methods (`connect`, `send_bytes`, `close_conn`) whose work routes through those modules. The public API surface grows by three extern "C" functions (`resd_net_connect`, `resd_net_send`, `resd_net_close`) and `resd_net_poll` now fills the caller's `events_out` buffer instead of being a no-op.
+**Architecture:** Eight new pure-Rust modules in `dpdk-net-core`: `tcp_seq` (wrap-safe seq comparisons), `tcp_state` (11-state enum per RFC 9293 §3.3.2), `flow_table` (handle-indexed slot array + 4-tuple hash for RX lookup), `iss` (RFC 6528 SipHash-based ISS generator — skeleton; A5 finalizes), `tcp_conn` (per-connection state with minimum A3 fields from spec §6.2), `tcp_output` (SYN / ACK / data / FIN / RST frame builders + TCP+IP pseudo-header checksum), `tcp_events` (internal FIFO event queue consumed by `dpdk_net_poll`), and `tcp_input` (header parser + per-state segment handler). `engine.rs` gains a flow table, an event queue, an ISS generator, and three application-facing methods (`connect`, `send_bytes`, `close_conn`) whose work routes through those modules. The public API surface grows by three extern "C" functions (`dpdk_net_connect`, `dpdk_net_send`, `dpdk_net_close`) and `dpdk_net_poll` now fills the caller's `events_out` buffer instead of being a no-op.
 
 **Tech Stack:** same as A2 — Rust stable, DPDK 23.11, bindgen, cbindgen. New stdlib: `std::collections::{HashMap, VecDeque}`, `std::hash::{BuildHasher, BuildHasherDefault}`. The test harness uses `std::net::TcpListener` on a kernel-side TAP interface as the peer, so there is no external process dependency (no `nc` / `ncat`).
 
-**Spec reference:** `docs/superpowers/specs/2026-04-17-dpdk-tcp-design.md` §§ 4 (public API: `resd_net_connect`, `resd_net_send`, `RESD_NET_EVT_CONNECTED` / `_READABLE` / `_CLOSED`), 5.2 (TX call chain), 6.1 (FSM — RFC 9293 §3.3.2 eleven-state client-side), 6.2 (`TcpConn` minimum fields for A3), 6.5 (ISS stub, SYN retransmit semantics scoped out), 7.1 (`tx_hdr_mempool` vs `tx_data_mempool`), 9.1 (TCP counter group), 10.13 (mTCP review gate), 10.14 (RFC compliance review gate).
+**Spec reference:** `docs/superpowers/specs/2026-04-17-dpdk-tcp-design.md` §§ 4 (public API: `dpdk_net_connect`, `dpdk_net_send`, `DPDK_NET_EVT_CONNECTED` / `_READABLE` / `_CLOSED`), 5.2 (TX call chain), 6.1 (FSM — RFC 9293 §3.3.2 eleven-state client-side), 6.2 (`TcpConn` minimum fields for A3), 6.5 (ISS stub, SYN retransmit semantics scoped out), 7.1 (`tx_hdr_mempool` vs `tx_data_mempool`), 9.1 (TCP counter group), 10.13 (mTCP review gate), 10.14 (RFC compliance review gate).
 
 **RFCs in scope for A3** (for the §10.14 RFC compliance review): **9293** (TCP — client FSM, segmentation, ACK generation, RST reply, TIME_WAIT, checksum), **6691** (MSS — clamp to local MTU, SYN MSS option format), **6528** (ISS generation — SipHash skeleton). RFCs 7323 / 2018 / 6298 / 8985 / 5961 / 3168 are all out of scope for A3; they land in A4–A6. All text is vendored at `docs/rfcs/rfcNNNN.txt`.
 
@@ -23,8 +23,8 @@
 - **Window scale = 0 on both sides**. `snd_wnd` is peer's advertised window with no left shift.
 - **No reassembly**: out-of-order segments are dropped and counted (`tcp.rx_out_of_order`). In-order data appends to the per-conn recv buffer; the A4 reassembly queue replaces this behaviour.
 - **Per-segment ACK** (burst coalescing only, per spec §6.4): every segment that advances `rcv_nxt` triggers an ACK on the same poll iteration. Delayed-ACK scheduling (default off anyway; RFC-compliance-preset in A6) is not implemented here.
-- **`RESD_NET_EVT_WRITABLE` and true backpressure**: send buffer backpressure in A3 returns partial from `resd_net_send` but does NOT emit `EVT_WRITABLE` on drain — A6 wires that event. The send buffer is capped at `send_buffer_bytes` per connection.
-- **Internal event borrow lifetime**: `RESD_NET_EVT_READABLE.data` points into a per-connection `last_read_buf: Vec<u8>` that is cleared at the start of the next `resd_net_poll` on the same engine. Still matches the spec §4.2 contract ("valid … until the next `resd_net_poll` call"), but is one copy heavier than the mbuf-pinning model that arrives in a later phase.
+- **`DPDK_NET_EVT_WRITABLE` and true backpressure**: send buffer backpressure in A3 returns partial from `dpdk_net_send` but does NOT emit `EVT_WRITABLE` on drain — A6 wires that event. The send buffer is capped at `send_buffer_bytes` per connection.
+- **Internal event borrow lifetime**: `DPDK_NET_EVT_READABLE.data` points into a per-connection `last_read_buf: Vec<u8>` that is cleared at the start of the next `dpdk_net_poll` on the same engine. Still matches the spec §4.2 contract ("valid … until the next `dpdk_net_poll` call"), but is one copy heavier than the mbuf-pinning model that arrives in a later phase.
 - **RST reply on unmatched segments** (spec §5.1 `reply_rst`): implemented. Emits a bare ACK|RST with `seq=0`, `ack=their_seq+payload_len+flags_count` per RFC 9293 §3.10.7.1.
 - **TIME_WAIT duration**: 2×MSL (MSL = `tcp_msl_ms` default 30000 ms). Connection sits in TIME_WAIT until a `tcp_tick` walk reaps it. A3's tick is naïve (checks deadline at end of `poll_once`); the real timer wheel arrives in A6.
 
@@ -42,7 +42,7 @@
 ## File Structure Created or Modified in This Phase
 
 ```
-crates/resd-net-core/src/
+crates/dpdk-net-core/src/
 ├── lib.rs               (MODIFIED: expose tcp_seq, tcp_state, flow_table, iss, tcp_conn, tcp_output, tcp_events, tcp_input)
 ├── counters.rs          (MODIFIED: extend TcpCounters; state_trans matrix added in a reserved _pad slot)
 ├── engine.rs            (MODIFIED: flow table, event queue, iss state, connect/send/close methods, tcp_input dispatch replaces stub, tx_data_frame helper, time_wait reaping)
@@ -56,19 +56,19 @@ crates/resd-net-core/src/
 ├── tcp_events.rs        (NEW: internal FIFO event queue type)
 └── tcp_input.rs         (NEW: TCP header parser + per-state handlers)
 
-crates/resd-net-core/tests/
+crates/dpdk-net-core/tests/
 ├── engine_smoke.rs      (no change — A1 lifecycle test)
 ├── l2_l3_tap.rs         (no change — A2 integration test)
 └── tcp_basic_tap.rs     (NEW: TCP handshake + echo + close over TAP pair against kernel listener)
 
-crates/resd-net/src/
-├── lib.rs               (MODIFIED: resd_net_connect / resd_net_send / resd_net_close extern "C"; resd_net_poll fills events_out)
-└── api.rs               (MODIFIED: resd_net_tcp_counters_t extended; NO config field additions — A3 uses existing fields)
+crates/dpdk-net/src/
+├── lib.rs               (MODIFIED: dpdk_net_connect / dpdk_net_send / dpdk_net_close extern "C"; dpdk_net_poll fills events_out)
+└── api.rs               (MODIFIED: dpdk_net_tcp_counters_t extended; NO config field additions — A3 uses existing fields)
 
-crates/resd-net-sys/
+crates/dpdk-net-sys/
 └── (no change — the existing alloc/append/burst/free shims cover A3 TX paths)
 
-include/resd_net.h       (REGENERATED via cbindgen)
+include/dpdk_net.h       (REGENERATED via cbindgen)
 
 examples/cpp-consumer/main.cpp  (MODIFIED: print tcp counters, do a connect-send-close smoke against loopback when possible)
 
@@ -87,12 +87,12 @@ docs/superpowers/reviews/phase-a3-rfc-compliance.md    (NEW: A3 RFC compliance r
 **Goal:** Add the TCP counters Phase A3 will write. Reuse the existing `_pad: [u64; 3]` slot (plus an extended pad) to keep the cacheline-aligned struct intact; the layout-assertion `const _: ()` in `api.rs` enforces size + alignment parity. The `state_trans` transition matrix is 121 entries (11×11) but for A3 we only bump the slots we visit — unused slots are harmless zeros.
 
 **Files:**
-- Modify: `crates/resd-net-core/src/counters.rs`
-- Modify: `crates/resd-net/src/api.rs`
+- Modify: `crates/dpdk-net-core/src/counters.rs`
+- Modify: `crates/dpdk-net/src/api.rs`
 
 - [ ] **Step 1: Write the failing test**
 
-Append to `crates/resd-net-core/src/counters.rs` inside `mod tests`:
+Append to `crates/dpdk-net-core/src/counters.rs` inside `mod tests`:
 
 ```rust
     #[test]
@@ -119,10 +119,10 @@ Append to `crates/resd-net-core/src/counters.rs` inside `mod tests`:
 
 - [ ] **Step 2: Run — verify it fails**
 
-Run: `cargo test -p resd-net-core counters::tests::a3_new_tcp_counters_exist_and_zero`
+Run: `cargo test -p dpdk-net-core counters::tests::a3_new_tcp_counters_exist_and_zero`
 Expected: FAIL at compile — `no field tx_syn on TcpCounters`.
 
-- [ ] **Step 3: Extend `TcpCounters`** — replace in `crates/resd-net-core/src/counters.rs`:
+- [ ] **Step 3: Extend `TcpCounters`** — replace in `crates/dpdk-net-core/src/counters.rs`:
 
 ```rust
 #[repr(C, align(64))]
@@ -158,11 +158,11 @@ pub struct TcpCounters {
 }
 ```
 
-- [ ] **Step 4: Mirror into public API** — in `crates/resd-net/src/api.rs`, replace `resd_net_tcp_counters_t`:
+- [ ] **Step 4: Mirror into public API** — in `crates/dpdk-net/src/api.rs`, replace `dpdk_net_tcp_counters_t`:
 
 ```rust
 #[repr(C, align(64))]
-pub struct resd_net_tcp_counters_t {
+pub struct dpdk_net_tcp_counters_t {
     pub rx_syn_ack: u64,
     pub rx_data: u64,
     pub rx_ack: u64,
@@ -194,13 +194,13 @@ pub struct resd_net_tcp_counters_t {
 
 - [ ] **Step 5: Run tests**
 
-Run: `cargo test -p resd-net-core counters::tests && cargo test -p resd-net api`
+Run: `cargo test -p dpdk-net-core counters::tests && cargo test -p dpdk-net api`
 Expected: PASS. If the layout-assertion `const _: ()` fails, recount the `_pad` entries — a 121-entry AtomicU64 matrix + 10 u64 named fields is 131 u64s on top of the 13 original; you may need to adjust `_pad: [u64; 4]` to land on a cacheline-aligned total.
 
 - [ ] **Step 6: Commit**
 
 ```sh
-git add crates/resd-net-core/src/counters.rs crates/resd-net/src/api.rs
+git add crates/dpdk-net-core/src/counters.rs crates/dpdk-net/src/api.rs
 git commit -m "extend tcp counters for a3: tx/rx flag counts + state_trans matrix"
 ```
 
@@ -208,15 +208,15 @@ git commit -m "extend tcp counters for a3: tx/rx flag counts + state_trans matri
 
 ## Task 2: Extend `EngineConfig` with A3 carry-through fields
 
-**Goal:** Forward the A3-relevant fields from the public `resd_net_engine_config_t` (already present since A1) into `EngineConfig` so the core crate can read them. Fields to add: `max_connections`, `recv_buffer_bytes`, `send_buffer_bytes`, `tcp_mss`, `tcp_initial_rto_ms`, `tcp_msl_ms`, `tcp_nagle`. No public-API changes — those fields already exist on `resd_net_engine_config_t`.
+**Goal:** Forward the A3-relevant fields from the public `dpdk_net_engine_config_t` (already present since A1) into `EngineConfig` so the core crate can read them. Fields to add: `max_connections`, `recv_buffer_bytes`, `send_buffer_bytes`, `tcp_mss`, `tcp_initial_rto_ms`, `tcp_msl_ms`, `tcp_nagle`. No public-API changes — those fields already exist on `dpdk_net_engine_config_t`.
 
 **Files:**
-- Modify: `crates/resd-net-core/src/engine.rs`
-- Modify: `crates/resd-net/src/lib.rs`
+- Modify: `crates/dpdk-net-core/src/engine.rs`
+- Modify: `crates/dpdk-net/src/lib.rs`
 
 - [ ] **Step 1: Write the failing test**
 
-Append to `crates/resd-net-core/src/engine.rs` inside `mod tests`:
+Append to `crates/dpdk-net-core/src/engine.rs` inside `mod tests`:
 
 ```rust
     #[test]
@@ -234,10 +234,10 @@ Append to `crates/resd-net-core/src/engine.rs` inside `mod tests`:
 
 - [ ] **Step 2: Run — verify FAIL**
 
-Run: `cargo test -p resd-net-core engine::tests::default_engine_config_has_a3_fields`
+Run: `cargo test -p dpdk-net-core engine::tests::default_engine_config_has_a3_fields`
 Expected: FAIL at compile — no field `max_connections`.
 
-- [ ] **Step 3: Extend the `EngineConfig` struct** — replace `EngineConfig` and its `Default` in `crates/resd-net-core/src/engine.rs`:
+- [ ] **Step 3: Extend the `EngineConfig` struct** — replace `EngineConfig` and its `Default` in `crates/dpdk-net-core/src/engine.rs`:
 
 ```rust
 /// Config passed to Engine::new.
@@ -295,14 +295,14 @@ impl Default for EngineConfig {
 }
 ```
 
-- [ ] **Step 4: Bridge new fields in `crates/resd-net/src/lib.rs`** — replace the body of `resd_net_engine_create`:
+- [ ] **Step 4: Bridge new fields in `crates/dpdk-net/src/lib.rs`** — replace the body of `dpdk_net_engine_create`:
 
 ```rust
 #[no_mangle]
-pub unsafe extern "C" fn resd_net_engine_create(
+pub unsafe extern "C" fn dpdk_net_engine_create(
     lcore_id: u16,
-    cfg: *const resd_net_engine_config_t,
-) -> *mut resd_net_engine {
+    cfg: *const dpdk_net_engine_config_t,
+) -> *mut dpdk_net_engine {
     if cfg.is_null() {
         return ptr::null_mut();
     }
@@ -346,13 +346,13 @@ pub unsafe extern "C" fn resd_net_engine_create(
 
 - [ ] **Step 5: Run tests**
 
-Run: `cargo test -p resd-net-core engine::tests && cargo test -p resd-net`
+Run: `cargo test -p dpdk-net-core engine::tests && cargo test -p dpdk-net`
 Expected: PASS.
 
 - [ ] **Step 6: Commit**
 
 ```sh
-git add crates/resd-net-core/src/engine.rs crates/resd-net/src/lib.rs
+git add crates/dpdk-net-core/src/engine.rs crates/dpdk-net/src/lib.rs
 git commit -m "forward a3 config fields (max_connections, buffers, mss, nagle) into EngineConfig"
 ```
 
@@ -363,12 +363,12 @@ git commit -m "forward a3 config fields (max_connections, buffers, mss, nagle) i
 **Goal:** TCP sequence numbers are u32 with modular arithmetic; naive `<` is wrong across the 0/2^32 wraparound. RFC 9293 §3.4 defines the comparisons as signed 32-bit subtraction. Implement `seq_lt`, `seq_le`, `seq_gt`, `seq_ge`, plus `in_window(start, seq, len)` for "is `seq` in the window `[start, start+len)`?" (len is u32, zero-length means empty).
 
 **Files:**
-- Create: `crates/resd-net-core/src/tcp_seq.rs`
-- Modify: `crates/resd-net-core/src/lib.rs`
+- Create: `crates/dpdk-net-core/src/tcp_seq.rs`
+- Modify: `crates/dpdk-net-core/src/lib.rs`
 
 - [ ] **Step 1: Write the module with failing tests**
 
-Create `crates/resd-net-core/src/tcp_seq.rs`:
+Create `crates/dpdk-net-core/src/tcp_seq.rs`:
 
 ```rust
 //! Wrap-safe u32 TCP-sequence-space comparisons (RFC 9293 §3.4).
@@ -458,7 +458,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Expose the module** — in `crates/resd-net-core/src/lib.rs`, add before `pub mod arp;`:
+- [ ] **Step 2: Expose the module** — in `crates/dpdk-net-core/src/lib.rs`, add before `pub mod arp;`:
 
 ```rust
 pub mod tcp_seq;
@@ -466,13 +466,13 @@ pub mod tcp_seq;
 
 - [ ] **Step 3: Run — verify PASS**
 
-Run: `cargo test -p resd-net-core tcp_seq::`
+Run: `cargo test -p dpdk-net-core tcp_seq::`
 Expected: 6 PASS.
 
 - [ ] **Step 4: Commit**
 
 ```sh
-git add crates/resd-net-core/src/tcp_seq.rs crates/resd-net-core/src/lib.rs
+git add crates/dpdk-net-core/src/tcp_seq.rs crates/dpdk-net-core/src/lib.rs
 git commit -m "add tcp_seq: wrap-safe u32 sequence-space comparisons (rfc 9293 §3.4)"
 ```
 
@@ -483,18 +483,18 @@ git commit -m "add tcp_seq: wrap-safe u32 sequence-space comparisons (rfc 9293 �
 **Goal:** Strongly-typed state enum that maps 1:1 to `u8` for the public `tcp_state_change` event + `state_trans[from][to]` counter indexing. Includes a `Display` impl for debug logs (no strings on hot path — spec §9.4).
 
 **Files:**
-- Create: `crates/resd-net-core/src/tcp_state.rs`
-- Modify: `crates/resd-net-core/src/lib.rs`
+- Create: `crates/dpdk-net-core/src/tcp_state.rs`
+- Modify: `crates/dpdk-net-core/src/lib.rs`
 
 - [ ] **Step 1: Write the module + tests**
 
-Create `crates/resd-net-core/src/tcp_state.rs`:
+Create `crates/dpdk-net-core/src/tcp_state.rs`:
 
 ```rust
 //! RFC 9293 §3.3.2 eleven-state TCP FSM. States are numbered so the
 //! `state_trans[from][to]` counter matrix in `counters.rs` can be
 //! indexed by `state as usize` without collisions. Also exposed as
-//! `u8` for the public `RESD_NET_EVT_TCP_STATE_CHANGE` event.
+//! `u8` for the public `DPDK_NET_EVT_TCP_STATE_CHANGE` event.
 //!
 //! We never transition to LISTEN in production (spec §6.1); it's
 //! present only so the enum covers the full RFC set and so the
@@ -562,7 +562,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Expose the module** — in `crates/resd-net-core/src/lib.rs`, add after `pub mod tcp_seq;`:
+- [ ] **Step 2: Expose the module** — in `crates/dpdk-net-core/src/lib.rs`, add after `pub mod tcp_seq;`:
 
 ```rust
 pub mod tcp_state;
@@ -570,13 +570,13 @@ pub mod tcp_state;
 
 - [ ] **Step 3: Run — verify PASS**
 
-Run: `cargo test -p resd-net-core tcp_state::`
+Run: `cargo test -p dpdk-net-core tcp_state::`
 Expected: 2 PASS.
 
 - [ ] **Step 4: Commit**
 
 ```sh
-git add crates/resd-net-core/src/tcp_state.rs crates/resd-net-core/src/lib.rs
+git add crates/dpdk-net-core/src/tcp_state.rs crates/dpdk-net-core/src/lib.rs
 git commit -m "add tcp_state: rfc 9293 §3.3.2 eleven-state enum"
 ```
 
@@ -584,15 +584,15 @@ git commit -m "add tcp_state: rfc 9293 §3.3.2 eleven-state enum"
 
 ## Task 5: `flow_table.rs` — 4-tuple hash + handle-indexed slot array
 
-**Goal:** Two coupled structures. `FourTuple` is `(local_ip, local_port, peer_ip, peer_port)` in host byte order; it hashes into a standard Rust `HashMap`. `FlowTable` owns a `Vec<Option<TcpConn>>` pre-warmed to `max_connections`, plus a `HashMap<FourTuple, u32>` that maps 4-tuple → slot index. Handle values returned to callers are `slot_idx + 1` so that `0` is reserved as the invalid sentinel (matches the public `resd_net_conn_t` convention). Insertions do not reallocate the slot `Vec`; when full, allocation returns `None`.
+**Goal:** Two coupled structures. `FourTuple` is `(local_ip, local_port, peer_ip, peer_port)` in host byte order; it hashes into a standard Rust `HashMap`. `FlowTable` owns a `Vec<Option<TcpConn>>` pre-warmed to `max_connections`, plus a `HashMap<FourTuple, u32>` that maps 4-tuple → slot index. Handle values returned to callers are `slot_idx + 1` so that `0` is reserved as the invalid sentinel (matches the public `dpdk_net_conn_t` convention). Insertions do not reallocate the slot `Vec`; when full, allocation returns `None`.
 
 **Files:**
-- Create: `crates/resd-net-core/src/flow_table.rs`
-- Modify: `crates/resd-net-core/src/lib.rs`
+- Create: `crates/dpdk-net-core/src/flow_table.rs`
+- Modify: `crates/dpdk-net-core/src/lib.rs`
 
 - [ ] **Step 1: Write the module**
 
-Create `crates/resd-net-core/src/flow_table.rs`:
+Create `crates/dpdk-net-core/src/flow_table.rs`:
 
 ```rust
 //! 4-tuple hash and handle-indexed slot array. The hot path on RX is
@@ -601,7 +601,7 @@ Create `crates/resd-net-core/src/flow_table.rs`:
 //! skips the hash and just indexes the slot `Vec`.
 //!
 //! Handle values exposed to callers are `slot_idx + 1`, so handle `0`
-//! is reserved as the invalid sentinel — matching `resd_net_conn_t`'s
+//! is reserved as the invalid sentinel — matching `dpdk_net_conn_t`'s
 //! "0 = invalid" convention in spec §4.
 
 use std::collections::HashMap;
@@ -620,7 +620,7 @@ pub struct FourTuple {
 }
 
 /// Opaque connection handle. A `u32` internally; we widen to `u64` at
-/// the C ABI boundary (see `resd_net_conn_t`).
+/// the C ABI boundary (see `dpdk_net_conn_t`).
 pub type ConnHandle = u32;
 
 pub const INVALID_HANDLE: ConnHandle = 0;
@@ -778,21 +778,21 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Expose the module** — in `crates/resd-net-core/src/lib.rs`, add after `pub mod tcp_state;`:
+- [ ] **Step 2: Expose the module** — in `crates/dpdk-net-core/src/lib.rs`, add after `pub mod tcp_state;`:
 
 ```rust
 pub mod flow_table;
 pub mod tcp_conn;  // exposed now because flow_table depends on it
 ```
 
-(The `tcp_conn` module comes in Task 7; a one-line stub `pub struct TcpConn;` is enough for the workspace to compile this test without Task 7 yet. But since we add `tcp_conn` next, we skip the stub and land the two modules together — the `cargo test -p resd-net-core flow_table::` invocation below runs after Task 7.)
+(The `tcp_conn` module comes in Task 7; a one-line stub `pub struct TcpConn;` is enough for the workspace to compile this test without Task 7 yet. But since we add `tcp_conn` next, we skip the stub and land the two modules together — the `cargo test -p dpdk-net-core flow_table::` invocation below runs after Task 7.)
 
 - [ ] **Step 3: Do not run tests yet** — `flow_table` tests reference `TcpConn::new_client`, which is Task 7. Mark the module as written but defer test execution until after Task 7 builds.
 
 - [ ] **Step 4: Commit the module file only** (not `lib.rs` — we need `tcp_conn` first)
 
 ```sh
-git add crates/resd-net-core/src/flow_table.rs
+git add crates/dpdk-net-core/src/flow_table.rs
 git commit -m "add flow_table: 4-tuple hashmap + handle-indexed slot array"
 ```
 
@@ -803,12 +803,12 @@ git commit -m "add flow_table: 4-tuple hashmap + handle-indexed slot array"
 **Goal:** Generate a deterministic-but-peer-unpredictable initial sequence number per RFC 6528. The formula per spec §6.5: `ISS = (monotonic_time_4µs_ticks_low_32) + SipHash64(local_ip || local_port || peer_ip || peer_port || secret || boot_nonce)`. A3 ships a skeleton that uses `std::collections::hash_map::DefaultHasher` (SipHash-1-3) as the keyed-hash; A5 swaps in a dedicated SipHash-2-4 implementation + boot_nonce from `/proc/sys/kernel/random/boot_id`. The API is stable across the swap.
 
 **Files:**
-- Create: `crates/resd-net-core/src/iss.rs`
-- Modify: `crates/resd-net-core/src/lib.rs`
+- Create: `crates/dpdk-net-core/src/iss.rs`
+- Modify: `crates/dpdk-net-core/src/lib.rs`
 
 - [ ] **Step 1: Write the module**
 
-Create `crates/resd-net-core/src/iss.rs`:
+Create `crates/dpdk-net-core/src/iss.rs`:
 
 ```rust
 //! RFC 6528 §3 ISS generator — SipHash-of-4-tuple + secret + boot_nonce,
@@ -914,7 +914,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Expose the module** — in `crates/resd-net-core/src/lib.rs`, add after `pub mod flow_table;`:
+- [ ] **Step 2: Expose the module** — in `crates/dpdk-net-core/src/lib.rs`, add after `pub mod flow_table;`:
 
 ```rust
 pub mod iss;
@@ -925,7 +925,7 @@ pub mod iss;
 - [ ] **Step 4: Commit**
 
 ```sh
-git add crates/resd-net-core/src/iss.rs
+git add crates/dpdk-net-core/src/iss.rs
 git commit -m "add iss: rfc 6528 iss generator skeleton (siphash via default hasher)"
 ```
 
@@ -936,11 +936,11 @@ git commit -m "add iss: rfc 6528 iss generator skeleton (siphash via default has
 **Goal:** Implement the per-connection state per spec §6.2 but only the fields A3 actually touches. Later phases grow this struct — the point is to lock in the shape so A4+ additions are additive. Unused fields from §6.2 (`ws_shift_*`, `ts_*`, `sack_enabled`, `rack`, `cc`, timer handles) are deferred.
 
 **Files:**
-- Create: `crates/resd-net-core/src/tcp_conn.rs`
+- Create: `crates/dpdk-net-core/src/tcp_conn.rs`
 
 - [ ] **Step 1: Write the module + tests**
 
-Create `crates/resd-net-core/src/tcp_conn.rs`:
+Create `crates/dpdk-net-core/src/tcp_conn.rs`:
 
 ```rust
 //! Per-connection state (spec §6.2, subset for Phase A3).
@@ -990,8 +990,8 @@ pub struct RecvQueue {
     pub bytes: VecDeque<u8>,
     pub cap: u32,
     /// Scratch buffer for the borrow-view exposed to
-    /// `RESD_NET_EVT_READABLE.data`. Cleared at the start of each
-    /// `resd_net_poll` on the owning engine (not here).
+    /// `DPDK_NET_EVT_READABLE.data`. Cleared at the start of each
+    /// `dpdk_net_poll` on the owning engine (not here).
     pub last_read_buf: Vec<u8>,
 }
 
@@ -1160,13 +1160,13 @@ mod tests {
 
 - [ ] **Step 2: Run — verify PASS for tcp_conn + flow_table + iss**
 
-Run: `cargo test -p resd-net-core tcp_conn:: && cargo test -p resd-net-core flow_table:: && cargo test -p resd-net-core iss::`
+Run: `cargo test -p dpdk-net-core tcp_conn:: && cargo test -p dpdk-net-core flow_table:: && cargo test -p dpdk-net-core iss::`
 Expected: 5 + 6 + 3 = 14 PASS total.
 
 - [ ] **Step 3: Commit**
 
 ```sh
-git add crates/resd-net-core/src/tcp_conn.rs crates/resd-net-core/src/lib.rs
+git add crates/dpdk-net-core/src/tcp_conn.rs crates/dpdk-net-core/src/lib.rs
 git commit -m "add tcp_conn: per-conn state (spec §6.2 a3-minimum fields)"
 ```
 
@@ -1177,12 +1177,12 @@ git commit -m "add tcp_conn: per-conn state (spec §6.2 a3-minimum fields)"
 **Goal:** Build complete Ethernet + IPv4 + TCP frames for every outbound segment type A3 needs: SYN (with MSS option), bare ACK, ACK+data, ACK+FIN, ACK+RST, and a standalone RST for unmatched inbound packets. The TCP checksum is computed over the pseudo-header (src_ip, dst_ip, protocol=6, tcp_length) + TCP header + payload — spec §6.3 RFC 791/793 row.
 
 **Files:**
-- Create: `crates/resd-net-core/src/tcp_output.rs`
-- Modify: `crates/resd-net-core/src/lib.rs`
+- Create: `crates/dpdk-net-core/src/tcp_output.rs`
+- Modify: `crates/dpdk-net-core/src/lib.rs`
 
 - [ ] **Step 1: Write the module + tests**
 
-Create `crates/resd-net-core/src/tcp_output.rs`:
+Create `crates/dpdk-net-core/src/tcp_output.rs`:
 
 ```rust
 //! TCP segment builders. Every builder emits a complete Ethernet + IPv4 +
@@ -1396,7 +1396,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Expose the module** — in `crates/resd-net-core/src/lib.rs`, add after `pub mod tcp_conn;`:
+- [ ] **Step 2: Expose the module** — in `crates/dpdk-net-core/src/lib.rs`, add after `pub mod tcp_conn;`:
 
 ```rust
 pub mod tcp_output;
@@ -1404,13 +1404,13 @@ pub mod tcp_output;
 
 - [ ] **Step 3: Run — verify PASS**
 
-Run: `cargo test -p resd-net-core tcp_output::`
+Run: `cargo test -p dpdk-net-core tcp_output::`
 Expected: 5 PASS.
 
 - [ ] **Step 4: Commit**
 
 ```sh
-git add crates/resd-net-core/src/tcp_output.rs crates/resd-net-core/src/lib.rs
+git add crates/dpdk-net-core/src/tcp_output.rs crates/dpdk-net-core/src/lib.rs
 git commit -m "add tcp_output: eth+ip+tcp segment builders with pseudo-header csum"
 ```
 
@@ -1418,19 +1418,19 @@ git commit -m "add tcp_output: eth+ip+tcp segment builders with pseudo-header cs
 
 ## Task 9: `tcp_events.rs` — internal FIFO event queue
 
-**Goal:** An internal `VecDeque<InternalEvent>` that accumulates events as TCP FSM transitions fire, drained by `resd_net_poll` into the caller's `events_out[]`. Spec §4.2 event-overflow policy: "fills `events_out[0..max_events]` with events in FIFO enqueue order, stops further RX-burst processing for this iteration, and leaves the overflow queued inside the engine". A3 implements the FIFO side; the rx-burst-stop interaction is implemented in the `poll_once` change (Task 18).
+**Goal:** An internal `VecDeque<InternalEvent>` that accumulates events as TCP FSM transitions fire, drained by `dpdk_net_poll` into the caller's `events_out[]`. Spec §4.2 event-overflow policy: "fills `events_out[0..max_events]` with events in FIFO enqueue order, stops further RX-burst processing for this iteration, and leaves the overflow queued inside the engine". A3 implements the FIFO side; the rx-burst-stop interaction is implemented in the `poll_once` change (Task 18).
 
 **Files:**
-- Create: `crates/resd-net-core/src/tcp_events.rs`
-- Modify: `crates/resd-net-core/src/lib.rs`
+- Create: `crates/dpdk-net-core/src/tcp_events.rs`
+- Modify: `crates/dpdk-net-core/src/lib.rs`
 
 - [ ] **Step 1: Write the module + tests**
 
-Create `crates/resd-net-core/src/tcp_events.rs`:
+Create `crates/dpdk-net-core/src/tcp_events.rs`:
 
 ```rust
 //! Internal FIFO event queue. Populated by FSM transitions and data
-//! delivery; drained at the top of `resd_net_poll` into the caller's
+//! delivery; drained at the top of `dpdk_net_poll` into the caller's
 //! `events_out[]` array.
 
 use std::collections::VecDeque;
@@ -1439,7 +1439,7 @@ use crate::flow_table::ConnHandle;
 use crate::tcp_state::TcpState;
 
 /// Event kinds internal to the engine. Translated to public
-/// `resd_net_event_t` values at the C ABI boundary.
+/// `dpdk_net_event_t` values at the C ABI boundary.
 #[derive(Debug, Clone)]
 pub enum InternalEvent {
     Connected {
@@ -1528,7 +1528,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Expose the module** — in `crates/resd-net-core/src/lib.rs`, add after `pub mod tcp_output;`:
+- [ ] **Step 2: Expose the module** — in `crates/dpdk-net-core/src/lib.rs`, add after `pub mod tcp_output;`:
 
 ```rust
 pub mod tcp_events;
@@ -1536,13 +1536,13 @@ pub mod tcp_events;
 
 - [ ] **Step 3: Run — verify PASS**
 
-Run: `cargo test -p resd-net-core tcp_events::`
+Run: `cargo test -p dpdk-net-core tcp_events::`
 Expected: 2 PASS.
 
 - [ ] **Step 4: Commit**
 
 ```sh
-git add crates/resd-net-core/src/tcp_events.rs crates/resd-net-core/src/lib.rs
+git add crates/dpdk-net-core/src/tcp_events.rs crates/dpdk-net-core/src/lib.rs
 git commit -m "add tcp_events: internal fifo event queue"
 ```
 
@@ -1553,12 +1553,12 @@ git commit -m "add tcp_events: internal fifo event queue"
 **Goal:** Parse a TCP segment from an IP payload slice, extract the 4-tuple, and dispatch to per-state handlers. For now every handler is a stub that increments `tcp.rx_unmatched` — subsequent tasks fill in SYN_SENT (Task 11), ESTABLISHED (Task 12), and close-path states (Task 13). This task locks in the parser + the dispatch wiring so those tasks are additive.
 
 **Files:**
-- Create: `crates/resd-net-core/src/tcp_input.rs`
-- Modify: `crates/resd-net-core/src/lib.rs`
+- Create: `crates/dpdk-net-core/src/tcp_input.rs`
+- Modify: `crates/dpdk-net-core/src/lib.rs`
 
 - [ ] **Step 1: Write the parser + skeleton**
 
-Create `crates/resd-net-core/src/tcp_input.rs`:
+Create `crates/dpdk-net-core/src/tcp_input.rs`:
 
 ```rust
 //! Inbound TCP segment processing. Entry point is `tcp_input_dispatch`;
@@ -1868,7 +1868,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Expose the module** — in `crates/resd-net-core/src/lib.rs`, add after `pub mod tcp_events;`:
+- [ ] **Step 2: Expose the module** — in `crates/dpdk-net-core/src/lib.rs`, add after `pub mod tcp_events;`:
 
 ```rust
 pub mod tcp_input;
@@ -1876,13 +1876,13 @@ pub mod tcp_input;
 
 - [ ] **Step 3: Run — verify PASS**
 
-Run: `cargo test -p resd-net-core tcp_input::`
+Run: `cargo test -p dpdk-net-core tcp_input::`
 Expected: 7 PASS.
 
 - [ ] **Step 4: Commit**
 
 ```sh
-git add crates/resd-net-core/src/tcp_input.rs crates/resd-net-core/src/lib.rs
+git add crates/dpdk-net-core/src/tcp_input.rs crates/dpdk-net-core/src/lib.rs
 git commit -m "add tcp_input skeleton: header parser + per-state dispatch (stub handlers)"
 ```
 
@@ -1893,11 +1893,11 @@ git commit -m "add tcp_input skeleton: header parser + per-state dispatch (stub 
 **Goal:** When a segment arrives for a SYN_SENT connection: validate it's a SYN-ACK for our ISS+1; set `rcv_nxt = irs+1`, `snd_una = ack`, peer's MSS (via options); transition to ESTABLISHED; request an ACK be sent back; flag `connected = true` so the engine emits `EVT_CONNECTED`. A non-matching ACK → RST. A SYN-only (simultaneous-open) — deferred to A4; we drop with `BadFlags` counter.
 
 **Files:**
-- Modify: `crates/resd-net-core/src/tcp_input.rs`
+- Modify: `crates/dpdk-net-core/src/tcp_input.rs`
 
 - [ ] **Step 1: Write the failing tests**
 
-Append to `crates/resd-net-core/src/tcp_input.rs` inside `mod tests`:
+Append to `crates/dpdk-net-core/src/tcp_input.rs` inside `mod tests`:
 
 ```rust
     #[test]
@@ -1980,10 +1980,10 @@ Append to `crates/resd-net-core/src/tcp_input.rs` inside `mod tests`:
 
 - [ ] **Step 2: Run — verify FAIL**
 
-Run: `cargo test -p resd-net-core tcp_input::tests::syn_sent_`
+Run: `cargo test -p dpdk-net-core tcp_input::tests::syn_sent_`
 Expected: FAIL with assertion errors (stub returns `Outcome::none()`).
 
-- [ ] **Step 3: Implement `handle_syn_sent`** — replace the stub in `crates/resd-net-core/src/tcp_input.rs`:
+- [ ] **Step 3: Implement `handle_syn_sent`** — replace the stub in `crates/dpdk-net-core/src/tcp_input.rs`:
 
 ```rust
 fn handle_syn_sent(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
@@ -2049,13 +2049,13 @@ fn handle_syn_sent(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
 
 - [ ] **Step 4: Run — verify PASS**
 
-Run: `cargo test -p resd-net-core tcp_input::`
+Run: `cargo test -p dpdk-net-core tcp_input::`
 Expected: 10 PASS (7 from Task 10 + 3 new).
 
 - [ ] **Step 5: Commit**
 
 ```sh
-git add crates/resd-net-core/src/tcp_input.rs
+git add crates/dpdk-net-core/src/tcp_input.rs
 git commit -m "tcp_input: handle SYN_SENT — SYN-ACK completes handshake, rst path"
 ```
 
@@ -2066,11 +2066,11 @@ git commit -m "tcp_input: handle SYN_SENT — SYN-ACK completes handshake, rst p
 **Goal:** In ESTABLISHED: (1) validate `seq` is in-window `[rcv_nxt, rcv_nxt+rcv_wnd)`; out-of-window → ACK with current state and drop. (2) process the ACK field: advance `snd_una` if it moves; drop ACKed bytes from `snd.pending`; update `snd_wnd`/`snd_wl1`/`snd_wl2`. (3) if payload at `seq == rcv_nxt`, deliver in-order bytes to `recv` queue (drop/count out-of-order), advance `rcv_nxt`, set `delivered = n`. (4) if FIN — advance `rcv_nxt` by 1, transition to CLOSE_WAIT, request ACK. (5) RST on any established segment immediately closes.
 
 **Files:**
-- Modify: `crates/resd-net-core/src/tcp_input.rs`
+- Modify: `crates/dpdk-net-core/src/tcp_input.rs`
 
 - [ ] **Step 1: Write the failing tests**
 
-Append to `crates/resd-net-core/src/tcp_input.rs` inside `mod tests`:
+Append to `crates/dpdk-net-core/src/tcp_input.rs` inside `mod tests`:
 
 ```rust
     fn est_conn(iss: u32, irs: u32, peer_wnd: u16) -> crate::tcp_conn::TcpConn {
@@ -2181,7 +2181,7 @@ Append to `crates/resd-net-core/src/tcp_input.rs` inside `mod tests`:
 
 - [ ] **Step 2: Run — verify FAIL**
 
-Run: `cargo test -p resd-net-core tcp_input::tests::established_`
+Run: `cargo test -p dpdk-net-core tcp_input::tests::established_`
 Expected: FAIL.
 
 - [ ] **Step 3: Implement `handle_established`** — replace the stub:
@@ -2278,13 +2278,13 @@ fn handle_established(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
 
 - [ ] **Step 4: Run — verify PASS**
 
-Run: `cargo test -p resd-net-core tcp_input::`
+Run: `cargo test -p dpdk-net-core tcp_input::`
 Expected: 15 PASS.
 
 - [ ] **Step 5: Commit**
 
 ```sh
-git add crates/resd-net-core/src/tcp_input.rs
+git add crates/dpdk-net-core/src/tcp_input.rs
 git commit -m "tcp_input: handle ESTABLISHED — seq-window check, ack advance, in-order data, FIN"
 ```
 
@@ -2295,7 +2295,7 @@ git commit -m "tcp_input: handle ESTABLISHED — seq-window check, ack advance, 
 **Goal:** Implement the five close-path states. FIN_WAIT_1 → FIN_WAIT_2 on ACK-of-our-FIN; FIN_WAIT_1 → CLOSING on peer's FIN before our FIN is ACKed; FIN_WAIT_2 → TIME_WAIT on peer's FIN; CLOSING → TIME_WAIT on ACK-of-our-FIN; TIME_WAIT silently ACKs any inbound segment; CLOSE_WAIT is dead-in-dispatch (we only leave it via application `close`, which runs through Task 17's engine code). LAST_ACK → CLOSED on ACK-of-our-FIN.
 
 **Files:**
-- Modify: `crates/resd-net-core/src/tcp_input.rs`
+- Modify: `crates/dpdk-net-core/src/tcp_input.rs`
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2467,7 +2467,7 @@ Append to `mod tests`:
 
 - [ ] **Step 2: Run — verify FAIL**
 
-Run: `cargo test -p resd-net-core tcp_input::tests::fin_wait1_ tcp_input::tests::fin_wait2_ tcp_input::tests::closing_ tcp_input::tests::last_ack_ tcp_input::tests::time_wait_`
+Run: `cargo test -p dpdk-net-core tcp_input::tests::fin_wait1_ tcp_input::tests::fin_wait2_ tcp_input::tests::closing_ tcp_input::tests::last_ack_ tcp_input::tests::time_wait_`
 Expected: FAIL.
 
 - [ ] **Step 3: Implement `handle_close_path`** — replace the stub:
@@ -2546,13 +2546,13 @@ fn handle_close_path(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
 
 - [ ] **Step 4: Run — verify PASS**
 
-Run: `cargo test -p resd-net-core tcp_input::`
+Run: `cargo test -p dpdk-net-core tcp_input::`
 Expected: 21 PASS.
 
 - [ ] **Step 5: Commit**
 
 ```sh
-git add crates/resd-net-core/src/tcp_input.rs
+git add crates/dpdk-net-core/src/tcp_input.rs
 git commit -m "tcp_input: handle close-path states (fin_wait1/2, closing, last_ack, time_wait)"
 ```
 
@@ -2563,11 +2563,11 @@ git commit -m "tcp_input: handle close-path states (fin_wait1/2, closing, last_a
 **Goal:** Add `Error` variants `TooManyConns`, `InvalidConnHandle`, `PeerUnreachable`, `SendBufferFull` so the public-API bridge can emit meaningful errnos. The public API continues to use plain `-libc::ENOMEM`/`-ENOTCONN`/`-EINVAL` etc. at the boundary; the Rust variants exist for internal clarity.
 
 **Files:**
-- Modify: `crates/resd-net-core/src/error.rs`
+- Modify: `crates/dpdk-net-core/src/error.rs`
 
 - [ ] **Step 1: Write the failing test** (a compile-time check is enough here; no behavior to test)
 
-Append to `crates/resd-net-core/src/error.rs`:
+Append to `crates/dpdk-net-core/src/error.rs`:
 
 ```rust
 #[cfg(test)]
@@ -2599,13 +2599,13 @@ mod tests {
 
 - [ ] **Step 3: Run — verify PASS**
 
-Run: `cargo test -p resd-net-core error::`
+Run: `cargo test -p dpdk-net-core error::`
 Expected: 1 PASS.
 
 - [ ] **Step 4: Commit**
 
 ```sh
-git add crates/resd-net-core/src/error.rs
+git add crates/dpdk-net-core/src/error.rs
 git commit -m "add a3 error variants: TooManyConns, InvalidConnHandle, PeerUnreachable, SendBufferFull"
 ```
 
@@ -2616,11 +2616,11 @@ git commit -m "add a3 error variants: TooManyConns, InvalidConnHandle, PeerUnrea
 **Goal:** Extend `Engine` with `flow_table: RefCell<FlowTable>`, `events: RefCell<EventQueue>`, `iss: IssGen`, and a `last_ephemeral_port: Cell<u16>` to hand out outbound source ports. Replace `tcp_input_stub` with a real handler that parses the segment, looks up the conn, calls `dispatch`, emits ACK/RST via `tx_frame`, and pushes events to the queue. Add a `tx_data_frame(bytes)` helper that allocates from `tx_data_mempool` instead of `tx_hdr_mempool` (so large data segments don't exhaust the small-mbuf pool).
 
 **Files:**
-- Modify: `crates/resd-net-core/src/engine.rs`
+- Modify: `crates/dpdk-net-core/src/engine.rs`
 
 - [ ] **Step 1: Rewrite the `Engine` struct + `new` to hold A3 state**
 
-In `crates/resd-net-core/src/engine.rs`, extend the imports at the top:
+In `crates/dpdk-net-core/src/engine.rs`, extend the imports at the top:
 
 ```rust
 use std::cell::{Cell, RefCell};
@@ -2695,14 +2695,14 @@ Append inside `impl Engine { ... }`:
             inc(&self.counters.eth.tx_drop_nomem);
             return false;
         }
-        let m = unsafe { sys::resd_rte_pktmbuf_alloc(self.tx_data_mempool.as_ptr()) };
+        let m = unsafe { sys::shim_rte_pktmbuf_alloc(self.tx_data_mempool.as_ptr()) };
         if m.is_null() {
             inc(&self.counters.eth.tx_drop_nomem);
             return false;
         }
-        let dst = unsafe { sys::resd_rte_pktmbuf_append(m, bytes.len() as u16) };
+        let dst = unsafe { sys::shim_rte_pktmbuf_append(m, bytes.len() as u16) };
         if dst.is_null() {
-            unsafe { sys::resd_rte_pktmbuf_free(m) };
+            unsafe { sys::shim_rte_pktmbuf_free(m) };
             inc(&self.counters.eth.tx_drop_nomem);
             return false;
         }
@@ -2711,7 +2711,7 @@ Append inside `impl Engine { ... }`:
         }
         let mut pkts = [m];
         let sent = unsafe {
-            sys::resd_rte_eth_tx_burst(
+            sys::shim_rte_eth_tx_burst(
                 self.cfg.port_id,
                 self.cfg.tx_queue_id,
                 pkts.as_mut_ptr(),
@@ -2723,7 +2723,7 @@ Append inside `impl Engine { ... }`:
             inc(&self.counters.eth.tx_pkts);
             true
         } else {
-            unsafe { sys::resd_rte_pktmbuf_free(m) };
+            unsafe { sys::shim_rte_pktmbuf_free(m) };
             inc(&self.counters.eth.tx_drop_full_ring);
             false
         }
@@ -2995,13 +2995,13 @@ Remove the `tcp_input_stub` function entirely.
 
 - [ ] **Step 6: Run build**
 
-Run: `cargo build -p resd-net-core`
+Run: `cargo build -p dpdk-net-core`
 Expected: compiles. Tests from earlier tasks still pass on re-run.
 
 - [ ] **Step 7: Commit**
 
 ```sh
-git add crates/resd-net-core/src/engine.rs
+git add crates/dpdk-net-core/src/engine.rs
 git commit -m "engine: wire flow_table + events + iss + tcp_input dispatch; add tx_data_frame"
 ```
 
@@ -3012,11 +3012,11 @@ git commit -m "engine: wire flow_table + events + iss + tcp_input dispatch; add 
 **Goal:** Add `Engine::connect(peer_ip, peer_port, local_port_hint) -> Result<ConnHandle>`. Allocates a connection slot in the flow table, generates ISS via the RFC 6528 generator, builds + transmits a SYN with the MSS option, transitions the conn to SYN_SENT, and returns the handle. SYN retransmit is NOT implemented — one attempt, then the caller's `connect_timeout_ms` handles the failure at application level.
 
 **Files:**
-- Modify: `crates/resd-net-core/src/engine.rs`
+- Modify: `crates/dpdk-net-core/src/engine.rs`
 
 - [ ] **Step 1: Write the failing test** (unit-level; a real-network test is in Task 22)
 
-Append inside `crates/resd-net-core/src/engine.rs`'s `mod tests`:
+Append inside `crates/dpdk-net-core/src/engine.rs`'s `mod tests`:
 
 ```rust
     #[test]
@@ -3035,14 +3035,14 @@ Append inside `crates/resd-net-core/src/engine.rs`'s `mod tests`:
 
 - [ ] **Step 2: Run — verify FAIL**
 
-Run: `cargo test -p resd-net-core engine::tests::connect_requires_nonzero_local_ip`
+Run: `cargo test -p dpdk-net-core engine::tests::connect_requires_nonzero_local_ip`
 Expected: FAIL at compile — method `connect` doesn't exist.
 
 - [ ] **Step 3: Implement `connect`** — append inside `impl Engine`:
 
 ```rust
     /// Open a new client-side connection. Emits a single SYN and
-    /// returns the handle. The caller waits on `RESD_NET_EVT_CONNECTED`
+    /// returns the handle. The caller waits on `DPDK_NET_EVT_CONNECTED`
     /// (or times out at application level — SYN retransmit is A5).
     ///
     /// `peer_ip` / `peer_port` in host byte order.
@@ -3135,13 +3135,13 @@ Expected: FAIL at compile — method `connect` doesn't exist.
 
 - [ ] **Step 4: Run — verify PASS**
 
-Run: `cargo test -p resd-net-core engine::tests::connect_requires_nonzero_local_ip`
+Run: `cargo test -p dpdk-net-core engine::tests::connect_requires_nonzero_local_ip`
 Expected: PASS (compile succeeds).
 
 - [ ] **Step 5: Commit**
 
 ```sh
-git add crates/resd-net-core/src/engine.rs
+git add crates/dpdk-net-core/src/engine.rs
 git commit -m "engine: connect() — emit SYN with MSS option, insert flow, transition SYN_SENT"
 ```
 
@@ -3149,10 +3149,10 @@ git commit -m "engine: connect() — emit SYN with MSS option, insert flow, tran
 
 ## Task 17: Engine `send_bytes` — segment user data, emit MSS-sized TCP segments
 
-**Goal:** `Engine::send_bytes(handle, bytes) -> i32` where the return mirrors the public `resd_net_send` contract: `>= 0` bytes accepted, `< 0` on error (`-ENOTCONN` if not ESTABLISHED, `-ENOMEM` if tx_data_mempool is exhausted mid-send). A3 ignores the `tcp_nagle` setting — every call sends its own segments immediately. Segmentation respects `peer_mss` (capped to our `tcp_mss`). `snd_nxt` advances as segments are emitted; bytes in the pending queue are held but in A3 we send-then-forget (no retransmit buffer).
+**Goal:** `Engine::send_bytes(handle, bytes) -> i32` where the return mirrors the public `dpdk_net_send` contract: `>= 0` bytes accepted, `< 0` on error (`-ENOTCONN` if not ESTABLISHED, `-ENOMEM` if tx_data_mempool is exhausted mid-send). A3 ignores the `tcp_nagle` setting — every call sends its own segments immediately. Segmentation respects `peer_mss` (capped to our `tcp_mss`). `snd_nxt` advances as segments are emitted; bytes in the pending queue are held but in A3 we send-then-forget (no retransmit buffer).
 
 **Files:**
-- Modify: `crates/resd-net-core/src/engine.rs`
+- Modify: `crates/dpdk-net-core/src/engine.rs`
 
 - [ ] **Step 1: Implement `send_bytes`** — append inside `impl Engine`:
 
@@ -3260,13 +3260,13 @@ git commit -m "engine: connect() — emit SYN with MSS option, insert flow, tran
 
 - [ ] **Step 3: Run — verify PASS**
 
-Run: `cargo test -p resd-net-core engine::tests::send_bytes_signature_exists`
+Run: `cargo test -p dpdk-net-core engine::tests::send_bytes_signature_exists`
 Expected: PASS (compile succeeds).
 
 - [ ] **Step 4: Commit**
 
 ```sh
-git add crates/resd-net-core/src/engine.rs
+git add crates/dpdk-net-core/src/engine.rs
 git commit -m "engine: send_bytes — mss-sized segmentation with PSH|ACK, peer-window respect"
 ```
 
@@ -3277,7 +3277,7 @@ git commit -m "engine: send_bytes — mss-sized segmentation with PSH|ACK, peer-
 **Goal:** `Engine::close_conn(handle)` emits a FIN (ACK|FIN) from whichever state permits it, transitions to FIN_WAIT_1 (from ESTABLISHED) or LAST_ACK (from CLOSE_WAIT), and records `our_fin_seq` so `fin_has_been_acked` can detect the peer's ACK later. A call on an already-closed connection is a no-op. The `FORCE_TW_SKIP` flag is deferred to A6 (spec §6.5); A3 ignores the flag.
 
 **Files:**
-- Modify: `crates/resd-net-core/src/engine.rs`
+- Modify: `crates/dpdk-net-core/src/engine.rs`
 
 - [ ] **Step 1: Implement `close_conn`** — append inside `impl Engine`:
 
@@ -3349,13 +3349,13 @@ git commit -m "engine: send_bytes — mss-sized segmentation with PSH|ACK, peer-
 
 - [ ] **Step 3: Run — verify PASS**
 
-Run: `cargo test -p resd-net-core engine::tests::close_conn_signature_exists`
+Run: `cargo test -p dpdk-net-core engine::tests::close_conn_signature_exists`
 Expected: PASS.
 
 - [ ] **Step 4: Commit**
 
 ```sh
-git add crates/resd-net-core/src/engine.rs
+git add crates/dpdk-net-core/src/engine.rs
 git commit -m "engine: close_conn — emit FIN and enter FIN_WAIT_1 or LAST_ACK"
 ```
 
@@ -3363,14 +3363,14 @@ git commit -m "engine: close_conn — emit FIN and enter FIN_WAIT_1 or LAST_ACK"
 
 ## Task 19: Engine poll drain — publish events + TIME_WAIT reaping
 
-**Goal:** Rewrite `poll_once` to (a) clear each active connection's `last_read_buf` before processing so previous-iteration borrowed-views are invalidated per spec §4.2, (b) run the RX burst + `rx_frame` dispatch as today, (c) walk the flow table reaping any TIME_WAIT connection whose deadline has passed, (d) return — a new method `drain_events` handles transferring queued events into the caller's `events_out[]` array (called by the public API `resd_net_poll`).
+**Goal:** Rewrite `poll_once` to (a) clear each active connection's `last_read_buf` before processing so previous-iteration borrowed-views are invalidated per spec §4.2, (b) run the RX burst + `rx_frame` dispatch as today, (c) walk the flow table reaping any TIME_WAIT connection whose deadline has passed, (d) return — a new method `drain_events` handles transferring queued events into the caller's `events_out[]` array (called by the public API `dpdk_net_poll`).
 
 **Files:**
-- Modify: `crates/resd-net-core/src/engine.rs`
+- Modify: `crates/dpdk-net-core/src/engine.rs`
 
 - [ ] **Step 1: Extend `poll_once` with reaping + scratch clear**
 
-Replace the body of `poll_once` in `crates/resd-net-core/src/engine.rs`:
+Replace the body of `poll_once` in `crates/dpdk-net-core/src/engine.rs`:
 
 ```rust
     pub fn poll_once(&self) -> usize {
@@ -3391,7 +3391,7 @@ Replace the body of `poll_once` in `crates/resd-net-core/src/engine.rs`:
         const BURST: usize = 32;
         let mut mbufs: [*mut sys::rte_mbuf; BURST] = [std::ptr::null_mut(); BURST];
         let n = unsafe {
-            sys::resd_rte_eth_rx_burst(
+            sys::shim_rte_eth_rx_burst(
                 self.cfg.port_id,
                 self.cfg.rx_queue_id,
                 mbufs.as_mut_ptr(),
@@ -3413,7 +3413,7 @@ Replace the body of `poll_once` in `crates/resd-net-core/src/engine.rs`:
             let bytes = unsafe { crate::mbuf_data_slice(m) };
             add(&self.counters.eth.rx_bytes, bytes.len() as u64);
             self.rx_frame(bytes);
-            unsafe { sys::resd_rte_pktmbuf_free(m) };
+            unsafe { sys::shim_rte_pktmbuf_free(m) };
         }
 
         self.reap_time_wait();
@@ -3470,31 +3470,31 @@ Replace the body of `poll_once` in `crates/resd-net-core/src/engine.rs`:
 
 - [ ] **Step 3: Run build + all prior tests**
 
-Run: `cargo test -p resd-net-core`
+Run: `cargo test -p dpdk-net-core`
 Expected: PASS on all prior tests + the signature check.
 
 - [ ] **Step 4: Commit**
 
 ```sh
-git add crates/resd-net-core/src/engine.rs
+git add crates/dpdk-net-core/src/engine.rs
 git commit -m "engine: poll_once clears borrow-view scratch + reaps TIME_WAIT; drain_events helper"
 ```
 
 ---
 
-## Task 20: Public C ABI — `resd_net_connect`, `resd_net_send`, `resd_net_close`
+## Task 20: Public C ABI — `dpdk_net_connect`, `dpdk_net_send`, `dpdk_net_close`
 
-**Goal:** Implement the three extern "C" functions that expose `Engine::connect`/`send_bytes`/`close_conn` to C++ callers. `resd_net_connect_opts_t` integer fields are interpreted per api.rs (`peer_addr` is NETWORK byte order, per the existing "network byte order IPv4" comment); we convert to host order inside the bridge. Handle values are `u64` on the public API (widened from the internal `u32`).
+**Goal:** Implement the three extern "C" functions that expose `Engine::connect`/`send_bytes`/`close_conn` to C++ callers. `dpdk_net_connect_opts_t` integer fields are interpreted per api.rs (`peer_addr` is NETWORK byte order, per the existing "network byte order IPv4" comment); we convert to host order inside the bridge. Handle values are `u64` on the public API (widened from the internal `u32`).
 
 **Files:**
-- Modify: `crates/resd-net/src/lib.rs`
+- Modify: `crates/dpdk-net/src/lib.rs`
 
-- [ ] **Step 1: Write failing tests** — append to `crates/resd-net/src/lib.rs` inside `mod tests`:
+- [ ] **Step 1: Write failing tests** — append to `crates/dpdk-net/src/lib.rs` inside `mod tests`:
 
 ```rust
     #[test]
     fn connect_null_engine_returns_einval() {
-        let opts = resd_net_connect_opts_t {
+        let opts = dpdk_net_connect_opts_t {
             peer_addr: 0x0100_0a0a, // 10.0.0.1 in NBO (doesn't matter)
             peer_port: 5000u16.to_be(),
             local_addr: 0,
@@ -3503,14 +3503,14 @@ git commit -m "engine: poll_once clears borrow-view scratch + reaps TIME_WAIT; d
             idle_keepalive_sec: 0,
         };
         let mut out: u64 = 0;
-        let rc = unsafe { resd_net_connect(std::ptr::null_mut(), &opts, &mut out) };
+        let rc = unsafe { dpdk_net_connect(std::ptr::null_mut(), &opts, &mut out) };
         assert_eq!(rc, -libc::EINVAL);
     }
 
     #[test]
     fn send_null_engine_returns_einval() {
         let rc = unsafe {
-            resd_net_send(
+            dpdk_net_send(
                 std::ptr::null_mut(),
                 1u64,
                 b"x".as_ptr(),
@@ -3522,24 +3522,24 @@ git commit -m "engine: poll_once clears borrow-view scratch + reaps TIME_WAIT; d
 
     #[test]
     fn close_null_engine_returns_einval() {
-        let rc = unsafe { resd_net_close(std::ptr::null_mut(), 1u64, 0) };
+        let rc = unsafe { dpdk_net_close(std::ptr::null_mut(), 1u64, 0) };
         assert_eq!(rc, -libc::EINVAL);
     }
 ```
 
 - [ ] **Step 2: Run — verify FAIL**
 
-Run: `cargo test -p resd-net tests::connect_null_engine_returns_einval`
-Expected: FAIL at compile — `resd_net_connect` not defined.
+Run: `cargo test -p dpdk-net tests::connect_null_engine_returns_einval`
+Expected: FAIL at compile — `dpdk_net_connect` not defined.
 
-- [ ] **Step 3: Add the extern functions** — insert into `crates/resd-net/src/lib.rs` before the `#[cfg(test)]` block:
+- [ ] **Step 3: Add the extern functions** — insert into `crates/dpdk-net/src/lib.rs` before the `#[cfg(test)]` block:
 
 ```rust
 #[no_mangle]
-pub unsafe extern "C" fn resd_net_connect(
-    p: *mut resd_net_engine,
-    opts: *const resd_net_connect_opts_t,
-    out: *mut resd_net_conn_t,
+pub unsafe extern "C" fn dpdk_net_connect(
+    p: *mut dpdk_net_engine,
+    opts: *const dpdk_net_connect_opts_t,
+    out: *mut dpdk_net_conn_t,
 ) -> i32 {
     if p.is_null() || opts.is_null() || out.is_null() {
         return -libc::EINVAL;
@@ -3552,19 +3552,19 @@ pub unsafe extern "C" fn resd_net_connect(
     let local_port = u16::from_be(opts.local_port);
     match e.connect(peer_ip, peer_port, local_port) {
         Ok(h) => {
-            *out = h as resd_net_conn_t;
+            *out = h as dpdk_net_conn_t;
             0
         }
-        Err(resd_net_core::Error::TooManyConns) => -libc::EMFILE,
-        Err(resd_net_core::Error::PeerUnreachable(_)) => -libc::EHOSTUNREACH,
+        Err(dpdk_net_core::Error::TooManyConns) => -libc::EMFILE,
+        Err(dpdk_net_core::Error::PeerUnreachable(_)) => -libc::EHOSTUNREACH,
         Err(_) => -libc::EIO,
     }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn resd_net_send(
-    p: *mut resd_net_engine,
-    conn: resd_net_conn_t,
+pub unsafe extern "C" fn dpdk_net_send(
+    p: *mut dpdk_net_engine,
+    conn: dpdk_net_conn_t,
     buf: *const u8,
     len: u32,
 ) -> i32 {
@@ -3582,16 +3582,16 @@ pub unsafe extern "C" fn resd_net_send(
     };
     match e.send_bytes(conn as u32, slice) {
         Ok(n) => n as i32,
-        Err(resd_net_core::Error::InvalidConnHandle(_)) => -libc::ENOTCONN,
-        Err(resd_net_core::Error::SendBufferFull) => -libc::ENOMEM,
+        Err(dpdk_net_core::Error::InvalidConnHandle(_)) => -libc::ENOTCONN,
+        Err(dpdk_net_core::Error::SendBufferFull) => -libc::ENOMEM,
         Err(_) => -libc::EIO,
     }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn resd_net_close(
-    p: *mut resd_net_engine,
-    conn: resd_net_conn_t,
+pub unsafe extern "C" fn dpdk_net_close(
+    p: *mut dpdk_net_engine,
+    conn: dpdk_net_conn_t,
     _flags: u32,
 ) -> i32 {
     // FORCE_TW_SKIP flag is A6; ignore in A3.
@@ -3601,21 +3601,21 @@ pub unsafe extern "C" fn resd_net_close(
     let Some(e) = engine_from_raw(p) else { return -libc::EINVAL; };
     match e.close_conn(conn as u32) {
         Ok(()) => 0,
-        Err(resd_net_core::Error::InvalidConnHandle(_)) => -libc::ENOTCONN,
+        Err(dpdk_net_core::Error::InvalidConnHandle(_)) => -libc::ENOTCONN,
         Err(_) => -libc::EIO,
     }
 }
 ```
 
-- [ ] **Step 4: Update `resd_net_poll` to drain the event queue**
+- [ ] **Step 4: Update `dpdk_net_poll` to drain the event queue**
 
-Replace the body of `resd_net_poll`:
+Replace the body of `dpdk_net_poll`:
 
 ```rust
 #[no_mangle]
-pub unsafe extern "C" fn resd_net_poll(
-    p: *mut resd_net_engine,
-    events_out: *mut resd_net_event_t,
+pub unsafe extern "C" fn dpdk_net_poll(
+    p: *mut dpdk_net_engine,
+    events_out: *mut dpdk_net_event_t,
     max_events: u32,
     _timeout_ns: u64,
 ) -> i32 {
@@ -3626,68 +3626,68 @@ pub unsafe extern "C" fn resd_net_poll(
     }
     let mut filled: u32 = 0;
     e.drain_events(max_events, |ev, engine| {
-        let ts = resd_net_core::clock::now_ns();
+        let ts = dpdk_net_core::clock::now_ns();
         // Build the event value fully before writing it to events_out, so
         // we never read a possibly-uninitialized `kind` discriminant.
-        let event: resd_net_event_t = match ev {
-            resd_net_core::tcp_events::InternalEvent::Connected { conn, rx_hw_ts_ns } => {
-                resd_net_event_t {
-                    kind: resd_net_event_kind_t::RESD_NET_EVT_CONNECTED,
+        let event: dpdk_net_event_t = match ev {
+            dpdk_net_core::tcp_events::InternalEvent::Connected { conn, rx_hw_ts_ns } => {
+                dpdk_net_event_t {
+                    kind: dpdk_net_event_kind_t::DPDK_NET_EVT_CONNECTED,
                     conn: *conn as u64,
                     rx_hw_ts_ns: *rx_hw_ts_ns,
                     enqueued_ts_ns: ts,
-                    u: resd_net_event_payload_t { _pad: [0u8; 16] },
+                    u: dpdk_net_event_payload_t { _pad: [0u8; 16] },
                 }
             }
-            resd_net_core::tcp_events::InternalEvent::Readable { conn, byte_len, rx_hw_ts_ns } => {
+            dpdk_net_core::tcp_events::InternalEvent::Readable { conn, byte_len, rx_hw_ts_ns } => {
                 // Reach into the conn's last_read_buf for the view pointer.
                 let ft = engine.flow_table();
                 let (data_ptr, data_len) = match ft.get(*conn as u32) {
                     Some(c) => (c.recv.last_read_buf.as_ptr(), *byte_len),
                     None => (std::ptr::null(), 0),
                 };
-                resd_net_event_t {
-                    kind: resd_net_event_kind_t::RESD_NET_EVT_READABLE,
+                dpdk_net_event_t {
+                    kind: dpdk_net_event_kind_t::DPDK_NET_EVT_READABLE,
                     conn: *conn as u64,
                     rx_hw_ts_ns: *rx_hw_ts_ns,
                     enqueued_ts_ns: ts,
-                    u: resd_net_event_payload_t {
-                        readable: resd_net_event_readable_t { data: data_ptr, data_len },
+                    u: dpdk_net_event_payload_t {
+                        readable: dpdk_net_event_readable_t { data: data_ptr, data_len },
                     },
                 }
             }
-            resd_net_core::tcp_events::InternalEvent::Closed { conn, err } => {
-                resd_net_event_t {
-                    kind: resd_net_event_kind_t::RESD_NET_EVT_CLOSED,
+            dpdk_net_core::tcp_events::InternalEvent::Closed { conn, err } => {
+                dpdk_net_event_t {
+                    kind: dpdk_net_event_kind_t::DPDK_NET_EVT_CLOSED,
                     conn: *conn as u64,
                     rx_hw_ts_ns: 0,
                     enqueued_ts_ns: ts,
-                    u: resd_net_event_payload_t {
-                        closed: resd_net_event_error_t { err: *err },
+                    u: dpdk_net_event_payload_t {
+                        closed: dpdk_net_event_error_t { err: *err },
                     },
                 }
             }
-            resd_net_core::tcp_events::InternalEvent::StateChange { conn, from, to } => {
-                resd_net_event_t {
-                    kind: resd_net_event_kind_t::RESD_NET_EVT_TCP_STATE_CHANGE,
+            dpdk_net_core::tcp_events::InternalEvent::StateChange { conn, from, to } => {
+                dpdk_net_event_t {
+                    kind: dpdk_net_event_kind_t::DPDK_NET_EVT_TCP_STATE_CHANGE,
                     conn: *conn as u64,
                     rx_hw_ts_ns: 0,
                     enqueued_ts_ns: ts,
-                    u: resd_net_event_payload_t {
-                        tcp_state: resd_net_event_tcp_state_t {
+                    u: dpdk_net_event_payload_t {
+                        tcp_state: dpdk_net_event_tcp_state_t {
                             from_state: *from as u8, to_state: *to as u8,
                         },
                     },
                 }
             }
-            resd_net_core::tcp_events::InternalEvent::Error { conn, err } => {
-                resd_net_event_t {
-                    kind: resd_net_event_kind_t::RESD_NET_EVT_ERROR,
+            dpdk_net_core::tcp_events::InternalEvent::Error { conn, err } => {
+                dpdk_net_event_t {
+                    kind: dpdk_net_event_kind_t::DPDK_NET_EVT_ERROR,
                     conn: *conn as u64,
                     rx_hw_ts_ns: 0,
                     enqueued_ts_ns: ts,
-                    u: resd_net_event_payload_t {
-                        error: resd_net_event_error_t { err: *err },
+                    u: dpdk_net_event_payload_t {
+                        error: dpdk_net_event_error_t { err: *err },
                     },
                 }
             }
@@ -3699,7 +3699,7 @@ pub unsafe extern "C" fn resd_net_poll(
 }
 ```
 
-To satisfy the event draining closure needing `engine` mutably, we expose `Engine::flow_table()` publicly. In `crates/resd-net-core/src/engine.rs`, change the helper from `pub(crate)` to `pub`:
+To satisfy the event draining closure needing `engine` mutably, we expose `Engine::flow_table()` publicly. In `crates/dpdk-net-core/src/engine.rs`, change the helper from `pub(crate)` to `pub`:
 
 ```rust
     pub fn flow_table(&self) -> std::cell::RefMut<'_, crate::flow_table::FlowTable> {
@@ -3717,33 +3717,33 @@ Also expose `events` similarly (already `pub(crate)`, but change to `pub` for cr
 
 - [ ] **Step 5: Run — verify PASS**
 
-Run: `cargo test -p resd-net`
+Run: `cargo test -p dpdk-net`
 Expected: all prior + new tests pass.
 
 - [ ] **Step 6: Commit**
 
 ```sh
-git add crates/resd-net/src/lib.rs crates/resd-net-core/src/engine.rs
-git commit -m "public api: resd_net_connect/send/close + event-queue drain in resd_net_poll"
+git add crates/dpdk-net/src/lib.rs crates/dpdk-net-core/src/engine.rs
+git commit -m "public api: dpdk_net_connect/send/close + event-queue drain in dpdk_net_poll"
 ```
 
 ---
 
-## Task 21: Regenerate `include/resd_net.h` + verify
+## Task 21: Regenerate `include/dpdk_net.h` + verify
 
-**Goal:** Run `cargo build -p resd-net` so cbindgen regenerates the public header with the new functions + counter fields. Verify the symbols appear.
+**Goal:** Run `cargo build -p dpdk-net` so cbindgen regenerates the public header with the new functions + counter fields. Verify the symbols appear.
 
 **Files:**
-- Modify: `include/resd_net.h` (generated)
+- Modify: `include/dpdk_net.h` (generated)
 
 - [ ] **Step 1: Regenerate**
 
-Run: `cargo build -p resd-net`
+Run: `cargo build -p dpdk-net`
 Expected: header regenerates; build succeeds.
 
 - [ ] **Step 2: Grep for the new symbols**
 
-Run: `grep -E '(resd_net_connect|resd_net_send|resd_net_close|state_trans|tx_syn|tx_ack|tx_data|tx_fin|tx_rst|rx_fin|rx_unmatched)' include/resd_net.h`
+Run: `grep -E '(dpdk_net_connect|dpdk_net_send|dpdk_net_close|state_trans|tx_syn|tx_ack|tx_data|tx_fin|tx_rst|rx_fin|rx_unmatched)' include/dpdk_net.h`
 Expected: every term appears.
 
 - [ ] **Step 3: Drift check**
@@ -3754,28 +3754,28 @@ Expected: PASS.
 - [ ] **Step 4: Commit the regenerated header**
 
 ```sh
-git add include/resd_net.h
-git commit -m "regenerate resd_net.h for phase a3 (connect/send/close + tcp counter additions)"
+git add include/dpdk_net.h
+git commit -m "regenerate dpdk_net.h for phase a3 (connect/send/close + tcp counter additions)"
 ```
 
 ---
 
 ## Task 22: Integration test — TAP pair + kernel listener, TCP echo + clean close
 
-**Goal:** Full end-to-end A3 smoke: engine connects to a kernel-side `TcpListener` bound on the TAP peer IP, writes a known byte sequence, reads the echo, closes cleanly. Counters are asserted to reflect the expected packet counts (1 SYN sent, 1 SYN-ACK received, N ACKs, 1 FIN sent/received). Gated by `RESD_NET_TEST_TAP=1` + root (DPDK TAP + neighbor-cache manipulation).
+**Goal:** Full end-to-end A3 smoke: engine connects to a kernel-side `TcpListener` bound on the TAP peer IP, writes a known byte sequence, reads the echo, closes cleanly. Counters are asserted to reflect the expected packet counts (1 SYN sent, 1 SYN-ACK received, N ACKs, 1 FIN sent/received). Gated by `DPDK_NET_TEST_TAP=1` + root (DPDK TAP + neighbor-cache manipulation).
 
 **Files:**
-- Create: `crates/resd-net-core/tests/tcp_basic_tap.rs`
+- Create: `crates/dpdk-net-core/tests/tcp_basic_tap.rs`
 
 - [ ] **Step 1: Write the test file**
 
-Create `crates/resd-net-core/tests/tcp_basic_tap.rs`:
+Create `crates/dpdk-net-core/tests/tcp_basic_tap.rs`:
 
 ```rust
 //! Phase A3 TCP handshake + echo + close integration test.
 //!
-//! Requires RESD_NET_TEST_TAP=1 AND root (DPDK TAP vdev + `ip neigh`
-//! manipulation). Brings up `resdtap2` on the kernel side with
+//! Requires DPDK_NET_TEST_TAP=1 AND root (DPDK TAP vdev + `ip neigh`
+//! manipulation). Brings up `dpdktap2` on the kernel side with
 //! 10.99.1.1/24, starts a std `TcpListener` on 10.99.1.1:5000 that
 //! echoes bytes back, and walks the engine through connect / send /
 //! receive / close.
@@ -3788,17 +3788,17 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use resd_net_core::engine::{eal_init, Engine, EngineConfig};
-use resd_net_core::tcp_events::InternalEvent;
+use dpdk_net_core::engine::{eal_init, Engine, EngineConfig};
+use dpdk_net_core::tcp_events::InternalEvent;
 
-const TAP_IFACE: &str = "resdtap2";
+const TAP_IFACE: &str = "dpdktap2";
 const OUR_IP: u32 = 0x0a_63_01_02; // 10.99.1.2
 const PEER_IP: u32 = 0x0a_63_01_01; // 10.99.1.1
 const PEER_PORT: u16 = 5000;
 
 fn skip_if_not_tap() -> bool {
-    if std::env::var("RESD_NET_TEST_TAP").ok().as_deref() != Some("1") {
-        eprintln!("skipping; set RESD_NET_TEST_TAP=1 to run");
+    if std::env::var("DPDK_NET_TEST_TAP").ok().as_deref() != Some("1") {
+        eprintln!("skipping; set DPDK_NET_TEST_TAP=1 to run");
         return true;
     }
     false
@@ -3836,17 +3836,17 @@ fn handshake_echo_close_over_tap() {
     if skip_if_not_tap() { return; }
 
     let args = [
-        "resd-net-a3-test",
+        "dpdk-net-a3-test",
         "--in-memory",
         "--no-pci",
-        "--vdev=net_tap0,iface=resdtap2",
+        "--vdev=net_tap0,iface=dpdktap2",
         "-l", "0-1",
         "--log-level=3",
     ];
     eal_init(&args).expect("EAL init");
 
     bring_up_tap(TAP_IFACE);
-    // Give resdtap2 time to come up fully.
+    // Give dpdktap2 time to come up fully.
     thread::sleep(Duration::from_millis(200));
 
     let kernel_mac = read_kernel_tap_mac(TAP_IFACE);
@@ -3903,7 +3903,7 @@ fn handshake_echo_close_over_tap() {
     assert!(connected, "did not receive CONNECTED within deadline");
 
     // Send a known sequence and poll for the echo.
-    let msg = b"resd-net phase a3 smoke\n";
+    let msg = b"dpdk-net phase a3 smoke\n";
     let accepted = engine.send_bytes(handle, msg).expect("send");
     assert_eq!(accepted as usize, msg.len());
 
@@ -3964,10 +3964,10 @@ fn handshake_echo_close_over_tap() {
 - [ ] **Step 2: Run the test** (requires root + DPDK TAP)
 
 ```sh
-sudo -E RESD_NET_TEST_TAP=1 $(command -v cargo) test -p resd-net-core --test tcp_basic_tap -- --nocapture
+sudo -E DPDK_NET_TEST_TAP=1 $(command -v cargo) test -p dpdk-net-core --test tcp_basic_tap -- --nocapture
 ```
 
-Expected: PASS. Troubleshooting: if CONNECTED never fires, check (a) `ip neigh show dev resdtap2` has the permanent entry, (b) `/sys/class/net/resdtap2/address` matches `kernel_mac`, (c) port 5000 isn't already bound (`ss -tln | grep 5000`), (d) the engine's `gateway_mac` printed (add a `dbg!()` if needed) matches the kernel MAC.
+Expected: PASS. Troubleshooting: if CONNECTED never fires, check (a) `ip neigh show dev dpdktap2` has the permanent entry, (b) `/sys/class/net/dpdktap2/address` matches `kernel_mac`, (c) port 5000 isn't already bound (`ss -tln | grep 5000`), (d) the engine's `gateway_mac` printed (add a `dbg!()` if needed) matches the kernel MAC.
 
 - [ ] **Step 3: Document running it in README**
 
@@ -3978,14 +3978,14 @@ Append to `README.md`:
 ## TCP handshake + echo integration test (requires DPDK TAP + root)
 
 ```sh
-sudo -E RESD_NET_TEST_TAP=1 cargo test -p resd-net-core --test tcp_basic_tap -- --nocapture
+sudo -E DPDK_NET_TEST_TAP=1 cargo test -p dpdk-net-core --test tcp_basic_tap -- --nocapture
 ```
 ````
 
 - [ ] **Step 4: Commit**
 
 ```sh
-git add crates/resd-net-core/tests/tcp_basic_tap.rs README.md
+git add crates/dpdk-net-core/tests/tcp_basic_tap.rs README.md
 git commit -m "add TCP handshake+echo+close integration test over TAP pair"
 ```
 
@@ -4023,8 +4023,8 @@ In `examples/cpp-consumer/main.cpp`, find the block that prints IP counters (add
 - [ ] **Step 2: Build the C++ consumer**
 
 ```sh
-cargo build -p resd-net --release
-cmake -S examples/cpp-consumer -B examples/cpp-consumer/build -DRESD_NET_PROFILE=release
+cargo build -p dpdk-net --release
+cmake -S examples/cpp-consumer -B examples/cpp-consumer/build -DDPDK_NET_PROFILE=release
 cmake --build examples/cpp-consumer/build
 ```
 
@@ -4038,9 +4038,9 @@ cargo build --workspace --all-targets
 # All unit tests pass
 cargo test --workspace
 # TAP integration tests pass
-sudo -E RESD_NET_TEST_TAP=1 $(command -v cargo) test -p resd-net-core --test engine_smoke -- --nocapture
-sudo -E RESD_NET_TEST_TAP=1 $(command -v cargo) test -p resd-net-core --test l2_l3_tap -- --nocapture
-sudo -E RESD_NET_TEST_TAP=1 $(command -v cargo) test -p resd-net-core --test tcp_basic_tap -- --nocapture
+sudo -E DPDK_NET_TEST_TAP=1 $(command -v cargo) test -p dpdk-net-core --test engine_smoke -- --nocapture
+sudo -E DPDK_NET_TEST_TAP=1 $(command -v cargo) test -p dpdk-net-core --test l2_l3_tap -- --nocapture
+sudo -E DPDK_NET_TEST_TAP=1 $(command -v cargo) test -p dpdk-net-core --test tcp_basic_tap -- --nocapture
 # Header hasn't drifted
 ./scripts/check-header.sh
 # C++ consumer builds
@@ -4053,10 +4053,10 @@ All must succeed. If any fails, fix before proceeding to the review gates.
 
 - [ ] **Step 4: Verify spec coverage manually**
 
-- **§4 `resd_net_connect`** — `crates/resd-net/src/lib.rs:resd_net_connect`.
-- **§4 `resd_net_send`** — `crates/resd-net/src/lib.rs:resd_net_send` with `>= 0` / `< 0` contract.
-- **§4 `RESD_NET_EVT_CONNECTED/_READABLE/_CLOSED/_TCP_STATE_CHANGE`** — emitted by `Engine::tcp_input` / `drain_events`.
-- **§5.2 TX call chain** — `Engine::send_bytes` → `tcp_output::build_segment` → `tx_data_frame` → `resd_rte_eth_tx_burst`.
+- **§4 `dpdk_net_connect`** — `crates/dpdk-net/src/lib.rs:dpdk_net_connect`.
+- **§4 `dpdk_net_send`** — `crates/dpdk-net/src/lib.rs:dpdk_net_send` with `>= 0` / `< 0` contract.
+- **§4 `DPDK_NET_EVT_CONNECTED/_READABLE/_CLOSED/_TCP_STATE_CHANGE`** — emitted by `Engine::tcp_input` / `drain_events`.
+- **§5.2 TX call chain** — `Engine::send_bytes` → `tcp_output::build_segment` → `tx_data_frame` → `shim_rte_eth_tx_burst`.
 - **§6.1 FSM** — `tcp_state.rs` (11 states) + `tcp_input.rs` handlers covering CLOSED → SYN_SENT → ESTABLISHED → {FIN_WAIT_1|CLOSE_WAIT} → {FIN_WAIT_2|CLOSING|LAST_ACK} → TIME_WAIT → CLOSED.
 - **§6.2 TcpConn minimum fields** — `tcp_conn.rs` (sequence space, rcv/snd queues, peer_mss, our_fin_seq, time_wait_deadline_ns). Deferred fields explicitly noted in the module doc.
 - **§6.5 ISS stub** — `iss.rs` (DefaultHasher SipHash-1-3 + µs clock offset; A5 finalizes).
@@ -4272,7 +4272,7 @@ The next plan file to write is `docs/superpowers/plans/YYYY-MM-DD-stage1-phase-a
 ## Self-Review Notes
 
 **Spec coverage for Phase A3:**
-- **§4** public API (`resd_net_connect`, `resd_net_send`, `resd_net_close`, `RESD_NET_EVT_CONNECTED/READABLE/CLOSED/TCP_STATE_CHANGE`) → Tasks 18 + 20.
+- **§4** public API (`dpdk_net_connect`, `dpdk_net_send`, `dpdk_net_close`, `DPDK_NET_EVT_CONNECTED/READABLE/CLOSED/TCP_STATE_CHANGE`) → Tasks 18 + 20.
 - **§5.2** TX call chain → Task 17 (segmentation), Task 8 (header builders), Task 15 (`tx_data_frame`).
 - **§6.1** FSM — RFC 9293 §3.3.2 eleven-state client-side → Tasks 4 (state enum) + 11 (SYN_SENT) + 12 (ESTABLISHED) + 13 (close-path).
 - **§6.2** `TcpConn` minimum fields → Task 7.
@@ -4286,7 +4286,7 @@ The next plan file to write is `docs/superpowers/plans/YYYY-MM-DD-stage1-phase-a
 - TCP options WSCALE / timestamps / SACK-permitted → A4.
 - PAWS, out-of-order reassembly, SACK scoreboard → A4.
 - RACK-TLP, RTO, retransmit, full RFC 6528 ISS → A5.
-- `RESD_NET_EVT_WRITABLE`, true timer wheel, `resd_net_flush` actually flushing, `FORCE_TW_SKIP` with RFC 6191 guard, `preset=rfc_compliance` → A6.
+- `DPDK_NET_EVT_WRITABLE`, true timer wheel, `dpdk_net_flush` actually flushing, `FORCE_TW_SKIP` with RFC 6191 guard, `preset=rfc_compliance` → A6.
 - Delayed-ACK-on (RFC-compliance preset) → A6 per spec §6.4.
 
 **Placeholder scan:** Every code block contains complete content. No "TODO"/"TBD"/"implement later" in a step. Stubs that are intentional (Task 10's per-state handler stubs, replaced in 11–13) are called out as stubs with the replacing-task reference.
@@ -4295,8 +4295,8 @@ The next plan file to write is `docs/superpowers/plans/YYYY-MM-DD-stage1-phase-a
 - `FourTuple` / `ConnHandle` used identically in `flow_table.rs`, `tcp_conn.rs`, `tcp_input.rs`, `engine.rs`.
 - `TcpState` mapped to `u8` via `as u8` at every call site (state_trans indexing, public event payload).
 - `ParsedSegment` / `Outcome` / `TxAction` used identically in `tcp_input.rs` dispatch and `Engine::tcp_input`.
-- `InternalEvent` variants match the public `resd_net_event_kind_t` discriminants in Task 20's drain loop.
-- Host-byte-order vs network-byte-order: internal uses HBO throughout (EngineConfig, FourTuple, TcpConn, ParsedSegment). Only the public `resd_net_connect_opts_t.peer_addr/peer_port/local_port` are NBO; Task 20 converts at the ABI boundary via `u32::from_be` / `u16::from_be`.
+- `InternalEvent` variants match the public `dpdk_net_event_kind_t` discriminants in Task 20's drain loop.
+- Host-byte-order vs network-byte-order: internal uses HBO throughout (EngineConfig, FourTuple, TcpConn, ParsedSegment). Only the public `dpdk_net_connect_opts_t.peer_addr/peer_port/local_port` are NBO; Task 20 converts at the ABI boundary via `u32::from_be` / `u16::from_be`.
 
 **Counter-assertion strategy:** Task 22 asserts counter lower bounds for each expected traffic direction (SYN sent ≥ 1, SYN-ACK received ≥ 1, data sent ≥ 1, FIN sent ≥ 1, FIN received ≥ 1, conn_open ≥ 1, conn_close ≥ 1). Tight equality is avoided because the kernel peer's TCP stack may emit delayed-ACKs or coalesced packets we can't predict exactly — the direction+presence is what matters for A3's smoke gate.
 

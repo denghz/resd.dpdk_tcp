@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/resd-net-sys",
-    "crates/resd-net-core",
-    "crates/resd-net",
+    "crates/dpdk-net-sys",
+    "crates/dpdk-net-core",
+    "crates/dpdk-net",
     "tests/ffi-test",
 ]
 

@@ -17,17 +17,17 @@ In scope:
 - **RFC 6298 RTO** with RFC 7323 TS-sampled RTT (+ Karn's fallback). Classic Jacobson/Karels (α=1/8, β=1/4). Backoff enabled by default; per-connect opt-out knob.
 - **Retransmit path** per spec §5.3 / §6.5: fresh header mbuf chained to the original data mbuf — never edit in-flight mbufs in place.
 - **SYN retransmit** per spec §6.5: 3 attempts, exponential backoff bounded by `connect_timeout_ms`.
-- **Internal timer wheel** per spec §7.4 (hashed, 8 levels × 256 buckets, 10µs resolution, tombstone cancel, per-conn timer list). A5 consumes internally for RTO/TLP/SYN retransmit. A6 adds the public `resd_net_timer_add` / `cancel` / `TIMER` API layer on top.
+- **Internal timer wheel** per spec §7.4 (hashed, 8 levels × 256 buckets, 10µs resolution, tombstone cancel, per-conn timer list). A5 consumes internally for RTO/TLP/SYN retransmit. A6 adds the public `dpdk_net_timer_add` / `cancel` / `TIMER` API layer on top.
 - **ISS finalize** per spec §6.5: hand-written SipHash-2-4, boot_nonce from `/proc/sys/kernel/random/boot_id`, 4µs tick clock.
 - **A4 carry-overs** close: WS>14 SHOULD-log + counter (RFC 7323 §2.3), dup_ack strict RFC 5681 §2, WS≤14 decoder-side enforcement, `ooo_drop` legacy-field removal, A4 I-8 `rcv_wnd` vs `free_space_total` divergence in `send_bytes`.
 - **Counters**: wire `tx_retrans`, `tx_rto`, `tx_tlp` (declared but zero-referenced in A4); add `tx_rack_loss`, `rtt_samples`, `rack_reo_wnd_override_active`, `rto_no_backoff_active`, `conn_timeout_syn_sent`, `conn_timeout_retrans`, `rx_ws_shift_clamped`, `rx_dsack`. All slow-path per §9.1.1.
-- **Events**: `RESD_NET_EVT_TCP_RETRANS`, `RESD_NET_EVT_TCP_LOSS_DETECTED` gated by new `tcp_per_packet_events` config; `RESD_NET_EVT_ERROR{err=ETIMEDOUT}` on max-retrans-count or SYN-retrans-budget exhaustion.
+- **Events**: `DPDK_NET_EVT_TCP_RETRANS`, `DPDK_NET_EVT_TCP_LOSS_DETECTED` gated by new `tcp_per_packet_events` config; `DPDK_NET_EVT_ERROR{err=ETIMEDOUT}` on max-retrans-count or SYN-retrans-budget exhaustion.
 
 Out of scope (A5.1 / A6 / A-HW):
 - Congestion control (Reno `cc_mode`) — full punt to A5.1 "if/when needed in test". `cwnd`/`ssthresh` fields are **not** introduced by A5.
 - RFC 5682 F-RTO — explicitly out per brainstorming.
 - RFC 8985 dynamic reo_wnd adaptation — DSACK is counter-only; reo_wnd is `min(SRTT/4, min_RTT/2)` with no dynamic adjustment beyond that.
-- Public timer API (`resd_net_timer_add` / `cancel` / `TIMER` event) — A6's scope.
+- Public timer API (`dpdk_net_timer_add` / `cancel` / `TIMER` event) — A6's scope.
 - RFC 7323 §5.5 24-day TS.Recent expiration — punt to A6 (needs public timer API; Stage 1 trading flows don't idle 24 days per spec).
 - A4 AD `AD-A4-sack-generate` — stays indefinitely (we generate SACK blocks; mTCP has TODO stub).
 
@@ -35,7 +35,7 @@ Out of scope (A5.1 / A6 / A-HW):
 
 ## 2. Module layout
 
-### 2.1 New modules (`crates/resd-net-core/src/`)
+### 2.1 New modules (`crates/dpdk-net-core/src/`)
 
 | Module | Purpose |
 |---|---|
@@ -55,10 +55,10 @@ Out of scope (A5.1 / A6 / A-HW):
 | `tcp_input.rs` | RTT sample extraction (TS.Ecr preferred; Karn's fallback from non-retransmitted entries matched by ACK seq). Feed RACK on every ACK. Prune `snd_retrans` on `snd.una` advance. DSACK detection via SACK-block comparison against `snd.una` and prior SACKed ranges. Tighten dup_ack detection to RFC 5681 §2 5-condition strict check. Drop `ooo_drop` field from `Outcome` and call sites. |
 | `tcp_options.rs` | WS parser-side clamp: if the Window Scale option carries shift > 14, store `14` at parse time (defense-in-depth on top of the A4 handshake-site clamp in `tcp_input.rs`). Add a parser-level "clamp applied" signal for the one-shot log counter. |
 | `engine.rs` | Send path: clone mbuf ref into `snd_retrans` instead of freeing after TX. New retransmit primitive (fresh hdr mbuf from `tx_hdr_mempool` chained to held data mbuf). ACK handler invokes RTO re-arm lazily (spec §6.5). New RTO / TLP fire handlers. New SYN-retransmit scheduler + timer. `build_ack_outcome` uses `free_space_total` for advertised window (A4 I-8 close). `send_bytes` also uses `free_space_total` symmetrically (A4 I-8 close). WS>14 one-shot log + `tcp.rx_ws_shift_clamped++`. Enable `RTE_ETH_TX_OFFLOAD_MULTI_SEGS` in port config. |
-| `tcp_events.rs` | Add `RESD_NET_EVT_TCP_RETRANS`, `RESD_NET_EVT_TCP_LOSS_DETECTED`. Extend `RESD_NET_EVT_ERROR` with `err=ETIMEDOUT`. |
+| `tcp_events.rs` | Add `DPDK_NET_EVT_TCP_RETRANS`, `DPDK_NET_EVT_TCP_LOSS_DETECTED`. Extend `DPDK_NET_EVT_ERROR` with `err=ETIMEDOUT`. |
 | `counters.rs` | Add new fields: `tx_rack_loss`, `rtt_samples`, `rack_reo_wnd_override_active`, `rto_no_backoff_active`, `conn_timeout_syn_sent`, `conn_timeout_retrans`, `rx_ws_shift_clamped`, `rx_dsack`. All `AtomicU64`, slow-path. Remove entries for `tx_retrans`/`tx_rto`/`tx_tlp` from the deferred-counters whitelist; they are now wired. |
 | `lib.rs` | Export new modules. |
-| `include/resd_net.h` (cbindgen) | Add `tcp_min_rto_us`, `tcp_initial_rto_us`, `tcp_max_rto_us`, `tcp_max_retrans_count`, `tcp_per_packet_events` on engine config. Remove `tcp_initial_rto_ms` (replaced by `_us` variant). Add `rack_aggressive`, `rto_no_backoff` on `resd_net_connect_opts_t`. New event types + `err=ETIMEDOUT`. |
+| `include/dpdk_net.h` (cbindgen) | Add `tcp_min_rto_us`, `tcp_initial_rto_us`, `tcp_max_rto_us`, `tcp_max_retrans_count`, `tcp_per_packet_events` on engine config. Remove `tcp_initial_rto_ms` (replaced by `_us` variant). Add `rack_aggressive`, `rto_no_backoff` on `dpdk_net_connect_opts_t`. New event types + `err=ETIMEDOUT`. |
 
 ### 2.3 Dependencies introduced
 
@@ -72,7 +72,7 @@ Out of scope (A5.1 / A6 / A-HW):
 ### 3.1 TX first-send
 
 ```
-resd_net_send(bytes)
+dpdk_net_send(bytes)
   → snd.pending.push(bytes)                                 // bounded by send_buffer_bytes
   → engine poll drains snd.pending into MSS-sized mbufs
     from tx_data_mempool                                    // memcpy user bytes into mbuf.data
@@ -162,11 +162,11 @@ retransmit(entry):
   rte_eth_tx_burst(hdr_mbuf)
   entry.xmit_count += 1
   tcp.tx_retrans++
-  if tcp_per_packet_events: emit RESD_NET_EVT_TCP_RETRANS
+  if tcp_per_packet_events: emit DPDK_NET_EVT_TCP_RETRANS
 
   if entry.xmit_count > tcp_max_retrans_count:              // default 15
     tcp.conn_timeout_retrans++
-    emit RESD_NET_EVT_ERROR{err=ETIMEDOUT}
+    emit DPDK_NET_EVT_ERROR{err=ETIMEDOUT}
     drain snd_retrans (drop mbuf refs)
     transition to CLOSED
 ```
@@ -199,7 +199,7 @@ wheel tick → TlpTimer.on_fire(handle, gen):
   else:
     retransmit(snd_retrans.back())                          // last-segment probe
   tcp.tx_tlp++
-  if tcp_per_packet_events: emit RESD_NET_EVT_TCP_LOSS_DETECTED
+  if tcp_per_packet_events: emit DPDK_NET_EVT_TCP_LOSS_DETECTED
 ```
 
 ### 3.6 SYN retransmit
@@ -212,7 +212,7 @@ Terminate on:
   - SYN-ACK received (normal path; cancel timer)
   - syn_retrans_count > 3 OR total elapsed > connect_timeout_ms:
       tcp.conn_timeout_syn_sent++
-      emit RESD_NET_EVT_ERROR{err=ETIMEDOUT}
+      emit DPDK_NET_EVT_ERROR{err=ETIMEDOUT}
       transition to CLOSED
 ```
 
@@ -267,15 +267,15 @@ ISS = (monotonic_time_4µs_ticks_low_32)
 All increment sites are in error paths, rare-event handlers, or per-connection lifecycle — none are on the per-segment or per-poll hot path.
 
 **Events added (spec §9.3)**:
-- `RESD_NET_EVT_TCP_RETRANS` — per-retransmit, gated by `tcp_per_packet_events`.
-- `RESD_NET_EVT_TCP_LOSS_DETECTED` — per-loss-detection-trigger (RACK flag OR TLP fire OR RTO fire), gated by `tcp_per_packet_events`.
-- `RESD_NET_EVT_ERROR{err=ETIMEDOUT}` — unconditional (always emitted).
+- `DPDK_NET_EVT_TCP_RETRANS` — per-retransmit, gated by `tcp_per_packet_events`.
+- `DPDK_NET_EVT_TCP_LOSS_DETECTED` — per-loss-detection-trigger (RACK flag OR TLP fire OR RTO fire), gated by `tcp_per_packet_events`.
+- `DPDK_NET_EVT_ERROR{err=ETIMEDOUT}` — unconditional (always emitted).
 
 ---
 
 ## 7. Config / API surface changes
 
-### 7.1 `resd_net_engine_config_t` (additions)
+### 7.1 `dpdk_net_engine_config_t` (additions)
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
@@ -283,13 +283,13 @@ All increment sites are in error paths, rare-event handlers, or per-connection l
 | `tcp_initial_rto_us` | `u32` | 5000 (5ms) | First-RTO value before any RTT sample |
 | `tcp_max_rto_us` | `u32` | 1_000_000 (1s) | Backoff cap; trading-aligned fail-fast (RFC 6298 allows 60s) |
 | `tcp_max_retrans_count` | `u32` | 15 | Per-segment retransmit count before ETIMEDOUT. With default backoff cap hits ≈8.3s total budget |
-| `tcp_per_packet_events` | `bool` | false | Gates `RESD_NET_EVT_TCP_RETRANS` and `_LOSS_DETECTED` |
+| `tcp_per_packet_events` | `bool` | false | Gates `DPDK_NET_EVT_TCP_RETRANS` and `_LOSS_DETECTED` |
 
-### 7.2 `resd_net_engine_config_t` (removals)
+### 7.2 `dpdk_net_engine_config_t` (removals)
 
 - `tcp_initial_rto_ms`: replaced by `tcp_initial_rto_us`. Header regen + consumer update.
 
-### 7.3 `resd_net_connect_opts_t` (additions)
+### 7.3 `dpdk_net_connect_opts_t` (additions)
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
@@ -298,7 +298,7 @@ All increment sites are in error paths, rare-event handlers, or per-connection l
 
 ### 7.4 Error code
 
-- `RESD_NET_EVT_ERROR.err` adds `ETIMEDOUT` — SYN-retrans-budget or data-retrans-count exhaustion.
+- `DPDK_NET_EVT_ERROR.err` adds `ETIMEDOUT` — SYN-retrans-budget or data-retrans-count exhaustion.
 
 ---
 
@@ -347,11 +347,11 @@ Per-module tests land with the module in the same commit:
 
 Each scenario is a separate `#[test]` in the existing `tcp_*_tap.rs` pattern:
 
-1. **RTO retransmit** — peer drops first data segment; assert `tcp.tx_rto == 1`, `tcp.tx_retrans == 1`, `RESD_NET_EVT_TCP_RETRANS` delivered when `tcp_per_packet_events=true`.
+1. **RTO retransmit** — peer drops first data segment; assert `tcp.tx_rto == 1`, `tcp.tx_retrans == 1`, `DPDK_NET_EVT_TCP_RETRANS` delivered when `tcp_per_packet_events=true`.
 2. **RACK reorder detect** — peer SACKs segments past a hole; assert `tcp.tx_rack_loss == 1`, retransmit arrives before RTO deadline.
 3. **TLP tail-loss** — peer drops last segment, no further send; assert TLP fires at PTO, peer sees probe, ACK arrives.
 4. **`rack_aggressive=true`** — single-SACK-hole triggers immediate retransmit; no reo_wnd grace period.
-5. **Max-retrans exhausted** — blackhole path; assert after 15 retrans `RESD_NET_EVT_ERROR{err=ETIMEDOUT}`, state=CLOSED, `tcp.conn_timeout_retrans == 1`.
+5. **Max-retrans exhausted** — blackhole path; assert after 15 retrans `DPDK_NET_EVT_ERROR{err=ETIMEDOUT}`, state=CLOSED, `tcp.conn_timeout_retrans == 1`.
 6. **SYN retransmit** — peer doesn't reply SYN-ACK; assert 3 SYNs, then ETIMEDOUT, `tcp.conn_timeout_syn_sent == 1`.
 7. **ISS monotonicity across reconnect** — connect, close, reconnect same tuple within MSL; assert new ISS > old ISS.
 8. **No-backoff opt-in** — connect with `rto_no_backoff=true`, induce multiple RTO fires; assert RTO stays constant (no doubling).
@@ -425,7 +425,7 @@ Small edits to the parent spec land in the same commit as this phase design doc:
 - §6.4 new row: "RTO maximum | RFC 6298 ≥60s | 1s | trading fail-fast rationale as above."
 - §6.5 SYN retransmit bullet: cite `tcp_max_retrans_count=15` for clarity (data retrans budget, not SYN).
 - §9.1 counter examples: add `tx_rack_loss` to the tcp-group example list (already covered abstractly by "examples" phrasing but worth being explicit).
-- §9.3 events: `err=ETIMEDOUT` added to the `RESD_NET_EVT_ERROR` error enum.
+- §9.3 events: `err=ETIMEDOUT` added to the `DPDK_NET_EVT_ERROR` error enum.
 - §6.3 RFC matrix row for RFC 5681: note that dup_ack counter is now strict per-§2 (previously loose in A3/A4).
 
 ---

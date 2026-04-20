@@ -10,14 +10,14 @@ Retroactive review (gate added after A2 shipped per spec §10.14).
 ## Scope
 
 - Our files reviewed:
-  - `crates/resd-net-core/src/l2.rs`
-  - `crates/resd-net-core/src/l3_ip.rs`
-  - `crates/resd-net-core/src/icmp.rs`
-  - `crates/resd-net-core/src/arp.rs`
-  - `crates/resd-net-core/src/engine.rs` (RX pipeline: `poll_once`, `rx_frame`, `handle_arp`, `handle_ipv4`, `maybe_emit_gratuitous_arp`)
-  - `crates/resd-net-core/src/counters.rs` (A2 eth/ip counter additions)
-  - `crates/resd-net/src/lib.rs` (`resd_net_resolve_gateway_mac` public C ABI)
-  - `crates/resd-net-core/tests/l2_l3_tap.rs` (crafted-frame TAP integration test)
+  - `crates/dpdk-net-core/src/l2.rs`
+  - `crates/dpdk-net-core/src/l3_ip.rs`
+  - `crates/dpdk-net-core/src/icmp.rs`
+  - `crates/dpdk-net-core/src/arp.rs`
+  - `crates/dpdk-net-core/src/engine.rs` (RX pipeline: `poll_once`, `rx_frame`, `handle_arp`, `handle_ipv4`, `maybe_emit_gratuitous_arp`)
+  - `crates/dpdk-net-core/src/counters.rs` (A2 eth/ip counter additions)
+  - `crates/dpdk-net/src/lib.rs` (`dpdk_net_resolve_gateway_mac` public C ABI)
+  - `crates/dpdk-net-core/tests/l2_l3_tap.rs` (crafted-frame TAP integration test)
 - Spec §6.3 rows verified:
   - Row RFC 791 "IPv4 / full for client send/recv / TOS-DSCP passthrough, DF always set" — RX half only (TX is later-phase).
   - Row RFC 792 "ICMP / frag-needed + dest-unreachable (in-only) / drives PMTUD; drop others silently."

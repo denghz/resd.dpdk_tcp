@@ -8,15 +8,15 @@
 ## Scope
 
 - Our files reviewed:
-  - `crates/resd-net-core/src/tcp_options.rs` — option encode/decode (MSS, WS, SACK-permitted, TS, SACK blocks)
-  - `crates/resd-net-core/src/tcp_output.rs` — `build_segment` header + options writer
-  - `crates/resd-net-core/src/tcp_input.rs` — SYN-ACK option install, PAWS, OOO reassembly, SACK decode
-  - `crates/resd-net-core/src/tcp_conn.rs` — A4 option-negotiated fields on `TcpConn` + `last_sack_trigger`
-  - `crates/resd-net-core/src/tcp_reassembly.rs` — `ReorderQueue` (copy-based OOO buffer)
-  - `crates/resd-net-core/src/tcp_sack.rs` — `SackScoreboard` (received-SACK, 4-entry)
-  - `crates/resd-net-core/src/engine.rs` — `compute_ws_shift_for`, `build_connect_syn_opts`,
+  - `crates/dpdk-net-core/src/tcp_options.rs` — option encode/decode (MSS, WS, SACK-permitted, TS, SACK blocks)
+  - `crates/dpdk-net-core/src/tcp_output.rs` — `build_segment` header + options writer
+  - `crates/dpdk-net-core/src/tcp_input.rs` — SYN-ACK option install, PAWS, OOO reassembly, SACK decode
+  - `crates/dpdk-net-core/src/tcp_conn.rs` — A4 option-negotiated fields on `TcpConn` + `last_sack_trigger`
+  - `crates/dpdk-net-core/src/tcp_reassembly.rs` — `ReorderQueue` (copy-based OOO buffer)
+  - `crates/dpdk-net-core/src/tcp_sack.rs` — `SackScoreboard` (received-SACK, 4-entry)
+  - `crates/dpdk-net-core/src/engine.rs` — `compute_ws_shift_for`, `build_connect_syn_opts`,
     `build_ack_outcome`, `emit_ack`, `send_bytes` hot-path, `close_conn` FIN emit
-  - `crates/resd-net-core/tests/tcp_options_paws_reassembly_sack_tap.rs` — TAP smoke test
+  - `crates/dpdk-net-core/tests/tcp_options_paws_reassembly_sack_tap.rs` — TAP smoke test
 - Spec §6.3 rows verified: RFC 7323 (WS/TS/PAWS), RFC 2018 (SACK option + received-side scoreboard),
   RFC 6691 (MSS option semantics), RFC 9293 (TCP option-bearing segment text)
 - Spec §6.4 deviations touched: AD-A4-paws-challenge-ack, AD-A4-sack-scoreboard-size, AD-A4-reassembly
@@ -36,7 +36,7 @@ line-level code cite for the actual landed fix.
   - RFC clause: `docs/rfcs/rfc7323.txt:528-531` — "If a Window Scale option is received with a
     shift.cnt value larger than 14, the TCP SHOULD log the error but MUST use 14 instead of the
     specified value."
-  - Landed fix: `crates/resd-net-core/src/tcp_input.rs:306` — `conn.ws_shift_in = ws_peer.min(14);`
+  - Landed fix: `crates/dpdk-net-core/src/tcp_input.rs:306` — `conn.ws_shift_in = ws_peer.min(14);`
     in the `handle_syn_sent` SYN-ACK-options-install block. Falls back to `ws_shift_in = 0;
     ws_shift_out = 0;` on the `None` arm per RFC 7323 §2.3 "otherwise MUST set both shifts to zero".
   - Verified: peer-advertised shift values `>14` are clamped before `ws_shift_in` flows into the
@@ -46,7 +46,7 @@ line-level code cite for the actual landed fix.
   - RFC clause: `docs/rfcs/rfc7323.txt:489-493` — "The window field (SEG.WND) in the header of
     every incoming segment, with the exception of <SYN> segments, MUST be left-shifted by
     Snd.Wind.Shift bits before updating SND.WND: SND.WND = SEG.WND << Snd.Wind.Shift."
-  - Landed fix: `crates/resd-net-core/src/tcp_input.rs:469` —
+  - Landed fix: `crates/dpdk-net-core/src/tcp_input.rs:469` —
     `conn.snd_wnd = (seg.window as u32).wrapping_shl(conn.ws_shift_in as u32);`
     inside the SND.WL1/WL2-freshness-gated update branch in `handle_established`.
   - Verified: `ws_shift_in` is bounded at 14 (F-1), so `wrapping_shl` is safe and deterministic.
@@ -55,7 +55,7 @@ line-level code cite for the actual landed fix.
 - [x] **F-3 — CLOSED** — SYN-ACK window stored unscaled
   - RFC clause: `docs/rfcs/rfc7323.txt:464-465` — "The window field in a segment where the SYN
     bit is set (i.e., a <SYN> or <SYN,ACK>) MUST NOT be scaled."
-  - Landed fix: `crates/resd-net-core/src/tcp_input.rs:294` — `conn.snd_wnd = seg.window as u32;`
+  - Landed fix: `crates/dpdk-net-core/src/tcp_input.rs:294` — `conn.snd_wnd = seg.window as u32;`
     in `handle_syn_sent`. The prior `wrapping_shl(peer_ws as u32)` has been removed; the SYN-ACK's
     16-bit window is now widened to u32 verbatim, and left-shift resumes on the first
     post-handshake segment (F-2's branch).
@@ -66,7 +66,7 @@ line-level code cite for the actual landed fix.
   - RFC clause: `docs/rfcs/rfc7323.txt:498-502` — "The window field (SEG.WND) of every outgoing
     segment, with the exception of <SYN> segments, MUST be right-shifted by Rcv.Wind.Shift bits:
     SEG.WND = RCV.WND >> Rcv.Wind.Shift."
-  - Landed fix: `crates/resd-net-core/src/engine.rs:1422` —
+  - Landed fix: `crates/dpdk-net-core/src/engine.rs:1422` —
     `let advertised_window = (rcv_wnd >> ws_shift_out).min(u16::MAX as u32) as u16;`
     pre-computed once per `send_bytes` call and written into each per-segment `SegmentTx.window`
     at line 1457. `ws_shift_out` is now threaded through the per-burst snapshot tuple at lines
@@ -78,7 +78,7 @@ line-level code cite for the actual landed fix.
 
 - [x] **F-5 — CLOSED** — Outbound FIN right-shifts advertised window by `ws_shift_out`
   - RFC clause: same as F-4 (`docs/rfcs/rfc7323.txt:498-502`).
-  - Landed fix: `crates/resd-net-core/src/engine.rs:1551` —
+  - Landed fix: `crates/dpdk-net-core/src/engine.rs:1551` —
     `let advertised_window = (rcv_wnd >> ws_shift_out).min(u16::MAX as u32) as u16;`
     in the `close_conn` FIN-emit pre-snapshot, written into `SegmentTx.window` at line 1574.
     `ws_shift_out` threaded through the snapshot tuple at lines 1523/1534.
@@ -88,7 +88,7 @@ line-level code cite for the actual landed fix.
   - RFC clause: `docs/rfcs/rfc7323.txt:666-668` — "Once TSopt has been successfully negotiated,
     that is both <SYN> and <SYN,ACK> contain TSopt, the TSopt MUST be sent in every non-<RST>
     segment for the duration of the connection."
-  - Landed fix: `crates/resd-net-core/src/engine.rs:1438-1446` — per-iteration option build:
+  - Landed fix: `crates/dpdk-net-core/src/engine.rs:1438-1446` — per-iteration option build:
     ```rust
     let options = if ts_enabled {
         let tsval = (crate::clock::now_ns() / 1000) as u32;
@@ -108,7 +108,7 @@ line-level code cite for the actual landed fix.
 
 - [x] **F-7 — CLOSED** — Outbound FIN emits TSopt when negotiated
   - RFC clause: same as F-6 (`docs/rfcs/rfc7323.txt:666-668`).
-  - Landed fix: `crates/resd-net-core/src/engine.rs:1554-1562` — same mechanic as F-6, applied
+  - Landed fix: `crates/dpdk-net-core/src/engine.rs:1554-1562` — same mechanic as F-6, applied
     to the FIN segment in `close_conn`. FIN buffer widened from 64 to 128 bytes at line 1582
     (14+20+20+40 = 94, rounded to 128) to accommodate the TS option.
   - Verified: `ts_enabled`/`ts_recent` threaded through the `close_conn` pre-snapshot at lines
@@ -120,23 +120,23 @@ line-level code cite for the actual landed fix.
     block of data containing the segment which triggered this ACK, unless that segment advanced
     the Acknowledgment Number field in the header."
   - Landed fix — multi-site:
-    - `crates/resd-net-core/src/tcp_conn.rs:167` — new `pub last_sack_trigger: Option<(u32, u32)>`
+    - `crates/dpdk-net-core/src/tcp_conn.rs:167` — new `pub last_sack_trigger: Option<(u32, u32)>`
       field, initialized to `None` at line 209.
-    - `crates/resd-net-core/src/tcp_input.rs:527-529` — sets
+    - `crates/dpdk-net-core/src/tcp_input.rs:527-529` — sets
       `conn.last_sack_trigger = Some((seg.seq, seg.seq.wrapping_add(take)));` iff the OOO insert
       returned `newly_buffered > 0` (the "triggering" payload was actually stored, i.e. not an
       exact duplicate of an existing reorder span).
-    - `crates/resd-net-core/src/engine.rs:1030` — `emit_ack` captures
+    - `crates/dpdk-net-core/src/engine.rs:1030` — `emit_ack` captures
       `let trigger_range = conn.last_sack_trigger;` before dropping the flow-table borrow.
-    - `crates/resd-net-core/src/engine.rs:1051` — trigger passed as the new arg to
+    - `crates/dpdk-net-core/src/engine.rs:1051` — trigger passed as the new arg to
       `build_ack_outcome`.
-    - `crates/resd-net-core/src/engine.rs:120-158` — `build_ack_outcome` walks
+    - `crates/dpdk-net-core/src/engine.rs:120-158` — `build_ack_outcome` walks
       `reorder_segments` looking for the block containing the trigger's left edge
       (`seq_le(l, t_left) && seq_lt(t_left, r)`), emits that block first, then the rest in
       highest-seq-first order (skipping the already-emitted index). Falls back to
       reverse-seq-first when no trigger is supplied or the trigger was long-ago pruned.
       `#[allow(clippy::too_many_arguments)]` covers the signature at line 86.
-    - `crates/resd-net-core/src/engine.rs:1096` — trigger cleared to `None` immediately after
+    - `crates/dpdk-net-core/src/engine.rs:1096` — trigger cleared to `None` immediately after
       consumption so the next pure-ACK or in-order-only-ACK doesn't falsely resurface it.
   - Verified by unit tests:
     - `build_ack_outcome_trigger_middle_block_emitted_first` at `engine.rs:1864` — middle-seq
@@ -161,7 +161,7 @@ No open items.
   - Spec §6.4 / plan line: "AD-A4-paws-challenge-ack" in
     `docs/superpowers/plans/2026-04-18-stage1-phase-a4-options-paws-reassembly-sack.md` (plan
     declares challenge-ACK on PAWS rejection as the agreed behaviour).
-  - Our code behavior: `crates/resd-net-core/src/tcp_input.rs:420-426` returns `TxAction::Ack`
+  - Our code behavior: `crates/dpdk-net-core/src/tcp_input.rs:420-426` returns `TxAction::Ack`
     with `paws_rejected: true`. Counter `tcp.rx_paws_drop` bumps on this path.
 
 - **AD-2** — SACK scoreboard is 4-entry fixed array (evict-oldest on overflow)
@@ -170,7 +170,7 @@ No open items.
   - Spec §6.4 / plan line: "AD-A4-sack-scoreboard-size" in
     `docs/superpowers/plans/2026-04-18-stage1-phase-a4-options-paws-reassembly-sack.md` (plan
     declares 4-entry scoreboard with evict-oldest on overflow as the agreed Stage 1 trade-off).
-  - Our code behavior: `crates/resd-net-core/src/tcp_sack.rs:11,73-78` — `MAX_SACK_SCOREBOARD_ENTRIES
+  - Our code behavior: `crates/dpdk-net-core/src/tcp_sack.rs:11,73-78` — `MAX_SACK_SCOREBOARD_ENTRIES
     = 4`, and the overflow branch at lines 73-78 shifts entries left and writes the new block at
     index 3 (evicts the oldest).
 
@@ -181,19 +181,19 @@ No open items.
     `docs/superpowers/plans/2026-04-18-stage1-phase-a4-options-paws-reassembly-sack.md` (plan
     extends the existing AD-7 copy-based receive-buffer deviation to cover the OOO reorder
     queue).
-  - Our code behavior: `crates/resd-net-core/src/tcp_reassembly.rs` — each OOO insert copies
+  - Our code behavior: `crates/dpdk-net-core/src/tcp_reassembly.rs` — each OOO insert copies
     the payload into a `Vec<u8>` owned by the reorder span; drain copies again into the
     contiguous recv buffer.
 
 ### FYI (informational — no action)
 
-- **I-1** — Strict option decoder at `crates/resd-net-core/src/tcp_options.rs:167+` rejects
+- **I-1** — Strict option decoder at `crates/dpdk-net-core/src/tcp_options.rs:167+` rejects
   malformed options (BadKnownLen, ShortUnknown, Truncated, BadSackBlockCount) and the handlers
   convert that to `bad_option: true` → RST. This correctly implements RFC 9293 §3.1 "Options may
   occupy space at the end of the TCP header … Options must be processed correctly."
 
 - **I-2** — TS option: `ts_recent` only updates when `seq <= rcv_nxt`
-  (`crates/resd-net-core/src/tcp_input.rs:430-432`), which satisfies RFC 7323 §4.3 MUST-25.
+  (`crates/dpdk-net-core/src/tcp_input.rs:430-432`), which satisfies RFC 7323 §4.3 MUST-25.
   Checked against `rfc7323.txt` §4.3 "TS.Recent check" language.
 
 - **I-3** — PAWS uses strict `<` on TSval vs TS.Recent (`tcp_input.rs:420` —

@@ -41,8 +41,8 @@
 **Spec refs:** §2, §2.2, §4 (lifecycle subset), §7.1, §7.5, §9.1.
 
 **Deliverables:**
-- Cargo workspace with `resd-net-sys` (DPDK FFI), `resd-net-core` (internals), `resd-net` (public C ABI).
-- `include/resd_net.h` auto-generated via cbindgen.
+- Cargo workspace with `dpdk-net-sys` (DPDK FFI), `dpdk-net-core` (internals), `dpdk-net` (public C ABI).
+- `include/dpdk_net.h` auto-generated via cbindgen.
 - C++ consumer sample that creates + destroys an engine.
 - CI: build + unit tests + header drift + C++ build + clippy + rustfmt.
 - Integration test proving lifecycle over DPDK TAP.
@@ -79,9 +79,9 @@
 
 ## A3 — TCP handshake + basic data transfer
 
-**Goal:** `resd_net_connect` to a remote peer, complete the SYN/SYN-ACK/ACK handshake, send and receive bytes, clean close (FIN/FIN-ACK). No TCP options beyond MSS yet, no reassembly, no SACK, no RACK, no retransmit.
+**Goal:** `dpdk_net_connect` to a remote peer, complete the SYN/SYN-ACK/ACK handshake, send and receive bytes, clean close (FIN/FIN-ACK). No TCP options beyond MSS yet, no reassembly, no SACK, no RACK, no retransmit.
 
-**Spec refs:** §4 (`resd_net_connect`, `resd_net_send`, `RESD_NET_EVT_CONNECTED`, `RESD_NET_EVT_READABLE`, `RESD_NET_EVT_CLOSED`), §5.2 TX call chain, §6.1 FSM, §6.2 `TcpConn` struct (minimum fields for basic ops), §6.5 ISS (stub first — A5 finalizes).
+**Spec refs:** §4 (`dpdk_net_connect`, `dpdk_net_send`, `DPDK_NET_EVT_CONNECTED`, `DPDK_NET_EVT_READABLE`, `DPDK_NET_EVT_CLOSED`), §5.2 TX call chain, §6.1 FSM, §6.2 `TcpConn` struct (minimum fields for basic ops), §6.5 ISS (stub first — A5 finalizes).
 
 **Deliverables:**
 - `tcp/conn.rs` — `TcpConn` struct, minimum fields (sequence space, state, recv_queue, snd_retrans).
@@ -89,8 +89,8 @@
 - `tcp/input.rs` — basic segment processing: SYN-ACK handling, ACK handling, data ingress → `recv_queue`.
 - `tcp/output.rs` — SYN emission, ACK emission, data segmentation (MSS-sized chunks).
 - Flow table (`flow_table.rs`) — 4-tuple hash lookup with a small pre-warmed array.
-- `engine.rs` wires the TCP path into the poll loop; emits `RESD_NET_EVT_CONNECTED`, `RESD_NET_EVT_READABLE`, `RESD_NET_EVT_CLOSED`.
-- `resd_net_connect` / `resd_net_send` / `resd_net_close` extern "C" functions implemented end-to-end.
+- `engine.rs` wires the TCP path into the poll loop; emits `DPDK_NET_EVT_CONNECTED`, `DPDK_NET_EVT_READABLE`, `DPDK_NET_EVT_CLOSED`.
+- `dpdk_net_connect` / `dpdk_net_send` / `dpdk_net_close` extern "C" functions implemented end-to-end.
 - Integration test: connect to a netcat listener over a TAP pair, send + receive known bytes, close cleanly.
 
 **Does NOT include:** TCP options beyond MSS, PAWS, SACK, retransmit, out-of-order reassembly, `WRITABLE` event (punt to A6), `FORCE_TW_SKIP`, TIME_WAIT short-circuit.
@@ -135,10 +135,10 @@
   - `tx_zero_window` — we advertised `rwnd=0` (our recv buffer full).
   - `tx_window_update` — we emitted a pure window-update segment.
   - `conn_time_wait_reaped` — TIME_WAIT deadline expired, connection reclaimed (A3's reaper has no counter).
-  - `conn_table_full` — `resd_net_connect` rejected because flow table at `max_connections`.
+  - `conn_table_full` — `dpdk_net_connect` rejected because flow table at `max_connections`.
 
   Explicitly **not** in A4 scope (owned by later phases — included here only as a note so nobody re-proposes them as A4 work):
-  - `events_dropped_queue_full` / `events_error_enomem` / `events_error_eperm_tw_required` — per-engine event FIFO + `RESD_NET_EVT_ERROR` emissions (**A6**: depends on A6's real event-queue overflow semantics, `ENOMEM` mempool-exhaustion path, `FORCE_TW_SKIP` + RFC 6191 guard).
+  - `events_dropped_queue_full` / `events_error_enomem` / `events_error_eperm_tw_required` — per-engine event FIFO + `DPDK_NET_EVT_ERROR` emissions (**A6**: depends on A6's real event-queue overflow semantics, `ENOMEM` mempool-exhaustion path, `FORCE_TW_SKIP` + RFC 6191 guard).
   - `conn_timeout_syn_sent` — SYN_SENT timeout (**A5**: depends on A5's real RTO timer + `connect_timeout_ms` enforcement).
 
   All of the above A4-scope increments live in existing slow-path sites (error branches, rare-event handlers, per-connection lifecycle). None are on the per-segment or per-poll hot path. A8 counter-coverage audit adds scenarios for each so zero fields stay unreachable.
@@ -157,7 +157,7 @@
     - *Increment pattern*: single `if burst_size == max_burst { inc(counter); }` already inside the existing `iters_with_rx` branch. One extra comparison + conditional `fetch_add` per poll.
     - *Turn off* with `cargo build --no-default-features` (plus re-listing any other default features you want to keep) for absolute-minimum-overhead builds.
 
-  Both flags live in `crates/resd-net-core/Cargo.toml` under `[features]`. The C header (`include/resd_net.h`) is regenerated without `#[cfg]` gating on the struct itself, so `resd_net_counters_t` layout is stable across feature sets — feature-off builds just leave the corresponding fields at zero. `docs/user-guide/04-configuration.md` (A12) documents the flags and their trade-offs; `docs/maintainer-guide/14-coding-conventions.md` enforces the inline-justification rule for any future hot-path counter additions.
+  Both flags live in `crates/dpdk-net-core/Cargo.toml` under `[features]`. The C header (`include/dpdk_net.h`) is regenerated without `#[cfg]` gating on the struct itself, so `dpdk_net_counters_t` layout is stable across feature sets — feature-off builds just leave the corresponding fields at zero. `docs/user-guide/04-configuration.md` (A12) documents the flags and their trade-offs; `docs/maintainer-guide/14-coding-conventions.md` enforces the inline-justification rule for any future hot-path counter additions.
 
 **Does NOT include:** retransmit (A5), RACK, congestion control. Checksum-path split counters (`tx_csum_offload_used` / `_soft`) intentionally **not** added — one-shot startup log of the negotiated csum path is sufficient; runtime counters aren't worth the per-segment cost given offload state doesn't hot-swap.
 
@@ -179,7 +179,7 @@
 - `tcp/iss.rs` — full SipHash-based ISS with boot_nonce + monotonic clock.
 - Retransmit path: allocates fresh header mbuf from `tx_hdr_mempool`, chains to original data mbuf, never edits original in place.
 - Lazy RTO timer re-arm (no remove+insert on every ACK).
-- `RESD_NET_EVT_TCP_RETRANS` / `RESD_NET_EVT_TCP_LOSS_DETECTED` events emitted (gated by `tcp_per_packet_events`).
+- `DPDK_NET_EVT_TCP_RETRANS` / `DPDK_NET_EVT_TCP_LOSS_DETECTED` events emitted (gated by `tcp_per_packet_events`).
 - Integration tests: loss-induced retransmit, RACK reorder detection, TLP probe firing, ISS monotonicity across reconnects.
 
 **Does NOT include:** congestion control (off by default; Reno arrives in a dedicated follow-up if needed), ECN (separate flag, no delivery in Stage 1 gates).
@@ -202,10 +202,10 @@
 
 **Deliverables:**
 
-- `InternalEvent::emitted_ts_ns` field on every event variant, sampled at push time inside the engine (not at drain in `resd_net_poll`). `resd_net_event_t::enqueued_ts_ns` semantic tightens from "drain time" to "emission time" — field name unchanged, doc comment updated. Eliminates ±poll-interval skew (up to tens of µs at realistic poll rates) on every event's apparent time.
+- `InternalEvent::emitted_ts_ns` field on every event variant, sampled at push time inside the engine (not at drain in `dpdk_net_poll`). `dpdk_net_event_t::enqueued_ts_ns` semantic tightens from "drain time" to "emission time" — field name unchanged, doc comment updated. Eliminates ±poll-interval skew (up to tens of µs at realistic poll rates) on every event's apparent time.
 - `EventQueue` soft cap + drop-oldest policy on overflow. New slow-path counters `obs.events_dropped` (count of events discarded from the front) and `obs.events_queue_high_water` (latched max observed depth). New engine config field `event_queue_soft_cap` (u32, default 4096, min 64). Preserves "don't silently accumulate" without introducing head-of-line blocking on the producer side.
-- New extern "C" function `resd_net_conn_stats(engine, conn, out) → i32` returning 9 `u32` fields: send-path (`snd_una`, `snd_nxt`, `snd_wnd`, `send_buf_bytes_pending`, `send_buf_bytes_free`) + RTT estimator (`srtt_us`, `rttvar_us`, `min_rtt_us`, `rto_us`). Enables per-order forensics tagging: "bytes in flight + current RTT + current RTO at send time." Slow-path; safe per-order, not per-segment. Pure projection — all fields already exist on `TcpConn` after A5 (send-path since A3; RTT fields from `rtt_est` and `rack.min_rtt`).
-- Per-connection TLP tuning knobs (wire behavior; per-connect opt-in with defaults preserving RFC 8985). Five new `resd_net_connect_opts_t` fields: `tlp_pto_min_floor_us` (default inherits `tcp_min_rto_us`, range 0 .. `tcp_max_rto_us`), `tlp_pto_srtt_multiplier_x100` (default 200 = 2.0×, range 100..200 integer), `tlp_skip_flight_size_gate` (default false), `tlp_max_consecutive_probes` (default 1, range 1..5), `tlp_skip_rtt_sample_gate` (default false). Extends `tcp_tlp::pto_us` from fixed formula to `(srtt, &TlpConfig, flight_size) → u32`. Engine's TLP scheduler tracks a per-conn consecutive-probe counter that resets on every new RTT sample / newly-ACKed data. New slow-path counter `tcp.tx_tlp_spurious` incremented when DSACK confirms a prior TLP probe was unnecessary (attribution per probe via a fixed 5-entry ring on `TcpConn` with a 4·SRTT plausibility window). Spurious-ratio (`tx_tlp_spurious / tx_tlp`) is the app-side self-tuning signal — documented in A12's `13-order-entry-telemetry`.
+- New extern "C" function `dpdk_net_conn_stats(engine, conn, out) → i32` returning 9 `u32` fields: send-path (`snd_una`, `snd_nxt`, `snd_wnd`, `send_buf_bytes_pending`, `send_buf_bytes_free`) + RTT estimator (`srtt_us`, `rttvar_us`, `min_rtt_us`, `rto_us`). Enables per-order forensics tagging: "bytes in flight + current RTT + current RTO at send time." Slow-path; safe per-order, not per-segment. Pure projection — all fields already exist on `TcpConn` after A5 (send-path since A3; RTT fields from `rtt_est` and `rack.min_rtt`).
+- Per-connection TLP tuning knobs (wire behavior; per-connect opt-in with defaults preserving RFC 8985). Five new `dpdk_net_connect_opts_t` fields: `tlp_pto_min_floor_us` (default inherits `tcp_min_rto_us`, range 0 .. `tcp_max_rto_us`), `tlp_pto_srtt_multiplier_x100` (default 200 = 2.0×, range 100..200 integer), `tlp_skip_flight_size_gate` (default false), `tlp_max_consecutive_probes` (default 1, range 1..5), `tlp_skip_rtt_sample_gate` (default false). Extends `tcp_tlp::pto_us` from fixed formula to `(srtt, &TlpConfig, flight_size) → u32`. Engine's TLP scheduler tracks a per-conn consecutive-probe counter that resets on every new RTT sample / newly-ACKed data. New slow-path counter `tcp.tx_tlp_spurious` incremented when DSACK confirms a prior TLP probe was unnecessary (attribution per probe via a fixed 5-entry ring on `TcpConn` with a 4·SRTT plausibility window). Spurious-ratio (`tx_tlp_spurious / tx_tlp`) is the app-side self-tuning signal — documented in A12's `13-order-entry-telemetry`.
 - New `obs` counter group in `counters.rs` for engine-internal observability signals.
 - Integration tests on TAP pair: emission-time correctness, overflow behavior (including that drained events are the most-recent, not the oldest), send-state getter under backpressure, `-ENOENT` on stale handle.
 
@@ -227,7 +227,7 @@
 
 ## A5.6 — Per-connection RTT histogram (ABSORBED INTO A6)
 
-**Status:** Absorbed into A6 on 2026-04-19 — A5.6 did not ship as a standalone phase. All scoped content (16×u32 histogram on `TcpConn`, runtime-configurable edges, `resd_net_conn_rtt_histogram` getter, wraparound contract, cacheline placement, default edges) was folded into A6's design spec §3.8 and implementation plan tasks 3 (field + module), 6 (edges validation), 15 (update hook), 18 (ABI getter), 20 (ABI config field). See `docs/superpowers/specs/2026-04-19-stage1-phase-a6-public-api-completeness-design.md` and `docs/superpowers/plans/2026-04-19-stage1-phase-a6-public-api-completeness.md`. The original A5.6 design spec at `docs/superpowers/specs/2026-04-19-stage1-phase-a5-6-rtt-histogram-design.md` is retained as design-input reference only.
+**Status:** Absorbed into A6 on 2026-04-19 — A5.6 did not ship as a standalone phase. All scoped content (16×u32 histogram on `TcpConn`, runtime-configurable edges, `dpdk_net_conn_rtt_histogram` getter, wraparound contract, cacheline placement, default edges) was folded into A6's design spec §3.8 and implementation plan tasks 3 (field + module), 6 (edges validation), 15 (update hook), 18 (ABI getter), 20 (ABI config field). See `docs/superpowers/specs/2026-04-19-stage1-phase-a6-public-api-completeness-design.md` and `docs/superpowers/plans/2026-04-19-stage1-phase-a6-public-api-completeness.md`. The original A5.6 design spec at `docs/superpowers/specs/2026-04-19-stage1-phase-a5-6-rtt-histogram-design.md` is retained as design-input reference only.
 
 ---
 
@@ -241,7 +241,7 @@
 
 **Deliverables:**
 
-- **Compile-time feature gates** in `crates/resd-net-core/Cargo.toml` — one per Tier 1 offload, all on by default:
+- **Compile-time feature gates** in `crates/dpdk-net-core/Cargo.toml` — one per Tier 1 offload, all on by default:
 
   | Feature flag | Default | Gates |
   |---|---|---|
@@ -272,7 +272,7 @@
   - Feature ON: read `mbuf.hash.rss` as the initial 4-tuple hash when `RTE_MBUF_F_RX_RSS_HASH` is set; fall back to SipHash otherwise.
   - Feature OFF: always compute SipHash locally.
 - NIC RX timestamp plumbing in `engine.rs` + event-emission sites, compile-gated by `hw-offload-rx-timestamp`:
-  - Feature ON: at `engine_create`, call `rte_mbuf_dynfield_lookup("rte_dynfield_timestamp")` → store `ts_offset: Option<i32>` on engine state; call `rte_mbuf_dynflag_lookup("rte_dynflag_rx_timestamp")` → store `ts_flag_mask: Option<u64>`. Provide an always-inline accessor `hw_rx_ts_ns(mbuf) -> u64` that returns `*(uint64_t*)((char*)mbuf + ts_offset)` when **both** lookups succeeded **and** `mbuf.ol_flags & ts_flag_mask != 0`; returns 0 otherwise. RX paths that currently hardcode `rx_hw_ts_ns: 0` (`crates/resd-net-core/src/engine.rs:725`, `:995`; `crates/resd-net/src/lib.rs:161`, `:172`, `:185`) read the accessor from the originating mbuf instead. A3/A4 emission sites that have already dropped their source mbuf reference get the timestamp threaded through the internal event struct at the RX-decode boundary.
+  - Feature ON: at `engine_create`, call `rte_mbuf_dynfield_lookup("rte_dynfield_timestamp")` → store `ts_offset: Option<i32>` on engine state; call `rte_mbuf_dynflag_lookup("rte_dynflag_rx_timestamp")` → store `ts_flag_mask: Option<u64>`. Provide an always-inline accessor `hw_rx_ts_ns(mbuf) -> u64` that returns `*(uint64_t*)((char*)mbuf + ts_offset)` when **both** lookups succeeded **and** `mbuf.ol_flags & ts_flag_mask != 0`; returns 0 otherwise. RX paths that currently hardcode `rx_hw_ts_ns: 0` (`crates/dpdk-net-core/src/engine.rs:725`, `:995`; `crates/dpdk-net/src/lib.rs:161`, `:172`, `:185`) read the accessor from the originating mbuf instead. A3/A4 emission sites that have already dropped their source mbuf reference get the timestamp threaded through the internal event struct at the RX-decode boundary.
   - Feature OFF: accessor is `const fn hw_rx_ts_ns(_mbuf) -> u64 { 0 }`; no dynfield lookup at startup; all `rx_hw_ts_ns` fields stay 0.
   - On ENA (Stage 1 reference target): both dynfield and dynflag lookups return negative; accessor always yields 0; `rx_hw_ts_ns = 0` in every event as §8.3 / §9.2 already document. Callers use `enqueued_ts_ns` per §7.5. This is the exercised path in the Stage 1 smoke tests — the positive path is reachable but not asserted until a host with the dynfield is available (Stage 2 hardening).
 - Counter additions (all slow-path per §9.1.1 — fire on bring-up + on `BAD` checksum only; fields always allocated for C-ABI stability even when the feature is off):
@@ -305,21 +305,21 @@
 
 **Status:** Complete 2026-04-20. Design spec: `docs/superpowers/specs/2026-04-19-stage1-phase-a6-public-api-completeness-design.md`. Implementation plan: `docs/superpowers/plans/2026-04-19-stage1-phase-a6-public-api-completeness.md`. Ship tag: `phase-a6-complete`. Review reports: `docs/superpowers/reviews/phase-a6-mtcp-compare.md` + `docs/superpowers/reviews/phase-a6-rfc-compliance.md` (both PASS, zero open `[ ]`). A5.6 absorbed into A6 (see row above). Final task count: 22 implementation tasks + 1 phase-gate task = 23.
 
-**Goal:** Finalize the public C ABI per §4: `resd_net_flush` actually flushes via data-segment TX ring batching, `WRITABLE` events on send-buffer drain (level-triggered hysteresis at `send_buffer_bytes/2`), timer API (`timer_add`/`cancel` + `TIMER` event layered on the A5 wheel), `resd_net_close(flags)` with `FORCE_TW_SKIP` under `ts_enabled` prerequisite + `-EPERM` event when prereq not met, mempool exhaustion error paths (per-occurrence on retransmit; edge-triggered per-poll on RX), `preset=rfc_compliance` runtime switch. Also: per-connection RTT histogram (16×u32 cacheline-aligned buckets, runtime-configurable edges). RFC 7323 §5.5 24-day `TS.Recent` lazy expiration (no timer needed) landed from A5/A5.5 deferral list.
+**Goal:** Finalize the public C ABI per §4: `dpdk_net_flush` actually flushes via data-segment TX ring batching, `WRITABLE` events on send-buffer drain (level-triggered hysteresis at `send_buffer_bytes/2`), timer API (`timer_add`/`cancel` + `TIMER` event layered on the A5 wheel), `dpdk_net_close(flags)` with `FORCE_TW_SKIP` under `ts_enabled` prerequisite + `-EPERM` event when prereq not met, mempool exhaustion error paths (per-occurrence on retransmit; edge-triggered per-poll on RX), `preset=rfc_compliance` runtime switch. Also: per-connection RTT histogram (16×u32 cacheline-aligned buckets, runtime-configurable edges). RFC 7323 §5.5 24-day `TS.Recent` lazy expiration (no timer needed) landed from A5/A5.5 deferral list.
 
 **Spec refs:** §4 (API), §4.2 contracts (flush data-only, timer_cancel -ENOENT-collapse, close EPERM event), §6.5 TIME_WAIT shortening (ts_enabled prerequisite + client-side RFC 6191 analog), §7.4 timer wheel (reused from A5), §9.1 four A6 counters, §9.3 ENOMEM emission sites, §6.4 `AD-A6-force-tw-skip` new accepted deviation.
 
 **Deliverables (landed):**
 - Public timer API extern fns + `InternalEvent::ApiTimer` wiring + `TimerKind::ApiPublic` fire branch.
-- Engine-scope `tx_pending_data` ring + `drain_tx_pending_data` helper + `resd_net_flush` body; control frames stay inline per spec §3.2 option (c).
-- `RESD_NET_EVT_WRITABLE` hysteresis: `send_refused_pending` bit on `TcpConn`; ACK-prune path fires once per refusal cycle when in_flight ≤ send_buffer_bytes/2.
-- `resd_net_close(flags)` honors `FORCE_TW_SKIP` bit; `ts_enabled==true` sets `c.force_tw_skip`; `reap_time_wait` short-circuits for force_tw_skip; `ts_enabled==false` emits `Error{err=-EPERM}` + normal 2×MSL.
+- Engine-scope `tx_pending_data` ring + `drain_tx_pending_data` helper + `dpdk_net_flush` body; control frames stay inline per spec §3.2 option (c).
+- `DPDK_NET_EVT_WRITABLE` hysteresis: `send_refused_pending` bit on `TcpConn`; ACK-prune path fires once per refusal cycle when in_flight ≤ send_buffer_bytes/2.
+- `dpdk_net_close(flags)` honors `FORCE_TW_SKIP` bit; `ts_enabled==true` sets `c.force_tw_skip`; `reap_time_wait` short-circuits for force_tw_skip; `ts_enabled==false` emits `Error{err=-EPERM}` + normal 2×MSL.
 - Engine event queue FIFO drop-oldest + soft-cap contract (reused from A5.5 Task 5; A6 verified A6 variants preserve FIFO).
 - `preset=rfc_compliance` engine-create override: `tcp_nagle=true`, `tcp_delayed_ack=true`, `cc_mode=1` (Reno), `tcp_min_rto_us=200_000`, `tcp_initial_rto_us=1_000_000`; `preset>=2` rejected with null-return.
-- `preset` constants `RESD_NET_PRESET_LATENCY=0` / `RESD_NET_PRESET_RFC_COMPLIANCE=1` emitted as C #defines.
+- `preset` constants `DPDK_NET_PRESET_LATENCY=0` / `DPDK_NET_PRESET_RFC_COMPLIANCE=1` emitted as C #defines.
 - RX-mempool-drop edge-triggered `Error{err=-ENOMEM}` event (1/poll iteration max) via `rx_drop_nomem_prev` snapshot.
 - Retransmit `Error{err=-ENOMEM}` emission at all 4 alloc-fail sites inside the retransmit function.
-- Per-connection `RttHistogram` (16×u32, `#[repr(C, align(64))]`, compile-time size/align pinned to 64 B); update hook after every `rtt_est.sample` site (tcp_input.rs + SYN-ACK seed path); engine-wide edges config field with validation (non-monotonic → null-return); ABI POD `resd_net_tcp_rtt_histogram_t` + extern `resd_net_conn_rtt_histogram`; default edges tuned for trading-exchange RTT range (50µs–500ms log-spaced).
+- Per-connection `RttHistogram` (16×u32, `#[repr(C, align(64))]`, compile-time size/align pinned to 64 B); update hook after every `rtt_est.sample` site (tcp_input.rs + SYN-ACK seed path); engine-wide edges config field with validation (non-monotonic → null-return); ABI POD `dpdk_net_tcp_rtt_histogram_t` + extern `dpdk_net_conn_rtt_histogram`; default edges tuned for trading-exchange RTT range (50µs–500ms log-spaced).
 - RFC 7323 §5.5 24-day `TS.Recent` lazy expiration at PAWS gate + `ts_recent_age` backfilled at all 3 write sites (fixed latent A5-era debt).
 - Four new slow-path `tcp.*` counters: `tx_api_timers_fired`, `ts_recent_expired`, `tx_flush_bursts`, `tx_flush_batched_pkts`.
 - Integration test file `tests/tcp_a6_public_api_tap.rs` (17 pure in-process tests pinning the public-API contracts end-to-end at the TcpConn / Engine / EventQueue level).
@@ -329,14 +329,14 @@
 
 Per-connection RTT histogram (merged from A5.6):
 - Per-conn `rtt_histogram: [u32; 16]` field on `TcpConn` (exactly 64 B, one cacheline). Updated inside `rtt_est.sample()` via a 15-comparison bucket-selection ladder + `wrapping_add(1)`. Cost: ~5–10 ns per RTT sample; no atomic (single-lcore RTC model).
-- Runtime-configurable bucket edges via `resd_net_engine_config_t::rtt_histogram_bucket_edges_us[15]` (15 × `uint32_t` = 60 B, strictly monotonically increasing). All-zero = stack applies trading-tuned defaults `{50, 100, 200, 300, 500, 750, 1000, 2000, 3000, 5000, 10000, 25000, 50000, 100000, 500000}` µs (dense resolution in the 50µs–1ms colo/same-region range, coarser beyond). Non-monotonic edges rejected at `engine_create` with `-EINVAL`.
-- New extern "C" getter `resd_net_conn_rtt_histogram(engine, conn, out) → i32` returning a 64-byte `resd_net_tcp_rtt_histogram_t { uint32_t bucket[16] }`. Slow-path, per-order or per-minute cadence.
+- Runtime-configurable bucket edges via `dpdk_net_engine_config_t::rtt_histogram_bucket_edges_us[15]` (15 × `uint32_t` = 60 B, strictly monotonically increasing). All-zero = stack applies trading-tuned defaults `{50, 100, 200, 300, 500, 750, 1000, 2000, 3000, 5000, 10000, 25000, 50000, 100000, 500000}` µs (dense resolution in the 50µs–1ms colo/same-region range, coarser beyond). Non-monotonic edges rejected at `engine_create` with `-EINVAL`.
+- New extern "C" getter `dpdk_net_conn_rtt_histogram(engine, conn, out) → i32` returning a 64-byte `dpdk_net_tcp_rtt_histogram_t { uint32_t bucket[16] }`. Slow-path, per-order or per-minute cadence.
 - Wraparound semantics: per-bucket `u32` overflows silently; application takes deltas via unsigned wraparound subtraction. Correctness bound: no single bucket accumulates > 2³² samples between polls. At 1M samples/sec that's ~71 minutes; at 10k samples/sec typical for order-entry it's ~5 days. Documented in the cbindgen header's struct doc-comment.
 - A8 audit integration: sibling per-conn-histogram coverage audit in `tests/per-conn-histogram-coverage.rs` (engine-wide counter audit doesn't reach per-conn state); scenario sweeps RTT across all 16 buckets. Knob-coverage audit picks up `rtt_histogram_bucket_edges_us` with a non-default-edges scenario.
 
 **Does NOT include:**
 - Test suite harnesses (A7/A8/A9).
-- Per-sample `RESD_NET_EVT_RTT_SAMPLE` events (deferred; histogram covers the stated minute-to-hour use case more cheaply).
+- Per-sample `DPDK_NET_EVT_RTT_SAMPLE` events (deferred; histogram covers the stated minute-to-hour use case more cheaply).
 - Raw-samples ring (deferred for the same reason).
 - Engine-wide histogram aggregation (derive from per-conn on demand if needed).
 - Mid-session edge changes (edges fixed at `engine_create`).
@@ -376,7 +376,7 @@ Group 3 — `SmallVec` / caller-buffer for per-ACK and per-tick scratch:
 Group 4 — zero-copy RX reassembly (completes spec §7.3):
 - `tcp_reassembly.rs` refactor: reassembly holds `Mbuf` refs + offsets instead of `Vec<u8>` payload copies.
 - Removes `to_insert: Vec<(u32, Vec<u8>)>` (`tcp_reassembly.rs:86`) and the two `payload[off..off + take].to_vec()` copies (`tcp_reassembly.rs:102, 121`).
-- READABLE event pins referenced mbufs until the next `resd_net_poll`, consistent with §5.3 mbuf-lifetime contract.
+- READABLE event pins referenced mbufs until the next `dpdk_net_poll`, consistent with §5.3 mbuf-lifetime contract.
 - Unit tests in `tests/tcp_options_paws_reassembly_sack_tap.rs` updated to assert ref-based reassembly (no byte copies observed via the alloc-audit harness from Group 5).
 
 Group 5 — verification + regression guard:
@@ -399,9 +399,9 @@ Group 5 — verification + regression guard:
 
 **Numbering note:** Inserted after A6.5 as the API-evolution half of the zero-copy RX story. A6.5 Group 4 retires internal `Vec<u8>` copies inside `tcp_reassembly.rs` (OOO path) and pins mbufs through the READABLE event — strictly internal. A6.6 evolves the *public* API to scatter-gather so chained mbufs (LRO / jumbo / IP-defragmented) deliver without a flatten copy, and finishes the in-order-delivery-path mbuf-ref rework that A6.5 Group 4 does not cover. Uses the "A6.6" decimal tag (A5.5 / A6.5 precedent) to avoid renumbering A7–A14.
 
-**Goal:** Close the drift between spec §5.3 / §7.3 (mbuf-pinned zero-copy delivery) and the current delivery implementation. After A6.6 the `RESD_NET_EVT_READABLE` event borrows directly into mempool-backed DMA memory via `resd_net_iovec_t segs[]`; no intermediate `Vec<u8>` on the RX hot path.
+**Goal:** Close the drift between spec §5.3 / §7.3 (mbuf-pinned zero-copy delivery) and the current delivery implementation. After A6.6 the `DPDK_NET_EVT_READABLE` event borrows directly into mempool-backed DMA memory via `dpdk_net_iovec_t segs[]`; no intermediate `Vec<u8>` on the RX hot path.
 
-**Spec refs:** §4.2 (event contract — `readable.data` lifetime), §5.3 (mbuf lifetime), §7.2 / §7.3 (per-conn buffers + zero-copy path). §4.1 header evolves: `resd_net_event_readable_t` gains `segs` / `n_segs` / `total_len`, drops `data` / `len`. New POD struct `resd_net_iovec_t`.
+**Spec refs:** §4.2 (event contract — `readable.data` lifetime), §5.3 (mbuf lifetime), §7.2 / §7.3 (per-conn buffers + zero-copy path). §4.1 header evolves: `dpdk_net_event_readable_t` gains `segs` / `n_segs` / `total_len`, drops `data` / `len`. New POD struct `dpdk_net_iovec_t`.
 
 **Design spec:** `docs/superpowers/specs/2026-04-20-stage1-phase-a6-6-and-a6-7-rx-zero-copy-and-ffi-safety-audit-design.md`.
 
@@ -414,9 +414,9 @@ Group 1 — in-order delivery-path mbuf-ref migration:
 - Partial-segment split on delivery uses an explicit `Mbuf::try_clone()` method (refcount-bump + new wrapper) — intentionally not a `Clone` derive, to avoid silent over-bumps.
 
 Group 2 — scatter-gather public API:
-- Add `resd_net_iovec_t { const uint8_t *base; uint32_t len; uint32_t _pad; }` (16 B, x86_64).
-- `resd_net_event_readable_t` reshaped: `segs: const resd_net_iovec_t*`, `n_segs: u32`, `total_len: u32`.
-- Engine-owned per-conn `readable_scratch_iovecs: RefCell<Vec<resd_net_iovec_t>>` (capacity retained; cleared at top of each `poll_once`).
+- Add `dpdk_net_iovec_t { const uint8_t *base; uint32_t len; uint32_t _pad; }` (16 B, x86_64).
+- `dpdk_net_event_readable_t` reshaped: `segs: const dpdk_net_iovec_t*`, `n_segs: u32`, `total_len: u32`.
+- Engine-owned per-conn `readable_scratch_iovecs: RefCell<Vec<dpdk_net_iovec_t>>` (capacity retained; cleared at top of each `poll_once`).
 - `TcpConn.delivered_segments: Vec<InOrderSegment>` holds popped segments until the *next* `poll_once` drains them — backing the scatter-gather pointers.
 
 Group 3 — multi-segment (LRO / jumbo) ingest:
@@ -424,7 +424,7 @@ Group 3 — multi-segment (LRO / jumbo) ingest:
 - No flatten helper in this phase. Consumers with contiguous-only processing call `memcpy` across `segs[]` themselves.
 
 Group 4 — pool sizing:
-- `resd_net_engine_config_t.rx_mempool_size: u32` (0 = compute default from `recv_buffer_bytes × max_conns / avg_payload_bytes × 2`, clamped to ≥ `2 × RTE_ETH_RX_DESC_DEFAULT`).
+- `dpdk_net_engine_config_t.rx_mempool_size: u32` (0 = compute default from `recv_buffer_bytes × max_conns / avg_payload_bytes × 2`, clamped to ≥ `2 × RTE_ETH_RX_DESC_DEFAULT`).
 - Plumbed through `engine_create`; documented in cbindgen header.
 
 Group 5 — verification:
@@ -440,13 +440,13 @@ Group 5 — verification:
 **Does NOT include:**
 - OOO reassembly mbuf-ref refactor — **A6.5 Group 4** owns it.
 - TX zero-copy (user-held buffer consumed without copy) — separate contract change, deferred.
-- `resd_net_readable_flatten()` convenience helper — YAGNI; add if a consumer asks.
+- `dpdk_net_readable_flatten()` convenience helper — YAGNI; add if a consumer asks.
 - WRITABLE event / backpressure — A6.
 - cxx-bridge migration — stays cbindgen.
 
 **Dependencies:**
 - **A6.5 Group 4** (firm) — OOO reassembly mbuf-refs + READABLE-event mbuf-pinning must land first.
-- **A6** (firm) — final public-API event shape stable before A6.6 evolves `resd_net_event_readable_t`.
+- **A6** (firm) — final public-API event shape stable before A6.6 evolves `dpdk_net_event_readable_t`.
 - **A-HW** (soft) — LRO enablement exercises the multi-segment path under realistic load; A6.6 ships correct single-seg behavior regardless.
 
 **Rough scale:** ~14 tasks (~3 Group 1 + ~3 Group 2 + ~2 Group 3 + ~1 Group 4 + ~4 Group 5 + ~1 cpp-consumer update).
@@ -466,13 +466,13 @@ Group 5 — verification:
 **In scope:**
 
 Group 1 — static + compile-time checks:
-- miri CI job over `resd-net-core` tests (DPDK-touching modules `#[cfg(miri)]`-skipped or shimmed). Covers safe/unsafe-Rust UB in pure-core logic.
-- cbindgen header-drift CI check: `cargo xtask check-header` regenerates `include/resd_net.h` and diffs against committed; CI fails on drift.
-- ABI-stability snapshot: `tests/abi/resd_net.h.expected` committed; `check-header` diffs against it; drift requires intentional snapshot update (semver-like discipline, pre-1.0 snapshot is the contract).
-- Counters data-race audit: emit `_Atomic uint64_t` guards in cbindgen-generated `resd_net_counters_t`, or document atomic-load requirement with a compile-time assertion in the cpp-consumer.
+- miri CI job over `dpdk-net-core` tests (DPDK-touching modules `#[cfg(miri)]`-skipped or shimmed). Covers safe/unsafe-Rust UB in pure-core logic.
+- cbindgen header-drift CI check: `cargo xtask check-header` regenerates `include/dpdk_net.h` and diffs against committed; CI fails on drift.
+- ABI-stability snapshot: `tests/abi/dpdk_net.h.expected` committed; `check-header` diffs against it; drift requires intentional snapshot update (semver-like discipline, pre-1.0 snapshot is the contract).
+- Counters data-race audit: emit `_Atomic uint64_t` guards in cbindgen-generated `dpdk_net_counters_t`, or document atomic-load requirement with a compile-time assertion in the cpp-consumer.
 
 Group 2 — runtime safety tests:
-- Panic-firewall test: child-process fork + `resd_net_panic_for_test()` ABI entry + SIGABRT assertion. Regression guard if `panic = abort` is ever unchanged.
+- Panic-firewall test: child-process fork + `dpdk_net_panic_for_test()` ABI entry + SIGABRT assertion. Regression guard if `panic = abort` is ever unchanged.
 - No-alloc-on-hot-path: extends A6.5 Group 5's `bench-alloc-audit` wrapper with a dedicated unit-test asserting `allocations == 0` over a representative workload through `poll_once` / `send_bytes` / event-emit.
 - C++ consumer under ASan + UBSan + LSan: `examples/cpp-consumer/main.cpp` in a CI sanitizer matrix, runs scripted connect → send → recv → close.
 
@@ -494,13 +494,13 @@ Group 3 — audit artifacts:
 
 ## A7 — Loopback test server + packetdrill-shim
 
-**Goal:** Server-mode cargo feature `test-server` (accept on listening port, byte-stream echo). Luna-pattern packetdrill-shim that links `libresd_net` + socket-shim wrapper and runs curated packetdrill scripts.
+**Goal:** Server-mode cargo feature `test-server` (accept on listening port, byte-stream echo). Luna-pattern packetdrill-shim that links `libdpdk_net` + socket-shim wrapper and runs curated packetdrill scripts.
 
 **Spec refs:** §10.2, §10.12, §11 test-only loopback server is in scope.
 
 **Deliverables:**
-- `resd-net-testserver` crate behind feature flag `test-server`: implements `LISTEN` / `SYN-RECEIVED` / `ESTABLISHED` server path + byte-stream echo.
-- `tools/packetdrill-shim/` — links `libresd_net.a`, redirects packetdrill's TUN read/write to stack rx/tx hooks, implements synchronous socket-shim wrapper for `connect`/`write`/`read`/`close`.
+- `dpdk-net-testserver` crate behind feature flag `test-server`: implements `LISTEN` / `SYN-RECEIVED` / `ESTABLISHED` server path + byte-stream echo.
+- `tools/packetdrill-shim/` — links `libdpdk_net.a`, redirects packetdrill's TUN read/write to stack rx/tx hooks, implements synchronous socket-shim wrapper for `connect`/`write`/`read`/`close`.
 - `tools/packetdrill-shim/SKIPPED.md` enumerates untranslatable scripts (anything using `SIGIO`, `FIONREAD`, `SO_RCVLOWAT`, `MSG_PEEK`, delayed-ACK timing).
 - Vendored or forked packetdrill in `third_party/packetdrill/`.
 - CI job that runs the runnable subset of ligurio + shivansh + google/packetdrill corpora.
@@ -531,12 +531,12 @@ Group 3 — audit artifacts:
   - Dynamic check: for every counter, the test suite must include at least one scenario that drives it nonzero. Implemented as a table of (counter_name, scenario_fn) with a test that runs each scenario on a fresh engine and asserts the named counter ended > 0. Missing entries fail the audit. A5.5 additions (`tcp.tx_tlp_spurious`, `obs.events_dropped`, `obs.events_queue_high_water`) are in-scope for this audit when A5.5 lands — the audit fails if A5.5 merged without adding the corresponding scenarios (DSACK-after-TLP spurious, queue-overflow, queue-high-water respectively).
   - `state_trans[from][to]`: every transition edge listed in spec §6.1 FSM must have a scenario that exercises it; unreachable edges are listed in an expected-unused file with a justification, reviewed at each phase sign-off.
 - **Configuration-knob coverage audit** (catches behavioral knobs that land in the API but are never actually exercised with a non-default value — the configuration-surface analog of the counter-coverage audit):
-  - Scope: every *behavioral* field on `resd_net_engine_config_t` and `resd_net_connect_opts_t` — fields whose non-default value changes observable wire behavior or observability output. Purely informational fields (e.g., `port_id`, `local_ip`, `gateway_mac`) and sizing fields without branching logic (e.g., `max_connections`) are out of scope; listed in `tests/knob-coverage-informational.txt` with justification.
+  - Scope: every *behavioral* field on `dpdk_net_engine_config_t` and `dpdk_net_connect_opts_t` — fields whose non-default value changes observable wire behavior or observability output. Purely informational fields (e.g., `port_id`, `local_ip`, `gateway_mac`) and sizing fields without branching logic (e.g., `max_connections`) are out of scope; listed in `tests/knob-coverage-informational.txt` with justification.
   - Static check: parse the two config structs + their cbindgen-generated C counterparts; cross-reference against a table of (knob_name, scenario_fn, non_default_value) in `tests/knob-coverage.rs`. Any behavioral knob without a table entry fails the audit.
   - Dynamic check: each scenario constructs an engine or connection with the knob set to the non-default value listed in the table, drives a minimal workload, and asserts at least one behavioral consequence (counter delta, event kind, timing window, or state transition) that distinguishes the non-default from default behavior. Missing consequence assertions fail the audit.
   - Required coverage for A5 + A5.5 knobs (canonical list — extend as later phases add knobs):
     - A5 per-connect: `rack_aggressive=true` (scenario: single-SACK-hole triggers immediate retransmit with no reo_wnd grace), `rto_no_backoff=true` (scenario: multiple consecutive RTO fires, RTO value stays constant across fires).
-    - A5 engine-wide: `tcp_per_packet_events=true` (scenario: induce one retransmit, assert `RESD_NET_EVT_TCP_RETRANS` delivered); `tcp_max_retrans_count` at a small value like 2 (scenario: blackhole peer, assert ETIMEDOUT after exactly 2 retrans).
+    - A5 engine-wide: `tcp_per_packet_events=true` (scenario: induce one retransmit, assert `DPDK_NET_EVT_TCP_RETRANS` delivered); `tcp_max_retrans_count` at a small value like 2 (scenario: blackhole peer, assert ETIMEDOUT after exactly 2 retrans).
     - A5.5 per-connect TLP: `tlp_pto_min_floor_us=0` (scenario: assert TLP fires at `2·SRTT` rather than `max(2·SRTT, min_rto_us)`); `tlp_pto_srtt_multiplier_x100=100` (scenario: assert TLP fires at ≈ SRTT); `tlp_skip_flight_size_gate=true` (scenario: single-in-flight + drop, assert TLP at `2·SRTT` without the `+max_ack_delay` penalty); `tlp_max_consecutive_probes=3` paired with `tlp_skip_rtt_sample_gate=true` (scenario: persistent tail loss, assert 3 probes fire at PTO cadence before RTO takes over); `tlp_skip_rtt_sample_gate=true` solo (scenario: back-to-back TLPs without intervening RTT sample — probe 2 fires where default behavior would suppress it).
     - A5.5 engine-wide: `event_queue_soft_cap=128` (scenario: overflow the queue, assert `obs.events_dropped > 0` and drained events are the most-recent).
     - A5.5 knob combinations: the "aggressive order-entry preset" from A5.5 §5.5 (all five TLP knobs on their aggressive values simultaneously) gets its own scenario — assert the first TLP fires within `1·SRTT` of the drop, three probes fire in series, no RTO fires in that window.
@@ -555,8 +555,8 @@ Group 3 — audit artifacts:
 **Spec refs:** §10.5, §10.6.
 
 **Deliverables:**
-- `tools/tcp-fuzz-differential/` — TCP-Fuzz driver configured to run `libresd_net` in `preset=rfc_compliance` against Linux TCP as oracle.
-- Regression-fuzz track: same inputs compared across `resd_net` releases.
+- `tools/tcp-fuzz-differential/` — TCP-Fuzz driver configured to run `libdpdk_net` in `preset=rfc_compliance` against Linux TCP as oracle.
+- Regression-fuzz track: same inputs compared across `dpdk_net` releases.
 - CI smoke run per merge; 72h continuous run on a dedicated box per stage cut.
 - `FaultInjector` RX middleware — random drop/duplicate/reorder/corrupt with configurable rates, enabled via env var.
 - Property tests (proptest) for TCP options encode/decode and reassembly invariants.
@@ -622,7 +622,7 @@ Group 3 — audit artifacts:
 
 ## A12 — Documentation (user + maintainer + future-work) + Stage 1 release tag
 
-**Goal:** Ship `libresd_net` with structured documentation sufficient for (a) users to integrate and operate, (b) future maintainers to extend and fix, and (c) a durable record of considered-but-deferred work. Each audience gets its own directory tree under `docs/` with one focused markdown file per topic, linked from a directory-level index. Places the `stage-1-ship` tag at the end of this phase.
+**Goal:** Ship `libdpdk_net` with structured documentation sufficient for (a) users to integrate and operate, (b) future maintainers to extend and fix, and (c) a durable record of considered-but-deferred work. Each audience gets its own directory tree under `docs/` with one focused markdown file per topic, linked from a directory-level index. Places the `stage-1-ship` tag at the end of this phase.
 
 **Spec refs:** §2.1 (stage scoping), §3 (threading), §4 (public API), §5–§9 (internals), §10 (testing), §11 (benchmarks), §12 (out of scope), §13 (open questions).
 
@@ -635,16 +635,16 @@ docs/
 │   ├── 01-overview.md            What it does, what it deliberately doesn't, positioning vs Linux TCP and vs mTCP
 │   ├── 02-build-and-link.md      DPDK 23.11 + hugepage + VFIO prereqs, cargo build, cbindgen-generated header, C++ link
 │   ├── 03-lifecycle.md           EAL init → engine_create → connect → poll → send/recv events → close → engine_destroy, with sequence diagram
-│   ├── 04-configuration.md       Every `resd_net_engine_config_t` field from §4, trading-latency defaults vs preset=rfc_compliance, when to use which
+│   ├── 04-configuration.md       Every `dpdk_net_engine_config_t` field from §4, trading-latency defaults vs preset=rfc_compliance, when to use which
 │   ├── 05-threading-model.md     One-engine-per-lcore, RTC, pinning contract from §3, what breaks if violated
-│   ├── 06-send-and-receive.md    `resd_net_send` semantics (copy-on-accept, partial accept, backpressure), READABLE event data-ptr lifetime, WRITABLE (A6)
+│   ├── 06-send-and-receive.md    `dpdk_net_send` semantics (copy-on-accept, partial accept, backpressure), READABLE event data-ptr lifetime, WRITABLE (A6)
 │   ├── 07-close-and-timewait.md  FIN flow, TIME_WAIT duration, FORCE_TW_SKIP and RFC 6191 §4.2 gating
-│   ├── 08-error-handling.md      Negative-errno conventions, RESD_NET_EVT_ERROR enumeration, mempool exhaustion, peer-unreachable
+│   ├── 08-error-handling.md      Negative-errno conventions, DPDK_NET_EVT_ERROR enumeration, mempool exhaustion, peer-unreachable
 │   ├── 09-counters.md            Every counter from §9.1 — meaning, expected steady-state, red-flag patterns
 │   ├── 10-events.md              Every event from §9.2 — when emitted, payload semantics, ordering guarantees
 │   ├── 11-limitations.md         Wire-compat subset vs Linux, **features not implemented** (ECN, IPv6, keepalive, TFO, dynamic ARP, etc.), TIME_WAIT, stage bounds. Pairs with 14-rfc-deviations: this section covers what's absent; 14 covers what's implemented-but-deliberately-different.
 │   ├── 12-troubleshooting.md     "No SYN-ACK", "peer window zero", "stuck in SYN_SENT", "RST on unmatched", "TIME_WAIT exhaustion" — counter-symptom driven
-│   ├── 13-order-entry-telemetry.md  Playbook for trading apps: how to tag every outbound order with stack-state snapshots (counters + `resd_net_conn_stats` for per-conn send-path + RTT) and the event log, then reconstruct what happened during congestion episodes. Complements 09-counters (dictionary) and 10-events (dictionary) with end-to-end recipes. Sections: (a) per-order telemetry pattern — pre-send + on-ACK stats snapshot, `snd_nxt` / `snd_wnd` / `send_buf_bytes_pending` / `srtt_us` / `rttvar_us` / `min_rtt_us` / `rto_us` tagging, event-log capture; (b) congestion-episode reconstruction — the six canonical patterns (`rx_zero_window↑` = peer/exchange slow, `send_buf_full↑` + partial send = our buffer saturating, `tx_rto↑` / `tx_rack_loss↑` (A5) = path loss, `rx_dup_ack↑` + high `rx_sack_blocks` = reorder not loss, `conn_timeout_retrans↑` = session dying, `tx_zero_window↑` + `recv_buf_drops↑` = our consumer slow), each with a concrete counter+event trace, a companion `stats()`-snapshot trace showing SRTT/RTTVAR/min_RTT trajectories, and the "what to do about it" action (reconnect, parallel connection, `rack_aggressive=true`, app-side pacing); (c) leading vs lagging indicators — `srtt_us` rise and `rttvar_us` spike often precede `send_buf_full` or `rx_zero_window` crossing into pathological territory, so apps can trigger mitigation earlier by watching RTT ratios (`srtt_us / min_rtt_us`) alongside counters; (d) aggressive-retry strategies the library's primitives enable but do not implement (parallel sockets, duplicate-clOrdID across connections, A5's `rto_no_backoff`, A5.5's per-connect TLP knobs `tlp_pto_min_floor_us=0` / `tlp_pto_srtt_multiplier_x100=100` / `tlp_skip_flight_size_gate=true` / `tlp_max_consecutive_probes≤5` / `tlp_skip_rtt_sample_gate=true`), with explicit notes on where stack ends and app orchestration begins; (e) the `obs.events_dropped` / `obs.events_queue_high_water` signal (A5.5) and what it means when nonzero during an episode; (f) **TLP self-tuning recipe** — app tracks `tcp.tx_tlp_spurious / tcp.tx_tlp` across a rolling window; ratio above ~3–5% means the aggressive PTO floor is firing probes before peer ACKs realistically arrive, so the app raises `tlp_pto_min_floor_us` on the offending socket (re-connect with new opts, since this is a connect-time knob). Targets a steady-state spurious rate under 5% while keeping the fastest PTO the path tolerates. Worked example from a simulated stall: raw counter-snapshot stream + per-conn `stats()` trajectory + event log reconstructed into a human-readable timeline.
+│   ├── 13-order-entry-telemetry.md  Playbook for trading apps: how to tag every outbound order with stack-state snapshots (counters + `dpdk_net_conn_stats` for per-conn send-path + RTT) and the event log, then reconstruct what happened during congestion episodes. Complements 09-counters (dictionary) and 10-events (dictionary) with end-to-end recipes. Sections: (a) per-order telemetry pattern — pre-send + on-ACK stats snapshot, `snd_nxt` / `snd_wnd` / `send_buf_bytes_pending` / `srtt_us` / `rttvar_us` / `min_rtt_us` / `rto_us` tagging, event-log capture; (b) congestion-episode reconstruction — the six canonical patterns (`rx_zero_window↑` = peer/exchange slow, `send_buf_full↑` + partial send = our buffer saturating, `tx_rto↑` / `tx_rack_loss↑` (A5) = path loss, `rx_dup_ack↑` + high `rx_sack_blocks` = reorder not loss, `conn_timeout_retrans↑` = session dying, `tx_zero_window↑` + `recv_buf_drops↑` = our consumer slow), each with a concrete counter+event trace, a companion `stats()`-snapshot trace showing SRTT/RTTVAR/min_RTT trajectories, and the "what to do about it" action (reconnect, parallel connection, `rack_aggressive=true`, app-side pacing); (c) leading vs lagging indicators — `srtt_us` rise and `rttvar_us` spike often precede `send_buf_full` or `rx_zero_window` crossing into pathological territory, so apps can trigger mitigation earlier by watching RTT ratios (`srtt_us / min_rtt_us`) alongside counters; (d) aggressive-retry strategies the library's primitives enable but do not implement (parallel sockets, duplicate-clOrdID across connections, A5's `rto_no_backoff`, A5.5's per-connect TLP knobs `tlp_pto_min_floor_us=0` / `tlp_pto_srtt_multiplier_x100=100` / `tlp_skip_flight_size_gate=true` / `tlp_max_consecutive_probes≤5` / `tlp_skip_rtt_sample_gate=true`), with explicit notes on where stack ends and app orchestration begins; (e) the `obs.events_dropped` / `obs.events_queue_high_water` signal (A5.5) and what it means when nonzero during an episode; (f) **TLP self-tuning recipe** — app tracks `tcp.tx_tlp_spurious / tcp.tx_tlp` across a rolling window; ratio above ~3–5% means the aggressive PTO floor is firing probes before peer ACKs realistically arrive, so the app raises `tlp_pto_min_floor_us` on the offending socket (re-connect with new opts, since this is a connect-time knob). Targets a steady-state spurious rate under 5% while keeping the fastest PTO the path tolerates. Worked example from a simulated stall: raw counter-snapshot stream + per-conn `stats()` trajectory + event log reconstructed into a human-readable timeline.
 │   └── 14-rfc-deviations.md     Comprehensive reference for every deliberate divergence from the RFCs the stack claims to implement. Audience: integrators doing interop testing, users porting code from kernel TCP, anyone asking "is this stack RFC-compliant for purpose X?" Organized by RFC (one section per RFC, ordered by RFC number): each section lists every deviation as a small structured entry carrying RFC clause citation (e.g., "RFC 6298 §2.4"), the RFC's literal text (a single-sentence quote or paraphrase), our stack's behavior, rationale (usually "trading fail-fast latency" or "scope bound"), config knob if any (per-conn opt-in / opt-out or engine-wide), and a cross-link to the relevant per-phase RFC-compliance review report in `docs/superpowers/reviews/phase-aN-rfc-compliance.md`. A quick-scan summary table at the top lists every deviation in one-line form so readers can grep for an RFC or keyword; the per-RFC sections below provide the detail. Canonical RFCs covered at Stage 1 ship: RFC 791 (IP), 793bis (TCP core), 1122 (TCP requirements), 2018 (SACK), 2883 (DSACK), 5681 (CC — dup_ack strictness etc.), 6191 (TIME_WAIT assessment), 6298 (RTO: minRTO 5ms / maxRTO 1s / no-backoff opt-in via `rto_no_backoff`), 6528 (ISS: SipHash + boot_nonce + 4µs ticks), 7323 (WS>14 clamp + TS.Recent 24-day expiration deferred), 8985 (RACK-TLP: reo_wnd static baseline + per-conn `rack_aggressive` + all five A5.5 TLP knobs `tlp_pto_min_floor_us` / `tlp_pto_srtt_multiplier_x100` / `tlp_skip_flight_size_gate` / `tlp_max_consecutive_probes` / `tlp_skip_rtt_sample_gate`), 9293 (TCP requirements baseline). Each deviation table entry also marks whether the deviation is *default-on* (the stack behaves this way without opt-in) or *opt-in* (user must flip a knob to see the deviation); interop testers especially care about the default-on set. Update policy: this document is the single source of truth for RFC deviations going forward; `future-work/02-rfc-deviations.md` becomes a pointer here rather than a parallel consolidation. Maintenance: when a phase RFC-compliance review adds a new §6.4 row to the parent spec, a corresponding entry lands in this document as part of the same phase's doc-update commit; CI check diff-compares §6.4 row count against entry count in this document to catch drift.
 │
 ├── maintainer-guide/
@@ -700,9 +700,9 @@ docs/
 
 **Parallelism note:** A13 and A14 are **independent of each other** and can (and should) run in parallel once A12 is complete. Whichever starts first lands the `Transport` abstraction in `contek-io/cpp_common` (see shared groundwork below); the other rebases onto it. Both phases depend on A12 (ship tag) but not on each other.
 
-**Framing:** This phase does not add HTTP, TLS, or WebSocket to `libresd_net` — Stage 1 stays raw-TCP (spec §1 / §2.1). Instead, it validates that the Stage 1 byte-stream API is fit-for-purpose for a real HTTP/1.1 + TLS client that lives **outside** the stack, in the user's existing C++ library `contek-io/cpp_common`. `libresd_net` sees only the encrypted byte stream; TLS handshake + record layer + HTTP/1.1 parsing all happen inside `cpp_common` as today.
+**Framing:** This phase does not add HTTP, TLS, or WebSocket to `libdpdk_net` — Stage 1 stays raw-TCP (spec §1 / §2.1). Instead, it validates that the Stage 1 byte-stream API is fit-for-purpose for a real HTTP/1.1 + TLS client that lives **outside** the stack, in the user's existing C++ library `contek-io/cpp_common`. `libdpdk_net` sees only the encrypted byte stream; TLS handshake + record layer + HTTP/1.1 parsing all happen inside `cpp_common` as today.
 
-**Goal:** Prove the byte-stream API is enough for a real HTTP/1.1 + TLS client. Build `cpp_common`'s HTTP client on top of a new `resd_net`-backed transport; run integration tests against a TLS HTTP server; benchmark p50 / p99 / p999 latency against the same client on kernel TCP as the comparator baseline.
+**Goal:** Prove the byte-stream API is enough for a real HTTP/1.1 + TLS client. Build `cpp_common`'s HTTP client on top of a new `dpdk_net`-backed transport; run integration tests against a TLS HTTP server; benchmark p50 / p99 / p999 latency against the same client on kernel TCP as the comparator baseline.
 
 **Spec refs:** §4 (public byte-stream API), §5.3 (buffer ownership — application owns TLS buffering), §6.4 (trading defaults like Nagle off / delayed-ACK off apply cleanly to encrypted byte streams), §11 (benchmark plan — this extends it with an HTTP+TLS bucket).
 
@@ -710,7 +710,7 @@ docs/
 
 - `contek-io/cpp_common` PR: add a `Transport` abstraction (C++ interface) with two concrete impls:
   - `KernelTransport` — existing behavior, wraps POSIX `::send` / `::recv` / epoll on a kernel socket.
-  - `ResdNetTransport` — wraps `resd_net_connect` / `resd_net_send` / `resd_net_poll` (consumes `RESD_NET_EVT_READABLE` / `WRITABLE` / `CLOSED` / `ERROR`) behind the same `Transport` interface.
+  - `DpdkNetTransport` — wraps `dpdk_net_connect` / `dpdk_net_send` / `dpdk_net_poll` (consumes `DPDK_NET_EVT_READABLE` / `WRITABLE` / `CLOSED` / `ERROR`) behind the same `Transport` interface.
 - Existing HTTP/1.1 and WebSocket clients in `cpp_common` are ported to consume the `Transport` interface rather than the POSIX socket API directly.
 - TLS layer in `cpp_common` (OpenSSL or rustls-backed, whichever cpp_common uses today) is unchanged except that its BIO / read-callback-write-callback pair sits on top of `Transport` instead of a raw socket FD. Both transports look identical to the TLS code.
 - cpp_common unit tests: `Transport` contract tests pass on both impls; end-to-end `GET https://<server>/echo` yields byte-identical responses on both.
@@ -719,27 +719,27 @@ The PR is reviewed and merged in `contek-io/cpp_common`'s own process; this repo
 
 **Deliverables (this repo):**
 
-- `tools/bench-http-tls/` — C++ harness that uses `cpp_common`'s HTTP/1.1 + TLS client configured with `ResdNetTransport`; drives a mixed request workload against a TLS HTTP server; measures end-to-end latency (`send_request` → `full_response_parsed`); writes CSV in the same schema as `tools/bench-vs-linux` so `tools/bench-report` (A10) handles it.
+- `tools/bench-http-tls/` — C++ harness that uses `cpp_common`'s HTTP/1.1 + TLS client configured with `DpdkNetTransport`; drives a mixed request workload against a TLS HTTP server; measures end-to-end latency (`send_request` → `full_response_parsed`); writes CSV in the same schema as `tools/bench-vs-linux` so `tools/bench-report` (A10) handles it.
   - Workload mix (three independent sub-benches):
     1. `small-get`: 100 B request, 1 KB response, new connection per request — measures TLS handshake cost under the stack.
     2. `keep-alive-get`: same sizes but persistent connection, 10 000 sequential requests — measures steady-state request-response RTT.
     3. `post-body`: 4 KB request body, 200 response, keep-alive — measures TX chain + TLS write-path behavior.
-  - Comparator runs: same harness, same server, `KernelTransport`. Reported per sub-bench as `resd_p99 − kernel_p99` (after the §11.1 measurement-discipline preconditions).
+  - Comparator runs: same harness, same server, `KernelTransport`. Reported per sub-bench as `dpdk_p99 − kernel_p99` (after the §11.1 measurement-discipline preconditions).
 - `tools/bench-http-tls/SERVER.md` — documents the test server matrix:
   - Local CI server: `nginx` with a self-signed cert + TLS 1.3 enabled + `/echo`, `/small`, `/large` endpoints. Containerized so CI is reproducible. TLS cert pinning documented.
   - Release validation server: a real exchange REST testnet (venue TBD by the user; the doc enumerates which venues the cpp_common client already connects to today, and selects one for the published numbers).
-- Integration test in `tests/` (cargo + cmake mixed crate): one end-to-end HTTP+TLS request/response exercising `resd_net_connect → send → poll → recv events → close`, asserting byte-identical response vs kernel transport.
-- Results artifact: `docs/superpowers/reports/app-fit-http-tls.md` — CSV of p50 / p99 / p999 per sub-bench × per transport, delta vs kernel, plus a bug/gap section listing any issues found in `libresd_net` or `cpp_common` with links to the fix commits / upstream PRs.
+- Integration test in `tests/` (cargo + cmake mixed crate): one end-to-end HTTP+TLS request/response exercising `dpdk_net_connect → send → poll → recv events → close`, asserting byte-identical response vs kernel transport.
+- Results artifact: `docs/superpowers/reports/app-fit-http-tls.md` — CSV of p50 / p99 / p999 per sub-bench × per transport, delta vs kernel, plus a bug/gap section listing any issues found in `libdpdk_net` or `cpp_common` with links to the fix commits / upstream PRs.
 
 **Does NOT include:**
-- TLS, HTTP/1.1, or HTTP/2/3 implementations inside `libresd_net` — these stay in Stage 3 / Stage 4 (spec §2.1) and are explicitly out of Stage 1.
+- TLS, HTTP/1.1, or HTTP/2/3 implementations inside `libdpdk_net` — these stay in Stage 3 / Stage 4 (spec §2.1) and are explicitly out of Stage 1.
 - Parsing HTTP inside the library (Stage 3).
 - Server-side HTTP (spec §1 explicitly: no production server-side TCP).
 - Benchmark-harness work that duplicates A10 — this reuses A10's measurement-discipline checker, CSV writer, and `bench-report` dashboard.
 
 **Dependencies:** A12 (Stage 1 ship tag exists; documentation-level API contract frozen). **Not dependent on A14** — A13 and A14 run in parallel.
 
-**Rough scale:** ~10 tasks (cpp_common `Transport` abstraction + upstream PR if not yet landed; cpp_common HTTP/1.1-on-Transport port; `bench-http-tls` harness + 3 sub-benches; test server setup + CI container; integration test; CSV writer wiring into `bench-report`; kernel-transport comparator run; p99-delta evaluator; report generator; any `libresd_net` bugfix cycles uncovered by the run).
+**Rough scale:** ~10 tasks (cpp_common `Transport` abstraction + upstream PR if not yet landed; cpp_common HTTP/1.1-on-Transport port; `bench-http-tls` harness + 3 sub-benches; test server setup + CI container; integration test; CSV writer wiring into `bench-report`; kernel-transport comparator run; p99-delta evaluator; report generator; any `libdpdk_net` bugfix cycles uncovered by the run).
 
 ---
 
@@ -749,7 +749,7 @@ The PR is reviewed and merged in `contek-io/cpp_common`'s own process; this repo
 
 **Framing:** Mirror of A13 for the WebSocket + TLS client in `cpp_common`. Validates the byte-stream API under a long-lived, asymmetric-traffic (server-push) workload typical of market-data WebSocket feeds — a more demanding shape than HTTP/1.1 request-response, and the dominant real-world consumer of the stack in trading deployments.
 
-**Goal:** Prove the byte-stream API is enough for a real WebSocket + TLS client under market-data-shaped traffic. Build `cpp_common`'s WS client on top of the `ResdNetTransport`; run integration tests against a TLS WS echo server; benchmark server-push latency and echo RTT against the kernel-transport baseline.
+**Goal:** Prove the byte-stream API is enough for a real WebSocket + TLS client under market-data-shaped traffic. Build `cpp_common`'s WS client on top of the `DpdkNetTransport`; run integration tests against a TLS WS echo server; benchmark server-push latency and echo RTT against the kernel-transport baseline.
 
 **Spec refs:** §4, §5.3, §6.4, §11.
 
@@ -757,20 +757,20 @@ The PR is reviewed and merged in `contek-io/cpp_common`'s own process; this repo
 
 **Deliverables (this repo):**
 
-- `tools/bench-ws-tls/` — C++ harness using `cpp_common`'s WS + TLS client on `ResdNetTransport`. Two independent sub-benches:
+- `tools/bench-ws-tls/` — C++ harness using `cpp_common`'s WS + TLS client on `DpdkNetTransport`. Two independent sub-benches:
   1. `echo-rtt`: small (64 B) frames in a tight request → server echoes → measure RTT loop, 10 000 frames post-warmup. p50 / p99 / p999 RTT. Exercises the stack's per-segment TX/RX path under encrypted framing.
-  2. `server-push`: connect, subscribe-pattern (configurable topic list), server pushes binary frames at sustained ~1 MB/s for 60 s with a realistic frame-size distribution (most 200 B, occasional 4 KB, rare 64 KB). Measure per-frame `server_push_send_ts → RESD_NET_EVT_READABLE delivered` latency. Drives the canonical market-data shape.
+  2. `server-push`: connect, subscribe-pattern (configurable topic list), server pushes binary frames at sustained ~1 MB/s for 60 s with a realistic frame-size distribution (most 200 B, occasional 4 KB, rare 64 KB). Measure per-frame `server_push_send_ts → DPDK_NET_EVT_READABLE delivered` latency. Drives the canonical market-data shape.
 - `tools/bench-ws-tls/SERVER.md` — documents the test server matrix:
   - Local CI server: `websocketd` or a small purpose-built server wrapping an echo + configurable-push endpoint, with TLS 1.3 + self-signed cert. Containerized. Push-rate and frame-size distribution configurable per bench run.
   - Release validation: a real exchange WebSocket market-data testnet (venue TBD; document which venues cpp_common connects to today and pick one).
 - Integration test: WS handshake → subscribe → receive N frames → close cleanly; asserts byte-identical frame payloads vs kernel-transport run.
-- Frame-size coverage: small (64 B), medium (1 KB), large (64 KB) — exercises WS frame fragmentation in cpp_common and `libresd_net`'s single-mbuf vs mbuf-chain paths.
+- Frame-size coverage: small (64 B), medium (1 KB), large (64 KB) — exercises WS frame fragmentation in cpp_common and `libdpdk_net`'s single-mbuf vs mbuf-chain paths.
 - Results artifact: `docs/superpowers/reports/app-fit-ws-tls.md` — CSV + percentile table per sub-bench × per transport, delta vs kernel, per-frame-size decomposition for the large end, plus bug/gap section. Same schema as A13's report so both can be consumed by a single dashboard.
 
 **Does NOT include:**
-- WebSocket implementation inside `libresd_net` (spec §2.1 Stage 5, and §12 explicitly for `permessage-deflate` — that stays permanently out of scope).
+- WebSocket implementation inside `libdpdk_net` (spec §2.1 Stage 5, and §12 explicitly for `permessage-deflate` — that stays permanently out of scope).
 - Server-side WebSocket (spec §1 no production server-side).
-- TLS implementation inside `libresd_net`.
+- TLS implementation inside `libdpdk_net`.
 - HTTP/1.1 handshake upgrade path — cpp_common owns the WS upgrade; this repo only sees the encrypted byte stream after upgrade.
 
 **Dependencies:** A12. **Not dependent on A13** — A14 and A13 run in parallel.

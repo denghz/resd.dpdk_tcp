@@ -8,15 +8,15 @@
 ## Scope
 
 - Our files reviewed:
-  - `crates/resd-net-core/src/tcp_tlp.rs` (migrated `pto_us` + `TlpConfig` POD)
-  - `crates/resd-net-core/src/tcp_conn.rs` (5 TLP knobs, runtime TLP state, `syn_tx_ts_ns`, `tlp_arm_gate_passes`, `maybe_seed_srtt_from_syn`, `attribute_dsack_to_recent_tlp_probe`, `ConnStats`)
-  - `crates/resd-net-core/src/tcp_input.rs` (`handle_syn_sent` SYN-seed site; DSACK-to-TLP-attribution site; ACK-path `on_rtt_sample_tlp_hook` / `on_new_data_ack_tlp_hook`)
-  - `crates/resd-net-core/src/tcp_rack.rs` (new `rack_mark_losses_on_rto` helper)
-  - `crates/resd-net-core/src/engine.rs` (`on_rto_fire` §6.3 pass, `arm_tlp_pto` helper + `send_bytes` call-site, `emit_syn` `syn_tx_ts_ns` stamping)
-  - `crates/resd-net-core/src/tcp_events.rs` (`EventQueue` soft-cap + drop-oldest + counter wiring)
-  - `crates/resd-net-core/src/counters.rs` (new `ObsCounters` group + `tx_tlp_spurious`)
-  - `crates/resd-net/src/api.rs` + `crates/resd-net/src/lib.rs` (5 TLP ABI fields + validation, 3 new counter fields, `resd_net_conn_stats` extern)
-  - `crates/resd-net-core/tests/knob-coverage.rs` (5 A5.5 TLP knobs + `event_queue_soft_cap`)
+  - `crates/dpdk-net-core/src/tcp_tlp.rs` (migrated `pto_us` + `TlpConfig` POD)
+  - `crates/dpdk-net-core/src/tcp_conn.rs` (5 TLP knobs, runtime TLP state, `syn_tx_ts_ns`, `tlp_arm_gate_passes`, `maybe_seed_srtt_from_syn`, `attribute_dsack_to_recent_tlp_probe`, `ConnStats`)
+  - `crates/dpdk-net-core/src/tcp_input.rs` (`handle_syn_sent` SYN-seed site; DSACK-to-TLP-attribution site; ACK-path `on_rtt_sample_tlp_hook` / `on_new_data_ack_tlp_hook`)
+  - `crates/dpdk-net-core/src/tcp_rack.rs` (new `rack_mark_losses_on_rto` helper)
+  - `crates/dpdk-net-core/src/engine.rs` (`on_rto_fire` §6.3 pass, `arm_tlp_pto` helper + `send_bytes` call-site, `emit_syn` `syn_tx_ts_ns` stamping)
+  - `crates/dpdk-net-core/src/tcp_events.rs` (`EventQueue` soft-cap + drop-oldest + counter wiring)
+  - `crates/dpdk-net-core/src/counters.rs` (new `ObsCounters` group + `tx_tlp_spurious`)
+  - `crates/dpdk-net/src/api.rs` + `crates/dpdk-net/src/lib.rs` (5 TLP ABI fields + validation, 3 new counter fields, `dpdk_net_conn_stats` extern)
+  - `crates/dpdk-net-core/tests/knob-coverage.rs` (5 A5.5 TLP knobs + `event_queue_soft_cap`)
 
 - Spec §6.3 rows verified:
   - RFC 6298 §3.3 (renamed from "yes" to "yes (A5.5)" with SYN-seed explanation — spec §6.3 line 387)
@@ -67,12 +67,12 @@ _(none — 0 open. The SHOULD at RFC 8985 §7.2 arm-on-send is now satisfied by 
 - **AD-A5-5-tlp-pto-floor-zero** — per-connect `tlp_pto_min_floor_us` knob, `u32::MAX` sentinel = explicit no-floor, default 0 substitutes to engine `tcp_min_rto_us`.
   - RFC clause: `docs/rfcs/rfc8985.txt:932-981` §7.2 — silent on a PTO floor (the formula is `max(2·SRTT, ...) + penalty`, no minimum clamp). Linux-kernel TLP uses ~10 ms; the spec §6.4 row notes this.
   - Spec §6.4 line: `docs/superpowers/specs/2026-04-17-dpdk-tcp-design.md:412`
-  - Our code behavior: `tcp_tlp.rs:63-74` `pto_us` clamps `with_penalty` at `cfg.floor_us`. `tcp_conn.rs:350-361` `tlp_config` maps `tlp_pto_min_floor_us == u32::MAX` to `floor_us = 0` (explicit no-floor), else passes the substituted value through. Validation at `resd-net/src/lib.rs:433-443` ensures `tlp_pto_min_floor_us == 0` → engine `tcp_min_rto_us` substitution (A5 behavior preserved) and otherwise `tlp_pto_min_floor_us == u32::MAX` OR `<= tcp_max_rto_us`.
+  - Our code behavior: `tcp_tlp.rs:63-74` `pto_us` clamps `with_penalty` at `cfg.floor_us`. `tcp_conn.rs:350-361` `tlp_config` maps `tlp_pto_min_floor_us == u32::MAX` to `floor_us = 0` (explicit no-floor), else passes the substituted value through. Validation at `dpdk-net/src/lib.rs:433-443` ensures `tlp_pto_min_floor_us == 0` → engine `tcp_min_rto_us` substitution (A5 behavior preserved) and otherwise `tlp_pto_min_floor_us == u32::MAX` OR `<= tcp_max_rto_us`.
 
 - **AD-A5-5-tlp-multiplier-below-2x** — per-connect `tlp_pto_srtt_multiplier_x100` knob, integer ×100, default 200 (2.0×), valid `[100, 200]`.
   - RFC clause: `docs/rfcs/rfc8985.txt:947-953` §7.2 — "the default PTO interval is 2*SRTT. By that time, it is prudent to declare that an ACK is overdue since under normal circumstances, i.e., no losses, an ACK typically arrives in one SRTT. Choosing the PTO to be exactly an SRTT would risk causing spurious probes given that network and end-host delay variance can cause an ACK to be delayed beyond the SRTT. Hence, the PTO is conservatively chosen to be the next integral multiple of SRTT."
   - Spec §6.4 line: `docs/superpowers/specs/2026-04-17-dpdk-tcp-design.md:413`
-  - Our code behavior: `tcp_tlp.rs:67` `base = srtt * multiplier_x100 / 100`. Default 200 matches RFC `2·SRTT` exactly. Validation at `resd-net/src/lib.rs:427-438` substitutes `0 → 200` (A5 preservation) and rejects `< 100` OR `> 200`. Spurious-probe counter `tcp.tx_tlp_spurious` gives the app self-correction signal.
+  - Our code behavior: `tcp_tlp.rs:67` `base = srtt * multiplier_x100 / 100`. Default 200 matches RFC `2·SRTT` exactly. Validation at `dpdk-net/src/lib.rs:427-438` substitutes `0 → 200` (A5 preservation) and rejects `< 100` OR `> 200`. Spurious-probe counter `tcp.tx_tlp_spurious` gives the app self-correction signal.
 
 - **AD-A5-5-tlp-skip-flight-size-gate** — per-connect `tlp_skip_flight_size_gate` bool; when true, skip the RFC 8985 §7.2 FlightSize==1 penalty.
   - RFC clause: `docs/rfcs/rfc8985.txt:959-962` §7.2 — "Third, when the FlightSize is one segment, the sender MAY inflate the PTO by TLP.max_ack_delay to accommodate a potentially delayed acknowledgment and reduce the risk of spurious retransmissions. The actual value of TLP.max_ack_delay is implementation specific."
