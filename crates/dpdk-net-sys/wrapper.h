@@ -46,6 +46,12 @@ uint16_t shim_rte_pktmbuf_nb_segs(const struct rte_mbuf *m);
  * Returns m->next or NULL if `m` is the last/only segment. */
 struct rte_mbuf *shim_rte_pktmbuf_next(struct rte_mbuf *m);
 
+/* A6.6-7 Task 13: current free-count of a DPDK mempool. Used by the
+ * rx_close_drains_mbufs integration test to verify the engine's close
+ * path releases RX-mempool refs back to baseline. Real extern re-
+ * exported for bindgen-allowlist consistency. */
+unsigned shim_rte_mempool_avail_count(struct rte_mempool *mp);
+
 /* A-HW Task 7: TX offload metadata setters. `struct rte_mbuf` is opaque
  * to bindgen (packed anonymous unions), so we can't touch ol_flags /
  * l2_len / l3_len / l4_len directly from Rust — expose OR + set via

@@ -1398,6 +1398,16 @@ impl Engine {
         self.rx_mempool_size
     }
 
+    /// A6.6-7 Task 13: raw pointer to the RX mempool for integration-test
+    /// pool-occupancy assertions (see `rx_close_drains_mbufs`). Not a
+    /// production API — tests call `shim_rte_mempool_avail_count` on
+    /// this pointer to verify the engine's close path released all pinned
+    /// RX mbufs back to the pool. Stays `pub` (rather than `#[cfg(test)]`)
+    /// because integration tests compile outside the crate's own `cfg(test)`.
+    pub fn rx_mempool_ptr(&self) -> *mut dpdk_net_sys::rte_mempool {
+        self._rx_mempool.as_ptr()
+    }
+
     /// Slow-path: scrape ENA-PMD xstats (ENI allowances + per-queue
     /// counters) into `EthCounters`. Application drives the cadence —
     /// recommended ≤1 Hz. On non-ENA / non-advertising PMDs this is a

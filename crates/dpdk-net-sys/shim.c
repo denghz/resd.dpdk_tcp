@@ -105,6 +105,16 @@ struct rte_mbuf *shim_rte_pktmbuf_next(struct rte_mbuf *m) {
     return m->next;
 }
 
+/* A6.6-7 Task 13: mempool occupancy reader — returns the current count
+ * of FREE mbufs in `mp`. The close-drains integration test uses this
+ * together with `Engine::rx_mempool_size()` to compute the in-flight
+ * occupancy (capacity - avail). `rte_mempool_avail_count` is a real
+ * extern symbol in DPDK but re-exporting through a shim keeps the
+ * bindgen allowlist consistent with `shim_rte_*`. */
+unsigned shim_rte_mempool_avail_count(struct rte_mempool *mp) {
+    return rte_mempool_avail_count(mp);
+}
+
 /* A-HW Task 7: TX offload metadata setters/getters.
  *
  * `struct rte_mbuf` is opaque in the Rust bindings (packed anonymous
