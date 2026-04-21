@@ -3287,7 +3287,6 @@ impl Engine {
                             tuple.peer_port,
                             parsed.seq,
                             parsed_opts,
-                            crate::clock::now_ns(),
                         );
                         return 0;
                     }
@@ -5462,7 +5461,6 @@ impl Engine {
         peer_port: u16,
         iss_peer: u32,
         opts: crate::tcp_options::TcpOpts,
-        now_ns: u64,
     ) -> Result<(), crate::Error> {
         let (local_ip, local_port, full) = {
             let slots = self.listen_slots.borrow();
@@ -5484,7 +5482,6 @@ impl Engine {
             peer_port,
         };
         let iss_us = self.iss_gen.next(&tuple);
-        let _ = now_ns; // retained in signature for call-site symmetry with other tcp_input paths.
         let conn = crate::tcp_conn::TcpConn::new_passive(
             tuple,
             iss_us,
