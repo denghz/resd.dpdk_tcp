@@ -2529,6 +2529,8 @@ Recommendation: `maud` (type-safe Rust macro-based HTML) — no template file, n
 
 Reads every CSV under `target/bench-results/**/*.csv`, deserializes into `Vec<CsvRow>`. Groups by `(tool, test_case, feature_set, metric_name)`.
 
+**Follow-up to T1 (RI1 from code review):** The `CsvRow::Deserialize` visitor in `tools/bench-common/src/csv_row.rs` silently defaults any missing `precondition_*` column to `PreconditionValue::default()` (which is `Pass(None)` after the T1 fix-up for the `n/a` state). Under this T14 task, before writing the ingest pipeline, upgrade the visitor to `require()` each of the 14 precondition columns (matching the treatment of run-metadata scalars). A schema-drifted CSV from an older/newer tool should error with a clear "missing precondition column X" message, not silently parse as all-pass. Add a new test in `tools/bench-common/tests/csv_row_roundtrip.rs` that constructs a CSV with a missing column and asserts `CsvRow::deserialize` errors.
+
 - [ ] **Step 14.3: Filter — strict-only / include-lenient / all**
 
 Defaults to strict-only: only rows where `precondition_mode == strict` AND every precondition passes.
