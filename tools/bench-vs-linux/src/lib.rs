@@ -9,6 +9,8 @@ pub mod afpacket;
 pub mod linux_kernel;
 pub mod mode_rtt;
 pub mod mode_wire_diff;
+// A10 Plan B Task 9: pcap divergence-normalisation for mode B.
+pub mod normalize;
 
 /// Stack identifier for CSV `dimensions_json` + mode-A iteration.
 ///
@@ -49,7 +51,10 @@ impl Stack {
 }
 
 /// Mode selector: mode A (RTT, Task 8) vs. mode B (wire-diff, Task 9).
-/// Task 8 ships mode A only; mode B is a `todo!()` stub until T9.
+/// Task 9 delivers the pcap canonicalise + byte-diff engine and an
+/// MVP runner that consumes pre-captured pcaps via `--local-pcap` /
+/// `--peer-pcap`; live tcpdump+SSH capture orchestration is a Task 15
+/// follow-up (see `src/mode_wire_diff.rs` module docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Rtt,

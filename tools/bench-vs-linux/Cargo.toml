@@ -12,8 +12,15 @@ publish = false
 #   2. Linux kernel TCP via std::net::TcpStream
 #   3. Linux AF_PACKET mmap via libc::socket(PF_PACKET, SOCK_RAW, ...)
 #
-# Mode B (wire-diff, rfc_compliance preset) lands later in Task 9;
-# src/mode_wire_diff.rs is a `todo!()` stub here.
+# A10 Plan B Task 9: Mode B (wire-diff, rfc_compliance preset) — the
+# engine is built with `apply_preset(1, &mut cfg)` (from `dpdk-net`,
+# re-used here via a rlib link — the cdylib/staticlib build artefacts
+# are side-effects of cbindgen running in dpdk-net's build script) and
+# pcap captures are canonicalised + byte-diffed via `src/normalize.rs`.
+# Task 9 ships the normalise + diff engine and an MVP runner that
+# consumes pre-captured pcap files (`--local-pcap` / `--peer-pcap`).
+# Live tcpdump+SSH orchestration is a follow-up — it needs the paired
+# EC2 fleet that only bench-nightly.sh has access to (see Task 15).
 #
 # See docs/superpowers/specs/2026-04-21-stage1-phase-a10-benchmark-
 # harness-design.md §8 and parent spec §11.5.
@@ -30,6 +37,11 @@ path = "src/main.rs"
 bench-common = { path = "../bench-common" }
 bench-e2e = { path = "../bench-e2e" }
 dpdk-net-core = { path = "../../crates/dpdk-net-core" }
+# Task 9: imported for `apply_preset(DPDK_NET_PRESET_RFC_COMPLIANCE, ..)`
+# so mode B's engine build goes through the same preset entry point as
+# the C ABI. Pulling the rlib is free beyond cbindgen rerunning on
+# dpdk-net changes; we don't consume the FFI surface.
+dpdk-net = { path = "../../crates/dpdk-net" }
 dpdk-net-sys = { path = "../../crates/dpdk-net-sys" }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
@@ -40,3 +52,6 @@ hostname = "0.4"
 uuid = { version = "1", features = ["v4"] }
 libc = { workspace = true }
 thiserror = { workspace = true }
+# Task 9: pcap parsing + rewrite for mode B divergence-normalisation.
+# Same pcap-file 2.x version used by tools/scapy-fuzz-runner.
+pcap-file = "2"

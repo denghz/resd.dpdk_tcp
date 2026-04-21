@@ -45,7 +45,9 @@ use dpdk_net_core::engine::Engine;
     about = "bench-vs-linux — dual-stack latency comparison vs. Linux TCP"
 )]
 struct Args {
-    /// Mode selector: `rtt` (T8) or `wire-diff` (T9 stub).
+    /// Mode selector: `rtt` (T8 — trading-latency preset, RTT across
+    /// three stacks) or `wire-diff` (T9 — rfc_compliance preset,
+    /// pcap canonicalise + byte-diff).
     #[arg(long, default_value = "rtt")]
     mode: String,
 
@@ -119,9 +121,23 @@ struct Args {
     tool: String,
 
     /// Feature-set label emitted as the `feature_set` CSV column.
-    /// Default `trading-latency` matches spec §8 mode A.
+    /// Default `trading-latency` matches spec §8 mode A. Operators
+    /// should pass `--feature-set rfc-compliance` for mode B runs so
+    /// downstream reports group cleanly by (preset, feature_set).
     #[arg(long, default_value = "trading-latency")]
     feature_set: String,
+
+    // -------- Mode B (T9, wire-diff) inputs --------
+    /// Mode B — path to the local (DUT) pcap. Required iff
+    /// `--mode wire-diff`. In T9 MVP this is a pre-captured file;
+    /// future live-capture orchestration (Task 15 nightly) will pass
+    /// the tcpdump output path here.
+    #[arg(long, default_value = "")]
+    local_pcap: String,
+
+    /// Mode B — path to the peer pcap. Required iff `--mode wire-diff`.
+    #[arg(long, default_value = "")]
+    peer_pcap: String,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -129,10 +145,13 @@ fn main() -> anyhow::Result<()> {
     let mode = parse_precondition_mode(&args.precondition_mode)?;
     let run_mode = Mode::parse(&args.mode).map_err(|e| anyhow::anyhow!(e))?;
 
-    // Mode B is a T9 stub. Surface the deferred state immediately so
-    // operators don't think a no-op ran.
+    // Mode B dispatch — diff-from-pcaps MVP. No EAL init required in
+    // MVP mode; the preset-applied engine is the *source* of the local
+    // pcap, which is captured out-of-band in T9 and fed in here via
+    // `--local-pcap` / `--peer-pcap`. Live tcpdump+SSH orchestration
+    // is a Task 15 follow-up.
     if matches!(run_mode, Mode::WireDiff) {
-        return mode_wire_diff::run_mode_wire_diff();
+        return run_wire_diff_mode(&args, mode);
     }
 
     // Mode A: parse stack selection first so we can decide whether EAL
@@ -219,6 +238,46 @@ fn main() -> anyhow::Result<()> {
     };
     run_mode_rtt(&cfg, engine.as_ref(), &metadata, &mut writer)?;
     writer.flush()?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Mode B — wire-diff dispatch. MVP: requires --local-pcap + --peer-pcap
+// paths. Runs preconditions in the same strict/lenient shape as mode A
+// so downstream reports can filter wire-diff rows identically.
+// ---------------------------------------------------------------------------
+
+fn run_wire_diff_mode(args: &Args, mode: PreconditionMode) -> anyhow::Result<()> {
+    if args.local_pcap.is_empty() || args.peer_pcap.is_empty() {
+        anyhow::bail!(
+            "--mode wire-diff requires both --local-pcap and --peer-pcap. \
+             T9 MVP consumes pre-captured pcaps; live tcpdump+SSH orchestration \
+             is a Task 15 follow-up (see src/mode_wire_diff.rs module docs)."
+        );
+    }
+    let preconditions = run_preconditions_check(mode)?;
+    if mode == PreconditionMode::Strict && !preconditions_all_pass(&preconditions) {
+        eprintln!("bench-vs-linux: precondition failure in strict mode (wire-diff):");
+        for (name, value) in preconditions_as_pairs(&preconditions) {
+            if !(value.is_pass() || value.is_not_applicable()) {
+                eprintln!("  {name} = {value}");
+            }
+        }
+        std::process::exit(1);
+    }
+    let metadata = build_run_metadata(mode, preconditions)?;
+    let code = mode_wire_diff::run_mode_wire_diff_from_paths(
+        std::path::PathBuf::from(&args.local_pcap),
+        std::path::PathBuf::from(&args.peer_pcap),
+        args.output_csv.clone(),
+        &args.tool,
+        &args.feature_set,
+        &metadata,
+    )?;
+    // Exit codes per mode_wire_diff docs: 0 = empty-diff; 1 = divergence.
+    if code != 0 {
+        std::process::exit(code);
+    }
     Ok(())
 }
 

@@ -89,18 +89,79 @@ fn afpacket_min_frame_len_matches_ethernet_plus_min_ip_tcp() {
 }
 
 // ---------------------------------------------------------------------------
-// Mode B stub — wire-diff.
+// Mode B — wire-diff. T9 lands the full runner; T8's stub assertion is
+// replaced with invariant checks on the public API surface + the
+// dimensions tag so bench-report groups rfc_compliance rows cleanly.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn mode_wire_diff_stub_errors_with_t9_pointer() {
-    let err = mode_wire_diff::run_mode_wire_diff()
-        .unwrap_err()
-        .to_string();
-    assert!(
-        err.contains("T9") || err.contains("Task 9"),
-        "mode B stub must point at T9: {err}"
+fn mode_wire_diff_dimensions_json_tags_preset_and_mode() {
+    let dims = mode_wire_diff::build_dimensions_json(
+        std::path::Path::new("/tmp/local.pcap"),
+        std::path::Path::new("/tmp/peer.pcap"),
     );
+    let parsed: serde_json::Value = serde_json::from_str(&dims).unwrap();
+    assert_eq!(parsed["preset"], "rfc_compliance");
+    assert_eq!(parsed["mode"], "wire_diff");
+    assert_eq!(parsed["local_pcap"], "local.pcap");
+    assert_eq!(parsed["peer_pcap"], "peer.pcap");
+}
+
+#[test]
+fn mode_wire_diff_preset_builder_flips_five_fields() {
+    // Mode B's engine must run with preset=rfc_compliance — verify the
+    // builder flips the exact five fields `apply_preset(1, ...)`
+    // documents in crates/dpdk-net/src/lib.rs:30.
+    let cfg = mode_wire_diff::build_engine_config_rfc_compliance(
+        0x0A00_0001, // 10.0.0.1
+        0x0A00_00FE, // 10.0.0.254
+    )
+    .expect("preset apply must succeed");
+    assert!(cfg.tcp_nagle);
+    assert!(cfg.tcp_delayed_ack);
+    assert_eq!(cfg.cc_mode, 1);
+    assert_eq!(cfg.tcp_min_rto_us, 200_000);
+    assert_eq!(cfg.tcp_initial_rto_us, 1_000_000);
+}
+
+#[test]
+fn mode_wire_diff_missing_pcaps_surface_as_bail() {
+    // A mode-B run with non-existent pcap paths must fail cleanly
+    // (not panic, not silently emit empty CSV).
+    let tmp = std::env::temp_dir().join("bench-vs-linux-t9-does-not-exist");
+    let _ = std::fs::remove_file(&tmp); // best-effort cleanup
+    let out = std::env::temp_dir().join("bench-vs-linux-t9-out.csv");
+    let metadata = dummy_metadata();
+    let err = mode_wire_diff::run_mode_wire_diff_from_paths(
+        tmp.clone(),
+        tmp.clone(),
+        out,
+        "bench-vs-linux",
+        "rfc-compliance",
+        &metadata,
+    )
+    .unwrap_err();
+    let s = format!("{err:#}");
+    assert!(s.contains("reading"), "expected an io-style error: {s}");
+}
+
+fn dummy_metadata() -> bench_common::run_metadata::RunMetadata {
+    bench_common::run_metadata::RunMetadata {
+        run_id: uuid::Uuid::nil(),
+        run_started_at: "2026-04-21T00:00:00Z".into(),
+        commit_sha: String::new(),
+        branch: String::new(),
+        host: String::new(),
+        instance_type: String::new(),
+        cpu_model: String::new(),
+        dpdk_version: String::new(),
+        kernel: String::new(),
+        nic_model: String::new(),
+        nic_fw: String::new(),
+        ami_id: String::new(),
+        precondition_mode: bench_common::preconditions::PreconditionMode::Lenient,
+        preconditions: bench_common::preconditions::Preconditions::default(),
+    }
 }
 
 // ---------------------------------------------------------------------------
