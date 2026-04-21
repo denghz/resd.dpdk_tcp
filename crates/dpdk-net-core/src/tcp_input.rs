@@ -1204,8 +1204,21 @@ fn handle_established(
     }
 
     // FIN processing: consumes one seq and moves us to CLOSE_WAIT.
+    // I-8 (A9 Task 4): compare against `delivered` (the running total of
+    // bytes accepted for this segment, including chain-tail links AND
+    // OOO-drain bytes appended above), NOT `seg.payload.len()` (head-link
+    // only). Without this, multi-seg chains with FIN piggybacked silently
+    // drop the FIN because the equality fails on chains where
+    // `head_link_len < chain_total_bytes`. The same shape arises when an
+    // in-order head closes a gap that drains a previously queued OOO
+    // segment, so `delivered = head_take + drained_bytes` exceeds
+    // `seg.payload.len()`. Per RFC 9293 §3.10.7.4, FIN must advance the
+    // FSM to CLOSE_WAIT once all preceding data bytes have been accepted.
+    // Single-seg + no-drain delivery is unchanged: in that case
+    // `delivered == seg.payload.len() as u32` and the equality is
+    // bit-for-bit identical to the pre-fix expression.
     let mut new_state = None;
-    if (seg.flags & TCP_FIN) != 0 && seg.seq.wrapping_add(seg.payload.len() as u32) == conn.rcv_nxt
+    if (seg.flags & TCP_FIN) != 0 && seg.seq.wrapping_add(delivered) == conn.rcv_nxt
     {
         conn.rcv_nxt = conn.rcv_nxt.wrapping_add(1);
         new_state = Some(TcpState::CloseWait);
