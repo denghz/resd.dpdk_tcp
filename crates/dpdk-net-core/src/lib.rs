@@ -9,6 +9,8 @@ pub mod counters;
 pub mod dpdk_consts;
 pub mod engine;
 pub mod error;
+#[cfg(feature = "fault-injector")]
+pub mod fault_injector;
 pub mod flow_table;
 pub mod icmp;
 pub mod iss;

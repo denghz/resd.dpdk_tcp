@@ -320,6 +320,8 @@ pub struct Counters {
     pub tcp: TcpCounters,
     pub poll: PollCounters,
     pub obs: ObsCounters,
+    #[cfg(feature = "fault-injector")]
+    pub fault_injector: FaultInjectorCounters,
 }
 
 impl Counters {
@@ -331,6 +333,8 @@ impl Counters {
             tcp: TcpCounters::default(),
             poll: PollCounters::default(),
             obs: ObsCounters::default(),
+            #[cfg(feature = "fault-injector")]
+            fault_injector: FaultInjectorCounters::default(),
         }
     }
 }
@@ -364,6 +368,32 @@ impl Default for PollCounters {
 impl Default for ObsCounters {
     fn default() -> Self {
         unsafe { std::mem::zeroed() }
+    }
+}
+
+/// A9 fault-injector counter group. Slow-path per §9.1.1 — one `fetch_add`
+/// per fault-decision branch (drop / dup / reorder / corrupt). Feature-gated
+/// so release builds never see the struct. Owning Engine field wired in
+/// Task 6.
+#[cfg(feature = "fault-injector")]
+#[repr(C, align(64))]
+#[derive(Default)]
+pub struct FaultInjectorCounters {
+    pub drops: AtomicU64,
+    pub dups: AtomicU64,
+    pub reorders: AtomicU64,
+    pub corrupts: AtomicU64,
+}
+
+#[cfg(feature = "fault-injector")]
+impl FaultInjectorCounters {
+    pub const fn new() -> Self {
+        Self {
+            drops: AtomicU64::new(0),
+            dups: AtomicU64::new(0),
+            reorders: AtomicU64::new(0),
+            corrupts: AtomicU64::new(0),
+        }
     }
 }
 

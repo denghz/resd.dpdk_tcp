@@ -9,6 +9,8 @@ dpdk-net-sys = { path = "../dpdk-net-sys" }
 libc.workspace = true
 smallvec = { workspace = true }
 thiserror.workspace = true
+arrayvec = { version = "0.7", optional = true }
+rand = { version = "0.8", optional = true, default-features = false, features = ["small_rng"] }
 
 [features]
 default = [
@@ -83,6 +85,12 @@ miri-safe = []
 # lazily-created test-inject mempool. Release builds carry zero of it. Cbindgen
 # runs without the feature, so the functions never appear in `dpdk_net.h`.
 test-inject = []
+# A9 fault-injector: smoltcp-pattern post-PMD-RX / pre-L2 middleware that
+# drops, duplicates, reorders, or corrupts packets per an env-var-configured
+# rate spec. Default OFF — release builds carry zero of it. Pulls in
+# `arrayvec` (reorder ring) and `rand/small_rng` (PRNG). See fault_injector.rs
+# for the spec format and Task 6 for the process-body wiring.
+fault-injector = ["dep:arrayvec", "dep:rand"]
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "warn"
