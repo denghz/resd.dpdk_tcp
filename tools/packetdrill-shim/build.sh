@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
-# A7: build the patched packetdrill binary and link it against libdpdk_net.
-# Inputs: $DPDK_NET_SHIM_PROFILE (release|dev, default release).
-# Output: target/packetdrill-shim/packetdrill
+# A7 task 10: build the patched packetdrill binary and link it against
+# libdpdk_net (test-server feature). google/packetdrill uses a plain
+# Makefile.Linux (no autotools), so we drive the build via EXT_CFLAGS /
+# EXT_LIBS — the hooks added by patch 0004.
+#
+# Inputs (env): DPDK_NET_SHIM_PROFILE (release|dev, default release)
+# Output:       target/packetdrill-shim/packetdrill
 
 set -euo pipefail
 cd "$(dirname "$0")/../.."
@@ -9,14 +13,7 @@ REPO_ROOT="$(pwd)"
 
 PROFILE="${DPDK_NET_SHIM_PROFILE:-release}"
 
-# Require host tooling. In scaffold-only mode we only need git (for
-# submodule init); autotools/make aren't invoked until T10 turns off
-# scaffold-only.
-if [ -n "${DPDK_NET_SHIM_SCAFFOLD_ONLY:-}" ]; then
-  REQUIRED_BINS=(git)
-else
-  REQUIRED_BINS=(git autoreconf bison flex make gcc pkg-config)
-fi
+REQUIRED_BINS=(git bison flex make gcc pkg-config)
 for bin in "${REQUIRED_BINS[@]}"; do
   command -v "$bin" >/dev/null 2>&1 \
     || { echo "ERROR: missing host tool: $bin"; exit 1; }
@@ -26,10 +23,11 @@ done
 git submodule update --init --recursive \
   third_party/packetdrill third_party/packetdrill-testcases
 
-# 2. Apply the patch stack idempotently.
+# 2. Apply the patch stack idempotently. We probe for a patch-applied
+#    file that only exists after 0001 lands (dpdk_net_shim.c), so the
+#    marker survives `git submodule update` wiping the worktree.
 cd third_party/packetdrill
-# If already applied (the tip has a patch-marker file), skip.
-if ! [ -f .a7-patches-applied ]; then
+if ! [ -f gtests/net/packetdrill/dpdk_net_shim.c ]; then
   shopt -s nullglob
   patches=("$REPO_ROOT"/tools/packetdrill-shim/patches/*.patch)
   shopt -u nullglob
@@ -38,32 +36,9 @@ if ! [ -f .a7-patches-applied ]; then
       git am "$p"
     done
   fi
-  touch .a7-patches-applied
 fi
 
-# Scaffold-only short-circuit: T9 commits this file before T10's patch
-# stack exists, so we stage a stub binary and skip the expensive cargo
-# re-entry + autotools/make step. T10 drops the env var.
-if [ -n "${DPDK_NET_SHIM_SCAFFOLD_ONLY:-}" ]; then
-  # Determine packetdrill source dir just for the log message.
-  if [ -f configure.ac ] || [ -f configure.in ]; then
-    PD_DIR="$REPO_ROOT/third_party/packetdrill"
-  else
-    PD_DIR="$REPO_ROOT/third_party/packetdrill/gtests/net/packetdrill"
-  fi
-  echo "=== packetdrill-shim: scaffold-only mode (DPDK_NET_SHIM_SCAFFOLD_ONLY=1) ==="
-  echo "packetdrill source dir: $PD_DIR"
-  mkdir -p "$REPO_ROOT"/target/packetdrill-shim
-  cat > "$REPO_ROOT"/target/packetdrill-shim/packetdrill <<'EOF'
-#!/usr/bin/env bash
-echo "packetdrill shim stub — T10 must land the patch stack before use" >&2
-exit 1
-EOF
-  chmod +x "$REPO_ROOT"/target/packetdrill-shim/packetdrill
-  exit 0
-fi
-
-# 3. Build libdpdk_net (staticlib) with --features test-server.
+# 3. Build libdpdk_net.a (staticlib) with --features test-server.
 cd "$REPO_ROOT"
 if [ "$PROFILE" = "release" ]; then
   cargo build --release -p dpdk-net --features test-server
@@ -72,40 +47,35 @@ else
   cargo build -p dpdk-net --features test-server
   LIB_DIR="$REPO_ROOT/target/debug"
 fi
-
-# 4. Build packetdrill.
-cd "$REPO_ROOT"/third_party/packetdrill
-# google/packetdrill uses autotools inside gtests/net/packetdrill; adapt
-# to whichever layout this pinned SHA has. If the top-level configure.ac
-# doesn't exist, descend to gtests/net/packetdrill.
-if [ -f configure.ac ] || [ -f configure.in ]; then
-  PD_DIR="$REPO_ROOT/third_party/packetdrill"
-else
-  PD_DIR="$REPO_ROOT/third_party/packetdrill/gtests/net/packetdrill"
-fi
-cd "$PD_DIR"
-if [ ! -f configure.ac ] && [ ! -f configure.in ] && [ ! -f Makefile ]; then
-  echo "ERROR: packetdrill source dir has no autotools or Makefile; did the submodule update?"
+if [ ! -f "$LIB_DIR/libdpdk_net.a" ]; then
+  echo "ERROR: libdpdk_net.a not found under $LIB_DIR" >&2
   exit 1
 fi
-if [ -f configure.ac ] || [ -f configure.in ]; then
-  autoreconf -fi
-  ./configure CC=clang \
-    CFLAGS="-O2 -g -I$REPO_ROOT/include" \
-    LDFLAGS="-L$LIB_DIR -ldl -lpthread -lnuma" \
-    LIBS="-ldpdk_net"
-fi
-make clean 2>/dev/null || true
-make -j"$(nproc)"
 
-# 5. Stage the binary.
+# 4. Assemble the DPDK link line. libdpdk_net.a is a Rust staticlib and
+#    transitively pulls in the DPDK C ABI, so we also need the DPDK libs
+#    via pkg-config. The Rust staticlib itself wants -lm -lpthread -ldl
+#    which the Makefile already supplies.
+DPDK_CFLAGS="$(pkg-config --cflags libdpdk 2>/dev/null || true)"
+DPDK_LIBS="$(pkg-config --libs libdpdk 2>/dev/null || true)"
+
+EXT_CFLAGS="-I$REPO_ROOT/include $DPDK_CFLAGS"
+# Order matters: object files first, then libdpdk_net.a, then DPDK libs,
+# then OS libs. Use -l:libdpdk_net.a to force the archive (not the .so)
+# so the shim binary doesn't need LD_LIBRARY_PATH at runtime. The
+# Makefile already appends -lpthread -lrt -ldl after EXT_LIBS, so we
+# don't need to repeat them.
+EXT_LIBS="-L$LIB_DIR -l:libdpdk_net.a $DPDK_LIBS -lnuma -lm"
+
+# 5. Build packetdrill via Makefile.Linux.
+cd "$REPO_ROOT"/third_party/packetdrill/gtests/net/packetdrill
+make -f Makefile.Linux clean 2>/dev/null || true
+make -f Makefile.Linux -j"$(nproc)" \
+  EXT_CFLAGS="$EXT_CFLAGS" \
+  EXT_LIBS="$EXT_LIBS" \
+  packetdrill
+
+# 6. Stage the binary.
 mkdir -p "$REPO_ROOT"/target/packetdrill-shim
-if [ -f packetdrill ]; then
-  cp -f packetdrill "$REPO_ROOT"/target/packetdrill-shim/packetdrill
-elif [ -f gtests/net/packetdrill/packetdrill ]; then
-  cp -f gtests/net/packetdrill/packetdrill "$REPO_ROOT"/target/packetdrill-shim/packetdrill
-else
-  echo "ERROR: cannot find produced packetdrill binary"
-  exit 1
-fi
-echo "=== packetdrill-shim build OK ==="
+cp -f packetdrill "$REPO_ROOT"/target/packetdrill-shim/packetdrill
+echo "=== packetdrill-shim build OK: $REPO_ROOT/target/packetdrill-shim/packetdrill ==="

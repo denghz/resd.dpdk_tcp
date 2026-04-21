@@ -19,11 +19,9 @@ fn main() {
         return;
     }
 
-    // TODO(T10): remove DPDK_NET_SHIM_SCAFFOLD_ONLY once patches land.
     let st = Command::new("bash").arg(&build_sh)
         .env("DPDK_NET_SHIM_PROFILE",
              if env::var("DPDK_NET_SHIM_DEBUG").is_ok() { "dev" } else { "release" })
-        .env("DPDK_NET_SHIM_SCAFFOLD_ONLY", "1")
         .status().expect("run build.sh");
     assert!(st.success(), "packetdrill-shim build.sh failed");
 }
