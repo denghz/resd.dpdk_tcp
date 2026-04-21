@@ -7,6 +7,7 @@ members = [
     "tests/ffi-test",
     "tools/bench-ab-runner",
     "tools/bench-common",
+    "tools/bench-e2e",
     "tools/bench-micro",
     "tools/bench-rx-zero-copy",
     "tools/scapy-fuzz-runner",

@@ -132,6 +132,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "bench-e2e"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bench-common",
+ "chrono",
+ "clap 4.6.1",
+ "csv",
+ "dpdk-net",
+ "dpdk-net-core",
+ "dpdk-net-sys",
+ "hostname",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
 name = "bench-micro"
 version = "0.1.0"
 dependencies = [
