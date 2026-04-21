@@ -1,11 +1,16 @@
 //! Precondition-check data plumbing. Spec §4.1 + §4.3.
 //!
 //! Each host-level precondition resolves to a `PreconditionValue` which encodes
-//! both the pass/fail verdict and an optional observed-value string (e.g.
-//! `pass=2-7` for an `isolcpus` mask, `fail=C6` for a wrong c-state). The
-//! string form `"pass"` / `"fail"` / `"pass=X"` / `"fail=X"` is what we emit
-//! into the CSV and what we parse back when a downstream tool (bench-report)
-//! re-reads the file.
+//! the verdict (pass/fail/not-applicable) and, for pass/fail, an optional
+//! observed-value string (e.g. `pass=2-7` for an `isolcpus` mask, `fail=C6`
+//! for a wrong c-state). The string form `"pass"` / `"fail"` / `"pass=X"` /
+//! `"fail=X"` / `"n/a"` is what we emit into the CSV and what we parse back
+//! when a downstream tool (bench-report) re-reads the file.
+//!
+//! The `n/a` variant exists because spec §4.1 line 222 carves out a
+//! `bench-micro` exception: that tool does not bring up the DPDK engine, so
+//! the `precondition_wc_active` check is unreachable and the CSV column is
+//! marked `n/a` rather than `pass`/`fail`.
 
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
 use std::str::FromStr;
@@ -14,17 +19,12 @@ use std::str::FromStr;
 ///
 /// `Strict`: any fail aborts the run; `Lenient`: failures are recorded but the
 /// run continues (rows are still flagged via the per-precondition columns).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PreconditionMode {
+    #[default]
     Strict,
     Lenient,
-}
-
-impl Default for PreconditionMode {
-    fn default() -> Self {
-        Self::Strict
-    }
 }
 
 impl std::fmt::Display for PreconditionMode {
@@ -47,74 +47,93 @@ impl FromStr for PreconditionMode {
     }
 }
 
-/// A single precondition result — verdict plus an optional observed value
-/// (e.g. `isolcpus=2-7` or `cstate=C6`). Spec §4.3.
+/// A single precondition result — pass/fail/not-applicable, with an optional
+/// observed value (e.g. `isolcpus=2-7` or `cstate=C6`) attached to the
+/// pass/fail arms. Spec §4.3; `NotApplicable` covers the bench-micro carve-out
+/// from §4.1.
 ///
 /// Serde impl is hand-written so the value appears as a single CSV cell
-/// (`"pass=2-7"`, `"fail=C6"`, `"pass"`, `"fail"`) rather than as two
-/// sub-columns. This is what csv::Writer expects from each struct field.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct PreconditionValue {
-    pub passed: bool,
-    pub value: String,
+/// (`"pass=2-7"`, `"fail=C6"`, `"pass"`, `"fail"`, `"n/a"`) rather than as
+/// two sub-columns. This is what csv::Writer expects from each struct field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreconditionValue {
+    /// Check passed, optionally with an observed value (e.g. `Some("2-7")`
+    /// for an isolcpus mask).
+    Pass(Option<String>),
+    /// Check failed, optionally with an observed value.
+    Fail(Option<String>),
+    /// Check is not applicable for this tool invocation (e.g. bench-micro
+    /// skips `wc_active` because it does not bring up DPDK).
+    NotApplicable,
+}
+
+impl Default for PreconditionValue {
+    fn default() -> Self {
+        Self::Pass(None)
+    }
 }
 
 impl PreconditionValue {
+    /// Pass with no observed value.
     pub fn pass() -> Self {
-        Self {
-            passed: true,
-            value: String::new(),
-        }
+        Self::Pass(None)
     }
 
+    /// Fail with no observed value.
     pub fn fail() -> Self {
-        Self {
-            passed: false,
-            value: String::new(),
-        }
+        Self::Fail(None)
     }
 
+    /// Pass with an observed value (e.g. `"2-7"` for an isolcpus mask).
     pub fn pass_with(value: impl Into<String>) -> Self {
-        Self {
-            passed: true,
-            value: value.into(),
-        }
+        Self::Pass(Some(value.into()))
     }
 
+    /// Fail with an observed value (e.g. `"C6"` for a wrong c-state).
     pub fn fail_with(value: impl Into<String>) -> Self {
-        Self {
-            passed: false,
-            value: value.into(),
-        }
+        Self::Fail(Some(value.into()))
+    }
+
+    /// Not-applicable marker for checks skipped by a particular tool (e.g.
+    /// bench-micro's `wc_active`).
+    pub fn not_applicable() -> Self {
+        Self::NotApplicable
+    }
+
+    /// `true` iff this value represents a successful check. `NotApplicable`
+    /// does not count as a pass — it means the question was not asked.
+    pub fn is_pass(&self) -> bool {
+        matches!(self, Self::Pass(_))
+    }
+
+    /// `true` iff this value represents a failed check.
+    pub fn is_fail(&self) -> bool {
+        matches!(self, Self::Fail(_))
+    }
+
+    /// `true` iff this value is the `n/a` marker.
+    pub fn is_not_applicable(&self) -> bool {
+        matches!(self, Self::NotApplicable)
     }
 }
 
 impl FromStr for PreconditionValue {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s == "n/a" {
+            return Ok(Self::NotApplicable);
+        }
         if s == "pass" {
-            return Ok(Self {
-                passed: true,
-                value: String::new(),
-            });
+            return Ok(Self::Pass(None));
         }
         if s == "fail" {
-            return Ok(Self {
-                passed: false,
-                value: String::new(),
-            });
+            return Ok(Self::Fail(None));
         }
         if let Some(rest) = s.strip_prefix("pass=") {
-            return Ok(Self {
-                passed: true,
-                value: rest.into(),
-            });
+            return Ok(Self::Pass(Some(rest.into())));
         }
         if let Some(rest) = s.strip_prefix("fail=") {
-            return Ok(Self {
-                passed: false,
-                value: rest.into(),
-            });
+            return Ok(Self::Fail(Some(rest.into())));
         }
         Err(format!("unparseable precondition value: {s}"))
     }
@@ -122,15 +141,12 @@ impl FromStr for PreconditionValue {
 
 impl std::fmt::Display for PreconditionValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.value.is_empty() {
-            write!(f, "{}", if self.passed { "pass" } else { "fail" })
-        } else {
-            write!(
-                f,
-                "{}={}",
-                if self.passed { "pass" } else { "fail" },
-                self.value
-            )
+        match self {
+            Self::NotApplicable => write!(f, "n/a"),
+            Self::Pass(None) => write!(f, "pass"),
+            Self::Fail(None) => write!(f, "fail"),
+            Self::Pass(Some(v)) => write!(f, "pass={v}"),
+            Self::Fail(Some(v)) => write!(f, "fail={v}"),
         }
     }
 }
@@ -227,5 +243,24 @@ mod tests {
         assert_eq!(json, "\"pass=2-7\"");
         let back: PreconditionValue = serde_json::from_str("\"pass=2-7\"").unwrap();
         assert_eq!(back, v);
+    }
+
+    #[test]
+    fn precondition_value_parses_na() {
+        // FromStr accepts "n/a".
+        let parsed: PreconditionValue = "n/a".parse().unwrap();
+        assert_eq!(parsed, PreconditionValue::NotApplicable);
+        assert!(parsed.is_not_applicable());
+        assert!(!parsed.is_pass());
+        assert!(!parsed.is_fail());
+
+        // Display round-trips.
+        assert_eq!(parsed.to_string(), "n/a");
+
+        // Serde round-trips (single-cell string shape, same as pass/fail).
+        let json = serde_json::to_string(&parsed).unwrap();
+        assert_eq!(json, "\"n/a\"");
+        let back: PreconditionValue = serde_json::from_str("\"n/a\"").unwrap();
+        assert_eq!(back, PreconditionValue::NotApplicable);
     }
 }

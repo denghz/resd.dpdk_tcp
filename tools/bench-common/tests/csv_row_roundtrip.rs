@@ -66,12 +66,43 @@ fn metric_aggregation_serde() {
 #[test]
 fn precondition_value_parses_pass_and_fail() {
     let a: PreconditionValue = "pass=2-7".parse().unwrap();
-    assert_eq!(a.passed, true);
-    assert_eq!(a.value, "2-7");
+    assert!(a.is_pass());
+    assert_eq!(a, PreconditionValue::pass_with("2-7"));
     let b: PreconditionValue = "fail=C6".parse().unwrap();
-    assert_eq!(b.passed, false);
-    assert_eq!(b.value, "C6");
+    assert!(b.is_fail());
+    assert_eq!(b, PreconditionValue::fail_with("C6"));
     let c: PreconditionValue = "pass".parse().unwrap();
-    assert_eq!(c.passed, true);
-    assert_eq!(c.value, "");
+    assert!(c.is_pass());
+    assert_eq!(c, PreconditionValue::pass());
+}
+
+/// Round-trips a `CsvRow` whose `precondition_wc_active` column is the
+/// `n/a` marker — the bench-micro carve-out from spec §4.1 line 222.
+/// Before C1 this test failed at the read step because `FromStr` did not
+/// accept the `n/a` token.
+#[test]
+fn csv_row_round_trip_bench_micro_na() {
+    let mut row = sample_row();
+    row.run_metadata.preconditions.wc_active = PreconditionValue::not_applicable();
+
+    let mut buf = Vec::new();
+    {
+        let mut wtr = csv::Writer::from_writer(&mut buf);
+        row.write_with_header(&mut wtr).unwrap();
+    }
+    // Sanity: the cell for precondition_wc_active must read "n/a".
+    let text = std::str::from_utf8(&buf).unwrap();
+    assert!(
+        text.contains(",n/a,"),
+        "expected n/a cell in serialised row, got: {text}"
+    );
+
+    let mut rdr = csv::Reader::from_reader(&buf[..]);
+    let parsed: CsvRow = rdr.deserialize().next().unwrap().unwrap();
+    assert_eq!(parsed, row);
+    assert!(parsed
+        .run_metadata
+        .preconditions
+        .wc_active
+        .is_not_applicable());
 }

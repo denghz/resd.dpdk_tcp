@@ -17,8 +17,10 @@
 //! - Keep `RunMetadata` and `Preconditions` as ergonomic nested structs for
 //!   callers populating a row — they stay strongly typed and easy to build.
 //! - Implement `Serialize` on `CsvRow` by hand, writing one `SerializeStruct`
-//!   with all 37 (= 13 run-metadata + 14 precondition + 2 mode + 8 per-row)
-//!   columns as flat scalar fields. That shape is exactly what csv expects.
+//!   with all 35 columns as flat scalar fields. The breakdown is
+//!   13 run-metadata columns (12 scalars + `precondition_mode`) +
+//!   14 precondition-value columns + 8 per-row columns = 35. That shape is
+//!   exactly what csv expects.
 //! - Implement `Deserialize` on `CsvRow` via a `Visitor` that walks the
 //!   matching set of field keys and rebuilds the nested structs.
 //!
@@ -312,6 +314,38 @@ impl<'de> Visitor<'de> for CsvRowVisitor {
 mod tests {
     use super::*;
 
+    /// Construct a sample row used for drift-guard tests. Values are arbitrary;
+    /// what matters is that every field is present so the Serialize impl must
+    /// emit every column.
+    fn sample_row() -> CsvRow {
+        CsvRow {
+            run_metadata: RunMetadata {
+                run_id: uuid::Uuid::nil(),
+                run_started_at: "2026-04-22T03:14:07Z".into(),
+                commit_sha: "7f70ea50000000000000000000000000000000ab".into(),
+                branch: "phase-a10".into(),
+                host: "ip-10-0-0-42".into(),
+                instance_type: "c6a.2xlarge".into(),
+                cpu_model: "AMD EPYC 7R13".into(),
+                dpdk_version: "23.11.2".into(),
+                kernel: "6.17.0-1009-generic".into(),
+                nic_model: "Elastic Network Adapter (ENA)".into(),
+                nic_fw: String::new(),
+                ami_id: "ami-0123456789abcdef0".into(),
+                precondition_mode: PreconditionMode::Strict,
+                preconditions: Preconditions::default(),
+            },
+            tool: "bench-vs-mtcp".into(),
+            test_case: "burst".into(),
+            feature_set: "default".into(),
+            dimensions_json: "{}".into(),
+            metric_name: "metric".into(),
+            metric_unit: "unit".into(),
+            metric_value: 1.0,
+            metric_aggregation: MetricAggregation::P99,
+        }
+    }
+
     #[test]
     fn metric_aggregation_display_matches_serde() {
         for v in [
@@ -326,6 +360,48 @@ mod tests {
             let disp = v.to_string();
             let ser = serde_json::to_string(&v).unwrap();
             assert_eq!(ser, format!("\"{}\"", disp));
+        }
+    }
+
+    /// Invariance guard: the column count must match the spec. Breakdown:
+    /// 13 run-metadata, 14 precondition, 8 per-row — 35 total. If this fires,
+    /// a column was added/removed without updating the companion tests and
+    /// the Serialize impl.
+    #[test]
+    fn columns_len_is_expected() {
+        assert_eq!(COLUMNS.len(), 35);
+    }
+
+    /// Invariance guard: the header row that csv::Writer emits when it
+    /// serialises a `CsvRow` must match `COLUMNS.join(",")` exactly. Catches
+    /// any drift between the hand-written `Serialize::serialize_field` calls
+    /// and `COLUMNS`.
+    #[test]
+    fn serialised_header_matches_columns() {
+        let row = sample_row();
+        let mut buf = Vec::new();
+        {
+            let mut wtr = csv::Writer::from_writer(&mut buf);
+            wtr.serialize(&row).unwrap();
+            wtr.flush().unwrap();
+        }
+        let text = std::str::from_utf8(&buf).unwrap();
+        let header = text.lines().next().unwrap();
+        assert_eq!(header, COLUMNS.join(","));
+    }
+
+    /// Invariance guard: when the `Serialize` impl is dispatched to a
+    /// map-producing serialiser (serde_json → Map), the resulting object must
+    /// have exactly `COLUMNS.len()` keys. Catches drift between the column
+    /// set actually emitted and `COLUMNS`.
+    #[test]
+    fn serialised_keys_match_columns() {
+        let row = sample_row();
+        let value = serde_json::to_value(&row).unwrap();
+        let map = value.as_object().expect("CsvRow must serialise to a map");
+        assert_eq!(map.len(), COLUMNS.len());
+        for col in COLUMNS {
+            assert!(map.contains_key(*col), "missing column {col}");
         }
     }
 }
