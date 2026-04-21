@@ -792,6 +792,19 @@ struct PortConfigOutcome {
     driver_name: [u8; 32],
 }
 
+/// Errors returned by the test-inject RX hooks (`Engine::inject_rx_frame` /
+/// `Engine::inject_rx_chain`). Behind `#[cfg(feature = "test-inject")]`.
+#[cfg(feature = "test-inject")]
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum InjectErr {
+    #[error("test-inject mempool exhausted")]
+    MempoolExhausted,
+    #[error("frame too large for mempool segment ({frame_len} > {seg_size})")]
+    FrameTooLarge { frame_len: usize, seg_size: usize },
+    #[error("empty chain (at least one segment required)")]
+    EmptyChain,
+}
+
 impl Engine {
     pub fn new(cfg: EngineConfig) -> Result<Self, Error> {
         // Fail fast on non-invariant-TSC hosts (spec §7.5). Also primes
@@ -5095,6 +5108,27 @@ impl Engine {
             crate::counters::inc(&self.counters.eth.tx_arp);
         }
         *last = now;
+    }
+
+    /// Inject a synthetic Ethernet frame as if it came from PMD RX.
+    /// The frame is copied into an mbuf from a lazily-created test-inject
+    /// mempool; the same internal RX dispatch the poll loop uses runs end
+    /// to end. Returns once the mbuf is processed (refcount may be retained
+    /// downstream by reassembly / READABLE delivery — caller does not own
+    /// the mbuf after this returns).
+    #[cfg(feature = "test-inject")]
+    pub fn inject_rx_frame(&self, _frame: &[u8]) -> Result<(), InjectErr> {
+        unimplemented!("Task 2: single-seg inject_rx_frame implementation")
+    }
+
+    /// Inject a multi-segment Ethernet frame chain (LRO-shape).
+    /// Builds an mbuf chain: `segments[0]` carries the Ethernet header + first
+    /// payload chunk; each subsequent segment is chained via `rte_mbuf.next`.
+    /// `pkt_len` is set to `Σ segments[i].len()`; `nb_segs = segments.len()`.
+    /// Used by I-8 closure + chain-walk fuzz coverage.
+    #[cfg(feature = "test-inject")]
+    pub fn inject_rx_chain(&self, _segments: &[&[u8]]) -> Result<(), InjectErr> {
+        unimplemented!("Task 3: multi-seg inject_rx_chain implementation")
     }
 }
 

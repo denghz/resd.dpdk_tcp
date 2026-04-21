@@ -15,6 +15,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 # verify panic = "abort" at the C ABI boundary; never enabled in
 # production builds and never emitted into dpdk_net.h via cbindgen.
 test-panic-entry = []
+test-inject = ["dpdk-net-core/test-inject"]
 
 [dependencies]
 dpdk-net-core = { path = "../dpdk-net-core" }

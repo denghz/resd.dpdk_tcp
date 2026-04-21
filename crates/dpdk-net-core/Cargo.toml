@@ -78,6 +78,11 @@ bench-alloc-audit-backtrace = ["bench-alloc-audit"]
 # error, counters, clock) run fully under miri to detect UB,
 # aliasing, and integer-overflow hazards.
 miri-safe = []
+# A9 test-inject: synthetic RX-frame injection for Scapy / fuzz / A7 packetdrill-shim.
+# Default OFF. Gates `Engine::inject_rx_frame` + `Engine::inject_rx_chain` and the
+# lazily-created test-inject mempool. Release builds carry zero of it. Cbindgen
+# runs without the feature, so the functions never appear in `dpdk_net.h`.
+test-inject = []
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "warn"
