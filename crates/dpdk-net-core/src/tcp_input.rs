@@ -3044,6 +3044,7 @@ mod tests {
             sacked: false,
             lost: false,
             xmit_ts_ns: 0,
+            hdrs_len: 0,
         });
         // B: seq=1051, len=50, xmit_ts = now (much later than A).
         let now_ns = crate::clock::now_ns();
@@ -3056,6 +3057,7 @@ mod tests {
             sacked: false,
             lost: false,
             xmit_ts_ns: now_ns,
+            hdrs_len: 0,
         });
         // Build an ACK segment carrying a SACK block covering B (1051..1101).
         // `parse_options` expects the raw options bytes; construct them

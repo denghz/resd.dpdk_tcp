@@ -67,6 +67,7 @@ fn prime_retrans(c: &mut TcpConn, seq: u32, len: u16) {
         sacked: false,
         lost: false,
         xmit_ts_ns: 0,
+        hdrs_len: 0,
     });
 }
 

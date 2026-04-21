@@ -98,7 +98,14 @@ impl TimerWheel {
         Self {
             slots: Vec::with_capacity(initial_slot_capacity),
             generations: Vec::with_capacity(initial_slot_capacity),
-            free_list: Vec::new(),
+            // free_list holds slot indices recycled by `advance` /
+            // `cascade` after a timer fires (or its tombstoned slot is
+            // re-encountered). Under sustained TX with TLP firing on
+            // every poll, this can match the live-timer ceiling. We
+            // pre-size to the same hint as `slots`/`generations` so
+            // the no-alloc audit doesn't observe the geometric
+            // doubling (0→4→…→64) during ramp.
+            free_list: Vec::with_capacity(initial_slot_capacity),
             buckets,
             cursors: [0; LEVELS],
             last_tick: 0,

@@ -29,6 +29,16 @@ pub struct RetransEntry {
     /// Last-xmit time (first_tx_ts_ns on first send; updated on retransmit).
     /// RACK uses this as `xmit_ts` per RFC 8985 §6.1 definition.
     pub xmit_ts_ns: u64,
+    /// Bytes of L2+L3+TCP header (Ethernet+IPv4+TCP including options) at
+    /// the front of `mbuf`'s data region from the original TX. The mbuf
+    /// holds the WHOLE on-wire frame (headers || payload) because Stage 1
+    /// builds a single contiguous mbuf in `send_bytes`. The retransmit
+    /// primitive strips these bytes via `rte_pktmbuf_adj` before chaining
+    /// a fresh header mbuf, so the on-wire retrans frame is well-formed
+    /// (single L2+L3+TCP header) and `data_len == len` thereafter. Once
+    /// stripped (first retrans), this field is set to 0 so subsequent
+    /// retrans for the same entry skip the adj.
+    pub hdrs_len: u16,
 }
 
 #[derive(Default)]
@@ -39,6 +49,23 @@ pub struct SendRetrans {
 impl SendRetrans {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Pre-size variant. Steady-state in-flight is bounded above by
+    /// `send_buffer_bytes / mss` (the `send_buf_room` cap inside
+    /// `send_bytes`); pre-sizing the VecDeque to that ceiling once at
+    /// connection construction eliminates the geometric-doubling
+    /// reallocs the audit harness would otherwise observe under
+    /// sustained TX (a 256 KiB send buffer at 1460-byte MSS holds
+    /// ~180 in-flight segments — without pre-size, push_after_tx
+    /// grows the inner Vec at 1, 4, 8, 16, 32, 64, 128, 256 entries,
+    /// which surfaces as 8 hot-path allocations during ramp). Slack
+    /// in caller-side rounding (next power-of-two) absorbs the
+    /// brief overshoot when an ACK lags a push.
+    pub fn with_capacity(cap: usize) -> Self {
+        Self {
+            entries: VecDeque::with_capacity(cap),
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -164,6 +191,7 @@ mod tests {
             sacked: false,
             lost: false,
             xmit_ts_ns: ts,
+            hdrs_len: 0,
         }
     }
 

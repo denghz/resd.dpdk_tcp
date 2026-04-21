@@ -366,8 +366,29 @@ impl TcpConn {
             time_wait_deadline_ns: None,
             last_advertised_wnd: None,
             last_sack_trigger: None,
-            timer_ids: Vec::new(),
-            snd_retrans: crate::tcp_retrans::SendRetrans::new(),
+            // Pre-size to cover the live-timer ceiling per conn under
+            // sustained TX. Live distinct timers per conn are RTO +
+            // TLP + (transient) SYN-retrans, but `retain` is O(n) and
+            // doesn't shrink the Vec — so the steady-state high-water
+            // mark is what matters. Empirically the no-alloc audit
+            // observes the Vec briefly straddling 16+ entries during
+            // overlapped restart windows (RTO cancel + TLP fire +
+            // re-arm in adjacent ACKs); pre-sizing to 32 covers that
+            // P99 without the geometric-doubling grow surfacing in
+            // the audit's measurement window. 32 × 8 B = 256 B per
+            // conn — negligible footprint at `max_connections=1024`.
+            timer_ids: Vec::with_capacity(32),
+            // Pre-size the in-flight deque to the steady-state ceiling
+            // (`send_buf_bytes / our_mss`, +1 to absorb partial-segment
+            // rounding). `send_bytes` caps `room_in_peer_wnd` and
+            // `send_buf_room` so `snd_retrans` can never exceed this
+            // bound; pre-sizing here keeps the no-alloc-on-hot-path
+            // audit honest under sustained TX (otherwise the inner
+            // VecDeque doubles 1→4→…→256 during ramp and surfaces
+            // multiple hot-path allocs in the audit measurement window).
+            snd_retrans: crate::tcp_retrans::SendRetrans::with_capacity(
+                (send_buf_bytes / our_mss.max(1) as u32 + 1) as usize,
+            ),
             rtt_est: crate::tcp_rtt::RttEstimator::new(min_rto_us, initial_rto_us, max_rto_us),
             rto_timer_id: None,
             tlp_timer_id: None,
@@ -900,6 +921,7 @@ mod a5_5_tlp_hook_tests {
             sacked: false,
             lost: false,
             xmit_ts_ns: 0,
+            hdrs_len: 0,
         });
     }
 

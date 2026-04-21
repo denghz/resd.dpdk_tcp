@@ -81,6 +81,16 @@ int shim_rte_pktmbuf_chain(struct rte_mbuf *head, struct rte_mbuf *tail) {
     return rte_pktmbuf_chain(head, tail);
 }
 
+/* rte_pktmbuf_adj is static inline; re-export. Advances the mbuf's
+ * data_off by `len`, shrinking data_len + pkt_len by the same amount.
+ * Returns the new data pointer (after the advance), or NULL if `len`
+ * exceeds the segment's data_len. Used by the retransmit primitive to
+ * strip the original L2+L3+TCP headers off the snd_retrans data mbuf
+ * before chaining a fresh header mbuf in front of it. */
+char *shim_rte_pktmbuf_adj(struct rte_mbuf *m, uint16_t len) {
+    return rte_pktmbuf_adj(m, len);
+}
+
 /* rte_mbuf_refcnt_update is static inline; re-export. Adds `v` (may be
  * negative) to the refcount. */
 void shim_rte_mbuf_refcnt_update(struct rte_mbuf *m, int16_t v) {

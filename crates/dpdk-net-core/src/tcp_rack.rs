@@ -233,6 +233,7 @@ mod tests {
             sacked,
             lost,
             xmit_ts_ns,
+            hdrs_len: 0,
         }
     }
 

@@ -951,8 +951,28 @@ impl Engine {
             iss_gen: IssGen::new(),
             // RFC 6056 ephemeral port hint range: start at 49152.
             last_ephemeral_port: Cell::new(49151),
+            // Slot capacity hint: under sustained TX, every push that
+            // arms the RTO timer (when `snd_retrans` transitions empty
+            // → non-empty) and every cancel-then-rearm on the next ACK
+            // claims a fresh slot — `cancel` only sets the tombstone
+            // bit; the slot is recycled to `free_list` only at fire-
+            // time. With `send_bytes` capped at `send_buffer_bytes /
+            // mss` in-flight per conn, a single high-rate sender can
+            // hold up to that many slot-arms before the RTO fires.
+            // Pre-size to `max_in_flight × max_connections + slack` so
+            // the audit harness sees zero `slots.push` reallocs during
+            // its measurement window. (Old hint of `max_connections ×
+            // 4` was right for the per-conn-handshake case but undersized
+            // for the data-plane workload — surfaced by the no-alloc
+            // audit once the snd_retrans-grow path was eliminated.)
             timer_wheel: RefCell::new(crate::tcp_timer_wheel::TimerWheel::new(
-                (cfg.max_connections as usize).saturating_mul(4),
+                {
+                    let per_conn = (cfg.send_buffer_bytes / cfg.tcp_mss.max(1))
+                        as usize;
+                    (cfg.max_connections as usize)
+                        .saturating_mul(per_conn.max(4))
+                        .saturating_add(16)
+                },
             )),
             tx_pending_data: RefCell::new(Vec::with_capacity(cfg.tx_ring_size as usize)),
             tx_frame_scratch: RefCell::new(Vec::with_capacity(
@@ -4250,7 +4270,18 @@ impl Engine {
             // segment transitions `snd_retrans` from empty → non-empty and
             // no RTO timer is currently scheduled). Subsequent segments in
             // the same burst observe `was_empty == false` and skip the arm.
+            //
+            // `hdrs_len` records the L2+L3+TCP header bytes at the front of
+            // `m`'s data region. The frame mbuf holds the WHOLE on-wire
+            // frame (headers || payload) because Stage 1 builds a single
+            // contiguous mbuf above. The retransmit primitive uses
+            // `hdrs_len` to (1) slice the payload bytes for the checksum
+            // fold and (2) `rte_pktmbuf_adj` the headers off the front
+            // before chaining a fresh header mbuf — otherwise the on-wire
+            // retrans frame would carry a duplicate L2+L3+TCP header.
+            // `n - take` = ETH_HDR_LEN + IPV4_HDR_MIN + tcp_hdr_len_inc_opts.
             let first_tx_ts_ns = crate::clock::now_ns();
+            let hdrs_len = (n - take) as u16;
             let new_entry = crate::tcp_retrans::RetransEntry {
                 seq: cur_seq,
                 len: take as u16,
@@ -4260,6 +4291,7 @@ impl Engine {
                 sacked: false,
                 lost: false,
                 xmit_ts_ns: first_tx_ts_ns,
+                hdrs_len,
             };
             {
                 let mut ft = self.flow_table.borrow_mut();
@@ -4545,8 +4577,54 @@ impl Engine {
     /// original data mbuf — never edits the in-flight mbuf in place.
     #[allow(dead_code)] // wired up in Tasks 12 / 15 / 17 / 18
     pub(crate) fn retransmit(&self, conn_handle: ConnHandle, entry_index: usize) {
+        self.retransmit_inner(conn_handle, entry_index)
+    }
+
+    /// Test-only public wrapper around the crate-private `retransmit`
+    /// primitive. Lets integration tests synthesize a retransmit on a
+    /// snd_retrans entry without waiting for the natural RTO/RACK/TLP
+    /// trigger, which is what `multiseg_retrans_tap` uses to deterministically
+    /// exercise the multi-segment retrans path (and the `data_len ==
+    /// hdrs_len + len` invariant assertion). Hidden from the public API
+    /// surface — production callers must use the timer-driven paths.
+    #[doc(hidden)]
+    pub fn debug_retransmit_for_test(&self, conn_handle: ConnHandle, entry_index: usize) {
+        self.retransmit_inner(conn_handle, entry_index)
+    }
+
+    fn retransmit_inner(&self, conn_handle: ConnHandle, entry_index: usize) {
         use crate::counters::inc;
         use crate::tcp_output::{build_retrans_header, SegmentTx, TCP_ACK, TCP_PSH};
+
+        // Phase 0: drain any in-flight new-send mbufs out of the TX ring
+        // BEFORE we touch the snd_retrans data mbuf.
+        //
+        // Why: send_bytes pushes the just-built data mbuf onto
+        // tx_pending_data AND stashes the same mbuf in snd_retrans (with
+        // refcnt=2). Until that mbuf gets TAP-processed by the next
+        // tx_burst, it sits in BOTH the ring and snd_retrans. If a
+        // RACK-driven retransmit fires from inside rx_frame (i.e., during
+        // poll_once before the bottom-of-poll drain), and the lost entry
+        // happens to be the one still pending in the ring, then chaining
+        // hdr_mbuf → data_mbuf puts the same data_mbuf into the burst
+        // TWICE — once as a single-segment original send (ring head), once
+        // as the second segment of the retrans chain. TAP's software
+        // cksum path adj's the chain head in place, so the first
+        // appearance steals 54 bytes off the data_mbuf and the second
+        // appearance walks a too-short chain → SIGSEGV (data_mbuf->next ==
+        // NULL but cksum walk thinks more bytes are pending).
+        //
+        // Draining here forces the original send through the wire first;
+        // afterwards the data_mbuf is in its post-TAP shape (data_off
+        // shifted by 54, data_len = 1466-54 = 1412 for an MSS-sized
+        // segment) and is no longer in the ring. The Phase 4 adj +
+        // chain then operate on a clean, exclusive mbuf.
+        //
+        // Cost: at most one extra rte_eth_tx_burst per retransmit fire.
+        // Retransmit is the slow path — RTO/RACK/TLP fires are rare —
+        // so the extra burst is acceptable. The natural batch path
+        // (send_bytes → poll_once → drain) is unaffected.
+        self.drain_tx_pending_data();
 
         // Phase 1: snapshot the SegmentTx-building inputs + the data mbuf
         // pointer and payload-for-checksum bytes. We release the flow-table
@@ -4562,6 +4640,7 @@ impl Engine {
             let tuple = conn.four_tuple();
             let seg_seq = entry.seq;
             let entry_len = entry.len;
+            let entry_hdrs_len = entry.hdrs_len;
             let data_mbuf_ptr = entry.mbuf.as_ptr();
             // Advertised window mirrors `send_bytes` (F-4 RFC 7323 §2.3):
             // non-SYN segment ⇒ right-shift by ws_shift_out. Task 25:
@@ -4578,6 +4657,7 @@ impl Engine {
                 tuple,
                 seg_seq,
                 entry_len,
+                entry_hdrs_len,
                 data_mbuf_ptr,
                 advertised_window,
                 ts_enabled,
@@ -4591,6 +4671,7 @@ impl Engine {
             tuple,
             seg_seq,
             entry_len,
+            entry_hdrs_len,
             data_mbuf_ptr,
             advertised_window,
             ts_enabled,
@@ -4653,8 +4734,25 @@ impl Engine {
         };
 
         // Read the original payload bytes directly from the data mbuf for
-        // the TCP checksum fold. Stage 1 is single-segment-per-data-mbuf
-        // (no nested chains in `snd_retrans`), so data_len == entry_len.
+        // the TCP checksum fold. The mbuf holds the on-wire frame built
+        // by `send_bytes` (Ethernet + IPv4 + TCP-with-options + payload
+        // contiguously) but `data_off` and `data_len` shift over its
+        // lifetime as the TAP/PMD software-cksum path adj's headers off
+        // the front:
+        //
+        //   construction:        data_len = hdrs + payload   (e.g. 1466)
+        //   after 1st TAP burst: data_len = hdrs - 54 + payload (1412 — TAP
+        //                        strips ETH+IPv4+rte_tcp_hdr=54)
+        //   after 1st retrans:   data_len = payload          (1400 — Phase 4
+        //                        adj's down to payload-only)
+        //
+        // All three shapes are valid; the payload always lives at the
+        // tail of the current data region. Compute the live header
+        // prefix from `data_len - entry_len` so the slice + adj are
+        // robust regardless of which TAP/retransmit history the mbuf has
+        // accumulated. (`entry_hdrs_len` is the construction-time prefix
+        // and is no longer authoritative once any tx_burst has fired —
+        // it's retained on the entry for forensic / test assertions.)
         //
         // Safety: data_mbuf_ptr came from a live RetransEntry; the engine
         // holds a refcount on it via Mbuf (incremented at push-time, not
@@ -4665,16 +4763,29 @@ impl Engine {
             !data_ptr.is_null(),
             "live mbuf in snd_retrans must have a valid data pointer"
         );
-        debug_assert_eq!(
-            data_len, entry_len,
-            "Stage 1 invariant: snd_retrans entries are single-segment"
+        debug_assert!(
+            data_len >= entry_len,
+            "Stage 1 invariant: snd_retrans data mbuf must contain at least `len` \
+             payload bytes (data_len={data_len}, entry_len={entry_len})"
         );
-        // Safety: data_ptr + data_len describe the data region of a live
-        // mbuf we hold a refcount on. The slice lifetime is bounded by
-        // this function (we do not stash it past the build_retrans_header
-        // call, which copies out the bytes into its checksum fold).
-        let payload_bytes: &[u8] =
-            unsafe { std::slice::from_raw_parts(data_ptr, data_len as usize) };
+        debug_assert!(
+            entry_hdrs_len == 0 || data_len <= entry_hdrs_len + entry_len,
+            "snd_retrans data_len exceeds construction-time hdrs+payload \
+             (data_len={data_len}, entry_hdrs_len={entry_hdrs_len}, \
+             entry_len={entry_len}) — TAP/PMD adj should only shrink"
+        );
+        let live_hdrs_len = data_len - entry_len;
+        // Safety: data_ptr + live_hdrs_len .. + entry_len describes the
+        // payload region inside the data mbuf we hold a refcount on. The
+        // slice lifetime is bounded by this function (we do not stash it
+        // past the build_retrans_header call, which copies out the bytes
+        // into its checksum fold).
+        let payload_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                data_ptr.add(live_hdrs_len as usize),
+                entry_len as usize,
+            )
+        };
 
         // Phase 3: write header bytes into the hdr mbuf. Budget the same
         // 40-byte TCP-options cushion as `send_bytes` (MSS + WS + SACK-perm
@@ -4747,6 +4858,31 @@ impl Engine {
         // is paired with either the chain-success (the chain now owns one
         // of the references, dropped by rte_pktmbuf_free on the chain's
         // head) or the chain-failure rollback below.
+        //
+        // Before chaining, strip the live header prefix off the data
+        // mbuf via `rte_pktmbuf_adj`. `live_hdrs_len` reflects whatever
+        // ETH/IPv4/TCP/options bytes still sit at the front of the data
+        // region — typically 12 (TCP options only, after the original
+        // tx_burst's TAP cksum path stripped 54 bytes) on the first
+        // retrans, or 0 on subsequent retrans (the prior retrans adj'd
+        // it down to payload-only). Chaining hdr_mbuf -> data_mbuf
+        // without this strip would put a stale prefix on the wire after
+        // the freshly-built header. Phase 0's drain ensures the original
+        // burst has TAP-processed this mbuf already, so our refcount of
+        // 1 is exclusive — adj's metadata mutation is race-free.
+        let did_adj = if live_hdrs_len > 0 {
+            let new_data =
+                unsafe { sys::shim_rte_pktmbuf_adj(data_mbuf_ptr, live_hdrs_len) };
+            // adj returns NULL only if `len > data_len`, which our
+            // shape-detection invariant rules out (live_hdrs_len <
+            // data_len because entry_len > 0). Defensive: skip the
+            // adj-success-bookkeeping below if the impossible happens.
+            !new_data.is_null()
+        } else {
+            // No live headers — data mbuf is already payload-only from
+            // a prior retrans's adj.
+            false
+        };
         unsafe { sys::shim_rte_mbuf_refcnt_update(data_mbuf_ptr, 1) };
         let rc = unsafe { sys::shim_rte_pktmbuf_chain(hdr_mbuf, data_mbuf_ptr) };
         if rc != 0 {
@@ -4754,6 +4890,16 @@ impl Engine {
             // back the refcnt bump and free the hdr mbuf. The hdr mbuf
             // still owns zero chained segs at this point, so freeing it
             // only releases the header; the data mbuf is untouched.
+            //
+            // The earlier `adj` is NOT rolled back — `rte_pktmbuf_adj`
+            // only rewinds via `rte_pktmbuf_prepend`, which risks mis-
+            // restoring stale header bytes that no future caller would
+            // want anyway (the next retrans builds a fresh header). The
+            // live-prefix detection in Phase 4 reads `data_len -
+            // entry_len` each call, so a subsequent retrans on this
+            // entry observes the truncated shape (live_hdrs_len == 0)
+            // and skips the adj — no separate bookkeeping needed.
+            let _ = did_adj;
             unsafe { sys::shim_rte_pktmbuf_free(hdr_mbuf) };
             unsafe { sys::shim_rte_mbuf_refcnt_update(data_mbuf_ptr, -1) };
             inc(&self.counters.eth.tx_drop_nomem);
@@ -4800,6 +4946,11 @@ impl Engine {
 
         // Phase 6: update per-entry state + bump counters. Re-borrow the
         // flow table mutably only now, after all mbuf work is done.
+        // (`entry.hdrs_len` is the construction-time prefix; the
+        // live-prefix detection in Phase 4 reads `data_len - entry_len`
+        // each time, so we don't need to mutate `hdrs_len` after a
+        // retrans — leaving it as a forensic record of the original
+        // build.)
         {
             let mut ft = self.flow_table.borrow_mut();
             if let Some(conn) = ft.get_mut(conn_handle) {
@@ -4807,6 +4958,7 @@ impl Engine {
                     entry.xmit_count = entry.xmit_count.saturating_add(1);
                     entry.xmit_ts_ns = crate::clock::now_ns();
                     entry.lost = false;
+                    let _ = did_adj;
                 }
             }
         }
