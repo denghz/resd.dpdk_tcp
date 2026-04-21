@@ -26,7 +26,7 @@
 | A6.7 | FFI safety audit & hardening (miri, cbindgen header-drift CI, ABI snapshot, panic-firewall test, no-alloc-on-hot-path audit, C++ consumer under ASan/UBSan/LSan) | Complete | phase-a6-6-7-complete |
 | A7 | Loopback test server + packetdrill-shim | Not started | — |
 | A8 | tcpreq + observability gate | Not started | — |
-| A9 | TCP-Fuzz differential + smoltcp FaultInjector | Not started | — |
+| A9 | Property + bespoke fuzzing + smoltcp FaultInjector | Complete | phase-a9-complete |
 | A10 | Benchmark harness (micro + e2e + stress) | Not started | — |
 | A11 | Stage 1 ship gate verification | Not started | — |
 | A12 | Documentation (user + maintainer + future-work) + Stage 1 release tag | Not started | — |
@@ -579,24 +579,30 @@ Group 3 — audit artifacts:
 
 ---
 
-## A9 — TCP-Fuzz differential + smoltcp FaultInjector
+## A9 — Property + bespoke fuzzing + smoltcp FaultInjector
 
-**Goal:** Differential fuzzing vs Linux TCP (in RFC-compliance-preset mode). Port smoltcp's `FaultInjector` pattern as a stackable RX middleware for local soak testing.
+**Goal:** Land property + bespoke fuzz coverage of the Stage 1 TCP stack. proptest suites, cargo-fuzz targets (pure-module + one persistent-mode engine target), Scapy adversarial corpus driven through a test-inject RX hook, smoltcp-pattern FaultInjector RX middleware. Closes I-8 FYI from `docs/superpowers/reviews/phase-a6-6-7-rfc-compliance.md`.
 
-**Spec refs:** §10.5, §10.6.
+**Spec refs:** §10.6. (§10.5 Layer E differential-vs-Linux deferred to new Stage-2 phase S2-A.)
 
 **Deliverables:**
-- `tools/tcp-fuzz-differential/` — TCP-Fuzz driver configured to run `libdpdk_net` in `preset=rfc_compliance` against Linux TCP as oracle.
-- Regression-fuzz track: same inputs compared across `dpdk_net` releases.
-- CI smoke run per merge; 72h continuous run on a dedicated box per stage cut.
-- `FaultInjector` RX middleware — random drop/duplicate/reorder/corrupt with configurable rates, enabled via env var.
-- Property tests (proptest) for TCP options encode/decode and reassembly invariants.
-- cargo-fuzz targets: `tcp_input` with random pre-established state; IP/TCP header parser.
-- Scapy-based adversarial test corpus for overlapping segments, malformed options, timestamp wraparound.
+- 6 `proptest` suites under `crates/dpdk-net-core/tests/proptest_*.rs` (tcp_options, tcp_seq, tcp_sack, tcp_reassembly, paws, rack_xmit_ts)
+- 7 cargo-fuzz targets under `crates/dpdk-net-core/fuzz/fuzz_targets/` (6 pure-module T1 + 1 persistent-mode engine T1.5)
+- `crates/dpdk-net-core/src/fault_injector.rs` + counters + engine wiring, behind `fault-injector` cargo feature
+- `Engine::inject_rx_frame` + `inject_rx_chain` (behind `test-inject` cargo feature) — A7 coordination contract
+- `crates/dpdk-net-core/src/test_fixtures.rs` — hoisted `make_test_engine` for cross-crate test reuse
+- `tools/scapy-corpus/` (6 Python Scapy scripts generating .pcap + .manifest.json pairs)
+- `tools/scapy-fuzz-runner/` — Rust binary replaying pcap corpora via the test-inject hook
+- `scripts/fuzz-smoke.sh` (per-merge CI, 30s per target × 7) + `scripts/fuzz-long-run.sh` (per-stage-cut, 72h dedicated box) + `scripts/scapy-corpus.sh` (regen)
+- I-8 closure in `tcp_input.rs` + directed multi-seg regression test via dispatch
+- `.github/workflows/a9-fuzz.yml` — three parallel CI jobs (fuzz-smoke, scapy-corpus-replay, fault-injector-compile)
+- End-of-phase mTCP + RFC review reports
 
-**Dependencies:** A6.
+**Deferred to Stage 2 (S2-A):** differential-vs-Linux fuzz, `preset=rfc_compliance` engine knob, TCP-Fuzz vendor (zouyonghao/TCP-Fuzz), Linux netns oracle plumbing, divergence-normalisation layer. These combine with spec §10.7 Layer G WAN A/B in S2-A — both need the same Linux-oracle infrastructure.
 
-**Rough scale:** ~15 tasks.
+**Dependencies:** A6 (full API surface stable), A6.6-7 (test-inject hook integrates with the chain-walk ingest + FFI shape).
+
+**Rough scale:** ~26 tasks.
 
 ---
 
@@ -810,6 +816,26 @@ The PR is reviewed and merged in `contek-io/cpp_common`'s own process; this repo
 
 ---
 
+## S2-A — Differential-vs-Linux fuzz + Layer G WAN A/B
+
+**Goal:** Differential-vs-Linux fuzzing (deferred from A9) + Layer G WAN A/B harness (spec §10.7). Both share Linux-oracle infrastructure; unified phase introduces it once.
+
+**Spec refs:** §10.5 (Layer E), §10.7 (Layer G).
+
+**Deliverables:**
+- `preset=rfc_compliance` engine-wide knob (cc_mode=reno, delayed-ACK on ~40 ms, minRTO=200 ms, Nagle default) — ownership: this phase if A7 hasn't introduced it for packetdrill needs
+- `third_party/tcp-fuzz/` submodule (zouyonghao/TCP-Fuzz)
+- `tools/tcp-fuzz-differential/` driver running libdpdk_net + Linux TCP in same-host netns; divergence-normalisation layer (ISS, TSecr skew, etc.)
+- `tools/wan-ab-bench/` — pcap replay + HW-timestamp tap harness + tap-jitter calibration
+- §6.4 deviation row for `preset=rfc_compliance`; knob-coverage scenario in `tests/knob-coverage.rs` (if not already introduced by A7)
+- CI smoke + per-stage-cut 72 h run extensions
+
+**Dependencies:** A11 (Stage 1 ship). S2-A is the first Stage 2 hardening phase.
+
+**Rough scale:** ~14 tasks (~6 differential + ~8 Layer G).
+
+---
+
 ## Cross-phase process notes
 
 - Each per-phase plan file gets its date-prefixed name: `YYYY-MM-DD-stage1-phase-aN-<slug>.md`. Prefix with the date the plan is written, not the phase number.
@@ -821,3 +847,12 @@ The PR is reviewed and merged in `contek-io/cpp_common`'s own process; this repo
 - After a phase ships, tag: `git tag -a phase-aN-complete -m "Phase AN: <title>"`.
 - Update the "Status" column in this file when a phase starts (→ In progress) or ships (→ Complete, link the plan file if not already there).
 - The spec at `docs/superpowers/specs/2026-04-17-dpdk-tcp-design.md` is the single source of truth for what Stage 1 actually needs. If a phase reveals a spec gap or contradiction, amend the spec first (in a separate commit), then the plan.
+
+### Preset=rfc_compliance ownership
+
+The `preset=rfc_compliance` engine-wide knob (cc_mode=reno, delayed-ACK on ~40 ms, minRTO=200 ms, Nagle default) is owned by whichever Stage-1 phase first needs it:
+
+- If A7 curates a packetdrill subset that includes scripts requiring RFC behaviour, A7 introduces the preset.
+- If A7's runnable subset matches trading-latency defaults (RFC-only scripts marked SKIPPED), Stage-1 ships without the preset; S2-A introduces it for differential + Layer G.
+
+A9 does NOT introduce the preset (differential-vs-Linux deferred; all A9 fuzz/property tests operate against the engine's default config or override individual knobs per test case).
