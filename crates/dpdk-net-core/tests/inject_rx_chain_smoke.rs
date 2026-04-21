@@ -4,7 +4,7 @@
 //!
 //! `inject_empty_chain_returns_empty_chain_err` runs unconditionally
 //! against `make_test_engine`'s TAP gate — when the gate is unmet we
-//! skip cleanly. `inject_multi_seg_chain_advances_rx_pkts` requires
+//! skip cleanly. `inject_multi_seg_chain_advances_rx_bytes` requires
 //! `DPDK_NET_TEST_TAP=1` + sudo + hugepages to actually drive the inject
 //! through DPDK.
 //!
@@ -29,7 +29,7 @@ mod common;
 use common::{build_tcp_syn_head, make_test_engine};
 
 #[test]
-fn inject_multi_seg_chain_advances_rx_pkts() {
+fn inject_multi_seg_chain_advances_rx_bytes() {
     let Some(engine) = make_test_engine() else {
         return;
     };
