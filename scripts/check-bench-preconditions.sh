@@ -43,6 +43,12 @@ while (($#)); do
       JSON_FMT=0
       shift
       ;;
+    --json)
+      # No-op alias; JSON is the default output. Retained for
+      # compatibility with bench-ab-runner which passes --json
+      # explicitly (the plan's T2 sketch vs T3 sketch differed).
+      shift
+      ;;
     *)
       echo "unknown argument: $1" >&2
       exit 2
