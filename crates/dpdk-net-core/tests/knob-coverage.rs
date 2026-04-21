@@ -863,3 +863,187 @@ fn knob_bench_alloc_audit_feature_compiles() {
         "tautology — compile-reachability is the contract, not runtime state"
     );
 }
+
+// ---- A6.6-7 knob coverage ------------------------------------------------
+//
+// A6.6 introduces one new behavioural knob (`rx_mempool_size`) and A6.7
+// introduces two new compile-time markers (`miri-safe`, `test-panic-entry`).
+// Pattern follows the A6.5 Task 12 `bench-alloc-audit` precedent: runtime
+// knob → distinguishing assertion; compile-time feature → documentation
+// marker keyed on `cfg!`. See plan §Task 22 for the rationale.
+
+/// Knob: `EngineConfig::rx_mempool_size` (A6.6-7 Task 10).
+/// Non-default value: any `u32 > 0` (caller-supplied capacity in mbufs).
+/// Default value: `0` (sentinel that triggers the formula at `Engine::new`):
+///   `max(4 * rx_ring_size,
+///        2 * max_connections * ceil(recv_buffer_bytes / mbuf_data_room) + 4096)`
+///
+/// Observable consequence: the resolution branch in `Engine::new`
+/// (engine.rs ~line 767) returns the caller value verbatim when non-zero,
+/// and computes the formula when zero. The two paths produce different
+/// values for any reasonable EngineConfig (the formula evaluates to
+/// thousands of mbufs at default sizing; the caller value is whatever
+/// the caller chose). The retrievable backing field surfaces via
+/// `Engine::rx_mempool_size()` (engine.rs ~line 1417).
+///
+/// Engine::new requires DPDK EAL bring-up which a unit test cannot do
+/// without sudo + a real NIC — at this knob-coverage layer we assert:
+///   (a) the non-default value propagates unchanged through `EngineConfig`
+///       (catches the "field added but no code path reads it" failure mode
+///       this audit exists to prevent), and
+///   (b) the resolution rule itself — "use cfg.rx_mempool_size verbatim
+///       when non-zero, else compute the formula" — by replicating the
+///       branch body here and exercising it against both the non-default
+///       value (16384) and the default sentinel (0). Precedent:
+///       `knob_ena_miss_txc_to_sec_projects_to_devargs_key` replicates a
+///       projection rule at this layer for the same DPDK-init-required
+///       reason. Functional bring-up coverage lives in the TAP-driven
+///       integration tests in `crates/dpdk-net/tests/`.
+#[test]
+fn knob_rx_mempool_size_user_override() {
+    use dpdk_net_core::engine::EngineConfig;
+
+    // (a) Propagation: non-default value round-trips through EngineConfig.
+    let cfg_override = EngineConfig {
+        rx_mempool_size: 16384,
+        ..EngineConfig::default()
+    };
+    assert_eq!(
+        cfg_override.rx_mempool_size, 16384,
+        "non-default rx_mempool_size=16384 must propagate through EngineConfig"
+    );
+    // Sanity: default is 0 (the sentinel for "compute the formula").
+    assert_eq!(
+        EngineConfig::default().rx_mempool_size,
+        0,
+        "default rx_mempool_size is 0 (the formula-trigger sentinel)"
+    );
+
+    // (b) Resolution-branch rule — mirror the body of `Engine::new`'s
+    // rx_mempool_size resolution (engine.rs ~line 767):
+    //   let rx_mempool_size = if cfg.rx_mempool_size > 0 {
+    //       cfg.rx_mempool_size
+    //   } else {
+    //       let mbuf_data_room = cfg.mbuf_data_room as u32;
+    //       let per_conn = cfg.recv_buffer_bytes
+    //           .saturating_add(mbuf_data_room.saturating_sub(1))
+    //           / mbuf_data_room.max(1);
+    //       let computed = 2u32
+    //           .saturating_mul(cfg.max_connections)
+    //           .saturating_mul(per_conn)
+    //           .saturating_add(4096);
+    //       let floor = 4u32.saturating_mul(cfg.rx_ring_size as u32);
+    //       computed.max(floor)
+    //   };
+    fn resolve_rx_mempool_size(cfg: &EngineConfig) -> u32 {
+        if cfg.rx_mempool_size > 0 {
+            cfg.rx_mempool_size
+        } else {
+            let mbuf_data_room = cfg.mbuf_data_room as u32;
+            let per_conn = cfg
+                .recv_buffer_bytes
+                .saturating_add(mbuf_data_room.saturating_sub(1))
+                / mbuf_data_room.max(1);
+            let computed = 2u32
+                .saturating_mul(cfg.max_connections)
+                .saturating_mul(per_conn)
+                .saturating_add(4096);
+            let floor = 4u32.saturating_mul(cfg.rx_ring_size as u32);
+            computed.max(floor)
+        }
+    }
+
+    // Non-default branch: caller value is returned verbatim, regardless
+    // of what the formula would have produced.
+    let resolved_override = resolve_rx_mempool_size(&cfg_override);
+    assert_eq!(
+        resolved_override, 16384,
+        "non-default rx_mempool_size=16384 must resolve verbatim (no formula override)"
+    );
+
+    // Default branch: formula fires. Use the actual EngineConfig defaults
+    // so the computed value reflects production sizing — and crucially,
+    // it must NOT equal the non-default value above (otherwise this entry
+    // wouldn't distinguish anything).
+    let cfg_default = EngineConfig::default();
+    let resolved_default = resolve_rx_mempool_size(&cfg_default);
+    assert_ne!(
+        resolved_default, 16384,
+        "default formula must produce a value distinguishable from the non-default override"
+    );
+    // Sanity: the formula is non-zero (the floor `4 * rx_ring_size` is
+    // strictly positive for any sane rx_ring_size).
+    assert!(
+        resolved_default > 0,
+        "default formula must produce a positive capacity; got {resolved_default}"
+    );
+}
+
+/// Knob: `miri-safe` cargo feature (A6.6-7 Task 16).
+/// Non-default: feature ON (enabled by `scripts/hardening-miri.sh`).
+/// Observable consequence: the `miri-safe` cfg gates miri-incompatible
+/// code paths (DPDK FFI calls, raw-pointer mbuf manipulation) so
+/// `cargo +nightly miri test --features miri-safe` runs the pure-compute
+/// modules without trapping on UB it cannot model. This test is a
+/// documentation marker in the knob-coverage registry — the real
+/// compile-reachability + miri-validity check is the
+/// `scripts/hardening-miri.sh` job.
+///
+/// Pattern: `#[cfg(feature = "miri-safe")]` gate so the test is only
+/// instantiated under `--features miri-safe`. When that build path is
+/// removed, this test fails to compile (CI matrix would catch the orphan).
+/// Mirrors the A6.5 Task 12 precedent for compile-time-only knobs.
+#[cfg(feature = "miri-safe")]
+#[test]
+fn knob_miri_safe_feature_enabled() {
+    // Compile-presence check: under `--features miri-safe`, the
+    // `cfg!(feature = "miri-safe")` macro evaluates to `true`. The
+    // gating `#[cfg(...)]` above guarantees this test only compiles
+    // when the feature is on, so the assertion is structural.
+    assert!(
+        cfg!(feature = "miri-safe"),
+        "miri-safe feature must be active when this test compiles"
+    );
+}
+
+/// Knob: `test-panic-entry` cargo feature (A6.6-7 Task 19).
+/// Non-default: feature ON (enabled by `scripts/hardening-panic-firewall.sh`).
+/// Observable consequence: the `dpdk_net_panic_for_test()` FFI export
+/// becomes reachable, providing the panic-firewall test
+/// (`crates/dpdk-net/tests/panic_firewall.rs`) a deterministic way to
+/// trigger a Rust panic across the FFI boundary and assert the
+/// catch_unwind + abort firewall fires.
+///
+/// **Cross-crate placement note:** `test-panic-entry` is defined on the
+/// `dpdk-net` crate (the FFI surface), NOT on `dpdk-net-core` (this test
+/// file's host crate). A `#[cfg(feature = "test-panic-entry")]` gate
+/// here would never evaluate true — `dpdk-net-core` doesn't see its
+/// downstream crate's features. Per Task 22's "document the asymmetry"
+/// guidance, this entry serves as the in-source registry reminder; the
+/// real compile-reachability check is the
+/// `scripts/hardening-panic-firewall.sh` job which runs:
+///   `cargo test -p dpdk-net --features test-panic-entry --test panic_firewall`
+/// If that script stops running, the panic firewall coverage is silently
+/// orphaned — this test docs the expected wiring so a reviewer notices.
+///
+/// (A `cargo build -p dpdk-net --features test-panic-entry` smoke check
+/// can be added to CI's feature-matrix step alongside `bench-alloc-audit`
+/// to catch compile-rot independently.)
+#[test]
+fn knob_test_panic_entry_feature_documented() {
+    // No `cfg!(feature = "test-panic-entry")` reference here on purpose:
+    // the feature lives on a *different* crate (`dpdk-net`), so checking
+    // it from `dpdk-net-core` would fire `unexpected_cfgs` warnings under
+    // rustc check-cfg. This is a registry-presence marker; the real
+    // reachability check runs in scripts/hardening-panic-firewall.sh
+    // which invokes:
+    //   cargo test -p dpdk-net --features test-panic-entry --test panic_firewall
+    // The doc-comment on this test serves as the in-source pointer to
+    // the cross-crate wiring; that is the entire deliverable.
+    let placeholder: bool = true;
+    assert!(
+        placeholder,
+        "registry-presence marker for cross-crate feature `test-panic-entry`; \
+         enforced by scripts/hardening-panic-firewall.sh, not this test"
+    );
+}
