@@ -249,3 +249,92 @@ pub fn parse_syn_ack(frame: &[u8]) -> Option<(u32, u32)> {
     let ack = u32::from_be_bytes([tcp[8], tcp[9], tcp[10], tcp[11]]);
     Some((seq, ack))
 }
+
+/// A7 Task 6: build a bare FIN+ACK segment (flags 0x11). No options,
+/// empty payload. Mirrors the shape of `build_tcp_ack` but with FIN set
+/// so the peer-side of the passive-close test can close the inbound
+/// half of the stream.
+#[cfg(feature = "test-server")]
+pub fn build_tcp_fin(
+    src_ip: u32,
+    src_port: u16,
+    dst_ip: u32,
+    dst_port: u16,
+    seq: u32,
+    ack: u32,
+) -> Vec<u8> {
+    use dpdk_net_core::tcp_options::TcpOpts;
+    use dpdk_net_core::tcp_output::{TCP_ACK, TCP_FIN};
+    build_tcp_frame(
+        src_ip,
+        src_port,
+        dst_ip,
+        dst_port,
+        seq,
+        ack,
+        TCP_FIN | TCP_ACK,
+        u16::MAX,
+        TcpOpts::default(),
+        &[],
+    )
+}
+
+/// A7 Task 6: extract `(seq, ack)` from a wire-format TCP frame produced
+/// by `drain_tx_frames`. Used by the passive-close test to learn our FIN's
+/// sequence number so it can craft the peer's acknowledging final ACK.
+/// Does not validate flags — callers already know what shape frame they
+/// just pulled off the TX ring.
+#[cfg(feature = "test-server")]
+pub fn parse_tcp_seq_ack(frame: &[u8]) -> (u32, u32) {
+    let ip_ihl = (frame[14] & 0x0f) as usize * 4;
+    let tcp = &frame[14 + ip_ihl..];
+    let seq = u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]);
+    let ack = u32::from_be_bytes([tcp[8], tcp[9], tcp[10], tcp[11]]);
+    (seq, ack)
+}
+
+/// A7 Task 6: run a SYN → SYN-ACK → final-ACK three-way handshake against
+/// a live `Engine` under the test-server bypass. Returns the accepted
+/// `ConnHandle` and our server-side ISS so the caller can craft
+/// subsequent segments with correct seq/ack values. Uses `set_virt_ns`
+/// to seed the clock for SYN (t=1ms) and the final ACK (t=2ms) — close
+/// tests then advance the clock from there.
+#[cfg(feature = "test-server")]
+pub fn drive_passive_handshake(
+    eng: &dpdk_net_core::engine::Engine,
+    listen_h: dpdk_net_core::test_server::ListenHandle,
+) -> (dpdk_net_core::flow_table::ConnHandle, u32) {
+    use dpdk_net_core::clock::set_virt_ns;
+    use dpdk_net_core::test_tx_intercept::drain_tx_frames;
+
+    // Drain anything lingering from previous tests.
+    let _ = drain_tx_frames();
+
+    set_virt_ns(1_000_000);
+    let syn = build_tcp_syn(PEER_IP, 40_000, OUR_IP, 5555, 0x10000000, 1460);
+    eng.inject_rx_frame(&syn).expect("inject SYN");
+    let frames = drain_tx_frames();
+    assert_eq!(frames.len(), 1, "exactly one SYN-ACK expected");
+    let (our_iss, _ack) = parse_syn_ack(&frames[0]).expect("parse SYN-ACK");
+
+    set_virt_ns(2_000_000);
+    let final_ack = build_tcp_ack(
+        PEER_IP,
+        40_000,
+        OUR_IP,
+        5555,
+        0x10000001,
+        our_iss.wrapping_add(1),
+    );
+    eng.inject_rx_frame(&final_ack).expect("inject final ACK");
+    // ESTABLISHED transition must not emit a TX frame.
+    let post = drain_tx_frames();
+    assert_eq!(
+        post.len(),
+        0,
+        "ESTABLISHED transition must not emit a TX frame"
+    );
+
+    let conn = eng.accept_next(listen_h).expect("accept_next yields conn");
+    (conn, our_iss)
+}
