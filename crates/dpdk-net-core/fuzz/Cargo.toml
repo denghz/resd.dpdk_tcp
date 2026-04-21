@@ -16,6 +16,11 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 arbitrary = { version = "1", features = ["derive"] }
 dpdk-net-core = { path = "..", features = ["test-inject"] }
+# Direct dep for the `tcp_reassembly` target: it names `rte_mbuf` in a
+# `NonNull<rte_mbuf>` pointer when seeding a fake mbuf backing (mirrors
+# the pattern in `tests/proptest_tcp_reassembly.rs`). No other target
+# references sys symbols.
+dpdk-net-sys = { path = "../../dpdk-net-sys" }
 
 [[bin]]
 name = "tcp_options"
