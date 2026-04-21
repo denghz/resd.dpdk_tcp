@@ -18,7 +18,9 @@ fi
 TARGETS=(tcp_options tcp_sack tcp_reassembly tcp_state_fsm tcp_seq header_parser engine_inject)
 DURATION=${DURATION:-259200}   # 72 h
 DATE=$(date -u +%Y%m%d)
-OUTDIR="docs/superpowers/reports/fuzz-long-run-${DATE}"
+# Absolute so the `cd crates/dpdk-net-core/fuzz` inside parallel's subshells
+# still writes logs to the right place.
+OUTDIR="$PWD/docs/superpowers/reports/fuzz-long-run-${DATE}"
 mkdir -p "$OUTDIR"
 
 # Run all 7 targets in parallel for DURATION seconds each.
