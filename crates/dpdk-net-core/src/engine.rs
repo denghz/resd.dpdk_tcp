@@ -2282,10 +2282,18 @@ impl Engine {
     /// so the `timer_wheel` borrow ends at the semicolon — per-timer
     /// handlers are free to re-borrow the wheel (e.g. `on_rto_fire` re-arms).
     fn advance_timer_wheel(&self) {
-        let fired = self
-            .timer_wheel
-            .borrow_mut()
-            .advance(crate::clock::now_ns());
+        let _ = self.fire_timers_at(crate::clock::now_ns());
+    }
+
+    /// A7 Task 8 fixup: shared fire-loop used by both `advance_timer_wheel`
+    /// (always-on production path; takes `crate::clock::now_ns()` and
+    /// discards the count) and `pump_timers` (feature-gated test path;
+    /// takes an explicit `now_ns` and returns the count). Keeps the
+    /// per-`TimerKind` dispatch in exactly one place so any future
+    /// bug fix or new arm lands once.
+    pub(crate) fn fire_timers_at(&self, now_ns: u64) -> usize {
+        let fired = self.timer_wheel.borrow_mut().advance(now_ns);
+        let count = fired.len();
         for (id, node) in fired {
             match node.kind {
                 crate::tcp_timer_wheel::TimerKind::Rto => {
@@ -2311,6 +2319,7 @@ impl Engine {
                 }
             }
         }
+        count
     }
 
     /// A5 Task 12: RTO fire. Retransmits the front `snd_retrans` entry,
@@ -5603,36 +5612,12 @@ impl Engine {
     /// A7 Task 8: advance the timer wheel to `now_ns` and dispatch every
     /// fired timer through the same per-kind handlers `advance_timer_wheel`
     /// uses. Returns the number of timers that fired on this tick.
+    ///
+    /// A7 Task 8 fixup: thin delegation to `fire_timers_at` — the
+    /// per-`TimerKind` match now lives in exactly one place, shared
+    /// with the always-on `advance_timer_wheel` production path.
     pub fn pump_timers(&self, now_ns: u64) -> usize {
-        use crate::counters::inc;
-        let fired = self.timer_wheel.borrow_mut().advance(now_ns);
-        let count = fired.len();
-        for (id, node) in fired {
-            match node.kind {
-                crate::tcp_timer_wheel::TimerKind::Rto => {
-                    self.on_rto_fire(node.owner_handle, id);
-                }
-                crate::tcp_timer_wheel::TimerKind::Tlp => {
-                    self.on_tlp_fire(node.owner_handle, id);
-                }
-                crate::tcp_timer_wheel::TimerKind::SynRetrans => {
-                    self.on_syn_retrans_fire(node.owner_handle, id);
-                }
-                crate::tcp_timer_wheel::TimerKind::ApiPublic => {
-                    let mut ev = self.events.borrow_mut();
-                    ev.push(
-                        InternalEvent::ApiTimer {
-                            timer_id: id,
-                            user_data: node.user_data,
-                            emitted_ts_ns: crate::clock::now_ns(),
-                        },
-                        &self.counters,
-                    );
-                    inc(&self.counters.tcp.tx_api_timers_fired);
-                }
-            }
-        }
-        count
+        self.fire_timers_at(now_ns)
     }
 }
 

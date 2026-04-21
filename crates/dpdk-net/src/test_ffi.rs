@@ -245,15 +245,10 @@ pub unsafe extern "C" fn dpdk_net_test_recv(
     );
     let mut written: usize = 0;
     for ev in evs {
-        // `dpdk_net_event_kind_t` is `#[repr(u32)]` but not Copy/Clone on
-        // the FFI surface; read its discriminant through a raw ptr so we
-        // don't need to move / clone the enum. The layout guarantee
-        // (repr(u32) starts with the tag as a u32) is what lets this
-        // work soundly.
-        let kind_tag = unsafe {
-            *(&ev.kind as *const dpdk_net_event_kind_t as *const u32)
-        };
-        if kind_tag != dpdk_net_event_kind_t::DPDK_NET_EVT_READABLE as u32 {
+        // `dpdk_net_event_kind_t` is `#[repr(u32)]` + `#[derive(Copy, Clone)]`,
+        // so we can compare the discriminant idiomatically — no raw-ptr
+        // read required.
+        if ev.kind as u32 != dpdk_net_event_kind_t::DPDK_NET_EVT_READABLE as u32 {
             continue;
         }
         if ev.conn != h {
