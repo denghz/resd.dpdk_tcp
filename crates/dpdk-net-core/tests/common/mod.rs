@@ -204,6 +204,28 @@ pub fn build_tcp_fin(
     )
 }
 
+/// A7 Task 16: build a bare ACK carrying a single SACK block +
+/// Timestamps option, for forcing a RACK-driven retransmit of the
+/// first segment in the in-memory multi-seg I-8 regression.
+/// Thin forwarder to the public helper.
+#[cfg(feature = "test-server")]
+#[allow(clippy::too_many_arguments)]
+pub fn build_tcp_ack_with_sack(
+    src_ip: u32,
+    src_port: u16,
+    dst_ip: u32,
+    dst_port: u16,
+    seq: u32,
+    ack: u32,
+    sack_left: u32,
+    sack_right: u32,
+    tsval: u32,
+) -> Vec<u8> {
+    dpdk_net_core::test_server::test_packet::build_tcp_ack_with_sack(
+        src_ip, src_port, dst_ip, dst_port, seq, ack, sack_left, sack_right, tsval,
+    )
+}
+
 /// A7 Task 6: extract `(seq, ack)` from a wire-format TCP frame produced
 /// by `drain_tx_frames`. Thin forwarder to the public helper.
 #[cfg(feature = "test-server")]

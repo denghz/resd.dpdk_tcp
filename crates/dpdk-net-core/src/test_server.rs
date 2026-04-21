@@ -47,7 +47,7 @@ impl ListenSlot {
 /// sites is guaranteed-identical (zero drift between shim-runner tests
 /// and the existing A7 server FSM tests).
 pub mod test_packet {
-    use crate::tcp_options::TcpOpts;
+    use crate::tcp_options::{SackBlock, TcpOpts};
     use crate::tcp_output::{build_segment, SegmentTx, TCP_ACK, TCP_FIN, TCP_SYN};
 
     /// Build an Ethernet-framed IPv4/TCP packet using the same
@@ -152,6 +152,43 @@ pub mod test_packet {
             u16::MAX,
             TcpOpts::default(),
             &[],
+        )
+    }
+
+    /// A7 Task 16: bare ACK frame carrying a single SACK block + Timestamps
+    /// option. The SACK block covers the half-open range
+    /// `[sack_left, sack_right)` in TCP byte-stream seqs (host byte order);
+    /// the peer Timestamps value `tsval` pairs with a `tsecr` equal to the
+    /// engine's most recent advertised TSval (the caller passes both so
+    /// the ack is RFC-7323-valid — a zero `tsecr` is acceptable because
+    /// the engine accepts the initial ACK post-SYN with zero echo).
+    ///
+    /// SACK option wire shape: `[kind=5, len=2 + 8*N, left_be_u32,
+    /// right_be_u32, ...]`. `TcpOpts::encode` (in `tcp_options.rs`) writes
+    /// the option at the canonical position in the options block, so this
+    /// helper just populates `opts.sack_blocks` + `opts.timestamps` and
+    /// lets `build_tcp_frame` → `build_segment` take care of the wire
+    /// layout.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_tcp_ack_with_sack(
+        src_ip: u32,
+        src_port: u16,
+        dst_ip: u32,
+        dst_port: u16,
+        seq: u32,
+        ack: u32,
+        sack_left: u32,
+        sack_right: u32,
+        tsval: u32,
+    ) -> Vec<u8> {
+        let mut opts = TcpOpts::default();
+        opts.timestamps = Some((tsval, 0));
+        opts.push_sack_block_decode(SackBlock {
+            left: sack_left,
+            right: sack_right,
+        });
+        build_tcp_frame(
+            src_ip, src_port, dst_ip, dst_port, seq, ack, TCP_ACK, u16::MAX, opts, &[],
         )
     }
 
