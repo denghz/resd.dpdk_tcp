@@ -1,5 +1,7 @@
 use dpdk_net_sys as sys;
-use smallvec::{smallvec, SmallVec};
+#[cfg(not(feature = "obs-none"))]
+use smallvec::smallvec;
+use smallvec::SmallVec;
 use std::cell::{Cell, RefCell};
 use std::ffi::CString;
 use std::sync::Mutex;
@@ -2049,20 +2051,27 @@ impl Engine {
     /// the `EventQueue` under sustained pressure. `conn = 0` is the
     /// engine-level sentinel (handle 0 is reserved, never a live conn).
     pub(crate) fn check_and_emit_rx_enomem(&self) {
-        use std::sync::atomic::Ordering;
-        let now = self.counters.eth.rx_drop_nomem.load(Ordering::Relaxed);
-        let prev = self.rx_drop_nomem_prev.get();
-        if now > prev {
-            let mut ev = self.events.borrow_mut();
-            ev.push(
-                InternalEvent::Error {
-                    conn: 0, // engine-level; not bound to a conn.
-                    err: -libc::ENOMEM,
-                    emitted_ts_ns: crate::clock::now_ns(),
-                },
-                &self.counters,
-            );
-            self.rx_drop_nomem_prev.set(now);
+        // A10 D4 (G1+G2): under obs-none, skip the entire edge-triggered
+        // emission machinery. The `rx_drop_nomem_prev` latch stays at its
+        // previous value; a default-build A/B pair observes identical
+        // counter state but no Error event push.
+        #[cfg(not(feature = "obs-none"))]
+        {
+            use std::sync::atomic::Ordering;
+            let now = self.counters.eth.rx_drop_nomem.load(Ordering::Relaxed);
+            let prev = self.rx_drop_nomem_prev.get();
+            if now > prev {
+                let mut ev = self.events.borrow_mut();
+                ev.push(
+                    InternalEvent::Error {
+                        conn: 0, // engine-level; not bound to a conn.
+                        err: -libc::ENOMEM,
+                        emitted_ts_ns: crate::clock::now_ns(),
+                    },
+                    &self.counters,
+                );
+                self.rx_drop_nomem_prev.set(now);
+            }
         }
     }
 
@@ -2168,15 +2177,22 @@ impl Engine {
                     self.on_syn_retrans_fire(node.owner_handle, id);
                 }
                 crate::tcp_timer_wheel::TimerKind::ApiPublic => {
-                    let mut ev = self.events.borrow_mut();
-                    ev.push(
-                        InternalEvent::ApiTimer {
-                            timer_id: id,
-                            user_data: node.user_data,
-                            emitted_ts_ns: crate::clock::now_ns(),
-                        },
-                        &self.counters,
-                    );
+                    // A10 D4 (G1+G2): emit the ApiTimer event and capture
+                    // emitted_ts_ns only when observability is not
+                    // compiled out. The counter bump stays — it's not a
+                    // G-site, it's a slow-path fire count.
+                    #[cfg(not(feature = "obs-none"))]
+                    {
+                        let mut ev = self.events.borrow_mut();
+                        ev.push(
+                            InternalEvent::ApiTimer {
+                                timer_id: id,
+                                user_data: node.user_data,
+                                emitted_ts_ns: crate::clock::now_ns(),
+                            },
+                            &self.counters,
+                        );
+                    }
                     crate::counters::inc(&self.counters.tcp.tx_api_timers_fired);
                 }
             }
@@ -2311,6 +2327,12 @@ impl Engine {
         // forensic reconstruction. Borrows stay narrowly scoped so no
         // nested RefCell overlap with the subsequent backoff / re-arm
         // phases.
+        // A10 D4 (G1+G2): under obs-none, collapse the entire per-packet
+        // RTO-fire emission block away — the snapshot collection, the
+        // emitted_ts_ns capture, and every push. The `tcp_per_packet_events`
+        // runtime gate already makes this block cold by default; obs-none
+        // removes it at compile time for the zero-observability baseline.
+        #[cfg(not(feature = "obs-none"))]
         if self.cfg.tcp_per_packet_events {
             let emitted_ts_ns = crate::clock::now_ns();
             // A6.5 Task 4: SmallVec<[_; 4]> inline — the empty-lost_indexes
@@ -2499,6 +2521,9 @@ impl Engine {
             // `tcp_per_packet_events`. Order: TcpRetrans (the probe
             // segment) then TcpLossDetected{cause: Tlp}. Read seq +
             // xmit_count from the last entry after retransmit.
+            // A10 D4 (G1+G2): obs-none compiles the whole emission block
+            // away; the TLP retransmit itself already happened above.
+            #[cfg(not(feature = "obs-none"))]
             if self.cfg.tcp_per_packet_events {
                 let (seq, rtx_count) = {
                     let ft = self.flow_table.borrow();
@@ -2699,6 +2724,10 @@ impl Engine {
         // Ordered AFTER transition_conn so StateChange lands before
         // Error/Closed in the event queue, matching the ordering used
         // elsewhere when a transition accompanies terminal events.
+        // A10 D4 (G1+G2): compile the Error+Closed pair away under
+        // obs-none; the SYN-retrans timeout itself (flow-table mutation
+        // + flow removal below) still fires.
+        #[cfg(not(feature = "obs-none"))]
         {
             let emitted_ts_ns = crate::clock::now_ns();
             let mut ev = self.events.borrow_mut();
@@ -2779,6 +2808,10 @@ impl Engine {
                 }
             };
             self.transition_conn(h, TcpState::Closed);
+            // A10 D4 (G1+G2): skip the Closed event push + now_ns capture
+            // under obs-none. The flow-table mutation + counter bump below
+            // stay — removal + conn_close counter are not observability.
+            #[cfg(not(feature = "obs-none"))]
             self.events.borrow_mut().push(
                 InternalEvent::Closed {
                     conn: h,
@@ -3370,6 +3403,11 @@ impl Engine {
         // edge-per-refusal-cycle — a subsequent refusal restarts the
         // cycle. No payload on WRITABLE (ABI translator zeroes the
         // union); `emitted_ts_ns` sampled at push time per A5.5 §3.1.
+        // A10 D4 (G1+G2): obs-none removes the WRITABLE event emission
+        // entirely. The hysteresis bookkeeping (outcome flag, the
+        // send_refused_pending clear earlier in the pipeline) is a
+        // behavioural latch, not observability — it stays.
+        #[cfg(not(feature = "obs-none"))]
         if outcome.writable_hysteresis_fired {
             let emitted_ts_ns = crate::clock::now_ns();
             let mut ev = self.events.borrow_mut();
@@ -3403,6 +3441,10 @@ impl Engine {
             for i in &outcome.rack_lost_indexes {
                 self.retransmit(handle, *i as usize);
                 crate::counters::inc(&self.counters.tcp.tx_rack_loss);
+                // A10 D4 (G1+G2): obs-none compiles the per-packet
+                // TcpRetrans + TcpLossDetected pair away; the retransmit
+                // itself + tx_rack_loss counter remain.
+                #[cfg(not(feature = "obs-none"))]
                 if self.cfg.tcp_per_packet_events {
                     let (seq, rtx_count) = {
                         let ft = self.flow_table.borrow();
@@ -3617,6 +3659,9 @@ impl Engine {
         }
 
         if outcome.connected {
+            // A10 D4 (G1+G2): obs-none skips the Connected push + now_ns
+            // capture. conn_open counter stays — it's not observability.
+            #[cfg(not(feature = "obs-none"))]
             self.events.borrow_mut().push(
                 InternalEvent::Connected {
                     conn: handle,
@@ -3649,6 +3694,10 @@ impl Engine {
         }
 
         if outcome.closed {
+            // A10 D4 (G1+G2): obs-none skips the Closed push + now_ns.
+            // conn_close / conn_rst counters + flow-table removal remain
+            // — those are behavioural, not observability.
+            #[cfg(not(feature = "obs-none"))]
             self.events.borrow_mut().push(
                 InternalEvent::Closed {
                     conn: handle,
@@ -3735,6 +3784,9 @@ impl Engine {
         }
         drop(ft);
         inc(&self.counters.tcp.state_trans[from as usize][to as usize]);
+        // A10 D4 (G1+G2): obs-none compiles the StateChange push + now_ns
+        // capture away. The state_trans[][] counter matrix is kept.
+        #[cfg(not(feature = "obs-none"))]
         self.events.borrow_mut().push(
             InternalEvent::StateChange {
                 conn: handle,
@@ -4095,38 +4147,52 @@ impl Engine {
         // `seg_idx_start` is always 0 — scratch is cleared at the top
         // of this call and we only emit one event per deliver_readable
         // invocation.
-        let mut events = self.events.borrow_mut();
-        if seg_count > 0 {
-            // A6.6-7 Task 11: slow-path per-event counters. Batched
-            // `fetch_add(n_segs, Relaxed)` for the cumulative segs
-            // total — a single RMW even when N segments were
-            // emitted. `rx_multi_seg_events` is a conditional
-            // single-increment; both only fire when we actually push
-            // a READABLE event.
-            let n_segs = seg_count as u64;
-            self.counters
-                .tcp
-                .rx_iovec_segs_total
-                .fetch_add(n_segs, Ordering::Relaxed);
-            if n_segs > 1 {
+        // A10 D4 (G1+G2): obs-none compiles the READABLE push + now_ns
+        // + per-event observability counter bumps away. The pop loop
+        // above and the `readable_scratch_iovecs` materialization stay
+        // — those are the application-visible delivery primitives,
+        // not observability. The `recv_buf_delivered` bump is kept as
+        // a slow-path counter (cumulative byte throughput, not per-
+        // event observability).
+        #[cfg(not(feature = "obs-none"))]
+        {
+            let mut events = self.events.borrow_mut();
+            if seg_count > 0 {
+                // A6.6-7 Task 11: slow-path per-event counters. Batched
+                // `fetch_add(n_segs, Relaxed)` for the cumulative segs
+                // total — a single RMW even when N segments were
+                // emitted. `rx_multi_seg_events` is a conditional
+                // single-increment; both only fire when we actually push
+                // a READABLE event.
+                let n_segs = seg_count as u64;
                 self.counters
                     .tcp
-                    .rx_multi_seg_events
-                    .fetch_add(1, Ordering::Relaxed);
+                    .rx_iovec_segs_total
+                    .fetch_add(n_segs, Ordering::Relaxed);
+                if n_segs > 1 {
+                    self.counters
+                        .tcp
+                        .rx_multi_seg_events
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                events.push(
+                    InternalEvent::Readable {
+                        conn: handle,
+                        seg_idx_start: 0,
+                        seg_count,
+                        total_len,
+                        rx_hw_ts_ns,
+                        emitted_ts_ns: crate::clock::now_ns(),
+                    },
+                    &self.counters,
+                );
             }
-            events.push(
-                InternalEvent::Readable {
-                    conn: handle,
-                    seg_idx_start: 0,
-                    seg_count,
-                    total_len,
-                    rx_hw_ts_ns,
-                    emitted_ts_ns: crate::clock::now_ns(),
-                },
-                &self.counters,
-            );
+            drop(events);
         }
-        drop(events);
+        #[cfg(feature = "obs-none")]
+        {
+            let _ = (seg_count, total_len, rx_hw_ts_ns);
+        }
         drop(ft);
         add(&self.counters.tcp.recv_buf_delivered, total_delivered as u64);
     }
@@ -4814,16 +4880,22 @@ impl Engine {
                 ft.get(handle).map(|c| c.ts_enabled).unwrap_or(false)
             };
             if !ts_enabled {
-                let emitted_ts_ns = crate::clock::now_ns();
-                let mut ev = self.events.borrow_mut();
-                ev.push(
-                    InternalEvent::Error {
-                        conn: handle,
-                        err: -libc::EPERM,
-                        emitted_ts_ns,
-                    },
-                    &self.counters,
-                );
+                // A10 D4 (G1+G2): obs-none compiles away the EPERM event
+                // emission. The close_conn fall-through below still runs
+                // so the connection teardown semantics stay the same.
+                #[cfg(not(feature = "obs-none"))]
+                {
+                    let emitted_ts_ns = crate::clock::now_ns();
+                    let mut ev = self.events.borrow_mut();
+                    ev.push(
+                        InternalEvent::Error {
+                            conn: handle,
+                            err: -libc::EPERM,
+                            emitted_ts_ns,
+                        },
+                        &self.counters,
+                    );
+                }
             } else {
                 let mut ft = self.flow_table.borrow_mut();
                 if let Some(c) = ft.get_mut(handle) {
@@ -4967,16 +5039,22 @@ impl Engine {
             // A6 (spec §3.6 Site 2): surface retransmit ENOMEM as an
             // Error event per occurrence — callers don't see the inline
             // tx_drop_nomem bump unless they poll the counter.
-            let emitted_ts_ns = crate::clock::now_ns();
-            let mut ev = self.events.borrow_mut();
-            ev.push(
-                InternalEvent::Error {
-                    conn: conn_handle,
-                    err: -libc::ENOMEM,
-                    emitted_ts_ns,
-                },
-                &self.counters,
-            );
+            // A10 D4 (G1+G2): obs-none compiles the Error push + now_ns
+            // away; tx_drop_nomem counter still bumps so the pressure
+            // surfaces via counters per feedback_performance_first_flow_control.
+            #[cfg(not(feature = "obs-none"))]
+            {
+                let emitted_ts_ns = crate::clock::now_ns();
+                let mut ev = self.events.borrow_mut();
+                ev.push(
+                    InternalEvent::Error {
+                        conn: conn_handle,
+                        err: -libc::ENOMEM,
+                        emitted_ts_ns,
+                    },
+                    &self.counters,
+                );
+            }
             return;
         }
 
@@ -5075,16 +5153,20 @@ impl Engine {
             // A6 (spec §3.6 Site 2): Error event per occurrence on
             // retransmit ENOMEM path — header-build failure is treated
             // as no-memory for the caller-visible surface.
-            let emitted_ts_ns = crate::clock::now_ns();
-            let mut ev = self.events.borrow_mut();
-            ev.push(
-                InternalEvent::Error {
-                    conn: conn_handle,
-                    err: -libc::ENOMEM,
-                    emitted_ts_ns,
-                },
-                &self.counters,
-            );
+            // A10 D4 (G1+G2): obs-none skips the Error push.
+            #[cfg(not(feature = "obs-none"))]
+            {
+                let emitted_ts_ns = crate::clock::now_ns();
+                let mut ev = self.events.borrow_mut();
+                ev.push(
+                    InternalEvent::Error {
+                        conn: conn_handle,
+                        err: -libc::ENOMEM,
+                        emitted_ts_ns,
+                    },
+                    &self.counters,
+                );
+            }
             return;
         };
         let dst = unsafe { sys::shim_rte_pktmbuf_append(hdr_mbuf, hdr_n as u16) };
@@ -5093,16 +5175,20 @@ impl Engine {
             inc(&self.counters.eth.tx_drop_nomem);
             // A6 (spec §3.6 Site 2): Error event per occurrence on
             // retransmit ENOMEM path — append-null means no data-room.
-            let emitted_ts_ns = crate::clock::now_ns();
-            let mut ev = self.events.borrow_mut();
-            ev.push(
-                InternalEvent::Error {
-                    conn: conn_handle,
-                    err: -libc::ENOMEM,
-                    emitted_ts_ns,
-                },
-                &self.counters,
-            );
+            // A10 D4 (G1+G2): obs-none skips the Error push.
+            #[cfg(not(feature = "obs-none"))]
+            {
+                let emitted_ts_ns = crate::clock::now_ns();
+                let mut ev = self.events.borrow_mut();
+                ev.push(
+                    InternalEvent::Error {
+                        conn: conn_handle,
+                        err: -libc::ENOMEM,
+                        emitted_ts_ns,
+                    },
+                    &self.counters,
+                );
+            }
             return;
         }
         // Safety: `dst` points to `hdr_n` writable bytes inside hdr_mbuf.
@@ -5182,16 +5268,20 @@ impl Engine {
             // A6 (spec §3.6 Site 2): Error event per occurrence on
             // retransmit ENOMEM path — chain-fail surfaces as ENOMEM
             // to the caller alongside the tx_drop_nomem bump.
-            let emitted_ts_ns = crate::clock::now_ns();
-            let mut ev = self.events.borrow_mut();
-            ev.push(
-                InternalEvent::Error {
-                    conn: conn_handle,
-                    err: -libc::ENOMEM,
-                    emitted_ts_ns,
-                },
-                &self.counters,
-            );
+            // A10 D4 (G1+G2): obs-none skips the Error push.
+            #[cfg(not(feature = "obs-none"))]
+            {
+                let emitted_ts_ns = crate::clock::now_ns();
+                let mut ev = self.events.borrow_mut();
+                ev.push(
+                    InternalEvent::Error {
+                        conn: conn_handle,
+                        err: -libc::ENOMEM,
+                        emitted_ts_ns,
+                    },
+                    &self.counters,
+                );
+            }
             return;
         }
 

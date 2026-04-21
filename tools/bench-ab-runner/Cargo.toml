@@ -38,7 +38,9 @@ hw-offloads-all = ["dpdk-net-core/hw-offloads-all"]
 obs-byte-counters = ["dpdk-net-core/obs-byte-counters"]
 obs-poll-saturation = ["dpdk-net-core/obs-poll-saturation"]
 obs-all = ["dpdk-net-core/obs-all"]
-# TODO(T4): uncomment when T4 lands the `obs-none` meta-feature on
-# dpdk-net-core. The `bench-obs-overhead` harness needs this variant to
-# exercise the "no hot-path counters at all" A/B slot.
-# obs-none = ["dpdk-net-core/obs-none"]
+# A10 D4: obs-none pass-through. The `bench-obs-overhead` harness rebuilds
+# this crate with `--features obs-none` to exercise the zero-observability
+# A/B slot — the four G1-G4 emission sites compile away entirely, leaving
+# behavioural TCP paths intact so the throughput/latency delta is the pure
+# observability cost.
+obs-none = ["dpdk-net-core/obs-none"]

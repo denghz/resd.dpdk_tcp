@@ -678,29 +678,43 @@ pub unsafe extern "C" fn dpdk_net_conn_stats(
     conn: dpdk_net_conn_t,
     out: *mut dpdk_net_conn_stats_t,
 ) -> i32 {
-    if engine.is_null() || out.is_null() {
-        return -libc::EINVAL;
+    // A10 D4 (G4): under `obs-none`, this FFI getter returns `-ENOTSUP`
+    // and writes no data. The C ABI symbol stays present so the header
+    // (cbindgen-emitted `dpdk_net.h`) is unchanged; only the behaviour
+    // differs. Consumers that poll ConnStats for forensics will observe
+    // the unsupported return under the bench-obs-overhead baseline and
+    // know the feature is compiled out.
+    #[cfg(feature = "obs-none")]
+    {
+        let _ = (engine, conn, out);
+        return -libc::ENOTSUP;
     }
-    let Some(e) = engine_from_raw(engine) else {
-        return -libc::EINVAL;
-    };
-    let handle = conn as dpdk_net_core::flow_table::ConnHandle;
-    let send_buffer_bytes = e.send_buffer_bytes();
-    let ft = e.flow_table();
-    match ft.get_stats(handle, send_buffer_bytes) {
-        Some(s) => {
-            (*out).snd_una = s.snd_una;
-            (*out).snd_nxt = s.snd_nxt;
-            (*out).snd_wnd = s.snd_wnd;
-            (*out).send_buf_bytes_pending = s.send_buf_bytes_pending;
-            (*out).send_buf_bytes_free = s.send_buf_bytes_free;
-            (*out).srtt_us = s.srtt_us;
-            (*out).rttvar_us = s.rttvar_us;
-            (*out).min_rtt_us = s.min_rtt_us;
-            (*out).rto_us = s.rto_us;
-            0
+    #[cfg(not(feature = "obs-none"))]
+    {
+        if engine.is_null() || out.is_null() {
+            return -libc::EINVAL;
         }
-        None => -libc::ENOENT,
+        let Some(e) = engine_from_raw(engine) else {
+            return -libc::EINVAL;
+        };
+        let handle = conn as dpdk_net_core::flow_table::ConnHandle;
+        let send_buffer_bytes = e.send_buffer_bytes();
+        let ft = e.flow_table();
+        match ft.get_stats(handle, send_buffer_bytes) {
+            Some(s) => {
+                (*out).snd_una = s.snd_una;
+                (*out).snd_nxt = s.snd_nxt;
+                (*out).snd_wnd = s.snd_wnd;
+                (*out).send_buf_bytes_pending = s.send_buf_bytes_pending;
+                (*out).send_buf_bytes_free = s.send_buf_bytes_free;
+                (*out).srtt_us = s.srtt_us;
+                (*out).rttvar_us = s.rttvar_us;
+                (*out).min_rtt_us = s.min_rtt_us;
+                (*out).rto_us = s.rto_us;
+                0
+            }
+            None => -libc::ENOENT,
+        }
     }
 }
 
@@ -1303,6 +1317,12 @@ mod tests {
     // are covered by dpdk-net-core's flow_table::get_stats test at the
     // projection layer. Here we pin the null-guard contract so null
     // engine or null out cannot dereference into the engine box.
+    //
+    // A10 D4 (G4): under `obs-none`, the getter returns `-ENOTSUP`
+    // unconditionally — the null-arg guards fire only in the default
+    // path. Skip these two tests in that feature config; the obs-none
+    // return is covered by `conn_stats_obs_none_returns_enotsup` below.
+    #[cfg(not(feature = "obs-none"))]
     #[test]
     fn conn_stats_null_engine_returns_einval() {
         let mut out = dpdk_net_conn_stats_t::default();
@@ -1310,6 +1330,7 @@ mod tests {
         assert_eq!(rc, -libc::EINVAL);
     }
 
+    #[cfg(not(feature = "obs-none"))]
     #[test]
     fn conn_stats_null_out_returns_einval_before_engine_deref() {
         // The null-out check must fire BEFORE any engine dereference, so
@@ -1318,6 +1339,22 @@ mod tests {
         let fake_engine = std::ptr::dangling_mut::<dpdk_net_engine>();
         let rc = unsafe { dpdk_net_conn_stats(fake_engine, 0, std::ptr::null_mut()) };
         assert_eq!(rc, -libc::EINVAL);
+    }
+
+    /// A10 D4 (G4): under `obs-none`, the ConnStats FFI getter returns
+    /// `-ENOTSUP` unconditionally (arg checks are bypassed). Default
+    /// builds behave per RFC 793 / spec §5.3 — this test only compiles
+    /// under `--features obs-none`.
+    #[cfg(feature = "obs-none")]
+    #[test]
+    fn conn_stats_obs_none_returns_enotsup() {
+        let mut out = dpdk_net_conn_stats_t::default();
+        let rc = unsafe { dpdk_net_conn_stats(std::ptr::null_mut(), 0, &mut out) };
+        assert_eq!(
+            rc,
+            -libc::ENOTSUP,
+            "obs-none must short-circuit dpdk_net_conn_stats with ENOTSUP"
+        );
     }
 
     // A6 Task 18: C ABI null-argument rejection for the RTT histogram
