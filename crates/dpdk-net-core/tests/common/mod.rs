@@ -171,6 +171,44 @@ pub fn make_test_engine() -> Option<dpdk_net_core::engine::Engine> {
 // an LRO-merged coalesce-on-NIC shape.
 // ─────────────────────────────────────────────────────────────────────────
 
+/// A9 Task 6 smoke helper: build a minimal Ethernet+IPv4+ICMP echo-request
+/// frame addressed to the engine. Same shape as `inject_rx_frame_smoke.rs`
+/// — dst=our_mac, src=synthetic peer, ethertype=0x0800, IPv4/ICMP with a
+/// valid IPv4 checksum so the L3 decode accepts the header. Used by the
+/// `fault_injector_smoke` tests as a cheap "any well-formed frame" payload
+/// for drop/pass assertions (the ICMP body is discarded after rx_bytes is
+/// bumped; the counter of interest is `eth.rx_bytes` / `fault_injector.drops`).
+#[cfg(feature = "test-inject")]
+pub fn build_icmp_echo_frame(engine: &dpdk_net_core::engine::Engine) -> Vec<u8> {
+    let our_mac = engine.our_mac();
+    let peer_mac: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x99];
+    let dst_ip_be = engine.our_ip().to_be_bytes();
+
+    let mut frame = Vec::with_capacity(14 + 20 + 8);
+    // Ethernet II: dst=our_mac, src=peer_mac, ethertype=0x0800 (IPv4)
+    frame.extend_from_slice(&our_mac);
+    frame.extend_from_slice(&peer_mac);
+    frame.extend_from_slice(&0x0800u16.to_be_bytes());
+    // IPv4 header
+    frame.push(0x45); // version=4, ihl=5
+    frame.push(0x00); // tos
+    frame.extend_from_slice(&(20u16 + 8u16).to_be_bytes()); // total_len
+    frame.extend_from_slice(&0u16.to_be_bytes()); // id
+    frame.extend_from_slice(&0u16.to_be_bytes()); // flags+frag
+    frame.push(64); // ttl
+    frame.push(1); // proto = ICMP
+    frame.extend_from_slice(&0u16.to_be_bytes()); // cksum placeholder
+    frame.extend_from_slice(&[10, 0, 0, 2]); // source IP (arbitrary peer)
+    frame.extend_from_slice(&dst_ip_be);
+    // Recompute IPv4 cksum so the engine's IP decode accepts the header.
+    let cksum = dpdk_net_core::l3_ip::internet_checksum(&[&frame[14..14 + 20]]);
+    frame[14 + 10] = (cksum >> 8) as u8;
+    frame[14 + 11] = (cksum & 0xff) as u8;
+    // ICMP echo request body (type=8, code=0, rest zeroed).
+    frame.extend_from_slice(&[8, 0, 0, 0, 0, 0, 0, 0]);
+    frame
+}
+
 /// Build a synthetic Ethernet+IPv4+TCP-SYN frame header + `payload` bytes.
 /// Returns the assembled bytes ready to feed `inject_rx_chain`'s first
 /// segment. The destination MAC + IP match the engine's configured

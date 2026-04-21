@@ -200,19 +200,133 @@ impl FaultInjector {
 
     /// Middleware entry. Returns the list of mbufs to forward onto the L2
     /// decoder (0..=N items — a drop returns empty, a dup returns two, the
-    /// reorder path returns 0 or 2 depending on ring state).
+    /// reorder path may return 0 or 2 depending on ring state).
     ///
-    /// STUB: Task 5 only scaffolds; Task 6 implements the body.
+    /// Ordering of the four actions is deliberate:
+    ///   1. **Drop** first — if the mbuf is dropped, no other mutation
+    ///      applies and the pool frees the mbuf immediately. Cheapest
+    ///      path in the common case (rate typically ≤1%).
+    ///   2. **Corrupt** before dup — so a duplicated mbuf carries the
+    ///      same corruption as the original, matching the semantic of
+    ///      a retransmit that's also flipped a byte.
+    ///   3. **Dup** — bumps refcount +1 and pushes the same mbuf twice
+    ///      into `out`; the downstream `dispatch_one_rx_mbuf` loop calls
+    ///      `rte_pktmbuf_free` once per emission, so refcount balances.
+    ///   4. **Reorder** last — holds the just-produced tail mbuf in a
+    ///      bounded FIFO ring (depth 16). Ring not full → emit nothing
+    ///      this call; ring full → evict the oldest held mbuf and emit
+    ///      it in place of `held`. The ring ceiling bounds memory use
+    ///      when `reorder_rate` is pathologically close to 1.0.
     pub fn process(
         &mut self,
-        _mbuf: NonNull<rte_mbuf>,
-        _counters: &crate::counters::FaultInjectorCounters,
+        mbuf: NonNull<rte_mbuf>,
+        counters: &crate::counters::FaultInjectorCounters,
     ) -> smallvec::SmallVec<[NonNull<rte_mbuf>; 4]> {
-        // Silence unused-field warnings on the scaffolded-but-unused state
-        // without disabling the lint globally. Task 6 deletes these lines.
-        let _ = &self.rng;
-        let _ = &self.reorder_ring;
-        unimplemented!("Task 6: FaultInjector::process body")
+        use core::sync::atomic::Ordering;
+        use dpdk_net_sys as sys;
+        use rand::Rng;
+        let mut out: smallvec::SmallVec<[NonNull<rte_mbuf>; 4]> =
+            smallvec::SmallVec::new();
+
+        // 1. Drop — frees the mbuf and emits nothing.
+        if self.cfg.drop_rate > 0.0 && self.rng.gen::<f32>() < self.cfg.drop_rate {
+            // SAFETY: `mbuf` is a live mbuf we took ownership of from the
+            // caller. `shim_rte_pktmbuf_free` returns it to its pool (and
+            // walks `next` for chain heads). After this the pointer is
+            // dangling; we do not emit it.
+            unsafe {
+                sys::shim_rte_pktmbuf_free(mbuf.as_ptr());
+            }
+            counters.drops.fetch_add(1, Ordering::Relaxed);
+            return out;
+        }
+
+        // 2. Corrupt — single-byte XOR at a random in-bounds offset,
+        //    in-place on the head segment's data room. Applied BEFORE
+        //    the dup branch so a duplicated mbuf carries the same flip.
+        //    `shim_rte_pktmbuf_data` / `shim_rte_pktmbuf_data_len` are
+        //    the opaque-mbuf-safe accessors (bindgen cannot deref the
+        //    packed anonymous unions on rte_mbuf).
+        if self.cfg.corrupt_rate > 0.0
+            && self.rng.gen::<f32>() < self.cfg.corrupt_rate
+        {
+            // SAFETY: `mbuf` is a live mbuf. The shim accessors are
+            // `static inline` wrappers around DPDK's `rte_pktmbuf_mtod`
+            // / `rte_pktmbuf_data_len`, returning a pointer into the
+            // mbuf's data room and its populated byte count. The XOR
+            // write is within `[0, data_len)` by construction, so the
+            // store stays within the same allocation the caller just
+            // read from.
+            let data_len = unsafe {
+                sys::shim_rte_pktmbuf_data_len(mbuf.as_ptr())
+            } as usize;
+            if data_len > 0 {
+                let idx = self.rng.gen_range(0..data_len);
+                // `max(1)` so the XOR always flips at least one bit —
+                // a `0u8` XOR would be a no-op that still bumped the
+                // corrupts counter, violating the counter's meaning.
+                let xor: u8 = self.rng.gen::<u8>().max(1);
+                let data_ptr = unsafe {
+                    sys::shim_rte_pktmbuf_data(mbuf.as_ptr()) as *mut u8
+                };
+                unsafe {
+                    *data_ptr.add(idx) ^= xor;
+                }
+            }
+            counters.corrupts.fetch_add(1, Ordering::Relaxed);
+        }
+
+        out.push(mbuf);
+
+        // 3. Duplicate — emit the same mbuf twice, bumping refcount on
+        //    the second emission so downstream `rte_pktmbuf_free` calls
+        //    balance. `shim_rte_mbuf_refcnt_update(m, +1)` wraps DPDK's
+        //    `rte_mbuf_refcnt_update` (same primitive reassembly /
+        //    tcp_output use for held-by-reassembly mbufs).
+        if self.cfg.dup_rate > 0.0 && self.rng.gen::<f32>() < self.cfg.dup_rate {
+            // SAFETY: `mbuf` is still a live mbuf we own. The refcount
+            // bump is a lock-xadd on the mbuf's refcnt field; the shim
+            // dereffs the opaque struct internally.
+            unsafe {
+                sys::shim_rte_mbuf_refcnt_update(mbuf.as_ptr(), 1);
+            }
+            out.push(mbuf);
+            counters.dups.fetch_add(1, Ordering::Relaxed);
+        }
+
+        // 4. Reorder — hold the tail mbuf (the one we just pushed) in
+        //    the depth-16 ring; emit the oldest held mbuf instead when
+        //    the ring is full (FIFO eviction). Lazy-init the ring on
+        //    first reorder decision so no-reorder configurations carry
+        //    no allocated storage.
+        //
+        //    Panic-firewall: `out.pop()` yields `Option<NonNull<_>>`
+        //    and the `if let Some(held)` shape means a surprise empty
+        //    `out` silently degrades to "do nothing this call" instead
+        //    of panicking on an FFI-reachable path (A6.7).
+        if self.cfg.reorder_rate > 0.0
+            && self.rng.gen::<f32>() < self.cfg.reorder_rate
+        {
+            if let Some(held) = out.pop() {
+                let ring = self
+                    .reorder_ring
+                    .get_or_insert_with(arrayvec::ArrayVec::new);
+                if ring.is_full() {
+                    // Pop oldest, emit it in place of the new mbuf.
+                    let evict = ring.remove(0);
+                    ring.push(held);
+                    out.push(evict);
+                } else {
+                    // Ring not full: held mbuf stays in ring until a
+                    // future call evicts it. This call emits nothing
+                    // for that mbuf (or just the dup, if dup fired).
+                    ring.push(held);
+                }
+                counters.reorders.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        out
     }
 }
 

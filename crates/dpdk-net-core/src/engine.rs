@@ -546,6 +546,24 @@ pub struct Engine {
     /// the `DPDK_NET_TEST_INJECT_POOL_SIZE` environment variable.
     #[cfg(feature = "test-inject")]
     test_inject_mempool: std::cell::OnceCell<crate::mempool::Mempool>,
+
+    /// A9 Task 6: optional post-PMD-RX / pre-L2 fault-injector middleware.
+    /// `None` when `DPDK_NET_FAULT_INJECTOR` is unset / empty / invalid —
+    /// `dispatch_one_rx_mbuf` then takes the zero-cost straight-through
+    /// path. `Some(..)` when the env var parsed cleanly at engine-create;
+    /// the `process()` call applies drop / dup / reorder / corrupt per
+    /// the configured rates.
+    ///
+    /// `RefCell` because every RX dispatch holds `&self` (the FFI
+    /// `dpdk_net_poll` entry is `&Engine`) but `FaultInjector::process`
+    /// mutates an internal RNG + reorder ring. The engine is single-
+    /// lcore / `!Sync` so the RefCell is borrowed exactly once per
+    /// dispatch — no nested-borrow risk.
+    ///
+    /// Feature-gated so release builds with the feature off carry zero
+    /// of it: no field, no RefCell storage, no `arrayvec`/`rand` deps.
+    #[cfg(feature = "fault-injector")]
+    fault_injector: std::cell::RefCell<Option<crate::fault_injector::FaultInjector>>,
 }
 
 /// A4: map an `Outcome` to per-segment `TcpCounters` bumps. Pure slow-path
@@ -1090,6 +1108,27 @@ impl Engine {
             rtt_histogram_edges,
             #[cfg(feature = "test-inject")]
             test_inject_mempool: std::cell::OnceCell::new(),
+            // A9 Task 6: parse `DPDK_NET_FAULT_INJECTOR` at engine-create.
+            // Unset / empty / invalid → `None`, and `dispatch_one_rx_mbuf`
+            // takes the zero-cost pass-through. Valid spec → construct a
+            // `FaultInjector` with the parsed rates. When `cfg.seed == 0`
+            // we fall back to `clock::now_ns()` so two engines created in
+            // the same process get distinct reproducible streams without
+            // anyone touching the env var (boot-unique via the TSC read
+            // at construction time, mixed with the port id to distinguish
+            // multi-port processes). The IssGen module owns the
+            // `read_boot_id` reader but its output is wrapped inside the
+            // private `IssGen` struct and not exposed; TSC-derived seed
+            // is adequate for fault-injection PRNG (non-cryptographic).
+            #[cfg(feature = "fault-injector")]
+            fault_injector: std::cell::RefCell::new(
+                crate::fault_injector::FaultConfig::from_env().map(|fc| {
+                    let boot_seed = crate::clock::now_ns()
+                        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                        .wrapping_add(cfg.port_id as u64);
+                    crate::fault_injector::FaultInjector::new(fc, boot_seed)
+                }),
+            ),
             cfg,
         })
     }
@@ -2783,13 +2822,55 @@ impl Engine {
     ///
     /// Extracted from `poll_once`'s per-mbuf loop so the `test-inject`
     /// hook (`inject_rx_frame` / `inject_rx_chain`) can share the
-    /// identical path. Behaviour-preserving — the pre-extraction
-    /// inline sequence is reproduced verbatim here.
+    /// identical path.
     ///
-    /// Future A9 Task 6: the FaultInjector intercept lands at the
-    /// TOP of this function — see phase-a9 plan §6.
+    /// A9 Task 6: when the `fault-injector` feature is on AND a
+    /// `FaultInjector` was constructed at engine-create (env var
+    /// `DPDK_NET_FAULT_INJECTOR` parsed), the mbuf is handed to the
+    /// middleware first. The middleware returns 0..=N mbufs to
+    /// dispatch; each is fed through the unchanged per-real-mbuf
+    /// decode path (`dispatch_one_real_mbuf`). When the feature is
+    /// off OR the injector is `None`, exactly one dispatch happens
+    /// against the input mbuf — bit-for-bit identical to the
+    /// pre-Task 6 behaviour.
     #[inline]
     fn dispatch_one_rx_mbuf(
+        &self,
+        mbuf: std::ptr::NonNull<sys::rte_mbuf>,
+    ) -> u32 {
+        // Build the list of mbufs to dispatch. Under the feature-off
+        // or injector-None path, this is always exactly `[mbuf]` and
+        // LLVM elides the SmallVec into a direct tail-call to
+        // `dispatch_one_real_mbuf`.
+        #[cfg(feature = "fault-injector")]
+        let frames: smallvec::SmallVec<[std::ptr::NonNull<sys::rte_mbuf>; 4]> = {
+            let mut fi_opt = self.fault_injector.borrow_mut();
+            if let Some(fi) = fi_opt.as_mut() {
+                fi.process(mbuf, &self.counters.fault_injector)
+            } else {
+                smallvec::smallvec![mbuf]
+            }
+        };
+        #[cfg(not(feature = "fault-injector"))]
+        let frames: smallvec::SmallVec<[std::ptr::NonNull<sys::rte_mbuf>; 4]> =
+            smallvec::smallvec![mbuf];
+
+        let mut total_bytes: u32 = 0;
+        for m in frames {
+            total_bytes = total_bytes.saturating_add(self.dispatch_one_real_mbuf(m));
+        }
+        total_bytes
+    }
+
+    /// Per-mbuf decode body — the pre-Task-6 inline sequence of
+    /// `dispatch_one_rx_mbuf`, preserved verbatim. Split out so the
+    /// Task 6 outer dispatch can loop over the FaultInjector's 0..=N
+    /// output mbufs without duplicating the decode logic.
+    ///
+    /// Always frees the mbuf before returning — the caller MUST NOT
+    /// touch the pointer afterwards.
+    #[inline]
+    fn dispatch_one_real_mbuf(
         &self,
         mbuf: std::ptr::NonNull<sys::rte_mbuf>,
     ) -> u32 {
