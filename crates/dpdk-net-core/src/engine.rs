@@ -1603,6 +1603,10 @@ impl Engine {
             {
                 // A7 Task 4: intercept TX — copy frame bytes into shim queue.
                 let m = pkts[0];
+                debug_assert_eq!(
+                    unsafe { sys::shim_rte_pktmbuf_nb_segs(m) } as u32, 1,
+                    "A7 TX intercept: tx_frame expects single-segment mbuf"
+                );
                 let data = unsafe { sys::shim_rte_pktmbuf_data(m) } as *const u8;
                 let len = unsafe { sys::shim_rte_pktmbuf_data_len(m) } as usize;
                 let mut bytes = Vec::with_capacity(len);
@@ -1692,6 +1696,10 @@ impl Engine {
             {
                 // A7 Task 4: intercept TX — copy frame bytes into shim queue.
                 let m = pkts[0];
+                debug_assert_eq!(
+                    unsafe { sys::shim_rte_pktmbuf_nb_segs(m) } as u32, 1,
+                    "A7 TX intercept: tx_tcp_frame expects single-segment mbuf"
+                );
                 let data = unsafe { sys::shim_rte_pktmbuf_data(m) } as *const u8;
                 let len = unsafe { sys::shim_rte_pktmbuf_data_len(m) } as usize;
                 let mut bytes = Vec::with_capacity(len);
@@ -1757,6 +1765,10 @@ impl Engine {
             {
                 // A7 Task 4: intercept TX — copy frame bytes into shim queue.
                 let m = pkts[0];
+                debug_assert_eq!(
+                    unsafe { sys::shim_rte_pktmbuf_nb_segs(m) } as u32, 1,
+                    "A7 TX intercept: tx_data_frame expects single-segment mbuf"
+                );
                 let data = unsafe { sys::shim_rte_pktmbuf_data(m) } as *const u8;
                 let len = unsafe { sys::shim_rte_pktmbuf_data_len(m) } as usize;
                 let mut bytes = Vec::with_capacity(len);
@@ -2089,18 +2101,48 @@ impl Engine {
             #[cfg(feature = "test-server")]
             {
                 // A7 Task 4: intercept TX burst — copy every frame's bytes.
+                // A7 Task 4 fixup: the data-segment TX path can enqueue
+                // multi-seg mbuf chains (header mbuf + retained data mbuf
+                // under the retransmit pre-chain pattern). Walk the chain
+                // via `shim_rte_pktmbuf_next`, concatenating each segment's
+                // `data_len` bytes into one `Vec<u8>` sized to `pkt_len`,
+                // so intercepted frames reflect the full on-wire payload
+                // (not just segment 0). Mirrors the multi-seg RX walk in
+                // tcp_input.rs (A6.6 Task 5).
                 let nb = ring.len();
                 for i in 0..nb {
-                    let m = ring[i].as_ptr();
-                    let data = unsafe { sys::shim_rte_pktmbuf_data(m) } as *const u8;
-                    let len = unsafe { sys::shim_rte_pktmbuf_data_len(m) } as usize;
-                    let mut bytes = Vec::with_capacity(len);
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(data, bytes.as_mut_ptr(), len);
-                        bytes.set_len(len);
+                    let head = ring[i].as_ptr();
+                    let total = unsafe { sys::shim_rte_pktmbuf_pkt_len(head) } as usize;
+                    let mut bytes: Vec<u8> = Vec::with_capacity(total);
+                    let mut cur = head;
+                    while !cur.is_null() {
+                        let seg_ptr = unsafe { sys::shim_rte_pktmbuf_data(cur) } as *const u8;
+                        let seg_len = unsafe { sys::shim_rte_pktmbuf_data_len(cur) } as usize;
+                        let dst_off = bytes.len();
+                        // Safety: capacity == pkt_len == sum(data_len) across
+                        // the chain (DPDK invariant maintained by
+                        // rte_pktmbuf_chain + the allocator), so dst_off +
+                        // seg_len never exceeds capacity. `seg_ptr` points to
+                        // the live segment's data room for `seg_len` bytes.
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                seg_ptr,
+                                bytes.as_mut_ptr().add(dst_off),
+                                seg_len,
+                            );
+                            bytes.set_len(dst_off + seg_len);
+                        }
+                        cur = unsafe { sys::shim_rte_pktmbuf_next(cur) };
                     }
+                    debug_assert_eq!(
+                        bytes.len(), total,
+                        "A7 TX intercept: segment walk covered less than pkt_len"
+                    );
                     crate::test_tx_intercept::push_tx_frame(bytes);
-                    unsafe { sys::shim_rte_pktmbuf_free(m) };
+                    // Frees the whole chain (DPDK rte_pktmbuf_free walks
+                    // `next` internally, decrementing each segment's
+                    // refcount).
+                    unsafe { sys::shim_rte_pktmbuf_free(head) };
                 }
                 nb
             }
