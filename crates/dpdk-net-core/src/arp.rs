@@ -106,9 +106,17 @@ pub enum ArpAction {
 ///
 /// Policy:
 /// * Any REQUEST whose `target_ip == local_ip` (and `local_ip != 0`)
-///   gets a reply.
+///   gets a reply. This branch short-circuits — even if the requester
+///   is the gateway, we just answer and move on; the gateway's
+///   subsequent cache update will not flow through the `UpdateGatewayMac`
+///   path on this frame. That's fine: gateway MAC learning is already
+///   handled on REPLY and gratuitous-REQUEST paths, and a unicast
+///   REQUEST from the gateway is an uncommon trigger.
 /// * Any REPLY whose `sender_ip == gateway_ip` updates our learned
-///   gateway MAC (RFC 826 resolver response).
+///   gateway MAC (RFC 826 resolver response). We intentionally accept
+///   overheard replies targeted at other hosts too — if the gateway
+///   answered someone else's ARP, the sender_mac is still authoritative
+///   for `gateway_ip`.
 /// * A gratuitous REQUEST (sender_ip == target_ip == gateway_ip) also
 ///   updates the learned MAC. Useful when the gateway failover emits a
 ///   gratuitous announce.
@@ -184,6 +192,7 @@ pub fn build_arp_request(
         [0u8; 6], // target MAC unknown — that's what we're asking
         target_ip,
     );
+    // Pad to Ethernet minimum to avoid runt-frame drops at the receiver.
     out[14 + ARP_HDR_LEN..ARP_FRAME_LEN].fill(0);
     Some(ARP_FRAME_LEN)
 }
@@ -297,6 +306,8 @@ const RTF_GATEWAY: u32 = 0x0002;
 /// `iface_filter == None` accepts any interface.
 pub(crate) fn parse_proc_route_line(line: &str, iface_filter: Option<&str>) -> Option<u32> {
     // Columns: Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT
+    // We read through Mask (field 8) and ignore MTU/Window/IRTT — they
+    // don't affect whether this is a usable default-route gateway.
     let mut fields = line.split_whitespace();
     let iface = fields.next()?;
     let dest = fields.next()?;
@@ -602,6 +613,26 @@ mod tests {
             sender_ip: GATEWAY_IP,
             target_mac: [0u8; 6],
             target_ip: GATEWAY_IP,
+        };
+        assert_eq!(
+            super::classify_arp(&pkt, LOCAL_IP, GATEWAY_IP),
+            super::ArpAction::UpdateGatewayMac(PEER_MAC)
+        );
+    }
+
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
+    #[test]
+    fn classify_arp_overheard_reply_from_gateway_still_updates() {
+        // Gateway replies to some other host, but we see the frame on
+        // the shared L2 segment. RFC 826 permits learning from this
+        // overheard reply: the sender_mac is authoritative for the
+        // gateway IP regardless of who the reply was addressed to.
+        let pkt = ArpPacket {
+            op: ARP_OP_REPLY,
+            sender_mac: PEER_MAC,
+            sender_ip: GATEWAY_IP,
+            target_mac: [9, 9, 9, 9, 9, 9],
+            target_ip: 0x0a_00_00_07,
         };
         assert_eq!(
             super::classify_arp(&pkt, LOCAL_IP, GATEWAY_IP),

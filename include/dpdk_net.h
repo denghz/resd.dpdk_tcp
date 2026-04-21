@@ -667,10 +667,9 @@ int32_t dpdk_net_resolve_gateway_mac(uint32_t gateway_ip_host_order, uint8_t *ou
  *
  * Returns:
  *   0 — success, `*out_ip` populated.
- *  -EINVAL — `out_ip` is NULL.
+ *  -EINVAL — `out_ip` is NULL, or `iface` is not valid UTF-8.
  *  -ENOENT — no default route matched (including unknown iface).
- *  -EIO   — `/proc/net/route` could not be read, or `iface` was not
- *           valid UTF-8.
+ *  -EIO   — `/proc/net/route` could not be read.
  */
 int32_t dpdk_net_read_default_gateway_ip(const char *iface, uint32_t *out_ip);
 

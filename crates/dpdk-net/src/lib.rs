@@ -779,10 +779,9 @@ pub unsafe extern "C" fn dpdk_net_resolve_gateway_mac(
 ///
 /// Returns:
 ///   0 — success, `*out_ip` populated.
-///  -EINVAL — `out_ip` is NULL.
+///  -EINVAL — `out_ip` is NULL, or `iface` is not valid UTF-8.
 ///  -ENOENT — no default route matched (including unknown iface).
-///  -EIO   — `/proc/net/route` could not be read, or `iface` was not
-///           valid UTF-8.
+///  -EIO   — `/proc/net/route` could not be read.
 #[no_mangle]
 pub unsafe extern "C" fn dpdk_net_read_default_gateway_ip(
     iface: *const libc::c_char,
@@ -796,7 +795,10 @@ pub unsafe extern "C" fn dpdk_net_read_default_gateway_ip(
     } else {
         match CStr::from_ptr(iface).to_str() {
             Ok(s) => Some(s),
-            Err(_) => return -libc::EIO,
+            // Malformed caller input, not a /proc read failure — keep
+            // this distinct from -EIO so the C caller can tell the two
+            // cases apart.
+            Err(_) => return -libc::EINVAL,
         }
     };
     match dpdk_net_core::arp::read_default_gateway_ip(iface_str) {
