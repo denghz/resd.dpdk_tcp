@@ -132,6 +132,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "bench-micro"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bench-common",
+ "chrono",
+ "criterion",
+ "csv",
+ "dpdk-net",
+ "dpdk-net-core",
+ "dpdk-net-sys",
+ "hostname",
+ "serde_json",
+ "uuid",
+ "walkdir",
+]
+
+[[package]]
 name = "bench-rx-zero-copy"
 version = "0.1.0"
 dependencies = [
