@@ -2,6 +2,9 @@
 
 pub mod api;
 
+#[cfg(feature = "test-panic-entry")]
+pub mod test_only;
+
 use api::*;
 use dpdk_net_core::clock;
 use dpdk_net_core::counters::Counters;
