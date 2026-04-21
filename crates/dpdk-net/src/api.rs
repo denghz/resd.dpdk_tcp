@@ -64,6 +64,16 @@ pub struct dpdk_net_engine_config_t {
     /// disabling causes severe performance degradation (ENA README
     /// §5.1 caution). 0 here specifically means "use PMD default".
     pub ena_miss_txc_to_sec: u8,
+    /// A6.6-7 Task 10: RX mempool capacity in mbufs. `0` = compute
+    /// default at `dpdk_net_engine_create` using:
+    ///   max(4 * rx_ring_size,
+    ///       2 * max_connections * ceil(recv_buffer_bytes / mbuf_data_room) + 4096)
+    /// Assumes `mbuf_data_room == 2048` bytes (DPDK default); jumbo-frame
+    /// deployments either raise `mbuf_data_room` or set this explicitly.
+    /// The resolved value is retrievable post-create via
+    /// `dpdk_net_rx_mempool_size()`. Non-zero caller value is used
+    /// verbatim (no floor clamp).
+    pub rx_mempool_size: u32,
 }
 
 #[repr(C)]
@@ -122,11 +132,44 @@ pub enum dpdk_net_event_kind_t {
     DPDK_NET_EVT_TCP_STATE_CHANGE = 9,
 }
 
+/// Scatter-gather view over a received in-order byte range.
+/// `base` points into a mempool-backed rte_mbuf data area; the pointer is
+/// only valid until the next `dpdk_net_poll` on the same engine.
+///
+/// ABI: 16 bytes on 64-bit targets (x86_64, ARM64 Graviton). Not 32-bit
+/// compatible — Stage 1 targets are 64-bit only.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct dpdk_net_iovec_t {
+    pub base: *const u8,
+    pub len: u32,
+    pub _pad: u32,
+}
+
+// Layout-compat assertion: the FFI struct and the core-crate struct MUST
+// agree on size, alignment, and field offsets. Any drift breaks the ABI.
+const _: () = {
+    use dpdk_net_core::iovec::DpdkNetIovec;
+    assert!(std::mem::size_of::<dpdk_net_iovec_t>() == std::mem::size_of::<DpdkNetIovec>());
+    assert!(std::mem::align_of::<dpdk_net_iovec_t>() == std::mem::align_of::<DpdkNetIovec>());
+};
+
+/// READABLE event payload. `segs` points at an engine-owned array of
+/// `dpdk_net_iovec_t` with `n_segs` entries. Multi-segment when chained
+/// mbufs were received (LRO / jumbo / IP-defragmented); single-segment
+/// for standard MTU packets. `total_len = Σ segs[i].len`.
+///
+/// Lifetime: `segs` and every `segs[i].base` pointer are only valid
+/// until the next `dpdk_net_poll` on the same engine. The engine reuses
+/// per-conn scratch for the array; the backing mbufs are refcount-
+/// pinned in the connection's `delivered_segments` and released at the
+/// next poll iteration.
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct dpdk_net_event_readable_t {
-    pub data: *const u8,
-    pub data_len: u32,
+    pub segs: *const dpdk_net_iovec_t,
+    pub n_segs: u32,
+    pub total_len: u32,
 }
 
 #[repr(C)]
@@ -233,12 +276,17 @@ const _: () = {
 
 /// Counters struct — exposed to application via dpdk_net_counters().
 /// Fields are plain u64 on the C ABI for clean cbindgen emission, but
-/// internally the stack writes them as AtomicU64 (Relaxed). AtomicU64
-/// has identical size and alignment as u64 on x86_64 so pointer-casting
-/// between dpdk_net_core::Counters and dpdk_net_counters_t is sound.
-/// C/C++ readers should use `__atomic_load_n(&field, __ATOMIC_RELAXED)`
-/// (or `std::atomic_ref<uint64_t>`) for strictly correct reads; on x86_64
-/// this compiles to a plain `mov` so there's no runtime cost.
+/// internally the stack writes them as AtomicU64 (Relaxed).
+///
+/// Cross-platform atomic-load contract: C/C++ readers MUST use the
+/// helper in `dpdk_net_counters_load.h`:
+///
+///     uint64_t rx = dpdk_net_load_u64(&counters->eth.rx_pkts);
+///
+/// Plain dereference is only atomic on x86_64 with aligned uint64_t.
+/// On ARM32 a plain read may tear; ARM64 has weaker ordering semantics
+/// than x86. The helper compiles to a plain mov on x86_64 (zero cost)
+/// and the correct LDREXD/LDR sequence on ARM.
 #[repr(C, align(64))]
 pub struct dpdk_net_eth_counters_t {
     pub rx_pkts: u64,
@@ -380,6 +428,12 @@ pub struct dpdk_net_tcp_counters_t {
     pub ts_recent_expired: u64,
     pub tx_flush_bursts: u64,
     pub tx_flush_batched_pkts: u64,
+    // A6.6-7 Task 11 — slow-path RX zero-copy event-shape counters.
+    // Declaration order must match `dpdk_net_core::counters::TcpCounters`
+    // exactly. Field docs live on the core struct (see counters.rs).
+    pub rx_iovec_segs_total: u64,
+    pub rx_multi_seg_events: u64,
+    pub rx_partial_read_splits: u64,
 }
 #[repr(C, align(64))]
 pub struct dpdk_net_poll_counters_t {

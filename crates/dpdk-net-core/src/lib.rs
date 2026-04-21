@@ -18,6 +18,7 @@ pub mod l3_ip;
 pub mod llq_verify;
 pub mod wc_verify;
 pub mod ena_xstats;
+pub mod iovec;
 pub mod mempool;
 pub mod rtt_histogram;
 pub mod siphash24;

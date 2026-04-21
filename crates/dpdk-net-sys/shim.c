@@ -81,6 +81,16 @@ int shim_rte_pktmbuf_chain(struct rte_mbuf *head, struct rte_mbuf *tail) {
     return rte_pktmbuf_chain(head, tail);
 }
 
+/* rte_pktmbuf_adj is static inline; re-export. Advances the mbuf's
+ * data_off by `len`, shrinking data_len + pkt_len by the same amount.
+ * Returns the new data pointer (after the advance), or NULL if `len`
+ * exceeds the segment's data_len. Used by the retransmit primitive to
+ * strip the original L2+L3+TCP headers off the snd_retrans data mbuf
+ * before chaining a fresh header mbuf in front of it. */
+char *shim_rte_pktmbuf_adj(struct rte_mbuf *m, uint16_t len) {
+    return rte_pktmbuf_adj(m, len);
+}
+
 /* rte_mbuf_refcnt_update is static inline; re-export. Adds `v` (may be
  * negative) to the refcount. */
 void shim_rte_mbuf_refcnt_update(struct rte_mbuf *m, int16_t v) {
@@ -91,6 +101,28 @@ void shim_rte_mbuf_refcnt_update(struct rte_mbuf *m, int16_t v) {
  * bindgen can't expose the rte_mbuf field layout directly. */
 uint16_t shim_rte_pktmbuf_nb_segs(const struct rte_mbuf *m) {
     return m->nb_segs;
+}
+
+/* A6.6 Task 5: next-segment accessor for RX ingest chain walk. Returns
+ * the next rte_mbuf in a scattered-packet chain, or NULL when `m` is
+ * the last (or only) segment. ENA does not advertise RX_OFFLOAD_SCATTER
+ * today so the chain is always length-1 in production, but the RX
+ * ingest path calls this unconditionally so the multi-seg branch is
+ * exercised in synthetic tests (T13) + automatically light up when a
+ * future PMD enables scatter. bindgen can't deref struct rte_mbuf
+ * fields directly (packed anonymous unions), hence the shim. */
+struct rte_mbuf *shim_rte_pktmbuf_next(struct rte_mbuf *m) {
+    return m->next;
+}
+
+/* A6.6-7 Task 13: mempool occupancy reader — returns the current count
+ * of FREE mbufs in `mp`. The close-drains integration test uses this
+ * together with `Engine::rx_mempool_size()` to compute the in-flight
+ * occupancy (capacity - avail). `rte_mempool_avail_count` is a real
+ * extern symbol in DPDK but re-exporting through a shim keeps the
+ * bindgen allowlist consistent with `shim_rte_*`. */
+unsigned shim_rte_mempool_avail_count(struct rte_mempool *mp) {
+    return rte_mempool_avail_count(mp);
 }
 
 /* A-HW Task 7: TX offload metadata setters/getters.

@@ -108,13 +108,52 @@ struct dpdk_net_engine_config_t {
    * §5.1 caution). 0 here specifically means "use PMD default".
    */
   uint8_t ena_miss_txc_to_sec;
+  /**
+   * A6.6-7 Task 10: RX mempool capacity in mbufs. `0` = compute
+   * default at `dpdk_net_engine_create` using:
+   *   max(4 * rx_ring_size,
+   *       2 * max_connections * ceil(recv_buffer_bytes / mbuf_data_room) + 4096)
+   * Assumes `mbuf_data_room == 2048` bytes (DPDK default); jumbo-frame
+   * deployments either raise `mbuf_data_room` or set this explicitly.
+   * The resolved value is retrievable post-create via
+   * `dpdk_net_rx_mempool_size()`. Non-zero caller value is used
+   * verbatim (no floor clamp).
+   */
+  uint32_t rx_mempool_size;
 };
 
 typedef uint64_t dpdk_net_conn_t;
 
+/**
+ * Scatter-gather view over a received in-order byte range.
+ * `base` points into a mempool-backed rte_mbuf data area; the pointer is
+ * only valid until the next `dpdk_net_poll` on the same engine.
+ *
+ * ABI: 16 bytes on 64-bit targets (x86_64, ARM64 Graviton). Not 32-bit
+ * compatible — Stage 1 targets are 64-bit only.
+ */
+struct dpdk_net_iovec_t {
+  const uint8_t *base;
+  uint32_t len;
+  uint32_t _pad;
+};
+
+/**
+ * READABLE event payload. `segs` points at an engine-owned array of
+ * `dpdk_net_iovec_t` with `n_segs` entries. Multi-segment when chained
+ * mbufs were received (LRO / jumbo / IP-defragmented); single-segment
+ * for standard MTU packets. `total_len = Σ segs[i].len`.
+ *
+ * Lifetime: `segs` and every `segs[i].base` pointer are only valid
+ * until the next `dpdk_net_poll` on the same engine. The engine reuses
+ * per-conn scratch for the array; the backing mbufs are refcount-
+ * pinned in the connection's `delivered_segments` and released at the
+ * next poll iteration.
+ */
 struct dpdk_net_event_readable_t {
-  const uint8_t *data;
-  uint32_t data_len;
+  const struct dpdk_net_iovec_t *segs;
+  uint32_t n_segs;
+  uint32_t total_len;
 };
 
 struct dpdk_net_event_error_t {
@@ -175,12 +214,17 @@ struct dpdk_net_event_t {
 /**
  * Counters struct — exposed to application via dpdk_net_counters().
  * Fields are plain u64 on the C ABI for clean cbindgen emission, but
- * internally the stack writes them as AtomicU64 (Relaxed). AtomicU64
- * has identical size and alignment as u64 on x86_64 so pointer-casting
- * between dpdk_net_core::Counters and dpdk_net_counters_t is sound.
- * C/C++ readers should use `__atomic_load_n(&field, __ATOMIC_RELAXED)`
- * (or `std::atomic_ref<uint64_t>`) for strictly correct reads; on x86_64
- * this compiles to a plain `mov` so there's no runtime cost.
+ * internally the stack writes them as AtomicU64 (Relaxed).
+ *
+ * Cross-platform atomic-load contract: C/C++ readers MUST use the
+ * helper in `dpdk_net_counters_load.h`:
+ *
+ *     uint64_t rx = dpdk_net_load_u64(&counters->eth.rx_pkts);
+ *
+ * Plain dereference is only atomic on x86_64 with aligned uint64_t.
+ * On ARM32 a plain read may tear; ARM64 has weaker ordering semantics
+ * than x86. The helper compiles to a plain mov on x86_64 (zero cost)
+ * and the correct LDREXD/LDR sequence on ARM.
  */
 struct DPDK_NET_ALIGNED(64) dpdk_net_eth_counters_t {
   uint64_t rx_pkts;
@@ -309,6 +353,9 @@ struct DPDK_NET_ALIGNED(64) dpdk_net_tcp_counters_t {
   uint64_t ts_recent_expired;
   uint64_t tx_flush_bursts;
   uint64_t tx_flush_batched_pkts;
+  uint64_t rx_iovec_segs_total;
+  uint64_t rx_multi_seg_events;
+  uint64_t rx_partial_read_splits;
 };
 
 struct DPDK_NET_ALIGNED(64) dpdk_net_poll_counters_t {
@@ -447,6 +494,34 @@ void dpdk_net_flush(struct dpdk_net_engine *p);
 uint64_t dpdk_net_now_ns(struct dpdk_net_engine *_p);
 
 const struct dpdk_net_counters_t *dpdk_net_counters(struct dpdk_net_engine *p);
+
+/**
+ * A6.6-7 Task 10: returns the RX mempool capacity (in mbufs) in use on
+ * this engine. When the caller set `dpdk_net_engine_config_t.rx_mempool_size`
+ * to a non-zero value, that value is returned verbatim. When the caller
+ * left it zero, the returned value is the formula default computed at
+ * `dpdk_net_engine_create` time:
+ *
+ *   max(4 * rx_ring_size,
+ *       2 * max_connections * ceil(recv_buffer_bytes / mbuf_data_room) + 4096)
+ *
+ * where `mbuf_data_room` is the DPDK mbuf payload slot size (2048 bytes
+ * on the standard-MTU default). The `2 * max_conns * per_conn` term is
+ * "two full receive buffers' worth of mbufs per connection" so the RX
+ * path never blocks on mempool exhaustion when all connections
+ * concurrently hold a receive buffer of in-flight data; the `+ 4096`
+ * cushion covers LRO chains, retransmit backlog, and SYN/ACK spikes.
+ * The `4 * rx_ring_size` floor guarantees at least 4× the RX descriptor
+ * count to keep `rte_eth_rx_burst` fully refilled.
+ *
+ * Returns `UINT32_MAX` if `p` is null. Slow-path (reads a single `u32`
+ * field, no locks).
+ *
+ * # Safety
+ * `p` must be a valid Engine pointer obtained from
+ * `dpdk_net_engine_create`, or null.
+ */
+uint32_t dpdk_net_rx_mempool_size(const struct dpdk_net_engine *p);
 
 /**
  * Slow-path: trigger an ENA-PMD xstats scrape. Reads ENI

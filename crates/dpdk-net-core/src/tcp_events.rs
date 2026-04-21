@@ -31,25 +31,29 @@ pub enum InternalEvent {
         rx_hw_ts_ns: u64,
         emitted_ts_ns: u64,
     },
-    /// `payload_len` bytes are available starting at `payload_offset`
-    /// inside the mbuf at `conn.recv.last_read_mbufs[mbuf_idx]`. The
-    /// caller promotes this to a `(data, data_len)` view at the ABI
-    /// boundary by dereferencing the mbuf's data area and adding
-    /// `payload_offset`. The pin stays valid for the duration of the
-    /// event-emission window — until the next `dpdk_net_poll` clears
-    /// `last_read_mbufs` and drops every held `MbufHandle`.
+    /// A6.6 T9: scatter-gather view over an in-order delivery window.
+    /// `seg_idx_start` / `seg_count` reference a slice of the owning
+    /// `TcpConn.readable_scratch_iovecs` Vec. At the ABI boundary,
+    /// `dpdk_net_poll` materializes the corresponding `dpdk_net_iovec_t`
+    /// pointer + length onto the `dpdk_net_event_readable_t` payload.
+    ///
+    /// Lifetime: the scratch Vec (and the mbufs referenced by each
+    /// iovec's `base` pointer) stay valid until the next `dpdk_net_poll`
+    /// on the owning engine — top-of-poll clears `delivered_segments`
+    /// (dropping refcounts) and `readable_scratch_iovecs` for every live
+    /// conn before any fresh RX dispatch.
     Readable {
         conn: ConnHandle,
-        /// A6.5 Task 4c: index into `conn.recv.last_read_mbufs`
-        /// identifying the mbuf whose payload region this event
-        /// references. One event per mbuf in A6.5; A6.6 will collapse
-        /// multi-segment mbufs into scatter-gather iovec events.
-        mbuf_idx: u32,
-        /// Offset (bytes) into the mbuf's data region where the
-        /// payload window starts.
-        payload_offset: u32,
-        /// Length (bytes) of the payload window.
-        payload_len: u32,
+        /// A6.6 T9: start index into the owning
+        /// `TcpConn.readable_scratch_iovecs` for this event's iovec
+        /// slice. Per-conn scratch, so always 0 at emit time (the full
+        /// scratch is cleared and rebuilt per event for that conn).
+        seg_idx_start: u32,
+        /// Number of iovec entries this event covers.
+        seg_count: u32,
+        /// Sum of `segs[i].len` across
+        /// `[seg_idx_start, seg_idx_start + seg_count)`.
+        total_len: u32,
         rx_hw_ts_ns: u64,
         emitted_ts_ns: u64,
     },

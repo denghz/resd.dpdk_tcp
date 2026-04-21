@@ -2,6 +2,9 @@
 
 pub mod api;
 
+#[cfg(feature = "test-panic-entry")]
+pub mod test_only;
+
 use api::*;
 use dpdk_net_core::clock;
 use dpdk_net_core::counters::Counters;
@@ -147,8 +150,14 @@ pub unsafe extern "C" fn dpdk_net_engine_create(
         tx_queue_id: cfg.tx_queue_id,
         rx_ring_size: 1024,
         tx_ring_size: 1024,
-        rx_mempool_elems: 8192,
         mbuf_data_room: 2048,
+        // A6.6-7 Task 10: pass through caller knob as-is. `0` (the common
+        // case from a zero-initialized `dpdk_net_engine_config_t`) signals
+        // `Engine::new` to apply the formula default. Caller-supplied
+        // non-zero values go through verbatim — no zero-sentinel default
+        // at this layer, the substitution lives next to the formula in
+        // `Engine::new` so the two stay co-located.
+        rx_mempool_size: cfg.rx_mempool_size,
         local_ip: cfg.local_ip,
         gateway_ip: cfg.gateway_ip,
         gateway_mac: cfg.gateway_mac,
@@ -206,16 +215,17 @@ pub unsafe extern "C" fn dpdk_net_engine_destroy(p: *mut dpdk_net_engine) {
 }
 
 /// Pure translation: `InternalEvent` → `dpdk_net_event_t`. The caller
-/// resolves the `Readable` variant's (data_ptr, data_len) via the engine's
-/// flow table and passes it in; for every other variant the tuple is
-/// ignored. `enqueued_ts_ns` on the returned event is read from the
-/// variant's `emitted_ts_ns` field — sampled at push time inside the
-/// engine (A5.5 Task 1), not at drain time. Split out so the "drain copies
-/// through, not re-samples" contract is unit-testable without an EAL-backed
-/// Engine or a mock clock.
+/// resolves the `Readable` variant's `dpdk_net_event_readable_t`
+/// scatter-gather payload (segs pointer + n_segs + total_len) via the
+/// engine's flow table and passes it in; for every other variant the
+/// struct is ignored. `enqueued_ts_ns` on the returned event is read
+/// from the variant's `emitted_ts_ns` field — sampled at push time
+/// inside the engine (A5.5 Task 1), not at drain time. Split out so
+/// the "drain copies through, not re-samples" contract is unit-testable
+/// without an EAL-backed Engine or a mock clock.
 fn build_event_from_internal(
     ev: &dpdk_net_core::tcp_events::InternalEvent,
-    readable_view: (*const u8, u32),
+    readable_view: dpdk_net_event_readable_t,
 ) -> dpdk_net_event_t {
     use dpdk_net_core::tcp_events::{InternalEvent, LossCause};
     let emitted = match ev {
@@ -241,7 +251,6 @@ fn build_event_from_internal(
         },
         InternalEvent::Readable {
             conn,
-            payload_len,
             rx_hw_ts_ns,
             ..
         } => dpdk_net_event_t {
@@ -250,10 +259,7 @@ fn build_event_from_internal(
             rx_hw_ts_ns: *rx_hw_ts_ns,
             enqueued_ts_ns: emitted,
             u: dpdk_net_event_payload_t {
-                readable: dpdk_net_event_readable_t {
-                    data: readable_view.0,
-                    data_len: *payload_len,
-                },
+                readable: readable_view,
             },
         },
         InternalEvent::Closed { conn, err, .. } => dpdk_net_event_t {
@@ -378,44 +384,63 @@ pub unsafe extern "C" fn dpdk_net_poll(
     }
     let mut filled: u32 = 0;
     e.drain_events(max_events, |ev, engine| {
-        // A6.5 Task 4c: resolve the `Readable` variant's data-view
-        // pointer by dereferencing the pinned mbuf at
-        // `conn.recv.last_read_mbufs[mbuf_idx]` and adding
-        // `payload_offset`. The pin is valid until the next
-        // `dpdk_net_poll` clears `last_read_mbufs`. Non-Readable
-        // variants ignore the tuple.
-        let readable_view: (*const u8, u32) = match ev {
+        // A6.6 T8/T9: resolve the `Readable` variant's scatter-gather
+        // payload by pointing `segs` at the owning conn's
+        // `readable_scratch_iovecs` (per-conn scratch). The Vec's
+        // `as_ptr()` is stable because nothing appends to it between
+        // deliver_readable-emit and this drain call — top-of-next-
+        // `poll_once` is the only site that mutates the scratch, and
+        // it runs AFTER the app has consumed the event.
+        //
+        // `seg_idx_start` is always 0 in A6.6 (one emit per
+        // deliver_readable; scratch is cleared and rebuilt per event
+        // for that conn), but the offset-add below is future-proof
+        // against a multi-emit-per-poll design.
+        let readable_view: dpdk_net_event_readable_t = match ev {
             dpdk_net_core::tcp_events::InternalEvent::Readable {
                 conn,
-                mbuf_idx,
-                payload_offset,
-                payload_len,
+                seg_idx_start,
+                seg_count,
+                total_len,
                 ..
             } => {
                 let ft = engine.flow_table();
                 match ft.get(*conn) {
                     Some(c) => {
-                        let idx = *mbuf_idx as usize;
-                        if idx < c.recv.last_read_mbufs.len() {
-                            let mbuf_ptr = c.recv.last_read_mbufs[idx].as_ptr();
-                            // SAFETY: `mbuf_ptr` is live (MbufHandle
-                            // holds a refcount). `payload_offset` is
-                            // bounded by the mbuf's data region at
-                            // insert / in-order-delivery time.
-                            let data_ptr = unsafe {
-                                let base = dpdk_net_sys::shim_rte_pktmbuf_data(mbuf_ptr)
-                                    as *const u8;
-                                base.add(*payload_offset as usize)
-                            };
-                            (data_ptr, *payload_len)
-                        } else {
-                            (std::ptr::null(), 0)
+                        // SAFETY: `c.readable_scratch_iovecs` is a
+                        // per-conn Vec whose capacity is preserved
+                        // across the poll; `seg_idx_start` is always
+                        // 0 (single emit per deliver_readable) and
+                        // `seg_count` is bounded by the Vec's len
+                        // when the event was enqueued. The Vec is
+                        // cleared only at the top of the NEXT
+                        // `poll_once`, so the pointers remain valid
+                        // for the entire event-drain window of THIS
+                        // poll.
+                        let segs_ptr = unsafe {
+                            c.readable_scratch_iovecs
+                                .as_ptr()
+                                .add(*seg_idx_start as usize)
+                                as *const dpdk_net_iovec_t
+                        };
+                        dpdk_net_event_readable_t {
+                            segs: segs_ptr,
+                            n_segs: *seg_count,
+                            total_len: *total_len,
                         }
                     }
-                    None => (std::ptr::null(), 0),
+                    None => dpdk_net_event_readable_t {
+                        segs: std::ptr::null(),
+                        n_segs: 0,
+                        total_len: 0,
+                    },
                 }
             }
-            _ => (std::ptr::null(), 0),
+            _ => dpdk_net_event_readable_t {
+                segs: std::ptr::null(),
+                n_segs: 0,
+                total_len: 0,
+            },
         };
         // Build the event value fully before writing it to events_out, so
         // we never read a possibly-uninitialized `kind` discriminant.
@@ -450,6 +475,45 @@ pub unsafe extern "C" fn dpdk_net_counters(p: *mut dpdk_net_engine) -> *const dp
         Some(e) => e.counters() as *const Counters as *const dpdk_net_counters_t,
         None => ptr::null(),
     }
+}
+
+/// A6.6-7 Task 10: returns the RX mempool capacity (in mbufs) in use on
+/// this engine. When the caller set `dpdk_net_engine_config_t.rx_mempool_size`
+/// to a non-zero value, that value is returned verbatim. When the caller
+/// left it zero, the returned value is the formula default computed at
+/// `dpdk_net_engine_create` time:
+///
+///   max(4 * rx_ring_size,
+///       2 * max_connections * ceil(recv_buffer_bytes / mbuf_data_room) + 4096)
+///
+/// where `mbuf_data_room` is the DPDK mbuf payload slot size (2048 bytes
+/// on the standard-MTU default). The `2 * max_conns * per_conn` term is
+/// "two full receive buffers' worth of mbufs per connection" so the RX
+/// path never blocks on mempool exhaustion when all connections
+/// concurrently hold a receive buffer of in-flight data; the `+ 4096`
+/// cushion covers LRO chains, retransmit backlog, and SYN/ACK spikes.
+/// The `4 * rx_ring_size` floor guarantees at least 4× the RX descriptor
+/// count to keep `rte_eth_rx_burst` fully refilled.
+///
+/// Returns `UINT32_MAX` if `p` is null. Slow-path (reads a single `u32`
+/// field, no locks).
+///
+/// # Safety
+/// `p` must be a valid Engine pointer obtained from
+/// `dpdk_net_engine_create`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn dpdk_net_rx_mempool_size(p: *const dpdk_net_engine) -> u32 {
+    if p.is_null() {
+        return u32::MAX;
+    }
+    // SAFETY: caller contract pins `p` to a valid
+    // `Box<OpaqueEngine>`-derived pointer. We go through `OpaqueEngine`
+    // (same as `engine_from_raw`) because `box_to_raw` wraps `Engine`
+    // in the opaque newtype. Taking a `*mut` → `&` is the same pattern
+    // `engine_from_raw` uses; the const-pointer signature just matches
+    // the "read-only inspector" intent.
+    let opaque: &OpaqueEngine = unsafe { &*(p as *const OpaqueEngine) };
+    opaque.0.rx_mempool_size()
 }
 
 /// Slow-path: trigger an ENA-PMD xstats scrape. Reads ENI
@@ -907,6 +971,8 @@ mod tests {
             rtt_histogram_bucket_edges_us: [0u32; 15],
             ena_large_llq_hdr: 0,
             ena_miss_txc_to_sec: 0,
+            // A6.6-7 T10: zero means "use formula default" at engine_create.
+            rx_mempool_size: 0,
         };
         assert_eq!(cfg.local_ip, 0x0a_00_00_02);
         assert_eq!(cfg.gateway_mac[2], 0xbe);
@@ -950,6 +1016,9 @@ mod tests {
             rtt_histogram_bucket_edges_us: [0u32; 15],
             ena_large_llq_hdr: 0,
             ena_miss_txc_to_sec: 0,
+            // A6.6-7 T10: zero = formula default; validation-rejection test
+            // doesn't reach the mempool-create path so the value is inert.
+            rx_mempool_size: 0,
         };
         let p = unsafe { dpdk_net_engine_create(0, &cfg) };
         assert!(p.is_null());
@@ -1025,9 +1094,9 @@ mod tests {
             },
             InternalEvent::Readable {
                 conn: ConnHandle::default(),
-                mbuf_idx: 0,
-                payload_offset: 0,
-                payload_len: 0,
+                seg_idx_start: 0,
+                seg_count: 0,
+                total_len: 0,
                 rx_hw_ts_ns: 0,
                 emitted_ts_ns: EMITTED,
             },
@@ -1060,7 +1129,14 @@ mod tests {
             },
         ];
         for ev in &cases {
-            let out = build_event_from_internal(ev, (std::ptr::null(), 0));
+            let out = build_event_from_internal(
+                ev,
+                dpdk_net_event_readable_t {
+                    segs: std::ptr::null(),
+                    n_segs: 0,
+                    total_len: 0,
+                },
+            );
             assert_eq!(
                 out.enqueued_ts_ns, EMITTED,
                 "variant {:?} failed to copy emitted_ts_ns through",

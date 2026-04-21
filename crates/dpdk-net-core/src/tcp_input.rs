@@ -161,10 +161,12 @@ pub enum TxAction {
 
 /// Outcome of dispatching a segment to a per-state handler.
 ///
-/// Not `Clone`: `drained_mbufs` carries refcount handoffs from the
-/// reorder queue that must not be duplicated without a matching refcnt
-/// bump. The engine always consumes `Outcome` by-move via
-/// `std::mem::take` on the field.
+/// Not `Clone`: the contained `MbufHandle` refcount handoffs historically
+/// lived here; post-A6.6 T3+T4 they land directly in `conn.recv.bytes`
+/// at tcp_input ingest time, so this struct is now plain-Copy-data
+/// plus `SmallVec<RackLostIndex>`. `Clone` is still withheld to keep
+/// the "consume by-move" contract consistent with future additions
+/// that might re-introduce owning handles here.
 #[derive(Debug)]
 pub struct Outcome {
     pub tx: TxAction,
@@ -263,13 +265,6 @@ pub struct Outcome {
     /// engine's `deliver_readable` to know how many bytes of the RX
     /// mbuf's payload to pin for the READABLE event.
     pub in_order_delivered_from_seg: u32,
-    /// A6.5 Task 4c: mbufs drained from the reorder queue by
-    /// `drain_contiguous_from_mbuf` on this dispatch. The queue
-    /// transferred its per-segment refcount to each entry here; the
-    /// engine's `deliver_readable` consumes the list, wraps each in
-    /// an `MbufHandle`, and emits one READABLE event per entry. When
-    /// empty, no drain happened on this dispatch.
-    pub drained_mbufs: SmallVec<[crate::tcp_reassembly::DrainedMbuf; 4]>,
     pub connected: bool,
     pub closed: bool,
 }
@@ -302,7 +297,6 @@ impl Outcome {
             writable_hysteresis_fired: false,
             mbuf_ref_retained: false,
             in_order_delivered_from_seg: 0,
-            drained_mbufs: SmallVec::new(),
             connected: false,
             closed: false,
         }
@@ -904,52 +898,185 @@ fn handle_established(
     // engine's `deliver_readable` uses this to decide how many bytes
     // of the RX mbuf's payload to pin for the READABLE event.
     let mut in_order_delivered_from_seg = 0u32;
-    // A6.5 Task 4c: mbufs drained from the reorder queue by
-    // `drain_contiguous_from_mbuf` on gap-close. The queue transfers
-    // one refcount per entry to the caller; the engine wraps each in
-    // an `MbufHandle` and emits a READABLE event.
-    let mut drained_mbufs: SmallVec<[crate::tcp_reassembly::DrainedMbuf; 4]> = SmallVec::new();
     if !seg.payload.is_empty() {
         if seg.seq == conn.rcv_nxt {
-            delivered = conn.recv.append(seg.payload);
+            // A6.6 Task 3: push an `InOrderSegment` directly into
+            // `recv.bytes`, carrying one mbuf refcount. The engine's RX
+            // path has already ensured `mbuf_ctx` is `Some` whenever
+            // the RX mbuf is live; the `None` branch retains the
+            // legacy pure-slice behaviour for direct-construct unit
+            // tests (no mbuf backing → cannot pin a segment, so the
+            // in-order byte-delivery is dropped with no `delivered`
+            // bump). Test coverage for the refcount-accounting branch
+            // lives in `tcp_conn.rs` + TAP tests that exercise the
+            // real RX path.
+            //
+            // A6.6 Task 5: walk the rte_mbuf.next chain so every chain
+            // link becomes a separate `InOrderSegment`. The head link
+            // uses the TCP payload offset (header stripped) and the
+            // head-link's TCP-payload length; subsequent links start at
+            // offset 0 and carry their full `data_len`. ENA does not
+            // advertise RX_OFFLOAD_SCATTER today (chain always length-1
+            // → the while-loop iterates once and behaviour is
+            // byte-identical to pre-T5). T13 exercises the multi-link
+            // branch synthetically.
+            let cap_room = conn.recv.free_space();
+            let head_take = (seg.payload.len() as u32).min(cap_room);
+            // A6.6 T3 follow-up (reviewer request): the RX path
+            // always routes payload segments with a live `MbufCtx`;
+            // the `None` branch silently dropping delivery is a
+            // latent bug-catcher for direct-construct test callers.
+            // A future caller wiring this path without mbuf backing
+            // should fail loudly in debug builds; release builds keep
+            // the drop-silently behaviour so test-only paths still
+            // compile.
+            debug_assert!(
+                mbuf_ctx.is_some() || head_take == 0,
+                "A6.6 T3: in-order append requires mbuf-backed ctx",
+            );
+            if head_take > 0 {
+                if let Some(ctx) = mbuf_ctx.as_ref() {
+                    // Head link. SAFETY: `ctx.mbuf` is the live RX
+                    // mbuf from the active rx_burst iteration; the
+                    // bump is paired with the `MbufHandle::Drop` that
+                    // runs when the segment is eventually popped +
+                    // released by the consumer (via
+                    // `deliver_readable` → `delivered_segments` →
+                    // next-poll clear).
+                    unsafe {
+                        sys::shim_rte_mbuf_refcnt_update(ctx.mbuf.as_ptr(), 1);
+                    }
+                    // SAFETY: the refcount bump above transferred one
+                    // refcount unit to this handle; the segment owns
+                    // it until pop / drop.
+                    let handle = unsafe {
+                        crate::mempool::MbufHandle::from_raw(ctx.mbuf)
+                    };
+                    conn.recv.bytes.push_back(crate::tcp_conn::InOrderSegment {
+                        mbuf: handle,
+                        offset: ctx.payload_offset,
+                        len: head_take as u16,
+                    });
+                    delivered = head_take;
+
+                    // Walk the chain for additional links. The head
+                    // link's TCP payload is what `seg.payload` covers;
+                    // subsequent links are raw data blocks contributing
+                    // `data_len` each. SAFETY: every `cur` below is
+                    // either the just-observed `next` of a validated
+                    // prior link (or NULL, in which case the loop
+                    // exits), and the DPDK chain invariant guarantees
+                    // the pointer is valid as long as we hold a
+                    // refcount on at least one chain member. Here the
+                    // engine's pre-dispatch bump on the head keeps the
+                    // whole chain alive through this walk.
+                    let mut cur = unsafe {
+                        sys::shim_rte_pktmbuf_next(ctx.mbuf.as_ptr())
+                    };
+                    while !cur.is_null() {
+                        let room = conn.recv.free_space();
+                        if room == 0 {
+                            // Record the rest of the chain as cap-drop
+                            // for observability, then stop walking. We
+                            // cannot enqueue further InOrderSegments.
+                            let mut walk = cur;
+                            while !walk.is_null() {
+                                let ll = unsafe {
+                                    sys::shim_rte_pktmbuf_data_len(walk)
+                                } as u32;
+                                buf_full_drop = buf_full_drop.saturating_add(ll);
+                                walk = unsafe {
+                                    sys::shim_rte_pktmbuf_next(walk)
+                                };
+                            }
+                            break;
+                        }
+                        let link_data_len = unsafe {
+                            sys::shim_rte_pktmbuf_data_len(cur)
+                        } as u32;
+                        let link_take = link_data_len.min(room);
+                        if link_take > 0 {
+                            // Bump the link's own refcount — each chain
+                            // member has an independent refcnt. The
+                            // +1 transfers one ref to the
+                            // `InOrderSegment` we're about to push. No
+                            // rollback needed: we commit unconditionally
+                            // after the bump by push_back-ing below.
+                            unsafe {
+                                sys::shim_rte_mbuf_refcnt_update(cur, 1);
+                            }
+                            // SAFETY: refcount bump above gives us one
+                            // owned ref; `cur` is non-null (loop cond).
+                            let cur_nn =
+                                unsafe { std::ptr::NonNull::new_unchecked(cur) };
+                            let handle = unsafe {
+                                crate::mempool::MbufHandle::from_raw(cur_nn)
+                            };
+                            conn.recv.bytes.push_back(
+                                crate::tcp_conn::InOrderSegment {
+                                    mbuf: handle,
+                                    offset: 0,
+                                    len: link_take as u16,
+                                },
+                            );
+                            delivered = delivered.saturating_add(link_take);
+                        }
+                        if link_take < link_data_len {
+                            buf_full_drop = buf_full_drop
+                                .saturating_add(link_data_len - link_take);
+                        }
+                        cur = unsafe { sys::shim_rte_pktmbuf_next(cur) };
+                    }
+                }
+            }
             conn.rcv_nxt = conn.rcv_nxt.wrapping_add(delivered);
-            buf_full_drop = (seg.payload.len() as u32).saturating_sub(delivered);
+            // Head-link truncation contribution (if head TCP payload
+            // exceeded free_space) — chain-tail truncation was already
+            // added inline above.
+            buf_full_drop = buf_full_drop.saturating_add(
+                (seg.payload.len() as u32).saturating_sub(head_take),
+            );
             in_order_delivered_from_seg = delivered;
 
-            // A6.5 Task 4c: zero-copy drain. Each `DrainedMbuf` carries
-            // a refcount ref handed off from the queue; the engine
-            // wraps them in `MbufHandle` and emits one READABLE per
-            // drained entry. We still append the drained bytes to
-            // `conn.recv.bytes` for flow-control accounting (the
-            // VecDeque's len participates in `free_space_total`);
-            // A6.6 retires that VecDeque entirely.
-            let drained = conn.recv.reorder.drain_contiguous_from_mbuf(conn.rcv_nxt);
-            let mut drained_count = 0u32;
-            for d in &drained {
-                // SAFETY: `d.mbuf` is live (queue held a refcount
-                // until this drain transferred it to the caller). The
-                // data range `[d.offset, d.offset + d.len)` is bounded
-                // by the mbuf's data_len at `insert` time.
-                let payload_area = unsafe {
-                    let mbuf_ptr = d.mbuf.as_ptr();
-                    let base_ptr = sys::shim_rte_pktmbuf_data(mbuf_ptr) as *const u8;
-                    std::slice::from_raw_parts(
-                        base_ptr.add(d.offset as usize),
-                        d.len as usize,
-                    )
-                };
-                let appended = conn.recv.append(payload_area);
-                conn.rcv_nxt = conn.rcv_nxt.wrapping_add(appended);
-                buf_full_drop += (d.len as u32).saturating_sub(appended);
-                delivered += appended;
-                drained_count += 1;
-            }
+            // A6.6 Task 4: zero-copy drain with output-param form. Each
+            // kept OOO segment's refcount transfers directly into a
+            // freshly constructed `InOrderSegment` inside
+            // `conn.recv.bytes` — no intermediate SmallVec, no
+            // `DrainedMbuf::into_handle` hop. `drain_contiguous_into`
+            // returns `(bytes_appended, cap_dropped)` so we can
+            // advance counters + `rcv_nxt` in one shot and account the
+            // cap-pressure overshoot uniformly with the in-order
+            // `buf_full_drop` path above.
+            //
+            // `conn.recv.free_space()` reflects the in-order queue's
+            // remaining room (in-order-only, not reorder); the reorder
+            // queue shares `recv_buffer_bytes` but accounts
+            // independently, so the drain site enforces this cap here.
+            let bytes_before = conn.recv.bytes.len();
+            let cap_room = conn.recv.free_space();
+            let (drained_bytes, drained_cap_dropped) = conn
+                .recv
+                .reorder
+                .drain_contiguous_into(conn.rcv_nxt, cap_room, &mut conn.recv.bytes);
+            let drained_count = (conn.recv.bytes.len() - bytes_before) as u32;
+            conn.rcv_nxt = conn.rcv_nxt.wrapping_add(drained_bytes);
+            delivered += drained_bytes;
+            buf_full_drop += drained_cap_dropped;
             reassembly_hole_filled = drained_count;
-            drained_mbufs = drained;
         } else if seq_lt(conn.rcv_nxt, seg.seq) {
+            // A6.6 Task 5: walk the rte_mbuf.next chain and call
+            // `reorder.insert` once per link, transferring one refcount
+            // unit per insert. The head link inherits the engine's
+            // pre-dispatch +1 bump (surfaces back via
+            // `outcome.mbuf_ref_retained` for engine-side rollback);
+            // additional links' +1 is bumped locally here and rolled
+            // back locally when their insert returns
+            // `mbuf_ref_retained == false`. Per-link seq is advanced by
+            // the link's data-length (head uses `seg.payload.len()`;
+            // subsequent links use `shim_rte_pktmbuf_data_len`).
             let total_cap = conn.recv.free_space_total();
             if total_cap > 0 {
-                let take = (seg.payload.len() as u32).min(total_cap);
+                let head_take = (seg.payload.len() as u32).min(total_cap);
                 if let Some(ctx) = mbuf_ctx {
                     // A6.5 Task 4b/4d: mbuf-ref path. The engine has
                     // already bumped the mbuf refcount by one; if no
@@ -959,7 +1086,7 @@ fn handle_established(
                     // non-mbuf callers don't enqueue OOO.
                     let outcome = conn.recv.reorder.insert(
                         seg.seq,
-                        &seg.payload[..take as usize],
+                        &seg.payload[..head_take as usize],
                         ctx.mbuf,
                         ctx.payload_offset,
                     );
@@ -970,17 +1097,107 @@ fn handle_established(
                     // that triggered this OOO-insert so
                     // `build_ack_outcome` emits it as the first SACK
                     // block. `emit_ack` clears the trigger after
-                    // consuming it.
+                    // consuming it. When the chain has additional
+                    // links, the trigger extends to cover the whole
+                    // chain's newly-buffered span; we grow the trigger
+                    // in-line as each link's insert lands below.
                     if outcome.newly_buffered > 0 {
                         conn.last_sack_trigger =
-                            Some((seg.seq, seg.seq.wrapping_add(take)));
+                            Some((seg.seq, seg.seq.wrapping_add(head_take)));
                     }
-                }
-                if (take as usize) < seg.payload.len() {
-                    buf_full_drop += seg.payload.len() as u32 - take;
+                    if (head_take as usize) < seg.payload.len() {
+                        buf_full_drop += seg.payload.len() as u32 - head_take;
+                    }
+
+                    // A6.6 Task 5: walk additional links. SAFETY: same
+                    // chain-validity rationale as the in-order branch —
+                    // the engine's pre-dispatch bump on the head keeps
+                    // the whole chain alive through this walk.
+                    let mut link_seq = seg.seq.wrapping_add(seg.payload.len() as u32);
+                    let mut cur = unsafe {
+                        sys::shim_rte_pktmbuf_next(ctx.mbuf.as_ptr())
+                    };
+                    while !cur.is_null() {
+                        let link_data_len = unsafe {
+                            sys::shim_rte_pktmbuf_data_len(cur)
+                        } as u32;
+                        if link_data_len == 0 {
+                            cur = unsafe {
+                                sys::shim_rte_pktmbuf_next(cur)
+                            };
+                            continue;
+                        }
+                        let cur_nn =
+                            unsafe { std::ptr::NonNull::new_unchecked(cur) };
+                        // Per-link +1 to match insert's "caller bumped
+                        // by 1" contract. Rolled back locally if
+                        // insert returns `mbuf_ref_retained == false`.
+                        unsafe {
+                            sys::shim_rte_mbuf_refcnt_update(cur, 1);
+                        }
+                        // Build the link's raw payload slice. SAFETY:
+                        // `data_ptr + data_len` points into the mbuf's
+                        // data region per DPDK layout; `insert` reads
+                        // this slice only for length + overlap carving
+                        // and stores the (mbuf, offset=0, len) triple.
+                        let link_data_ptr = unsafe {
+                            sys::shim_rte_pktmbuf_data(cur)
+                        } as *const u8;
+                        let link_slice = unsafe {
+                            std::slice::from_raw_parts(
+                                link_data_ptr,
+                                link_data_len as usize,
+                            )
+                        };
+                        let outcome = conn.recv.reorder.insert(
+                            link_seq,
+                            link_slice,
+                            cur_nn,
+                            0,
+                        );
+                        reassembly_queued_bytes =
+                            reassembly_queued_bytes.saturating_add(outcome.newly_buffered);
+                        buf_full_drop =
+                            buf_full_drop.saturating_add(outcome.cap_dropped);
+                        if !outcome.mbuf_ref_retained {
+                            // Nothing stored for this link — roll back
+                            // our local +1 so the link's refcount is
+                            // unchanged. The engine's head-rollback
+                            // does NOT cover additional links.
+                            unsafe {
+                                sys::shim_rte_mbuf_refcnt_update(cur, -1);
+                            }
+                        }
+                        if outcome.newly_buffered > 0 {
+                            // Extend the SACK trigger to include this
+                            // link's buffered span. Multi-link SACK
+                            // triggers cover the contiguous chain so
+                            // `emit_ack` reports one merged block.
+                            let link_end = link_seq.wrapping_add(link_data_len);
+                            conn.last_sack_trigger = Some(match conn.last_sack_trigger {
+                                Some((l, _)) => (l, link_end),
+                                None => (link_seq, link_end),
+                            });
+                        }
+                        link_seq = link_seq.wrapping_add(link_data_len);
+                        cur = unsafe { sys::shim_rte_pktmbuf_next(cur) };
+                    }
                 }
             } else {
                 buf_full_drop = seg.payload.len() as u32;
+                // Cap was 0 for the head; account chain-tail links too.
+                if let Some(ctx) = mbuf_ctx.as_ref() {
+                    let mut cur = unsafe {
+                        sys::shim_rte_pktmbuf_next(ctx.mbuf.as_ptr())
+                    };
+                    while !cur.is_null() {
+                        let ll = unsafe {
+                            sys::shim_rte_pktmbuf_data_len(cur)
+                        } as u32;
+                        buf_full_drop = buf_full_drop.saturating_add(ll);
+                        cur = unsafe { sys::shim_rte_pktmbuf_next(cur) };
+                    }
+                }
             }
         }
         // else: seg.seq < conn.rcv_nxt — duplicate/old payload; drop silently.
@@ -1023,7 +1240,6 @@ fn handle_established(
         writable_hysteresis_fired,
         mbuf_ref_retained,
         in_order_delivered_from_seg,
-        drained_mbufs,
         ..Outcome::base()
     }
 }
@@ -1165,6 +1381,7 @@ mod tests {
         out
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn parse_ack_segment_with_payload() {
         let frame = build_test_segment(TCP_ACK | TCP_PSH, None, b"hello");
@@ -1178,12 +1395,14 @@ mod tests {
         assert_eq!(p.flags, TCP_ACK | TCP_PSH);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn parse_rejects_short_segment() {
         let err = parse_segment(&[0u8; 10], 0, 0, true).unwrap_err();
         assert_eq!(err, TcpParseError::Short);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn parse_rejects_syn_fin_combo() {
         let frame = build_test_segment(TCP_SYN | TCP_FIN, None, &[]);
@@ -1192,6 +1411,7 @@ mod tests {
         assert_eq!(err, TcpParseError::BadFlags);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn bad_tcp_csum_rejected() {
         let mut frame = build_test_segment(TCP_ACK, None, b"hi");
@@ -1202,6 +1422,7 @@ mod tests {
         assert_eq!(err, TcpParseError::Csum);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn tuple_from_segment_swaps_src_and_dst() {
         let frame = build_test_segment(TCP_ACK, None, &[]);
@@ -1214,6 +1435,7 @@ mod tests {
         assert_eq!(t.peer_port, 5000);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn syn_sent_syn_ack_negotiates_full_option_set() {
         use crate::flow_table::FourTuple;
@@ -1262,6 +1484,7 @@ mod tests {
         assert_eq!(c.ts_recent, 0xCAFEBABE);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn handle_syn_sent_wires_maybe_seed_srtt_from_syn() {
         // A5.5 Task 13 wiring gate: the 4 unit tests on
@@ -1326,6 +1549,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn syn_sent_peer_without_wscale_zeroes_both_shifts() {
         use crate::flow_table::FourTuple;
@@ -1367,6 +1591,7 @@ mod tests {
         assert_eq!(c.ws_shift_out, 0);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn syn_ack_window_is_not_ws_scaled_per_rfc7323_2_2() {
         // F-3 RFC 7323 §2.2: SYN/SYN-ACK window fields MUST NOT be scaled.
@@ -1409,6 +1634,7 @@ mod tests {
         assert_eq!(c.ws_shift_in, 7, "peer's WS is recorded for post-handshake");
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn syn_ack_ws_shift_clamped_at_14_per_rfc7323_2_3() {
         // F-1 RFC 7323 §2.3: peer's shift.cnt > 14 MUST be clamped to 14.
@@ -1449,6 +1675,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn established_post_handshake_snd_wnd_is_ws_scaled_per_rfc7323_2_3() {
         // F-2 RFC 7323 §2.3: on post-handshake segments, receiver MUST
@@ -1477,6 +1704,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn syn_sent_plain_ack_wrong_seq_sends_rst() {
         use crate::flow_table::FourTuple;
@@ -1507,6 +1735,7 @@ mod tests {
         assert_eq!(out.tx, TxAction::RstForSynSentBadAck);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn syn_sent_rst_matching_our_ack_closes() {
         use crate::flow_table::FourTuple;
@@ -1557,8 +1786,23 @@ mod tests {
         c
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn established_inorder_data_delivered_and_acked() {
+        // A6.6 Task 3: the in-order append now pushes an
+        // `InOrderSegment` pinning the RX mbuf, so we feed a fake
+        // mbuf-backed ctx — same pattern as the OOO test below. Boxed
+        // storage keeps the refcount-update shim pointed at live
+        // memory even though we don't dereference it beyond the first
+        // cacheline's `refcnt` field.
+        let mut fake_mbuf_storage: Box<[u8; 256]> = Box::new([0u8; 256]);
+        let fake_mbuf: std::ptr::NonNull<dpdk_net_sys::rte_mbuf> = unsafe {
+            std::ptr::NonNull::new_unchecked(
+                fake_mbuf_storage.as_mut_ptr() as *mut dpdk_net_sys::rte_mbuf,
+            )
+        };
+        let mbuf_ctx = MbufInsertCtx { mbuf: fake_mbuf, payload_offset: 54 };
+
         let mut c = est_conn(1000, 5000, 1024);
         let payload = b"abcdef";
         let seg = ParsedSegment {
@@ -1572,15 +1816,30 @@ mod tests {
             payload,
             options: &[],
         };
-        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, Some(mbuf_ctx));
         assert_eq!(out.tx, TxAction::Ack);
         assert_eq!(out.delivered, 6);
         assert_eq!(c.rcv_nxt, 5001 + 6);
-        assert_eq!(c.recv.bytes.len(), 6);
-        let got: Vec<u8> = c.recv.bytes.iter().copied().collect();
-        assert_eq!(&got, b"abcdef");
+        // A6.6 Task 3: structural assertion on the VecDeque<InOrderSegment>
+        // shape. Byte-level content verification moves to the TAP
+        // tests under the real RX path (byte payloads live inside a
+        // real mbuf's data region there). Direct-unit byte readback
+        // through the fake mbuf is covered separately by dedicated
+        // reassembly unit tests with in-memory storage.
+        assert_eq!(c.recv.bytes.len(), 1);
+        let seg0 = c.recv.bytes.front().unwrap();
+        assert_eq!(seg0.offset, 54);
+        assert_eq!(seg0.len, 6);
+        assert_eq!(c.recv.buffered_bytes(), 6);
+
+        // Drop `c` (and its held segment refcount) before the fake
+        // mbuf storage goes out of scope so the refcount decrement on
+        // segment Drop lands in live storage.
+        drop(c);
+        let _ = &mut fake_mbuf_storage;
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn established_ooo_segment_queues_into_reassembly() {
         // A6.5 Task 4d: OOO-enqueue is mbuf-ref only. This test sources
@@ -1651,8 +1910,18 @@ mod tests {
     //     the test running clean under repeated invocations.
     // A6.6 / A10 may add the dedicated OOO end-to-end scenario.
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn established_inorder_payload_does_not_flag_ooo() {
+        // A6.6 Task 3: in-order append requires mbuf-backed ctx (fake
+        // mbuf boxed storage for the refcnt shim).
+        let mut fake_mbuf_storage: Box<[u8; 256]> = Box::new([0u8; 256]);
+        let fake_mbuf: std::ptr::NonNull<dpdk_net_sys::rte_mbuf> = unsafe {
+            std::ptr::NonNull::new_unchecked(
+                fake_mbuf_storage.as_mut_ptr() as *mut dpdk_net_sys::rte_mbuf,
+            )
+        };
+        let mbuf_ctx = MbufInsertCtx { mbuf: fake_mbuf, payload_offset: 54 };
         let mut c = est_conn(1000, 5000, 1024);
         let seg = ParsedSegment {
             src_port: 5000,
@@ -1665,14 +1934,25 @@ mod tests {
             payload: b"abc",
             options: &[],
         };
-        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, Some(mbuf_ctx));
         assert_eq!(out.delivered, 3);
         assert_eq!(out.buf_full_drop, 0);
+        drop(c);
+        let _ = &mut fake_mbuf_storage;
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn established_recv_buf_full_flags_buf_full_drop_not_ooo() {
+        // A6.6 Task 3: in-order append requires mbuf-backed ctx.
         // recv buffer cap is 1024 in `est_conn`; send 2000 bytes in-order.
+        let mut fake_mbuf_storage: Box<[u8; 256]> = Box::new([0u8; 256]);
+        let fake_mbuf: std::ptr::NonNull<dpdk_net_sys::rte_mbuf> = unsafe {
+            std::ptr::NonNull::new_unchecked(
+                fake_mbuf_storage.as_mut_ptr() as *mut dpdk_net_sys::rte_mbuf,
+            )
+        };
+        let mbuf_ctx = MbufInsertCtx { mbuf: fake_mbuf, payload_offset: 54 };
         let mut c = est_conn(1000, 5000, 4096);
         // Widen rcv_wnd so the 2000-byte segment is in-window, else the
         // handler would reject it before the delivery branch.
@@ -1689,12 +1969,15 @@ mod tests {
             payload: &payload,
             options: &[],
         };
-        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, Some(mbuf_ctx));
         // 1024 accepted, 976 dropped — overflow is `buf_full_drop`, not OOO.
         assert_eq!(out.delivered, 1024);
         assert_eq!(out.buf_full_drop, 2000 - 1024);
+        drop(c);
+        let _ = &mut fake_mbuf_storage;
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn established_ack_field_advances_snd_una() {
         let mut c = est_conn(1000, 5000, 1024);
@@ -1718,6 +2001,7 @@ mod tests {
         assert_eq!(c.snd.pending.len(), 0);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn established_fin_transitions_to_close_wait() {
         let mut c = est_conn(1000, 5000, 1024);
@@ -1738,6 +2022,7 @@ mod tests {
         assert_eq!(c.rcv_nxt, 5002); // FIN consumes one seq
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn established_rst_closes_immediately() {
         let mut c = est_conn(1000, 5000, 1024);
@@ -1757,6 +2042,7 @@ mod tests {
         assert!(out.closed);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn established_rst_outcome_carries_rst_cause() {
         let mut c = est_conn(1000, 5000, 1024);
@@ -1780,6 +2066,7 @@ mod tests {
         assert!((seg.flags & TCP_RST) != 0);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn fin_wait1_ack_of_our_fin_transitions_to_fin_wait2() {
         use crate::flow_table::FourTuple;
@@ -1814,6 +2101,7 @@ mod tests {
         assert_eq!(out.new_state, Some(TcpState::FinWait2));
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn fin_wait2_peer_fin_transitions_to_time_wait() {
         use crate::flow_table::FourTuple;
@@ -1850,6 +2138,7 @@ mod tests {
         assert_eq!(c.rcv_nxt, 5002);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn fin_wait1_peer_fin_without_ack_of_our_fin_transitions_to_closing() {
         use crate::flow_table::FourTuple;
@@ -1884,6 +2173,7 @@ mod tests {
         assert_eq!(out.new_state, Some(TcpState::Closing));
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn closing_ack_of_our_fin_transitions_to_time_wait() {
         use crate::flow_table::FourTuple;
@@ -1918,6 +2208,7 @@ mod tests {
         assert_eq!(out.new_state, Some(TcpState::TimeWait));
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn last_ack_ack_of_our_fin_closes_connection() {
         use crate::flow_table::FourTuple;
@@ -1960,6 +2251,7 @@ mod tests {
         c
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn paws_drops_segment_with_stale_tsval_and_emits_challenge_ack() {
         use crate::tcp_options::TcpOpts;
@@ -1986,9 +2278,18 @@ mod tests {
         assert_eq!(c.ts_recent, 200); // unchanged
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn paws_accepts_fresh_tsval_and_updates_ts_recent() {
+        // A6.6 Task 3: in-order append requires mbuf-backed ctx.
         use crate::tcp_options::TcpOpts;
+        let mut fake_mbuf_storage: Box<[u8; 256]> = Box::new([0u8; 256]);
+        let fake_mbuf: std::ptr::NonNull<dpdk_net_sys::rte_mbuf> = unsafe {
+            std::ptr::NonNull::new_unchecked(
+                fake_mbuf_storage.as_mut_ptr() as *mut dpdk_net_sys::rte_mbuf,
+            )
+        };
+        let mbuf_ctx = MbufInsertCtx { mbuf: fake_mbuf, payload_offset: 54 };
         let mut c = est_conn_ts(1000, 5000, 1024, 200);
         let mut peer_opts = TcpOpts::default();
         peer_opts.timestamps = Some((300, 0));
@@ -2005,12 +2306,15 @@ mod tests {
             payload: b"hello",
             options: &buf[..n],
         };
-        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, Some(mbuf_ctx));
         assert!(!out.paws_rejected);
         assert_eq!(out.delivered, 5);
         assert_eq!(c.ts_recent, 300);
+        drop(c);
+        let _ = &mut fake_mbuf_storage;
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn missing_ts_on_ts_enabled_conn_bumps_bad_option_and_drops() {
         let mut c = est_conn_ts(1000, 5000, 1024, 200);
@@ -2030,6 +2334,7 @@ mod tests {
         assert_eq!(out.delivered, 0);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn established_decodes_peer_sack_blocks_into_scoreboard() {
         use crate::tcp_options::{SackBlock, TcpOpts};
@@ -2068,6 +2373,7 @@ mod tests {
         assert!(!c.sack_scoreboard.is_sacked(1003));
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn established_prunes_scoreboard_below_snd_una() {
         use crate::tcp_options::{SackBlock, TcpOpts};
@@ -2108,6 +2414,7 @@ mod tests {
     // A5 Task 16: RFC 2883 DSACK detection. Visibility only — no behavior
     // change; the block is skipped from the scoreboard and counted.
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn is_dsack_below_snd_una() {
         // Condition (a): block.right <= snd_una — the peer is reporting a
@@ -2133,6 +2440,7 @@ mod tests {
         ));
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn is_dsack_covered_by_existing_scoreboard_block() {
         // Condition (b): block is fully enclosed by an existing scoreboard
@@ -2161,6 +2469,7 @@ mod tests {
         ));
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn is_dsack_rejects_block_reporting_new_data() {
         // Block above snd_una and not covered by any existing scoreboard
@@ -2176,6 +2485,7 @@ mod tests {
         ));
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn is_dsack_rejects_partial_overlap_with_existing() {
         // Block overlaps but is NOT fully covered by the existing entry —
@@ -2195,6 +2505,7 @@ mod tests {
         ));
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn established_dsack_below_snd_una_counted_and_skipped() {
         use crate::tcp_options::{SackBlock, TcpOpts};
@@ -2234,6 +2545,7 @@ mod tests {
         assert!(c.rack.dsack_seen);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn established_dsack_covered_by_existing_counted_and_skipped() {
         use crate::tcp_options::{SackBlock, TcpOpts};
@@ -2276,6 +2588,7 @@ mod tests {
         assert_eq!(c.sack_scoreboard.blocks()[0].right, 1020);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn established_mixed_dsack_plus_live_sack_handled_separately() {
         use crate::tcp_options::{SackBlock, TcpOpts};
@@ -2318,6 +2631,7 @@ mod tests {
         assert_eq!(c.sack_scoreboard.blocks()[0].left, 1015);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn time_wait_replays_ack_on_any_segment() {
         use crate::flow_table::FourTuple;
@@ -2351,6 +2665,7 @@ mod tests {
 
     // A4 Task 19: cross-phase backfill flags on `Outcome`.
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn established_urg_flag_drops_and_sets_urgent_dropped() {
         use crate::tcp_output::TCP_URG;
@@ -2374,6 +2689,7 @@ mod tests {
         assert_eq!(c.rcv_nxt, 5001);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn established_out_of_window_sets_bad_seq_and_challenge_acks() {
         let mut c = est_conn(1000, 5000, 1024);
@@ -2395,6 +2711,7 @@ mod tests {
         assert_eq!(out.delivered, 0);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn established_ack_ahead_of_snd_nxt_sets_bad_ack() {
         let mut c = est_conn(1000, 5000, 1024);
@@ -2415,6 +2732,7 @@ mod tests {
         assert_eq!(out.tx, TxAction::Ack); // challenge ACK
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn established_duplicate_ack_sets_dup_ack() {
         let mut c = est_conn(1000, 5000, 1024);
@@ -2441,9 +2759,21 @@ mod tests {
         assert!(out.dup_ack);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn dup_ack_ignored_when_seg_has_data() {
-        // c2 violated: payload non-empty.
+        // c2 violated: payload non-empty. A6.6 T3 follow-up: the
+        // in-order-append site now `debug_assert`s that the caller
+        // provides an mbuf-backed ctx whenever payload is non-empty,
+        // so feed this test a real-backed fake mbuf even though we
+        // only care about the `dup_ack` flag.
+        let mut fake_mbuf_storage: Box<[u8; 256]> = Box::new([0u8; 256]);
+        let fake_mbuf: std::ptr::NonNull<dpdk_net_sys::rte_mbuf> = unsafe {
+            std::ptr::NonNull::new_unchecked(
+                fake_mbuf_storage.as_mut_ptr() as *mut dpdk_net_sys::rte_mbuf,
+            )
+        };
+        let mbuf_ctx = MbufInsertCtx { mbuf: fake_mbuf, payload_offset: 54 };
         let mut c = est_conn(1000, 5000, 1024);
         c.snd_nxt = c.snd_una.wrapping_add(100);
         c.snd_wnd = 65535;
@@ -2459,10 +2789,16 @@ mod tests {
             payload: b"xxx",
             options: &[],
         };
-        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, Some(mbuf_ctx));
         assert!(!out.dup_ack);
+        // The in-order append pushed an InOrderSegment into c.recv.bytes
+        // that owns a refcount on `fake_mbuf`. Drop `c` explicitly so
+        // MbufHandle::Drop fires against the real-backed storage.
+        drop(c);
+        let _ = &mut fake_mbuf_storage;
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn dup_ack_ignored_when_seg_updates_window() {
         // c3 violated: seg.window differs from conn.snd_wnd (no-shift).
@@ -2485,6 +2821,7 @@ mod tests {
         assert!(!out.dup_ack);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn dup_ack_ignored_when_no_outstanding_data() {
         // c4 violated: snd_una == snd_nxt (nothing in flight).
@@ -2507,6 +2844,7 @@ mod tests {
         assert!(!out.dup_ack);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn dup_ack_set_when_all_five_conditions_hold_with_ws_shift() {
         // Parallel to `established_duplicate_ack_sets_dup_ack`, but with a
@@ -2532,6 +2870,7 @@ mod tests {
         assert!(out.dup_ack);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn dup_ack_ignored_when_fin_flag_set() {
         // c5 violated: FIN flag set. All other conditions (c1-c4) hold,
@@ -2556,6 +2895,7 @@ mod tests {
         assert!(!out.dup_ack);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn dup_ack_ignored_when_syn_flag_set() {
         // c5 violated: SYN flag set. Mirrors the FIN case — RFC 5681 §2 (c)
@@ -2579,6 +2919,7 @@ mod tests {
         assert!(!out.dup_ack);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn established_zero_window_segment_sets_rx_zero_window() {
         let mut c = est_conn(1000, 5000, 1024);
@@ -2597,6 +2938,7 @@ mod tests {
         assert!(out.rx_zero_window);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn established_nonzero_window_does_not_set_rx_zero_window() {
         let mut c = est_conn(1000, 5000, 1024);
@@ -2615,6 +2957,7 @@ mod tests {
         assert!(!out.rx_zero_window);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn close_path_out_of_window_sets_bad_seq() {
         use crate::flow_table::FourTuple;
@@ -2651,6 +2994,7 @@ mod tests {
         assert_eq!(out.tx, TxAction::Ack);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn established_base_outcome_flags_default_false() {
         let out = Outcome::base();
@@ -2661,6 +3005,7 @@ mod tests {
         assert!(!out.rx_zero_window);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn outcome_snd_una_advanced_to_field_defaults() {
         let o = Outcome::base();
@@ -2668,6 +3013,7 @@ mod tests {
         assert!(!o.rtt_sample_taken);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn outcome_rack_lost_indexes_defaults_empty() {
         let o = Outcome::base();
@@ -2679,6 +3025,7 @@ mod tests {
     // (newer xmit, SACKed by the incoming ACK). After the ACK, A's
     // xmit_ts is older than RACK.xmit_ts + age exceeds reo_wnd, so it's
     // marked lost and its index is surfaced via Outcome.rack_lost_indexes.
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn rack_detects_older_entry_as_lost_when_newer_sacked_and_beyond_reo_wnd() {
         use crate::mempool::Mbuf;
@@ -2697,6 +3044,7 @@ mod tests {
             sacked: false,
             lost: false,
             xmit_ts_ns: 0,
+            hdrs_len: 0,
         });
         // B: seq=1051, len=50, xmit_ts = now (much later than A).
         let now_ns = crate::clock::now_ns();
@@ -2709,6 +3057,7 @@ mod tests {
             sacked: false,
             lost: false,
             xmit_ts_ns: now_ns,
+            hdrs_len: 0,
         });
         // Build an ACK segment carrying a SACK block covering B (1051..1101).
         // `parse_options` expects the raw options bytes; construct them
@@ -2745,6 +3094,7 @@ mod tests {
     }
 
     // Empty snd_retrans → RACK pass is a no-op, rack_lost_indexes stays empty.
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn rack_pass_noop_when_no_inflight_segments() {
         let mut c = est_conn(1000, 5000, 1024);

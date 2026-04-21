@@ -22,8 +22,8 @@
 | A-HW+ | ENA observability + tuning knobs (WC verify + ENI xstats + per-queue xstats + large_llq_hdr / miss_txc_to knobs) | **Complete** ✓ | `2026-04-20-stage1-phase-a-hw-plus-ena-obs-knobs.md` |
 | A6 | Public API surface completeness **+ per-connection RTT histogram** (merged from former A5.6) | Not started | — |
 | A6.5 | Hot-path allocation elimination (reusable scratch, streaming csum, SmallVec, zero-copy reassembly) | Complete | phase-a6-5-complete |
-| A6.6 | RX zero-copy (scatter-gather iovec API, in-order delivery-path mbuf-ref rework, LRO-compatible multi-segment, `rx_mempool_size` knob) | Not started | — |
-| A6.7 | FFI safety audit & hardening (miri, cbindgen header-drift CI, ABI snapshot, panic-firewall test, no-alloc-on-hot-path audit, C++ consumer under ASan/UBSan/LSan) | Not started | — |
+| A6.6 | RX zero-copy (scatter-gather iovec API, in-order delivery-path mbuf-ref rework, LRO-compatible multi-segment, `rx_mempool_size` knob) | Complete[^a66fused] | phase-a6-6-7-complete |
+| A6.7 | FFI safety audit & hardening (miri, cbindgen header-drift CI, ABI snapshot, panic-firewall test, no-alloc-on-hot-path audit, C++ consumer under ASan/UBSan/LSan) | Complete | phase-a6-6-7-complete |
 | A7 | Loopback test server + packetdrill-shim | Not started | — |
 | A8 | tcpreq + observability gate | Not started | — |
 | A9 | TCP-Fuzz differential + smoltcp FaultInjector | Not started | — |
@@ -32,6 +32,8 @@
 | A12 | Documentation (user + maintainer + future-work) + Stage 1 release tag | Not started | — |
 | A13 | HTTP/1.1 + TLS client integration + bench (via `contek-io/cpp_common`) | Not started | — |
 | A14 | WebSocket + TLS client integration + bench (via `contek-io/cpp_common`) | Not started | — |
+
+[^a66fused]: Shares end-of-phase tag with A6.7 per fused-execution model (spec §6 / §11 in `2026-04-20-stage1-phase-a6-6-7-fused-design.md`).
 
 ---
 

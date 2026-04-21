@@ -38,54 +38,82 @@ impl SendQueue {
     }
 }
 
+/// One contiguous in-order payload segment backed by a refcount-pinned mbuf.
+/// Each segment references a live DPDK mbuf (via `MbufHandle` that owns
+/// exactly one refcount) and a `[offset, offset+len)` window into the
+/// mbuf's data region. The window is the TCP payload slice; `offset`
+/// starts at the first TCP payload byte (post-header).
+///
+/// Ownership contract: at most one `InOrderSegment` holds each refcount
+/// unit. A split on partial-read produces two `InOrderSegment`s both
+/// referencing the same underlying `rte_mbuf` with refcount bumped once
+/// via `MbufHandle::try_clone()` — both halves own independent refcounts.
+#[derive(Debug)]
+pub struct InOrderSegment {
+    pub mbuf: crate::mempool::MbufHandle,
+    pub offset: u16,
+    pub len: u16,
+}
+
+impl InOrderSegment {
+    #[inline]
+    pub fn data_ptr(&self) -> *const u8 {
+        // SAFETY: mbuf is refcount-pinned for the lifetime of this segment;
+        // offset/len were bounds-checked at construction (see tcp_reassembly.rs).
+        unsafe {
+            let base = dpdk_net_sys::shim_rte_pktmbuf_data(self.mbuf.as_ptr()) as *const u8;
+            base.add(self.offset as usize)
+        }
+    }
+
+    #[inline]
+    pub fn len_bytes(&self) -> u32 {
+        self.len as u32
+    }
+}
+
 /// Per-connection receive buffer. A4 co-locates the out-of-order
 /// reassembly queue (`reorder`) with the in-order ring (`bytes`); both
 /// share the same cap, so `free_space_total` reports combined room.
+///
+/// A6.6 Task 3: `bytes` is now a queue of `InOrderSegment` descriptors
+/// pinning mbuf-resident payload windows, not a flattened `VecDeque<u8>`
+/// byte ring. Flow-control accounting reads `buffered_bytes()` which
+/// sums `seg.len` over the queue.
 pub struct RecvQueue {
-    pub bytes: VecDeque<u8>,
+    pub bytes: VecDeque<InOrderSegment>,
     pub cap: u32,
     /// A4: out-of-order segments buffered past the in-order point.
     /// Shares `cap` with `bytes`; `free_space_total` reports combined room.
     pub reorder: crate::tcp_reassembly::ReorderQueue,
-    /// A6.5 Task 4c: mbuf handle list pinning payload windows for the
-    /// current poll's READABLE events. Cleared at the start of each
-    /// `dpdk_net_poll` on the owning engine (not here); each stored
-    /// `MbufHandle` drops its held refcount on clear, releasing the
-    /// pin. The public `DPDK_NET_EVT_READABLE.data` pointer lives
-    /// inside one of these mbufs for the duration of the event-
-    /// emission window.
-    pub last_read_mbufs: smallvec::SmallVec<[crate::mempool::MbufHandle; 4]>,
 }
 
 impl RecvQueue {
     pub fn new(cap: u32) -> Self {
         Self {
-            bytes: VecDeque::with_capacity(cap as usize),
+            bytes: VecDeque::new(),
             cap,
             reorder: crate::tcp_reassembly::ReorderQueue::new(cap),
-            last_read_mbufs: smallvec::SmallVec::new(),
         }
+    }
+
+    /// Total bytes currently pinned in the in-order queue (sum of segment
+    /// lengths). Used by flow-control accounting (free_space / free_space_total).
+    #[inline]
+    pub fn buffered_bytes(&self) -> u32 {
+        self.bytes.iter().map(|s| s.len as u32).sum()
     }
 
     /// In-order free-space only (matches A3's semantic).
     pub fn free_space(&self) -> u32 {
-        self.cap.saturating_sub(self.bytes.len() as u32)
+        self.cap.saturating_sub(self.buffered_bytes())
     }
 
     /// Combined free-space across in-order bytes + reorder queue.
     pub fn free_space_total(&self) -> u32 {
         self.cap
-            .saturating_sub(self.bytes.len() as u32)
+            .saturating_sub(self.buffered_bytes())
             .saturating_sub(self.reorder.total_bytes())
-    }
-
-    /// Append `payload` to the in-order queue, up to in-order free-space.
-    /// Returns the number of bytes accepted (may be < payload.len() if
-    /// the in-order half would overflow).
-    pub fn append(&mut self, payload: &[u8]) -> u32 {
-        let take = payload.len().min(self.free_space() as usize);
-        self.bytes.extend(&payload[..take]);
-        take as u32
     }
 }
 
@@ -269,6 +297,23 @@ pub struct TcpConn {
     /// buckets on one cacheline. Updated after each `rtt_est.sample()`
     /// in `tcp_input.rs` (Task 15). Slow-path update (~5–10 ns).
     pub rtt_histogram: crate::rtt_histogram::RttHistogram,
+
+    /// A6.6 Task 7: segments popped from `recv.bytes` during the most
+    /// recent poll's `deliver_readable`, refcount-pinned until the NEXT
+    /// poll drains them at the top of `poll_once`. Backs the iovec
+    /// slice pointed at by the READABLE event. Full `InOrderSegment`
+    /// is retained (mbuf + offset + len), not just the mbuf handle —
+    /// the offset/len window is what `data_ptr()` reads at iovec
+    /// materialization time.
+    pub delivered_segments: smallvec::SmallVec<[InOrderSegment; 4]>,
+    /// A6.6 Task 7: scratch for iovec array materialization in
+    /// `deliver_readable`. Cleared at the top of each `deliver_readable`
+    /// call for the conn (before pushing new iovecs) and again at the
+    /// top of the NEXT `poll_once`. Capacity retained across polls.
+    /// Uses the core-side `DpdkNetIovec`; the FFI crate's
+    /// `dpdk_net_iovec_t` has identical `#[repr(C)]` layout (layout-
+    /// asserted in `crates/dpdk-net/src/api.rs`).
+    pub readable_scratch_iovecs: Vec<crate::iovec::DpdkNetIovec>,
 }
 
 impl TcpConn {
@@ -321,8 +366,29 @@ impl TcpConn {
             time_wait_deadline_ns: None,
             last_advertised_wnd: None,
             last_sack_trigger: None,
-            timer_ids: Vec::new(),
-            snd_retrans: crate::tcp_retrans::SendRetrans::new(),
+            // Pre-size to cover the live-timer ceiling per conn under
+            // sustained TX. Live distinct timers per conn are RTO +
+            // TLP + (transient) SYN-retrans, but `retain` is O(n) and
+            // doesn't shrink the Vec — so the steady-state high-water
+            // mark is what matters. Empirically the no-alloc audit
+            // observes the Vec briefly straddling 16+ entries during
+            // overlapped restart windows (RTO cancel + TLP fire +
+            // re-arm in adjacent ACKs); pre-sizing to 32 covers that
+            // P99 without the geometric-doubling grow surfacing in
+            // the audit's measurement window. 32 × 8 B = 256 B per
+            // conn — negligible footprint at `max_connections=1024`.
+            timer_ids: Vec::with_capacity(32),
+            // Pre-size the in-flight deque to the steady-state ceiling
+            // (`send_buf_bytes / our_mss`, +1 to absorb partial-segment
+            // rounding). `send_bytes` caps `room_in_peer_wnd` and
+            // `send_buf_room` so `snd_retrans` can never exceed this
+            // bound; pre-sizing here keeps the no-alloc-on-hot-path
+            // audit honest under sustained TX (otherwise the inner
+            // VecDeque doubles 1→4→…→256 during ramp and surfaces
+            // multiple hot-path allocs in the audit measurement window).
+            snd_retrans: crate::tcp_retrans::SendRetrans::with_capacity(
+                (send_buf_bytes / our_mss.max(1) as u32 + 1) as usize,
+            ),
             rtt_est: crate::tcp_rtt::RttEstimator::new(min_rto_us, initial_rto_us, max_rto_us),
             rto_timer_id: None,
             tlp_timer_id: None,
@@ -359,6 +425,11 @@ impl TcpConn {
             send_refused_pending: false,
             force_tw_skip: false,
             rtt_histogram: crate::rtt_histogram::RttHistogram::default(),
+            // A6.6 Task 7: per-conn scratch for READABLE iovec
+            // materialization + segment-ref holding. Both cleared at
+            // top of each `poll_once`; capacity retained across polls.
+            delivered_segments: smallvec::SmallVec::new(),
+            readable_scratch_iovecs: Vec::new(),
         }
     }
 
@@ -577,6 +648,7 @@ mod tests {
         }
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn new_client_sets_iss_both_una_and_nxt() {
         let c = TcpConn::new_client(
@@ -595,12 +667,14 @@ mod tests {
         assert_eq!(c.state, TcpState::Closed);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn rcv_wnd_clamped_to_u16_max_without_wscale() {
         let c = TcpConn::new_client(tuple(), 0, 1460, 1_000_000, 1024, 5000, 5000, 1_000_000);
         assert_eq!(c.rcv_wnd, u16::MAX as u32);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn send_queue_push_respects_cap() {
         let mut sq = SendQueue::new(4);
@@ -609,13 +683,20 @@ mod tests {
         assert_eq!(sq.free_space(), 0);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
-    fn recv_queue_append_respects_cap() {
-        let mut rq = RecvQueue::new(3);
-        assert_eq!(rq.append(b"hello"), 3);
-        assert_eq!(rq.bytes.len(), 3);
+    fn recv_queue_buffered_bytes_starts_zero_and_matches_free_space() {
+        // A6.6 Task 3: `RecvQueue::append` is retired (the VecDeque<u8>
+        // ring was replaced by VecDeque<InOrderSegment>). The ingest
+        // path in `tcp_input.rs` now pushes mbuf-backed segments
+        // directly; this test retains the flow-control accounting
+        // check that pre-dated the ingest rework.
+        let rq = RecvQueue::new(3);
+        assert_eq!(rq.buffered_bytes(), 0);
+        assert_eq!(rq.free_space(), 3);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn fin_acked_checks_fin_seq_plus_one() {
         let mut c = TcpConn::new_client(tuple(), 100, 1460, 1024, 2048, 5000, 5000, 1_000_000);
@@ -626,6 +707,7 @@ mod tests {
         assert!(c.fin_has_been_acked(500));
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn recv_queue_has_reorder_field_and_shares_cap() {
         let rq = RecvQueue::new(1024);
@@ -635,6 +717,7 @@ mod tests {
         assert_eq!(rq.free_space_total(), 1024);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn a4_options_fields_default_to_not_negotiated() {
         let c = TcpConn::new_client(tuple(), 1000, 1460, 1024, 2048, 5000, 5000, 1_000_000);
@@ -649,6 +732,7 @@ mod tests {
         assert!(!c.sack_enabled);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn a4_sack_scoreboard_starts_empty() {
         let c = TcpConn::new_client(tuple(), 1000, 1460, 1024, 2048, 5000, 5000, 1_000_000);
@@ -656,6 +740,7 @@ mod tests {
         assert_eq!(c.sack_scoreboard.len(), 0);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn a4_last_sack_trigger_starts_none() {
         // F-8 RFC 2018 §4 MUST-26: conn.last_sack_trigger is set by
@@ -665,12 +750,14 @@ mod tests {
         assert!(c.last_sack_trigger.is_none());
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn new_client_timer_ids_starts_empty() {
         let c = TcpConn::new_client(tuple(), 1, 1460, 1024, 2048, 5000, 5000, 1_000_000);
         assert!(c.timer_ids.is_empty());
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn a5_conn_starts_with_empty_snd_retrans_and_default_rtt() {
         let c = TcpConn::new_client(tuple(), 100, 1460, 1024, 2048, 5000, 5000, 1_000_000);
@@ -684,6 +771,7 @@ mod tests {
         assert!(!c.rto_no_backoff);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn a5_conn_has_default_rack_state() {
         let c = TcpConn::new_client(tuple(), 1, 1460, 1024, 2048, 5000, 5000, 1_000_000);
@@ -701,6 +789,7 @@ mod tests {
     // direct-construct conn (bypassing `connect_with_opts`) has a working
     // `tlp_arm_gate_passes()` budget. All other TLP fields remain
     // zero/false/None (that still maps to A5 behavior).
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn a5_5_tlp_tuning_fields_default_init_on_new_client() {
         let c = TcpConn::new_client(tuple(), 1, 1460, 1024, 2048, 5000, 5000, 1_000_000);
@@ -722,6 +811,7 @@ mod tests {
         assert_eq!(c.syn_tx_ts_ns, 0);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn a5_5_tlp_config_projects_fields() {
         let mut c = TcpConn::new_client(tuple(), 1, 1460, 1024, 2048, 5000, 5000, 1_000_000);
@@ -734,6 +824,7 @@ mod tests {
         assert!(cfg.skip_flight_size_gate);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn a5_5_tlp_config_u32_max_means_no_floor() {
         let mut c = TcpConn::new_client(tuple(), 1, 1460, 1024, 2048, 5000, 5000, 1_000_000);
@@ -743,6 +834,7 @@ mod tests {
         assert_eq!(cfg.floor_us, 0, "u32::MAX sentinel must project to 0");
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn a6_new_fields_zero_init_after_new_client() {
         let c = TcpConn::new_client(
@@ -779,6 +871,7 @@ mod a5_5_stats_tests {
         TcpConn::new_client(tuple(), 0, 1460, 1024, 2048, 5000, 5000, 1_000_000)
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn stats_projects_send_path_fields() {
         let mut c = make_test_conn();
@@ -791,6 +884,7 @@ mod a5_5_stats_tests {
         assert_eq!(s.snd_wnd, 65535);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn stats_before_any_rtt_sample_returns_zero_except_rto() {
         let c = make_test_conn();
@@ -801,6 +895,7 @@ mod a5_5_stats_tests {
         assert_eq!(s.rto_us, c.rtt_est.rto_us());
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn stats_send_buf_bytes_free_saturates_at_zero() {
         let mut c = make_test_conn();
@@ -826,9 +921,11 @@ mod a5_5_tlp_hook_tests {
             sacked: false,
             lost: false,
             xmit_ts_ns: 0,
+            hdrs_len: 0,
         });
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn tlp_arm_gate_rejects_when_retrans_empty() {
         let mut c = make_test_conn();
@@ -837,6 +934,7 @@ mod a5_5_tlp_hook_tests {
         assert!(!c.tlp_arm_gate_passes());
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn tlp_arm_gate_rejects_when_timer_already_armed() {
         let mut c = make_test_conn();
@@ -850,6 +948,7 @@ mod a5_5_tlp_hook_tests {
         assert!(!c.tlp_arm_gate_passes());
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn tlp_arm_gates_reject_when_budget_exhausted() {
         let mut c = make_test_conn();
@@ -860,6 +959,7 @@ mod a5_5_tlp_hook_tests {
         assert!(!c.tlp_arm_gate_passes());
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn tlp_arm_gates_pass_when_under_budget_and_sample_seen() {
         let mut c = make_test_conn();
@@ -872,6 +972,7 @@ mod a5_5_tlp_hook_tests {
         assert!(c.tlp_arm_gate_passes());
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn tlp_arm_gate_rejects_without_rtt_sample_seen_when_not_skipped() {
         let mut c = make_test_conn();
@@ -883,6 +984,7 @@ mod a5_5_tlp_hook_tests {
         assert!(!c.tlp_arm_gate_passes());
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn tlp_arm_gate_bypasses_rtt_sample_check_when_skip_flag_set() {
         let mut c = make_test_conn();
@@ -897,6 +999,7 @@ mod a5_5_tlp_hook_tests {
         assert!(c.tlp_arm_gate_passes());
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn tlp_arm_gate_rejects_when_srtt_absent() {
         // A5.5 Task 15: gate rejects when SRTT is unavailable. Post
@@ -913,6 +1016,7 @@ mod a5_5_tlp_hook_tests {
         assert!(!c.tlp_arm_gate_passes());
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn on_tlp_fire_records_probe_bumps_counter_clears_flag() {
         let mut c = make_test_conn();
@@ -932,6 +1036,7 @@ mod a5_5_tlp_hook_tests {
         assert_eq!(c.tlp_recent_probes_next_slot, 1);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn on_tlp_fire_wraps_ring_at_slot_5() {
         let mut c = make_test_conn();
@@ -943,6 +1048,7 @@ mod a5_5_tlp_hook_tests {
         assert_eq!(c.tlp_recent_probes[1].unwrap().seq, 1);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn on_tlp_fire_budget_saturates_at_u8_max() {
         let mut c = make_test_conn();
@@ -951,6 +1057,7 @@ mod a5_5_tlp_hook_tests {
         assert_eq!(c.tlp_consecutive_probes_fired, u8::MAX);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn on_rtt_sample_tlp_hook_resets_budget_and_sets_sample_seen() {
         let mut c = make_test_conn();
@@ -963,6 +1070,7 @@ mod a5_5_tlp_hook_tests {
         assert!(c.tlp_rtt_sample_seen_since_last_tlp);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn on_new_data_ack_tlp_hook_resets_budget_only() {
         let mut c = make_test_conn();
@@ -981,6 +1089,7 @@ mod a5_5_dsack_attribution {
     use super::a5_5_stats_tests::make_test_conn;
     use super::RecentProbe;
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn attribute_dsack_matches_recent_probe_within_window() {
         let mut c = make_test_conn();
@@ -999,6 +1108,7 @@ mod a5_5_dsack_attribution {
         assert!(c.tlp_recent_probes[0].as_ref().unwrap().attributed);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn attribute_dsack_outside_window_skips_probe() {
         let mut c = make_test_conn();
@@ -1016,6 +1126,7 @@ mod a5_5_dsack_attribution {
         assert!(!c.tlp_recent_probes[0].as_ref().unwrap().attributed);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn attribute_dsack_does_not_double_count_same_probe() {
         let mut c = make_test_conn();
@@ -1034,6 +1145,7 @@ mod a5_5_dsack_attribution {
         assert!(!second); // already attributed
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn attribute_dsack_partial_block_coverage_skips_probe() {
         let mut c = make_test_conn();
@@ -1051,6 +1163,7 @@ mod a5_5_dsack_attribution {
         assert!(!attributed);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn attribute_dsack_with_no_probes_in_ring_returns_false() {
         let mut c = make_test_conn();
@@ -1067,6 +1180,7 @@ mod a5_5_syn_srtt_seed {
     use super::a5_5_stats_tests::make_test_conn;
     use crate::engine::DEFAULT_RTT_HISTOGRAM_EDGES_US;
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn syn_rtt_seed_absorbs_first_sample() {
         let mut c = make_test_conn();
@@ -1082,6 +1196,7 @@ mod a5_5_syn_srtt_seed {
         assert_eq!(c.rtt_histogram.buckets[12], 1);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn syn_rtt_seed_karns_rule_skips_retransmits() {
         let mut c = make_test_conn();
@@ -1096,6 +1211,7 @@ mod a5_5_syn_srtt_seed {
         assert!(c.rtt_histogram.buckets.iter().all(|&b| b == 0));
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn syn_rtt_seed_rejects_zero_syn_tx_ts() {
         let mut c = make_test_conn();
@@ -1109,6 +1225,7 @@ mod a5_5_syn_srtt_seed {
         assert!(c.rtt_histogram.buckets.iter().all(|&b| b == 0));
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn syn_rtt_seed_rejects_out_of_bounds_rtt() {
         let mut c = make_test_conn();

@@ -40,8 +40,23 @@ int shim_rte_eth_dev_get_mtu(uint16_t port_id, uint16_t *mtu);
 void *shim_rte_pktmbuf_data(const struct rte_mbuf *m);
 uint16_t shim_rte_pktmbuf_data_len(const struct rte_mbuf *m);
 int shim_rte_pktmbuf_chain(struct rte_mbuf *head, struct rte_mbuf *tail);
+/* Strip `len` bytes off the front of `m`'s data region (advances data_off,
+ * shrinks data_len + pkt_len). Returns the new data pointer or NULL if
+ * `len > data_len`. Used by the retransmit primitive to drop the original
+ * L2+L3+TCP headers from the snd_retrans data mbuf before chaining a
+ * fresh header mbuf in front. */
+char *shim_rte_pktmbuf_adj(struct rte_mbuf *m, uint16_t len);
 void shim_rte_mbuf_refcnt_update(struct rte_mbuf *m, int16_t v);
 uint16_t shim_rte_pktmbuf_nb_segs(const struct rte_mbuf *m);
+/* A6.6 Task 5: next-segment accessor for multi-seg RX ingest chain walk.
+ * Returns m->next or NULL if `m` is the last/only segment. */
+struct rte_mbuf *shim_rte_pktmbuf_next(struct rte_mbuf *m);
+
+/* A6.6-7 Task 13: current free-count of a DPDK mempool. Used by the
+ * rx_close_drains_mbufs integration test to verify the engine's close
+ * path releases RX-mempool refs back to baseline. Real extern re-
+ * exported for bindgen-allowlist consistency. */
+unsigned shim_rte_mempool_avail_count(struct rte_mempool *mp);
 
 /* A-HW Task 7: TX offload metadata setters. `struct rte_mbuf` is opaque
  * to bindgen (packed anonymous unions), so we can't touch ol_flags /

@@ -246,6 +246,29 @@ pub struct TcpCounters {
     /// / tx_flush_bursts; values near 1 mean the data path isn't
     /// actually batching.
     pub tx_flush_batched_pkts: AtomicU64,
+    // --- A6.6-7 Task 11: RX zero-copy event-shape counters (slow-path) ---
+    // All three are bumped exactly once per emitted `Event::Readable`
+    // from `deliver_readable` (never per-byte, never per-segment-loop).
+    // See spec §9.1.1 — slow-path, batched `fetch_add`, no hot-path cost.
+    /// A6.6-7: cumulative count of iovec segments emitted across every
+    /// READABLE event. Incremented once per event via `fetch_add(n_segs,
+    /// Relaxed)` (batched — a single RMW even when a READABLE covers N
+    /// segments). Mean-segs-per-event = rx_iovec_segs_total / (count of
+    /// READABLE events since start); values near 1 mean the reorder
+    /// queue rarely carries multiple contiguous segments.
+    pub rx_iovec_segs_total: AtomicU64,
+    /// A6.6-7: count of READABLE events whose iovec slice covered more
+    /// than one segment (`n_segs > 1`). Delta from
+    /// `rx_iovec_segs_total - rx_multi_seg_events = single-seg events`;
+    /// useful for reasoning about consumer loop shape.
+    pub rx_multi_seg_events: AtomicU64,
+    /// A6.6-7: count of READABLE events that required splitting the
+    /// front reorder-queue segment (partial pop via `try_clone` +
+    /// offset/len adjust). Incremented EXACTLY ONCE per event with a
+    /// split — not per split segment, not per byte. Nonzero = the
+    /// consumer is draining non-segment-aligned byte counts, which is
+    /// the common case for byte-stream protocols.
+    pub rx_partial_read_splits: AtomicU64,
 }
 
 #[repr(C, align(64))]
