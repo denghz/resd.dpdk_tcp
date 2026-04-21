@@ -107,7 +107,14 @@ fn bench_flow_lookup_cold(c: &mut Criterion) {
                 let h = ft.lookup_by_tuple(black_box(&target));
                 black_box(h);
             },
-            criterion::BatchSize::LargeInput,
+            // PerIteration: setup (scrub) runs before EACH measured lookup.
+            // LargeInput would run setup N times then measure N times, warming
+            // cache after the first measured iter — observed cold < hot which
+            // is physically impossible. PerIteration adds ~350 ns criterion
+            // overhead to every sample; the expected lookup cost (~200 ns per
+            // spec §11.2) stays clearly distinguishable from the hot path
+            // (~40 ns) after subtracting a stable overhead floor.
+            criterion::BatchSize::PerIteration,
         );
     });
 }
