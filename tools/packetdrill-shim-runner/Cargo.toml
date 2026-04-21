@@ -14,6 +14,15 @@ test-server = ["dpdk-net/test-server"]
 [dependencies]
 dpdk-net = { path = "../../crates/dpdk-net", default-features = false }
 
+[dev-dependencies]
+# A7 Task 12: the two shim direct self-tests (shim_inject_drain_roundtrip
+# and shim_virt_time_rto) exercise the test-FFI at the Rust level by
+# calling `Engine::inject_rx_frame` / `drain_tx_frames` / `pump_timers`
+# directly. They need dpdk-net-core's public surface (Engine, EngineConfig,
+# clock::set_virt_ns, test_tx_intercept, test_server::test_packet); the
+# runner crate otherwise only depends on the `dpdk-net` C-ABI facade.
+dpdk-net-core = { path = "../../crates/dpdk-net-core" }
+
 [[bin]]
 name = "pdshim-run-one"
 path = "src/main.rs"

@@ -645,6 +645,7 @@ name = "packetdrill-shim-runner"
 version = "0.1.0"
 dependencies = [
  "dpdk-net",
+ "dpdk-net-core",
 ]
 
 [[package]]

@@ -130,10 +130,9 @@ pub fn test_server_config() -> dpdk_net_core::engine::EngineConfig {
 }
 
 /// Build an Ethernet-framed IPv4/TCP packet using the same `build_segment`
-/// the engine emits on the wire. Reuses `dpdk_net_core::tcp_output::*` so
-/// the on-wire format stays byte-identical to what the engine would parse
-/// in production. Caller provides the flag set + options; the checksum is
-/// computed by `build_segment` itself.
+/// the engine emits on the wire. Thin forwarder to the public helper so
+/// out-of-crate test consumers (tools/packetdrill-shim-runner) share the
+/// exact same builder logic.
 #[cfg(feature = "test-server")]
 #[allow(clippy::too_many_arguments)]
 pub fn build_tcp_frame(
@@ -148,27 +147,9 @@ pub fn build_tcp_frame(
     options: dpdk_net_core::tcp_options::TcpOpts,
     payload: &[u8],
 ) -> Vec<u8> {
-    use dpdk_net_core::tcp_output::{build_segment, SegmentTx};
-    // MAC values are cosmetic for the test-server RX path; the engine
-    // reads L2 to advance to L3 but doesn't validate src_mac.
-    let seg = SegmentTx {
-        src_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x02],
-        dst_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
-        src_ip,
-        dst_ip,
-        src_port,
-        dst_port,
-        seq,
-        ack,
-        flags,
-        window,
-        options,
-        payload,
-    };
-    let mut buf = vec![0u8; 14 + 20 + 60 + payload.len()];
-    let n = build_segment(&seg, &mut buf).expect("build_segment fits");
-    buf.truncate(n);
-    buf
+    dpdk_net_core::test_server::test_packet::build_tcp_frame(
+        src_ip, src_port, dst_ip, dst_port, seq, ack, flags, window, options, payload,
+    )
 }
 
 #[cfg(feature = "test-server")]
@@ -180,21 +161,8 @@ pub fn build_tcp_syn(
     iss: u32,
     peer_mss: u16,
 ) -> Vec<u8> {
-    use dpdk_net_core::tcp_options::TcpOpts;
-    use dpdk_net_core::tcp_output::TCP_SYN;
-    let mut opts = TcpOpts::default();
-    opts.mss = Some(peer_mss);
-    build_tcp_frame(
-        src_ip,
-        src_port,
-        dst_ip,
-        dst_port,
-        iss,
-        0,
-        TCP_SYN,
-        u16::MAX,
-        opts,
-        &[],
+    dpdk_net_core::test_server::test_packet::build_tcp_syn(
+        src_ip, src_port, dst_ip, dst_port, iss, peer_mss,
     )
 }
 
@@ -207,53 +175,21 @@ pub fn build_tcp_ack(
     seq: u32,
     ack: u32,
 ) -> Vec<u8> {
-    use dpdk_net_core::tcp_options::TcpOpts;
-    use dpdk_net_core::tcp_output::TCP_ACK;
-    build_tcp_frame(
-        src_ip,
-        src_port,
-        dst_ip,
-        dst_port,
-        seq,
-        ack,
-        TCP_ACK,
-        u16::MAX,
-        TcpOpts::default(),
-        &[],
+    dpdk_net_core::test_server::test_packet::build_tcp_ack(
+        src_ip, src_port, dst_ip, dst_port, seq, ack,
     )
 }
 
 /// Parse a just-emitted frame from `drain_tx_frames`; extract the
 /// SYN-ACK's server ISS (= seq field) + the ack-value (which must be
-/// peer_iss + 1). Ignores IP / L2 validation — the test-server TX frames
-/// are produced by our own `build_segment`, so they're trivially well-formed.
+/// peer_iss + 1). Thin forwarder to the public helper.
 #[cfg(feature = "test-server")]
 pub fn parse_syn_ack(frame: &[u8]) -> Option<(u32, u32)> {
-    if frame.len() < 14 + 20 + 20 {
-        return None;
-    }
-    // L2 = 14. Read IP header length to locate TCP header.
-    let ip_ihl = (frame[14] & 0x0f) as usize * 4;
-    let tcp_off = 14 + ip_ihl;
-    if frame.len() < tcp_off + 20 {
-        return None;
-    }
-    let tcp = &frame[tcp_off..];
-    // Flags byte at offset 13 within the TCP header.
-    let flags = tcp[13];
-    // SYN|ACK = 0x12.
-    if flags & 0x12 != 0x12 {
-        return None;
-    }
-    let seq = u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]);
-    let ack = u32::from_be_bytes([tcp[8], tcp[9], tcp[10], tcp[11]]);
-    Some((seq, ack))
+    dpdk_net_core::test_server::test_packet::parse_syn_ack(frame)
 }
 
-/// A7 Task 6: build a bare FIN+ACK segment (flags 0x11). No options,
-/// empty payload. Mirrors the shape of `build_tcp_ack` but with FIN set
-/// so the peer-side of the passive-close test can close the inbound
-/// half of the stream.
+/// A7 Task 6: build a bare FIN+ACK segment (flags 0x11). Thin forwarder
+/// to the public helper.
 #[cfg(feature = "test-server")]
 pub fn build_tcp_fin(
     src_ip: u32,
@@ -263,34 +199,16 @@ pub fn build_tcp_fin(
     seq: u32,
     ack: u32,
 ) -> Vec<u8> {
-    use dpdk_net_core::tcp_options::TcpOpts;
-    use dpdk_net_core::tcp_output::{TCP_ACK, TCP_FIN};
-    build_tcp_frame(
-        src_ip,
-        src_port,
-        dst_ip,
-        dst_port,
-        seq,
-        ack,
-        TCP_FIN | TCP_ACK,
-        u16::MAX,
-        TcpOpts::default(),
-        &[],
+    dpdk_net_core::test_server::test_packet::build_tcp_fin(
+        src_ip, src_port, dst_ip, dst_port, seq, ack,
     )
 }
 
 /// A7 Task 6: extract `(seq, ack)` from a wire-format TCP frame produced
-/// by `drain_tx_frames`. Used by the passive-close test to learn our FIN's
-/// sequence number so it can craft the peer's acknowledging final ACK.
-/// Does not validate flags — callers already know what shape frame they
-/// just pulled off the TX ring.
+/// by `drain_tx_frames`. Thin forwarder to the public helper.
 #[cfg(feature = "test-server")]
 pub fn parse_tcp_seq_ack(frame: &[u8]) -> (u32, u32) {
-    let ip_ihl = (frame[14] & 0x0f) as usize * 4;
-    let tcp = &frame[14 + ip_ihl..];
-    let seq = u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]);
-    let ack = u32::from_be_bytes([tcp[8], tcp[9], tcp[10], tcp[11]]);
-    (seq, ack)
+    dpdk_net_core::test_server::test_packet::parse_tcp_seq_ack(frame)
 }
 
 /// A7 Task 6: run a SYN → SYN-ACK → final-ACK three-way handshake against
