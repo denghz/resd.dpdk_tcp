@@ -15,6 +15,10 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 # verify panic = "abort" at the C ABI boundary; never enabled in
 # production builds and never emitted into dpdk_net.h via cbindgen.
 test-panic-entry = []
+test-inject = ["dpdk-net-core/test-inject"]
+# A9 fault-injector pass-through: re-exports the dpdk-net-core feature gate.
+# Default OFF; cbindgen runs without it, so nothing leaks into dpdk_net.h.
+fault-injector = ["dpdk-net-core/fault-injector"]
 
 [dependencies]
 dpdk-net-core = { path = "../dpdk-net-core" }

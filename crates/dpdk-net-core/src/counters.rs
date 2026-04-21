@@ -320,6 +320,16 @@ pub struct Counters {
     pub tcp: TcpCounters,
     pub poll: PollCounters,
     pub obs: ObsCounters,
+    /// A9 fault-injector group. Struct is always present on the C ABI
+    /// (matching the `obs_events_dropped`/`tx_retrans` pre-declared
+    /// pattern); cargo feature `fault-injector` only controls whether
+    /// the FaultInjector middleware runs and populates these. cbindgen
+    /// doesn't honour `#[cfg(feature=...)]` when scanning module trees,
+    /// so feature-gated fields would leak into the default-build header.
+    /// Keeping the field unconditional + populated-when-feature-on avoids
+    /// that footgun (same pattern used for the A5 deferred tx_retrans /
+    /// tx_rto / tx_tlp counters).
+    pub fault_injector: FaultInjectorCounters,
 }
 
 impl Counters {
@@ -331,6 +341,7 @@ impl Counters {
             tcp: TcpCounters::default(),
             poll: PollCounters::default(),
             obs: ObsCounters::default(),
+            fault_injector: FaultInjectorCounters::default(),
         }
     }
 }
@@ -364,6 +375,32 @@ impl Default for PollCounters {
 impl Default for ObsCounters {
     fn default() -> Self {
         unsafe { std::mem::zeroed() }
+    }
+}
+
+/// A9 fault-injector counter group. Slow-path per §9.1.1 — one `fetch_add`
+/// per fault-decision branch (drop / dup / reorder / corrupt). Struct is
+/// ALWAYS present on the C ABI (the `fault-injector` cargo feature only
+/// gates whether the FaultInjector middleware runs and populates these;
+/// release builds with the feature off carry zero-valued counters, same
+/// pattern as the A5 deferred tx_retrans / tx_rto / tx_tlp counters).
+#[repr(C, align(64))]
+#[derive(Default)]
+pub struct FaultInjectorCounters {
+    pub drops: AtomicU64,
+    pub dups: AtomicU64,
+    pub reorders: AtomicU64,
+    pub corrupts: AtomicU64,
+}
+
+impl FaultInjectorCounters {
+    pub const fn new() -> Self {
+        Self {
+            drops: AtomicU64::new(0),
+            dups: AtomicU64::new(0),
+            reorders: AtomicU64::new(0),
+            corrupts: AtomicU64::new(0),
+        }
     }
 }
 
@@ -563,6 +600,19 @@ mod tests {
         assert_eq!(c.tcp.tx_window_update.load(Ordering::Relaxed), 0);
         assert_eq!(c.tcp.conn_table_full.load(Ordering::Relaxed), 0);
         assert_eq!(c.tcp.conn_time_wait_reaped.load(Ordering::Relaxed), 0);
+    }
+
+    /// A9 fault-injector counter group is zero at construction.
+    /// Struct is always present on the C ABI (feature only gates
+    /// population). Guards the per-group size+align asserts in
+    /// dpdk-net/src/api.rs from drifting silently.
+    #[test]
+    fn fault_injector_counters_zero_at_construction() {
+        let c = Counters::new();
+        assert_eq!(c.fault_injector.drops.load(Ordering::Relaxed), 0);
+        assert_eq!(c.fault_injector.dups.load(Ordering::Relaxed), 0);
+        assert_eq!(c.fault_injector.reorders.load(Ordering::Relaxed), 0);
+        assert_eq!(c.fault_injector.corrupts.load(Ordering::Relaxed), 0);
     }
 
     /// A5 pre-declared slow-path fields. Task 13 wires
