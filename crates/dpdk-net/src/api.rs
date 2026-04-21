@@ -81,6 +81,10 @@ pub struct dpdk_net_engine_config_t {
 pub struct dpdk_net_connect_opts_t {
     pub peer_addr: u32, // network byte order IPv4
     pub peer_port: u16,
+    /// Local source IP in network byte order. Zero = engine default.
+    /// Non-zero must match one of the engine's configured local IPs;
+    /// otherwise connect returns -EINVAL. Used for per-connection
+    /// source-IP binding in multi-homed / dual-NIC setups.
     pub local_addr: u32,
     pub local_port: u16,
     pub connect_timeout_ms: u32,

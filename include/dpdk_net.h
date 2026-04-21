@@ -414,6 +414,12 @@ struct dpdk_net_tcp_rtt_histogram_t {
 struct dpdk_net_connect_opts_t {
   uint32_t peer_addr;
   uint16_t peer_port;
+  /**
+   * Local source IP in network byte order. Zero = engine default.
+   * Non-zero must match one of the engine's configured local IPs;
+   * otherwise connect returns -EINVAL. Used for per-connection
+   * source-IP binding in multi-homed / dual-NIC setups.
+   */
   uint32_t local_addr;
   uint16_t local_port;
   uint32_t connect_timeout_ms;
@@ -476,6 +482,37 @@ struct dpdk_net_engine *dpdk_net_engine_create(uint16_t lcore_id,
                                                const struct dpdk_net_engine_config_t *cfg);
 
 void dpdk_net_engine_destroy(struct dpdk_net_engine *p);
+
+/**
+ * bug_010 → feature: register a secondary local source IP on this
+ * engine. `local_addr_nbo` is network byte order (matches the rest of
+ * the C ABI — `dpdk_net_connect_opts_t.local_addr` is also NBO).
+ *
+ * After this call, `dpdk_net_connect` accepts connect requests whose
+ * `local_addr` equals `local_addr_nbo` (or any previously-registered
+ * secondary, or the engine's primary `local_ip`). `local_addr == 0`
+ * in a connect request always selects the primary — the value 0 is
+ * reserved and rejected here as well.
+ *
+ * Idempotent: re-registering an already-known IP is not an error.
+ *
+ * Returns:
+ *   0        success (IP is registered; may or may not have been new)
+ *   -EINVAL  `p` is null, or `local_addr_nbo == 0`, or the value
+ *            equals the engine's primary `local_ip` (already accepted;
+ *            no registration needed).
+ *
+ * Scope note: this only extends the source-IP selection whitelist.
+ * It does NOT configure the address on the host interface, does NOT
+ * install a route for it, and does NOT program per-source ARP. The
+ * application is responsible for those in the dual-NIC / multi-homed
+ * setup this is designed to support.
+ *
+ * # Safety
+ * `p` must be a valid Engine pointer obtained from
+ * `dpdk_net_engine_create`, or null.
+ */
+int32_t dpdk_net_engine_add_local_ip(struct dpdk_net_engine *p, uint32_t local_addr_nbo);
 
 int32_t dpdk_net_poll(struct dpdk_net_engine *p,
                       struct dpdk_net_event_t *events_out,

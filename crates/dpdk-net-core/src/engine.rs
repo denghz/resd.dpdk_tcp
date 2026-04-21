@@ -260,6 +260,22 @@ pub struct EngineConfig {
 
     // Phase A2 additions (host byte order for IPs; raw bytes for MAC)
     pub local_ip: u32,
+    /// bug_010 → feature: additional local IPs the engine is willing to
+    /// use as the source IP for outbound connections. Host byte order.
+    /// Empty by default (single-IP engine, A2 behavior preserved).
+    ///
+    /// Semantics: `connect_with_opts(..., ConnectOpts { local_addr, .. })`
+    /// with `local_addr == 0` uses `local_ip` (the primary); with
+    /// `local_addr != 0` the value must equal `local_ip` or match one of
+    /// the entries here, otherwise connect returns `Error::InvalidLocalAddr`.
+    ///
+    /// Scope note (commit message): this field enables source-IP selection
+    /// at SYN build time only; outbound routing, per-source ARP, and the
+    /// RX queue / multi-NIC model are unchanged. In the intended dual-NIC
+    /// EC2 deployment, each ENI gets its own `Engine` (separate port/queue);
+    /// this list still proves useful for a single engine whose interface
+    /// carries multiple secondary IPs via the host's ARP machinery.
+    pub secondary_local_ips: Vec<u32>,
     pub gateway_ip: u32,
     pub gateway_mac: [u8; 6],
     pub garp_interval_sec: u32,
@@ -349,6 +365,7 @@ impl Default for EngineConfig {
             // mempool if they never set this field.
             rx_mempool_size: 0,
             local_ip: 0,
+            secondary_local_ips: Vec::new(),
             gateway_ip: 0,
             gateway_mac: [0u8; 6],
             garp_interval_sec: 0,
@@ -397,6 +414,13 @@ pub struct Engine {
     our_mac: [u8; 6],
     pmtu: RefCell<PmtuTable>,
     last_garp_ns: RefCell<u64>,
+    /// bug_010 → feature: runtime-mutable list of secondary local IPs
+    /// (host byte order) the engine accepts as `ConnectOpts.local_addr`.
+    /// Seeded from `EngineConfig.secondary_local_ips` at `Engine::new`;
+    /// C callers append post-create via `dpdk_net_engine_add_local_ip`
+    /// (slow-path setup; a `RefCell` is sufficient — no hot-path
+    /// contention because `connect_with_opts` is already slow-path).
+    secondary_local_ips: RefCell<Vec<u32>>,
 
     // Phase A3 additions
     flow_table: RefCell<FlowTable>,
@@ -673,6 +697,39 @@ pub struct ConnectOpts {
     pub tlp_skip_flight_size_gate: bool,
     pub tlp_max_consecutive_probes: u8,
     pub tlp_skip_rtt_sample_gate: bool,
+    /// bug_010 → feature: source IP (host byte order) to bind this
+    /// connection's SYN to. `0` = use engine primary (`EngineConfig.local_ip`).
+    /// Non-zero must equal `local_ip` or appear in `secondary_local_ips`;
+    /// otherwise `connect_with_opts` returns `Error::InvalidLocalAddr`.
+    pub local_addr: u32,
+}
+
+/// bug_010 → feature: pure selection+validation helper for per-connection
+/// source IPs. Factored out of `connect_with_opts` so the logic is
+/// testable without standing up a live DPDK-backed `Engine`.
+///
+/// * `requested == 0` → the engine's primary `local_ip` (backward-compat
+///   for existing zero-init callers).
+/// * `requested == local_ip` or `requested` appears in `secondaries` →
+///   that IP, verbatim.
+/// * otherwise → `Err(Error::InvalidLocalAddr(requested))`.
+///
+/// All addresses are in host byte order. `local_ip == 0` is a separate
+/// "no primary configured" failure that `connect_with_opts` rejects
+/// earlier on the `PeerUnreachable` path; this helper assumes the
+/// primary is already known-nonzero.
+pub fn select_source_ip(
+    requested: u32,
+    local_ip: u32,
+    secondaries: &[u32],
+) -> Result<u32, Error> {
+    if requested == 0 {
+        return Ok(local_ip);
+    }
+    if requested == local_ip || secondaries.contains(&requested) {
+        return Ok(requested);
+    }
+    Err(Error::InvalidLocalAddr(requested))
 }
 
 /// Bump `counter` when `requested_bit` is set but `advertised_mask` does
@@ -946,6 +1003,11 @@ impl Engine {
             our_mac,
             pmtu: RefCell::new(PmtuTable::new()),
             last_garp_ns: RefCell::new(0),
+            // bug_010 → feature: clone the Rust-side initial list out of
+            // cfg; further mutations (add_local_ip) go through this cell
+            // without touching cfg. `cfg.secondary_local_ips` stays
+            // authoritative for the initial-population path only.
+            secondary_local_ips: RefCell::new(cfg.secondary_local_ips.clone()),
             flow_table: RefCell::new(FlowTable::new(cfg.max_connections)),
             events: RefCell::new(EventQueue::with_cap(cfg.event_queue_soft_cap as usize)),
             iss_gen: IssGen::new(),
@@ -1452,6 +1514,38 @@ impl Engine {
     }
     pub fn our_ip(&self) -> u32 {
         self.cfg.local_ip
+    }
+
+    /// bug_010 → feature: append a secondary local IP (host byte order)
+    /// to the set of addresses this engine will accept as
+    /// `ConnectOpts.local_addr`. Idempotent: duplicates are silently
+    /// ignored. Rejects `ip == 0` (matches the engine's "no primary
+    /// configured" sentinel) and `ip == self.cfg.local_ip` (already the
+    /// primary). Returns `true` if the IP was newly registered, `false`
+    /// if it was already registered or rejected.
+    ///
+    /// Slow-path (once per interface at application startup). Scope note
+    /// (per commit message): this registers the IP with the engine's
+    /// source-selection list only; the caller is responsible for
+    /// configuring the IP on the host interface and for routing /
+    /// ARP / neighbor-discovery state.
+    pub fn add_local_ip(&self, ip: u32) -> bool {
+        if ip == 0 || ip == self.cfg.local_ip {
+            return false;
+        }
+        let mut v = self.secondary_local_ips.borrow_mut();
+        if v.contains(&ip) {
+            return false;
+        }
+        v.push(ip);
+        true
+    }
+
+    /// bug_010 → feature: test helper — read-only snapshot of the
+    /// currently-registered secondary local IPs (host byte order).
+    /// Excludes the primary. Slow-path; clones the backing Vec.
+    pub fn secondary_local_ips(&self) -> Vec<u32> {
+        self.secondary_local_ips.borrow().clone()
     }
     pub fn gateway_mac(&self) -> [u8; 6] {
         self.cfg.gateway_mac
@@ -3905,13 +3999,20 @@ impl Engine {
         if self.cfg.gateway_mac == [0u8; 6] {
             return Err(Error::PeerUnreachable(peer_ip));
         }
+        // bug_010 → feature: resolve per-connection source IP via the
+        // shared `select_source_ip` helper (pure; unit-tested without
+        // EAL). Slow-path: runs once per connect.
+        let selected_local_ip = {
+            let secondaries = self.secondary_local_ips.borrow();
+            select_source_ip(opts.local_addr, self.cfg.local_ip, &secondaries)?
+        };
         let local_port = if local_port_hint != 0 {
             local_port_hint
         } else {
             self.next_ephemeral_port()
         };
         let tuple = FourTuple {
-            local_ip: self.cfg.local_ip,
+            local_ip: selected_local_ip,
             local_port,
             peer_ip,
             peer_port,
@@ -5022,6 +5123,66 @@ mod tests {
         assert_eq!(cfg.gateway_mac, [0u8; 6]);
         // 0 = disabled (no gratuitous ARP emitted).
         assert_eq!(cfg.garp_interval_sec, 0);
+        // bug_010 → feature: empty by default; populated via field-set on
+        // EngineConfig (Rust-direct) or via dpdk_net_engine_add_local_ip
+        // post-create (C FFI).
+        assert!(cfg.secondary_local_ips.is_empty());
+    }
+
+    // bug_010 → feature: per-connect source-IP selection+validation.
+    // Pure-function tests on `select_source_ip` — exercises every branch
+    // without touching DPDK.
+    #[test]
+    fn select_source_ip_zero_uses_primary() {
+        let out = select_source_ip(0, 0x0a_00_00_02, &[0x0a_00_00_03])
+            .expect("zero must succeed");
+        assert_eq!(out, 0x0a_00_00_02);
+    }
+
+    #[test]
+    fn select_source_ip_matches_primary() {
+        let out = select_source_ip(0x0a_00_00_02, 0x0a_00_00_02, &[])
+            .expect("primary match must succeed");
+        assert_eq!(out, 0x0a_00_00_02);
+    }
+
+    #[test]
+    fn select_source_ip_matches_secondary() {
+        let secondaries = [0x0a_00_00_03, 0x0a_00_00_04];
+        let out = select_source_ip(0x0a_00_00_04, 0x0a_00_00_02, &secondaries)
+            .expect("secondary match must succeed");
+        assert_eq!(out, 0x0a_00_00_04);
+    }
+
+    #[test]
+    fn select_source_ip_unknown_rejected() {
+        let err = select_source_ip(
+            0x0a_00_00_99,
+            0x0a_00_00_02,
+            &[0x0a_00_00_03],
+        )
+        .expect_err("unknown IP must reject");
+        match err {
+            Error::InvalidLocalAddr(ip) => assert_eq!(ip, 0x0a_00_00_99),
+            other => panic!("expected InvalidLocalAddr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn select_source_ip_unknown_with_empty_secondaries() {
+        // Primary is set but no secondaries; any non-matching non-zero
+        // value must reject (regression guard against an early-return
+        // that treated "empty secondaries + zero" different from
+        // "empty secondaries + non-match").
+        let err = select_source_ip(0x0a_00_00_99, 0x0a_00_00_02, &[])
+            .expect_err("unknown IP with empty list must reject");
+        assert!(matches!(err, Error::InvalidLocalAddr(_)));
+    }
+
+    #[test]
+    fn connect_opts_default_local_addr_is_zero() {
+        let opts = super::ConnectOpts::default();
+        assert_eq!(opts.local_addr, 0);
     }
 
     #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
