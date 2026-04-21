@@ -1,8 +1,14 @@
 #include "dpdk_net.h"
+#include "dpdk_net_counters_load.h"
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <iostream>
+
+static_assert(sizeof(std::atomic<uint64_t>) == sizeof(uint64_t) &&
+              alignof(std::atomic<uint64_t>) == alignof(uint64_t),
+              "dpdk_net counters layout requires std::atomic<uint64_t> POD-compat");
 
 int main() {
     dpdk_net_engine_config_t cfg{};
@@ -85,9 +91,14 @@ int main() {
               << received_bytes_total << " bytes total, "
               << multi_seg_events_total << " were multi-seg\n";
 
-    const dpdk_net_counters_t* c = dpdk_net_counters(eng);
+    const dpdk_net_counters_t* counters = dpdk_net_counters(eng);
+    const dpdk_net_counters_t* c = counters;
     // Counter fields are plain uint64_t but written atomically.
-    // Use __atomic_load_n for strictly-correct cross-thread reads.
+    // Use the dpdk_net_load_u64 helper from dpdk_net_counters_load.h
+    // for strictly-correct cross-thread reads (zero-cost on x86_64,
+    // correct on ARM where naive uint64_t loads may tear).
+    uint64_t rx_pkts = dpdk_net_load_u64(&counters->eth.rx_pkts);
+    std::cout << "rx_pkts = " << rx_pkts << "\n";
     uint64_t iters = __atomic_load_n(&c->poll.iters, __ATOMIC_RELAXED);
     std::printf("poll iters: %llu\n", (unsigned long long)iters);
     std::printf("now_ns: %llu\n",

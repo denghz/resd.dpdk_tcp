@@ -276,12 +276,17 @@ const _: () = {
 
 /// Counters struct — exposed to application via dpdk_net_counters().
 /// Fields are plain u64 on the C ABI for clean cbindgen emission, but
-/// internally the stack writes them as AtomicU64 (Relaxed). AtomicU64
-/// has identical size and alignment as u64 on x86_64 so pointer-casting
-/// between dpdk_net_core::Counters and dpdk_net_counters_t is sound.
-/// C/C++ readers should use `__atomic_load_n(&field, __ATOMIC_RELAXED)`
-/// (or `std::atomic_ref<uint64_t>`) for strictly correct reads; on x86_64
-/// this compiles to a plain `mov` so there's no runtime cost.
+/// internally the stack writes them as AtomicU64 (Relaxed).
+///
+/// Cross-platform atomic-load contract: C/C++ readers MUST use the
+/// helper in `dpdk_net_counters_load.h`:
+///
+///     uint64_t rx = dpdk_net_load_u64(&counters->eth.rx_pkts);
+///
+/// Plain dereference is only atomic on x86_64 with aligned uint64_t.
+/// On ARM32 a plain read may tear; ARM64 has weaker ordering semantics
+/// than x86. The helper compiles to a plain mov on x86_64 (zero cost)
+/// and the correct LDREXD/LDR sequence on ARM.
 #[repr(C, align(64))]
 pub struct dpdk_net_eth_counters_t {
     pub rx_pkts: u64,
