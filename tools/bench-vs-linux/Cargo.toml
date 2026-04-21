@@ -1,0 +1,42 @@
+[package]
+name = "bench-vs-linux"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+# A10 Plan B Task 8: dual-stack latency comparison vs. Linux TCP.
+#
+# Mode A (RTT comparison, trading-latency preset) runs three stacks
+# side-by-side against the same C echo-server peer:
+#   1. dpdk_net via dpdk_net_core::Engine (bench-e2e's workload reused)
+#   2. Linux kernel TCP via std::net::TcpStream
+#   3. Linux AF_PACKET mmap via libc::socket(PF_PACKET, SOCK_RAW, ...)
+#
+# Mode B (wire-diff, rfc_compliance preset) lands later in Task 9;
+# src/mode_wire_diff.rs is a `todo!()` stub here.
+#
+# See docs/superpowers/specs/2026-04-21-stage1-phase-a10-benchmark-
+# harness-design.md §8 and parent spec §11.5.
+
+[lib]
+name = "bench_vs_linux"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bench-vs-linux"
+path = "src/main.rs"
+
+[dependencies]
+bench-common = { path = "../bench-common" }
+bench-e2e = { path = "../bench-e2e" }
+dpdk-net-core = { path = "../../crates/dpdk-net-core" }
+dpdk-net-sys = { path = "../../crates/dpdk-net-sys" }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+csv = "1.3"
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+hostname = "0.4"
+uuid = { version = "1", features = ["v4"] }
+libc = { workspace = true }
+thiserror = { workspace = true }
