@@ -38,6 +38,8 @@ pub mod tcp_seq;
 pub mod tcp_state;
 pub(crate) mod tcp_timer_wheel;
 pub mod tcp_tlp;
+#[cfg(feature = "test-inject")]
+pub mod test_fixtures;
 
 pub use error::Error;
 
