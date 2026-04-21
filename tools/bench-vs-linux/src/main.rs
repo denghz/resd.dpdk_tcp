@@ -170,20 +170,30 @@ fn main() -> anyhow::Result<()> {
     }
 
     // 2. EAL init + engine bring-up — only if dpdk_net is selected.
+    //
+    // Drop-order invariant: engine must drop BEFORE _eal_guard so
+    // Engine's Drop impl can safely call DPDK APIs (e.g.
+    // rte_eth_dev_stop) before rte_eal_cleanup fires in
+    // EalGuard::drop. Rust drops local `let` bindings in reverse
+    // declaration order, so declare _eal_guard first, engine second.
+    // Do NOT tuple-wrap — tuple field drop is declaration-order
+    // (forward), which would invert this invariant and cause
+    // use-after-cleanup on any error path.
+    // Ref: bench-e2e/src/main.rs for the same pattern.
     let needs_dpdk = stacks.contains(&Stack::DpdkNet);
-    let (_eal_guard, engine, tsc_hz) = if needs_dpdk {
+    let mut _eal_guard: Option<EalGuard> = None;
+    let mut engine: Option<Engine> = None;
+    let mut tsc_hz: u64 = 0;
+    if needs_dpdk {
         validate_dpdk_args(&args)?;
         eal_init(&args)?;
-        let guard = EalGuard;
-        let engine = build_engine(&args)?;
-        let tsc_hz = unsafe { dpdk_net_sys::rte_get_tsc_hz() };
+        _eal_guard = Some(EalGuard);
+        engine = Some(build_engine(&args)?);
+        tsc_hz = unsafe { dpdk_net_sys::rte_get_tsc_hz() };
         if tsc_hz == 0 {
             anyhow::bail!("rte_get_tsc_hz() returned 0 — EAL not initialised?");
         }
-        (Some(guard), Some(engine), tsc_hz)
-    } else {
-        (None, None, 0)
-    };
+    }
 
     // 3. Build run metadata + CSV writer.
     let metadata = build_run_metadata(mode, preconditions)?;
@@ -320,10 +330,11 @@ fn run_preconditions_check(mode: PreconditionMode) -> anyhow::Result<Preconditio
                 }
                 PreconditionMode::Lenient => {
                     eprintln!(
-                        "bench-vs-linux: check-bench-preconditions missing; \
-                         lenient mode, assuming all-pass"
+                        "bench-vs-linux: WARN lenient mode — check-bench-preconditions \
+                         not found and BENCH_PRECONDITIONS_JSON unset; emitting \
+                         preconditions as n/a (unverified)"
                     );
-                    return Ok(all_pass_preconditions());
+                    return Ok(all_unknown_preconditions());
                 }
             },
         },
@@ -387,22 +398,27 @@ fn parse_check(c: &serde_json::Value) -> PreconditionValue {
     }
 }
 
-fn all_pass_preconditions() -> Preconditions {
+/// Lenient-mode fallback when `check-bench-preconditions` is missing
+/// and `BENCH_PRECONDITIONS_JSON` is unset: emit every precondition
+/// as `n/a` (unverified) rather than falsely claiming pass. Bench-
+/// report treats `n/a` as neither pass nor fail in its verdict
+/// aggregation so this stays truthful.
+fn all_unknown_preconditions() -> Preconditions {
     Preconditions {
-        isolcpus: PreconditionValue::pass(),
-        nohz_full: PreconditionValue::pass(),
-        rcu_nocbs: PreconditionValue::pass(),
-        governor: PreconditionValue::pass(),
-        cstate_max: PreconditionValue::pass(),
-        tsc_invariant: PreconditionValue::pass(),
-        coalesce_off: PreconditionValue::pass(),
-        tso_off: PreconditionValue::pass(),
-        lro_off: PreconditionValue::pass(),
-        rss_on: PreconditionValue::pass(),
-        thermal_throttle: PreconditionValue::pass(),
-        hugepages_reserved: PreconditionValue::pass(),
-        irqbalance_off: PreconditionValue::pass(),
-        wc_active: PreconditionValue::pass(),
+        isolcpus: PreconditionValue::NotApplicable,
+        nohz_full: PreconditionValue::NotApplicable,
+        rcu_nocbs: PreconditionValue::NotApplicable,
+        governor: PreconditionValue::NotApplicable,
+        cstate_max: PreconditionValue::NotApplicable,
+        tsc_invariant: PreconditionValue::NotApplicable,
+        coalesce_off: PreconditionValue::NotApplicable,
+        tso_off: PreconditionValue::NotApplicable,
+        lro_off: PreconditionValue::NotApplicable,
+        rss_on: PreconditionValue::NotApplicable,
+        thermal_throttle: PreconditionValue::NotApplicable,
+        hugepages_reserved: PreconditionValue::NotApplicable,
+        irqbalance_off: PreconditionValue::NotApplicable,
+        wc_active: PreconditionValue::NotApplicable,
     }
 }
 

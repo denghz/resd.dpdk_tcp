@@ -11,12 +11,15 @@
 //! blocking would add epoll overhead to the RTT we're trying to
 //! measure.
 //!
-//! # Why raw `libc::setsockopt` for `TCP_NODELAY`
+//! # Socket options
 //!
-//! std's `TcpStream::set_nodelay` exists but we also want
-//! `TCP_QUICKACK` on kernels that honour it, and that's not in std —
-//! so we use the same `setsockopt` path for both to keep the setup
-//! consistent.
+//! Uses `std::net::TcpStream` with `set_nodelay(true)` for per-write
+//! latency (disables Nagle). `TCP_QUICKACK` is NOT set today —
+//! delayed ACK on the kernel side may add ~40 ms to the first echo;
+//! this is documented in spec §8 as a known skew vs dpdk_net's
+//! per-segment ACK. If a future task wants quick-ack on the kernel
+//! path, use `libc::setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, ...)`
+//! with Linux-only cfg guards.
 
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
@@ -96,41 +99,3 @@ pub fn run_rtt_workload(
     Ok(samples)
 }
 
-/// Aggregate helper: RTT samples as a clean `Vec<f64>` for the
-/// bench-common summariser. Kept separate from the workload so the
-/// unit test can exercise it without a live socket.
-///
-/// This is a light wrapper that exists so the tests have a named
-/// target; the summariser itself lives in `bench_common::percentile`.
-pub fn aggregate_rtt_samples(samples: &[u64]) -> Vec<f64> {
-    samples.iter().map(|&v| v as f64).collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn aggregate_rtt_samples_converts_and_preserves_order() {
-        let samples: Vec<u64> = vec![100, 200, 300, 150, 250];
-        let out = aggregate_rtt_samples(&samples);
-        assert_eq!(out, vec![100.0, 200.0, 300.0, 150.0, 250.0]);
-    }
-
-    #[test]
-    fn aggregate_rtt_samples_handles_empty_input() {
-        let samples: Vec<u64> = vec![];
-        let out = aggregate_rtt_samples(&samples);
-        assert!(out.is_empty());
-    }
-
-    #[test]
-    fn aggregate_rtt_samples_handles_max_u64() {
-        // Large timestamps still convert to finite f64 (loses precision
-        // for values above 2^53 but the RTT never approaches that).
-        let samples = vec![u64::MAX];
-        let out = aggregate_rtt_samples(&samples);
-        assert_eq!(out.len(), 1);
-        assert!(out[0].is_finite());
-    }
-}

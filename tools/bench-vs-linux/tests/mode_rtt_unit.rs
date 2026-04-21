@@ -1,9 +1,9 @@
 //! Integration tests for mode A (RTT comparison) pure-Rust primitives.
 //!
 //! These tests don't touch DPDK or a live peer — they validate the
-//! library façade (`Stack`, `Mode`, dimensions JSON shape, linux-
-//! kernel aggregation, AF_PACKET stub surface) so they run on any
-//! host without an ENA VF, EAL init, or peer echo-server.
+//! library façade (`Stack`, `Mode`, dimensions JSON shape, AF_PACKET
+//! stub surface) so they run on any host without an ENA VF, EAL
+//! init, or peer echo-server.
 //!
 //! The real end-to-end smoke (dpdk + linux + peer) lives post-AMI
 //! bake (Plan A T6+T7); see the parent plan for the sister IaC
@@ -11,7 +11,7 @@
 
 use bench_vs_linux::{
     afpacket::{self, AfPacketConfig, AfPacketError},
-    linux_kernel, mode_rtt, mode_wire_diff, Mode, Stack,
+    mode_rtt, mode_wire_diff, Mode, Stack,
 };
 
 // ---------------------------------------------------------------------------
@@ -40,27 +40,6 @@ fn stack_as_dimension_is_the_documented_string() {
     assert_eq!(Stack::DpdkNet.as_dimension(), "dpdk_net");
     assert_eq!(Stack::LinuxKernel.as_dimension(), "linux_kernel");
     assert_eq!(Stack::AfPacket.as_dimension(), "afpacket");
-}
-
-// ---------------------------------------------------------------------------
-// Linux kernel RTT sample aggregation — invariant test.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn linux_kernel_aggregate_preserves_samples() {
-    let samples: Vec<u64> = (0..1_000).map(|i| 1_000 + i * 10).collect();
-    let out = linux_kernel::aggregate_rtt_samples(&samples);
-    assert_eq!(out.len(), samples.len());
-    // Order preservation.
-    for (i, v) in samples.iter().enumerate() {
-        assert!((out[i] - *v as f64).abs() < 1e-9);
-    }
-}
-
-#[test]
-fn linux_kernel_aggregate_empty_is_ok() {
-    let out = linux_kernel::aggregate_rtt_samples(&[]);
-    assert!(out.is_empty());
 }
 
 // ---------------------------------------------------------------------------
