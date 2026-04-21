@@ -48,6 +48,11 @@ pub enum Error {
     /// or had an equal-adjacent pair. `engine_create` rejects with null-return.
     #[error("invalid histogram edges (not strictly monotonic)")]
     InvalidHistogramEdges,
+    /// bug_010 → feature: `ConnectOpts.local_addr` is non-zero but does not
+    /// match `EngineConfig.local_ip` nor appear in `secondary_local_ips`.
+    /// Mapped to `-EINVAL` at the FFI boundary (`dpdk_net_connect`).
+    #[error("invalid local source IP for connect: {0:#x}")]
+    InvalidLocalAddr(u32),
 }
 
 #[cfg(test)]
