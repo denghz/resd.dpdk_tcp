@@ -16,6 +16,7 @@ dpdk-net = { path = "../../crates/dpdk-net", default-features = false }
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+walkdir = "2"
 
 [dev-dependencies]
 # A7 Task 12: the two shim direct self-tests (shim_inject_drain_roundtrip
@@ -25,8 +26,16 @@ toml = "0.8"
 # clock::set_virt_ns, test_tx_intercept, test_server::test_packet); the
 # runner crate otherwise only depends on the `dpdk-net` C-ABI facade.
 dpdk-net-core = { path = "../../crates/dpdk-net-core" }
-walkdir = "2"
 
 [[bin]]
 name = "pdshim-run-one"
 path = "src/main.rs"
+
+# A7 Task 15: inventory tools to classify + dry-run the corpus.
+[[bin]]
+name = "dry-classify"
+path = "src/bin/dry-classify.rs"
+
+[[bin]]
+name = "dry-run"
+path = "src/bin/dry-run.rs"

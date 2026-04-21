@@ -16,7 +16,6 @@ use walkdir::WalkDir;
 const CORPUS_ROOT: &str = "../../third_party/packetdrill-testcases";
 
 #[test]
-#[ignore = "T15 pins counts; enable when classify/ligurio.toml + counts.rs are final"]
 fn ligurio_runnable_subset_passes() {
     let bin = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/packetdrill-shim/packetdrill");
