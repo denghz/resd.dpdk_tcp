@@ -28,6 +28,7 @@ use common::{build_icmp_echo_frame, make_test_engine};
 
 #[test]
 fn drop_rate_one_means_all_frames_dropped() {
+    let _env_guard = common::FAULT_INJECTOR_ENV_LOCK.lock().unwrap();
     std::env::set_var("DPDK_NET_FAULT_INJECTOR", "drop=1.0,seed=123");
     let Some(engine) = make_test_engine() else {
         std::env::remove_var("DPDK_NET_FAULT_INJECTOR");
@@ -78,6 +79,7 @@ fn drop_rate_one_means_all_frames_dropped() {
 
 #[test]
 fn drop_rate_zero_passes_all_frames() {
+    let _env_guard = common::FAULT_INJECTOR_ENV_LOCK.lock().unwrap();
     std::env::set_var("DPDK_NET_FAULT_INJECTOR", "drop=0.0,seed=7");
     let Some(engine) = make_test_engine() else {
         std::env::remove_var("DPDK_NET_FAULT_INJECTOR");
@@ -108,6 +110,7 @@ fn drop_rate_zero_passes_all_frames() {
 
 #[test]
 fn no_env_var_means_no_fault_injection_active() {
+    let _env_guard = common::FAULT_INJECTOR_ENV_LOCK.lock().unwrap();
     // Without DPDK_NET_FAULT_INJECTOR set, FaultInjector is None on Engine
     // and process() is never called. Frames pass through cleanly.
     std::env::remove_var("DPDK_NET_FAULT_INJECTOR");

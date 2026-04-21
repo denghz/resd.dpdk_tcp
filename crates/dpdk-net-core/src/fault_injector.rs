@@ -330,6 +330,18 @@ impl FaultInjector {
     }
 }
 
+impl Drop for FaultInjector {
+    /// Free any mbufs still held in the reorder ring at shutdown, so
+    /// Engine drop preserves mbuf refcount balance (spec §6 invariant #5).
+    fn drop(&mut self) {
+        if let Some(ring) = self.reorder_ring.take() {
+            for m in ring {
+                unsafe { dpdk_net_sys::shim_rte_pktmbuf_free(m.as_ptr()); }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

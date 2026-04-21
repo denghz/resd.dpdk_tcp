@@ -20,6 +20,13 @@
 
 #![allow(dead_code)]
 
+/// A process-wide lock for tests that mutate `DPDK_NET_FAULT_INJECTOR`.
+/// Cargo runs tests in a binary in parallel by default; without this guard,
+/// two env-var-mutating tests can race and one will pick up the other's
+/// config when constructing the Engine.
+#[cfg(feature = "test-inject")]
+pub static FAULT_INJECTOR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Peer-behavior modes for A5 fault-injection integration tests.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TapPeerMode {
