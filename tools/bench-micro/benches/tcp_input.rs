@@ -29,7 +29,18 @@ use std::time::Duration;
 
 const TEST_SEND_BUF_BYTES: u32 = 256 * 1024;
 
-fn make_est_conn_ts_sack(iss: u32, irs: u32, peer_wnd: u16, ts_recent: u32) -> TcpConn {
+/// Shared ESTABLISHED-state conn construction. Mirrors the in-tree
+/// `tcp_input::tests::est_conn` shape; TS + SACK are opt-in per caller
+/// so the OOO bench (target 8) can measure reassembly-queue enqueue
+/// without PAWS early-rejecting segments that arrive without a
+/// Timestamps option.
+fn make_est_conn(
+    iss: u32,
+    irs: u32,
+    peer_wnd: u16,
+    ts: Option<u32>,
+    sack: bool,
+) -> TcpConn {
     let t = FourTuple {
         local_ip: 0x0a_00_00_02,
         local_port: 40000,
@@ -43,9 +54,11 @@ fn make_est_conn_ts_sack(iss: u32, irs: u32, peer_wnd: u16, ts_recent: u32) -> T
     c.irs = irs;
     c.rcv_nxt = irs.wrapping_add(1);
     c.snd_wnd = peer_wnd as u32;
-    c.ts_enabled = true;
-    c.ts_recent = ts_recent;
-    c.sack_enabled = true;
+    if let Some(ts_recent) = ts {
+        c.ts_enabled = true;
+        c.ts_recent = ts_recent;
+    }
+    c.sack_enabled = sack;
     c
 }
 
@@ -76,7 +89,7 @@ fn bench_tcp_input_data_segment(c: &mut Criterion) {
             // Per-iteration setup: fresh conn so each dispatch sees an
             // in-order segment at rcv_nxt (5001), rather than the state
             // advancing after the first iteration.
-            || make_est_conn_ts_sack(1000, 5000, 1024, 200),
+            || make_est_conn(1000, 5000, 1024, Some(200), true),
             |c| {
                 // Increment TSval slightly so PAWS accepts. Using a
                 // fresh conn per-iteration means ts_recent == 200 on
@@ -114,7 +127,14 @@ fn bench_tcp_input_ooo_segment(c: &mut Criterion) {
     c.bench_function("bench_tcp_input_ooo_segment", |b| {
         // OOO segment: seq > rcv_nxt, so it queues into the reorder
         // buffer. No options payload (matches the in-tree OOO test's
-        // minimalism).
+        // minimalism at tcp_input.rs:1866).
+        //
+        // IMPORTANT: TS stays disabled here. If `conn.ts_enabled` were
+        // true, `dispatch` would PAWS-early-reject any segment lacking
+        // a Timestamps option (tcp_input.rs:606-614), returning before
+        // touching the reassembly queue. The point of this target is
+        // to measure reassembly-queue enqueue cost (~200-400 ns per
+        // spec §11.2), not PAWS rejection (~27 ns).
         let payload = [0x42u8; 64];
 
         let mut fake_storage: Box<[u8; 256]> = Box::new([0u8; 256]);
@@ -128,7 +148,7 @@ fn bench_tcp_input_ooo_segment(c: &mut Criterion) {
         };
 
         b.iter_batched_ref(
-            || make_est_conn_ts_sack(1000, 5000, 1024, 200),
+            || make_est_conn(1000, 5000, 1024, None, false),
             |c| {
                 // seq=5100 > rcv_nxt=5001 → reassembly queue path.
                 let seg = ParsedSegment {

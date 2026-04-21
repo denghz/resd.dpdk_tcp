@@ -1,10 +1,35 @@
-//! bench-micro::summarize — reads `target/criterion/**/new/estimates.json`
+//! bench-micro::summarize — reads `target/criterion/**/new/sample.json`
 //! emitted by cargo-criterion and produces a summarized CSV matching
 //! `bench-common`'s `CsvRow` schema, ready for `bench-report` ingest.
 //!
 //! Criterion's native JSON remains the authoritative sidecar (flame-graph
 //! and regression-diff consumers read it directly, per spec §13); the
 //! CSV here is the unified-schema projection for the cross-tool report.
+//!
+//! # Why `sample.json` and not `estimates.json`
+//!
+//! `estimates.json` carries only the summary estimators Criterion fits
+//! from the linear-regression model: `mean`, `median`, `std_dev`,
+//! `median_abs_dev`, `slope`. It does NOT expose percentile point
+//! estimates (p99, p999) that spec §5 line 270 requires. `sample.json`
+//! carries the raw per-sample iteration timings; we flatten them to
+//! per-iter costs and run `bench_common::percentile::summarize` to
+//! emit all seven aggregations (p50, p99, p999, mean, stddev,
+//! ci95_lower, ci95_upper).
+//!
+//! `sample.json`'s layout follows Criterion's native schema:
+//!
+//! ```json
+//! {"sampling_mode":"Linear","iters":[10,20,...],"times":[1234.5,2345.6,...]}
+//! ```
+//!
+//! `times[i]` is the total wall time (ns, as f64) for a sampling batch
+//! that ran `iters[i]` iterations — per-iter cost is `times[i] / iters[i]`.
+//!
+//! If `sample.json` is absent for any reason (e.g. older cached
+//! criterion output), fall back to `estimates.json` and emit the
+//! four aggregations we can recover (mean/stddev/ci95_lower/ci95_upper)
+//! — percentile cells are simply omitted, not fabricated.
 //!
 //! # Usage
 //!
@@ -19,9 +44,27 @@
 //! Empty / missing input root produces a header-only CSV and "wrote 0
 //! rows" on stderr — matches the spec §5.5 smoke test.
 
-use bench_common::csv_row::{CsvRow, MetricAggregation};
+use bench_common::csv_row::{CsvRow, MetricAggregation, COLUMNS};
+use bench_common::percentile::summarize;
 use bench_common::preconditions::{PreconditionMode, PreconditionValue, Preconditions};
 use bench_common::run_metadata::RunMetadata;
+
+/// Targets that still proxy with a pure-Rust stub instead of exercising
+/// the real Engine code-path (EAL init / public API gaps). Tagging these
+/// with `feature_set = "stub"` prevents phantom regression diffs when
+/// they're later swapped for real calls: the regression walker will see
+/// a `(test_case, feature_set=default)` pair appear rather than a 50x
+/// speed change against a `feature_set=default` baseline.
+///
+/// Keep in sync with each stub bench's module-level doc comment. When
+/// a stub is replaced with a real call, remove its entry here.
+const STUB_TARGETS: &[&str] = &[
+    "bench_poll_empty",
+    "bench_poll_idle_with_timers",
+    "bench_send_small",
+    "bench_send_large_chain",
+    "bench_timer_add_cancel",
+];
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -46,23 +89,32 @@ fn main() -> anyhow::Result<()> {
     let mut count = 0usize;
 
     // Criterion lays out its output as:
-    //   target/criterion/<benchmark_id>/new/estimates.json
     //   target/criterion/<benchmark_id>/new/sample.json
+    //   target/criterion/<benchmark_id>/new/estimates.json
     //   ... (plus base/, change/, report/, etc.)
     //
-    // We walk the whole tree looking for `*/new/estimates.json`. The
-    // `<benchmark_id>` is the criterion target name (e.g. `bench_poll_empty`),
-    // which becomes the CSV's `test_case` column. Walking may surface the
-    // root's own "report/" directory if present; ignored via the path-suffix
-    // check.
+    // We walk the whole tree looking for `*/new/sample.json` (primary)
+    // and fall back to `*/new/estimates.json` (best-effort) per-target.
+    // The `<benchmark_id>` is the criterion target name (e.g.
+    // `bench_poll_empty`), which becomes the CSV's `test_case` column.
     if std::path::Path::new(&input_root).exists() {
+        // Dedupe per-target so we emit at most one CSV cluster per
+        // criterion benchmark — walkdir surfaces both sample.json and
+        // estimates.json under the same `new/` dir.
+        let mut seen_targets: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         for entry in walkdir::WalkDir::new(&input_root)
             .into_iter()
             .filter_map(Result::ok)
         {
             let path = entry.path();
-            // We want exactly `<input_root>/<target_name>/new/estimates.json`.
-            if !path.is_file() || path.file_name() != Some(std::ffi::OsStr::new("estimates.json")) {
+            if !path.is_file() {
+                continue;
+            }
+            let filename = path.file_name();
+            if filename != Some(std::ffi::OsStr::new("sample.json"))
+                && filename != Some(std::ffi::OsStr::new("estimates.json"))
+            {
                 continue;
             }
             // Parent chain must be `.../<target_name>/new/`.
@@ -77,70 +129,64 @@ fn main() -> anyhow::Result<()> {
                 Some(name) => name.to_string(),
                 None => continue,
             };
-            // Criterion also emits top-level roll-up directories like "report"
-            // without a `new/` sibling. The filter above already narrowed us
-            // down to real per-target estimates — we don't need another guard.
+            if !seen_targets.insert(target_name.clone()) {
+                continue;
+            }
 
-            let json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
-            let median = json
-                .get("median")
-                .and_then(|v| v.get("point_estimate"))
-                .and_then(|v| v.as_f64());
-            let mean = json
-                .get("mean")
-                .and_then(|v| v.get("point_estimate"))
-                .and_then(|v| v.as_f64());
-            let stddev = json
-                .get("std_dev")
-                .and_then(|v| v.get("point_estimate"))
-                .and_then(|v| v.as_f64());
-            let ci_low = json
-                .get("mean")
-                .and_then(|v| v.get("confidence_interval"))
-                .and_then(|v| v.get("lower_bound"))
-                .and_then(|v| v.as_f64());
-            let ci_high = json
-                .get("mean")
-                .and_then(|v| v.get("confidence_interval"))
-                .and_then(|v| v.get("upper_bound"))
-                .and_then(|v| v.as_f64());
+            // Prefer sample.json (full 7 aggregations) over estimates.json.
+            let sample_path = parent.join("sample.json");
+            let est_path = parent.join("estimates.json");
+            let feature_set = if STUB_TARGETS.contains(&target_name.as_str()) {
+                "stub"
+            } else {
+                "default"
+            };
 
-            for (agg, value) in [
-                (MetricAggregation::P50, median),
-                (MetricAggregation::Mean, mean),
-                (MetricAggregation::Stddev, stddev),
-                (MetricAggregation::Ci95Lower, ci_low),
-                (MetricAggregation::Ci95Upper, ci_high),
-            ] {
-                if let Some(v) = value {
-                    let row = CsvRow {
-                        run_metadata: metadata.clone(),
-                        tool: "bench-micro".into(),
-                        test_case: target_name.clone(),
-                        feature_set: "default".into(),
-                        dimensions_json: "{}".into(),
-                        metric_name: "rtt_ns".into(),
-                        metric_unit: "ns".into(),
-                        metric_value: v,
-                        metric_aggregation: agg,
-                    };
-                    wtr.serialize(&row)?;
-                    count += 1;
+            let aggregations: Vec<(MetricAggregation, f64)> = if sample_path.exists() {
+                match read_sample_aggregations(&sample_path) {
+                    Ok(aggs) => aggs,
+                    Err(e) => {
+                        eprintln!(
+                            "warning: failed to parse sample.json for {}: {} — falling back to estimates.json",
+                            target_name, e
+                        );
+                        read_estimates_aggregations(&est_path).unwrap_or_default()
+                    }
                 }
+            } else if est_path.exists() {
+                read_estimates_aggregations(&est_path).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+
+            for (agg, value) in aggregations {
+                let row = CsvRow {
+                    run_metadata: metadata.clone(),
+                    tool: "bench-micro".into(),
+                    test_case: target_name.clone(),
+                    feature_set: feature_set.into(),
+                    dimensions_json: "{}".into(),
+                    metric_name: "ns_per_iter".into(),
+                    metric_unit: "ns".into(),
+                    metric_value: value,
+                    metric_aggregation: agg,
+                };
+                wtr.serialize(&row)?;
+                count += 1;
             }
         }
     }
 
     wtr.flush()?;
 
-    // When the input tree held no `estimates.json` files, `wtr` never
-    // serialised a record and csv never emitted the header. The spec §5.5
-    // smoke test expects a header-only CSV in that case — mirror the
-    // `CsvRow` Serialize impl's column order so downstream readers that
-    // inspect the file still see the schema even on a zero-row run.
+    // When the input tree held no recognisable criterion output, `wtr`
+    // never serialised a record and csv never emitted the header. The
+    // spec §5.5 smoke test expects a header-only CSV in that case —
+    // mirror `bench_common::csv_row::COLUMNS` so downstream readers
+    // that inspect the file still see the schema even on a zero-row run.
     if count == 0 {
         let mut wtr = csv::Writer::from_path(&output_path)?;
-        wtr.write_record(CSV_HEADER)?;
+        wtr.write_record(COLUMNS)?;
         wtr.flush()?;
     }
 
@@ -148,47 +194,82 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Mirror of the private `COLUMNS` constant in `bench_common::csv_row`.
-/// Kept in sync with the `Serialize` impl there; see the
-/// `serialised_header_matches_columns` regression test in that crate
-/// which locks drift down when paired with a bench-report round-trip.
-const CSV_HEADER: &[&str] = &[
-    "run_id",
-    "run_started_at",
-    "commit_sha",
-    "branch",
-    "host",
-    "instance_type",
-    "cpu_model",
-    "dpdk_version",
-    "kernel",
-    "nic_model",
-    "nic_fw",
-    "ami_id",
-    "precondition_mode",
-    "precondition_isolcpus",
-    "precondition_nohz_full",
-    "precondition_rcu_nocbs",
-    "precondition_governor",
-    "precondition_cstate_max",
-    "precondition_tsc_invariant",
-    "precondition_coalesce_off",
-    "precondition_tso_off",
-    "precondition_lro_off",
-    "precondition_rss_on",
-    "precondition_thermal_throttle",
-    "precondition_hugepages_reserved",
-    "precondition_irqbalance_off",
-    "precondition_wc_active",
-    "tool",
-    "test_case",
-    "feature_set",
-    "dimensions_json",
-    "metric_name",
-    "metric_unit",
-    "metric_value",
-    "metric_aggregation",
-];
+/// Parse criterion's `sample.json` into per-iter cost samples, then run
+/// `bench_common::percentile::summarize` to emit all seven
+/// `MetricAggregation` variants.
+fn read_sample_aggregations(
+    path: &std::path::Path,
+) -> anyhow::Result<Vec<(MetricAggregation, f64)>> {
+    #[derive(serde::Deserialize)]
+    struct SampleJson {
+        iters: Vec<f64>,
+        times: Vec<f64>,
+    }
+    let raw = std::fs::read_to_string(path)?;
+    let sj: SampleJson = serde_json::from_str(&raw)?;
+    if sj.times.len() != sj.iters.len() || sj.iters.is_empty() {
+        anyhow::bail!(
+            "sample.json: iters/times length mismatch or empty (iters={}, times={})",
+            sj.iters.len(),
+            sj.times.len()
+        );
+    }
+    // Per-iter cost = total batch time / batch iter count.
+    let samples: Vec<f64> = sj
+        .times
+        .iter()
+        .zip(sj.iters.iter())
+        .map(|(t, n)| t / n)
+        .collect();
+    let s = summarize(&samples);
+    Ok(vec![
+        (MetricAggregation::P50, s.p50),
+        (MetricAggregation::P99, s.p99),
+        (MetricAggregation::P999, s.p999),
+        (MetricAggregation::Mean, s.mean),
+        (MetricAggregation::Stddev, s.stddev),
+        (MetricAggregation::Ci95Lower, s.ci95_lower),
+        (MetricAggregation::Ci95Upper, s.ci95_upper),
+    ])
+}
+
+/// Fallback when `sample.json` is absent. `estimates.json` carries only
+/// mean/median/std_dev + confidence-interval — no percentile point
+/// estimates. Emit what we can (P50 from median, plus Mean / Stddev /
+/// Ci95{Lower,Upper}); percentile cells are omitted.
+fn read_estimates_aggregations(
+    path: &std::path::Path,
+) -> anyhow::Result<Vec<(MetricAggregation, f64)>> {
+    let json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+    let pe = |node: &str| -> Option<f64> {
+        json.get(node)
+            .and_then(|v| v.get("point_estimate"))
+            .and_then(|v| v.as_f64())
+    };
+    let ci = |node: &str, bound: &str| -> Option<f64> {
+        json.get(node)
+            .and_then(|v| v.get("confidence_interval"))
+            .and_then(|v| v.get(bound))
+            .and_then(|v| v.as_f64())
+    };
+    let mut out = Vec::with_capacity(5);
+    if let Some(v) = pe("median") {
+        out.push((MetricAggregation::P50, v));
+    }
+    if let Some(v) = pe("mean") {
+        out.push((MetricAggregation::Mean, v));
+    }
+    if let Some(v) = pe("std_dev") {
+        out.push((MetricAggregation::Stddev, v));
+    }
+    if let Some(v) = ci("mean", "lower_bound") {
+        out.push((MetricAggregation::Ci95Lower, v));
+    }
+    if let Some(v) = ci("mean", "upper_bound") {
+        out.push((MetricAggregation::Ci95Upper, v));
+    }
+    Ok(out)
+}
 
 fn build_run_metadata() -> anyhow::Result<RunMetadata> {
     let commit_sha = std::process::Command::new("git")

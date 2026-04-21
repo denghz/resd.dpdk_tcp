@@ -144,6 +144,7 @@ dependencies = [
  "dpdk-net-core",
  "dpdk-net-sys",
  "hostname",
+ "serde",
  "serde_json",
  "uuid",
  "walkdir",

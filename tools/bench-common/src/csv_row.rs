@@ -70,7 +70,10 @@ impl fmt::Display for MetricAggregation {
 /// The full list of CSV columns in spec order (§14.1). Kept as a module-level
 /// constant so the `Serialize` impl and the `Deserialize` visitor use exactly
 /// the same ordering — if a column is added / removed it only changes here.
-const COLUMNS: &[&str] = &[
+///
+/// Exported so downstream summariser binaries (bench-micro's `summarize`,
+/// etc.) can emit a header-only CSV without duplicating the column list.
+pub const COLUMNS: &[&str] = &[
     // Run-invariant columns
     "run_id",
     "run_started_at",

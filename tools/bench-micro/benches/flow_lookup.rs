@@ -71,45 +71,44 @@ fn bench_flow_lookup_cold(c: &mut Criterion) {
     }
 
     c.bench_function("bench_flow_lookup_cold", |b| {
-        b.iter(|| {
-            #[cfg(target_arch = "x86_64")]
-            {
-                // SAFETY: `ft`'s internal HashMap + slot Vec are behind
-                // borrow checker; we flush cache lines that hold the
-                // lookup path's data. CLFLUSH on stale cache lines is
-                // always well-defined — it only invalidates the line's
-                // cache state, not the backing memory.
-                unsafe {
-                    // We can't get a direct pointer to the HashMap's
-                    // buckets without internal access; flush the scrub
-                    // buffer's head + a linear stride so the
-                    // displacement path is deterministic. The real
-                    // effect comes from the read-loop below which
-                    // touches ~1 MiB of unrelated bytes — enough to
-                    // evict the ~1 KiB of FlowTable hot-path state
-                    // from L1+L2.
-                    let ptr = scrub.as_ptr();
-                    // Flush a handful of stride-spaced lines to kick
-                    // the prefetcher off-pattern.
-                    for off in (0..1024).step_by(64) {
-                        core::arch::x86_64::_mm_clflush(ptr.add(off));
+        // `iter_batched_ref` gives us a setup closure whose cost Criterion
+        // excludes from the measurement window. That's the only way to
+        // pay the 1 MiB scrub cost without having it dominate the
+        // measured lookup — `b.iter(...)` would lump them together and
+        // produce ~15.8 µs instead of the ~200 ns target.
+        b.iter_batched_ref(
+            || {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    // SAFETY: CLFLUSH on cache lines is always well-defined —
+                    // it only invalidates cache state, not the backing memory.
+                    unsafe {
+                        let ptr = scrub.as_ptr();
+                        // Flush stride-spaced lines to kick the prefetcher
+                        // off-pattern.
+                        for off in (0..1024).step_by(64) {
+                            core::arch::x86_64::_mm_clflush(ptr.add(off));
+                        }
                     }
                 }
-            }
-            // Cross-arch displacement: scan the scrub buffer. Reading
-            // every Nth byte with N=cacheline keeps the loop bounded.
-            let mut sum: u64 = 0;
-            let mut i = 0usize;
-            while i < CACHE_SCRUB_BYTES {
-                sum = sum.wrapping_add(scrub[i] as u64);
-                i += 64;
-            }
-            black_box(sum);
-
-            // Now look up with the lookup path cold.
-            let h = ft.lookup_by_tuple(black_box(&target));
-            black_box(h);
-        });
+                // Cross-arch displacement: scan every cacheline of the
+                // scrub buffer. This evicts the ~1 KiB of FlowTable
+                // hot-path state from L1+L2.
+                let mut sum: u64 = 0;
+                let mut i = 0usize;
+                while i < CACHE_SCRUB_BYTES {
+                    sum = sum.wrapping_add(scrub[i] as u64);
+                    i += 64;
+                }
+                black_box(sum)
+            },
+            |_scrub_sum| {
+                // Measured region: one cold lookup.
+                let h = ft.lookup_by_tuple(black_box(&target));
+                black_box(h);
+            },
+            criterion::BatchSize::LargeInput,
+        );
     });
 }
 
