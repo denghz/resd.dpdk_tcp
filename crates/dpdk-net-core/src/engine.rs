@@ -5568,6 +5568,18 @@ impl Engine {
         self.flow_table.borrow().get(h).map(|c| c.state)
     }
 
+    /// A8 T19: snapshot a conn's negotiated `peer_mss`. Consumed by
+    /// `tcpreq-runner`'s MissingMSS probe (RFC 9293 §3.7.1 MUST-15) to
+    /// verify the 536-byte fallback applies when the peer's SYN omits
+    /// the MSS option. `None` if the handle is unknown. Mirrors
+    /// `state_of` — a thin read-only accessor on internal conn state
+    /// exposed only under the test-server feature so the production
+    /// build keeps `FlowTable` fully private.
+    #[cfg(feature = "test-server")]
+    pub fn conn_peer_mss(&self, h: crate::flow_table::ConnHandle) -> Option<u16> {
+        self.flow_table.borrow().get(h).map(|c| c.peer_mss)
+    }
+
     /// A7 Task 5: inject a single Ethernet-framed bytes buffer into the
     /// engine's RX pipeline. Allocates an mbuf from the RX mempool, copies
     /// the caller's frame bytes in, and invokes `rx_frame` on it (same

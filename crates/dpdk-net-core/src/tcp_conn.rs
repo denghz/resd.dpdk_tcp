@@ -526,9 +526,13 @@ impl TcpConn {
         c.rcv_nxt = iss_peer.wrapping_add(1);
         c.irs = iss_peer;
         // Absorb peer options from the SYN.
-        if let Some(mss) = opts.mss {
-            c.peer_mss = mss;
-        }
+        // RFC 9293 §3.7.1 / RFC 6691 (MUST-15): if peer SYN omits the MSS
+        // option, send-MSS MUST fall back to 536 (the IPv4 default). Mirrors
+        // the active-open path in `handle_syn_sent` (tcp_input.rs ~632) which
+        // applies the same `unwrap_or(536)` on the SYN-ACK's MSS option.
+        // Before A8 T19 the passive path left `peer_mss` at the `our_mss`
+        // seed when MSS was absent, which violated MUST-15.
+        c.peer_mss = opts.mss.unwrap_or(536);
         c.ws_shift_in = opts.wscale.unwrap_or(0).min(14);
         c.ts_enabled = opts.timestamps.is_some();
         if let Some((tsval, _)) = opts.timestamps {
