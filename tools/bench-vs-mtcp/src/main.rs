@@ -675,7 +675,6 @@ fn run_maxtp_grid_dpdk<W: std::io::Write>(
             bucket: *bucket,
             warmup: std::time::Duration::from_secs(args.maxtp_warmup_secs),
             duration: std::time::Duration::from_secs(args.maxtp_duration_secs),
-            tsc_hz: 0, // Unused — maxtp window math is Instant-based.
             payload,
             tx_ts_mode,
         };

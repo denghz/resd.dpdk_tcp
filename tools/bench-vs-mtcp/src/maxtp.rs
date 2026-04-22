@@ -16,7 +16,13 @@
 //! - Warmup: 10 s pumping before measurement window.
 //! - Primary metric: sustained goodput = bytes ACKed in `[t_warmup_end,
 //!   t_warmup_end + T]` / T, bytes/sec.
-//! - Secondary metric: packet rate = `tcp.tx_pkts_delta / T`, pps.
+//! - Secondary metric: packet rate = `eth.tx_pkts_delta / T`, pps.
+//!   (Spec §11.2 asks for `tcp.tx_pkts`; that counter does not exist
+//!   in `dpdk-net-core` today. `eth.tx_pkts` is the closest available
+//!   proxy — the ARP/ICMP floor is <<< TCP data volume across a 60 s
+//!   steady-state pump, so the bias is negligible. Follow-up at T15
+//!   can expose the TCP-only variant if needed — tracked in
+//!   `dpdk_maxtp.rs` module doc.)
 //!
 //! # CSV dimensions
 //!
@@ -152,8 +158,11 @@ impl MaxtpSample {
     ///
     /// `acked_bytes_in_window` is the sum of bytes the peer has ACKed
     /// during `[t_warmup_end, t_warmup_end + duration_ns]`.
-    /// `tx_pkts_in_window` is the `tcp.tx_pkts` counter delta across
-    /// the same window (see spec §11.2 "secondary: tcp.tx_pkts").
+    /// `tx_pkts_in_window` is the `eth.tx_pkts` counter delta across
+    /// the same window. Spec §11.2 references `tcp.tx_pkts` — that
+    /// counter is not surfaced in `dpdk-net-core` today; we use
+    /// `eth.tx_pkts` as a close proxy because ARP/ICMP volume is
+    /// <<< TCP data volume across the 60 s steady-state pump.
     /// `duration_ns` must be strictly positive.
     ///
     /// Panics if `duration_ns == 0`.

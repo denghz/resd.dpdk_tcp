@@ -100,7 +100,6 @@ pub struct DpdkMaxtpCfg<'a> {
     pub warmup: Duration,
     /// Measurement window (spec §11.2: 60 s).
     pub duration: Duration,
-    pub tsc_hz: u64,
     /// Payload template. Caller allocates once at bucket entry (one
     /// vec per bucket) so the inner loop doesn't allocate.
     pub payload: &'a [u8],
@@ -160,10 +159,13 @@ pub fn open_persistent_connections(
 /// Drive one bucket on the dpdk_net side.
 ///
 /// Sequence per spec §11.2:
-/// 1. Pump writes for `warmup` (10 s).
-/// 2. Snapshot per-conn `snd_una` + counters.
-/// 3. Pump writes for `duration` (60 s).
-/// 4. Snapshot again. Compute ACKed bytes + counter deltas.
+/// 1. Pump writes for `warmup` (10 s), no sampling.
+/// 2. Snapshot per-conn `snd_una` + counters; seed the accumulator.
+/// 3. Pump writes for `duration` (60 s), folding a mid-window
+///    `snd_una` sample into the accumulator every `SAMPLE_INTERVAL`
+///    (C1 fix: survives u32 sequence-space wraps at sustained rates).
+/// 4. Close with a final per-conn snapshot and fold it into the
+///    accumulator so the tail sub-window is counted. Snapshot counters.
 /// 5. Return `MaxtpSample::from_window(acked_bytes, tx_pkts, elapsed_ns)`.
 pub fn run_bucket(cfg: &DpdkMaxtpCfg<'_>) -> anyhow::Result<BucketRun> {
     if cfg.conns.len() as u64 != cfg.bucket.conn_count {
@@ -186,11 +188,15 @@ pub fn run_bucket(cfg: &DpdkMaxtpCfg<'_>) -> anyhow::Result<BucketRun> {
 
     // Warmup.
     let warmup_deadline = Instant::now() + cfg.warmup;
-    pump_round_robin(cfg.engine, cfg.conns, cfg.payload, warmup_deadline)
+    pump_round_robin(cfg.engine, cfg.conns, cfg.payload, warmup_deadline, None)
         .context("dpdk_maxtp warmup phase")?;
 
     // Snapshot pre-window state.
-    let pre_snd_una_total: u64 = snapshot_snd_una_total(cfg.engine, cfg.conns);
+    // `snd_una` snapshot — per-connection u32 values (not a single u64
+    // sum, to avoid losing wrap bits when subtracting). The borrow on
+    // `flow_table` is released inside the snapshot helper before this
+    // call returns; subsequent drain calls are safe.
+    let pre_snd_una: Vec<u32> = snapshot_snd_una_per_conn(cfg.engine, cfg.conns);
     let pre_tx_payload = cfg
         .engine
         .counters()
@@ -204,11 +210,22 @@ pub fn run_bucket(cfg: &DpdkMaxtpCfg<'_>) -> anyhow::Result<BucketRun> {
         .tx_pkts
         .load(std::sync::atomic::Ordering::Relaxed);
 
-    // Measurement.
+    // Measurement — pump while sampling per-conn `snd_una` every
+    // SAMPLE_INTERVAL. This handles sustained-rate wraps of the u32
+    // sequence space during the 60 s window (C=1 at 100 Gbps wraps
+    // ~17× per window — a single pre/post delta would mask 16× of the
+    // ACKed bytes).
+    let mut accumulator = SndUnaAccumulator::new(pre_snd_una);
     let t_measure_start = Instant::now();
     let measure_deadline = t_measure_start + cfg.duration;
-    pump_round_robin(cfg.engine, cfg.conns, cfg.payload, measure_deadline)
-        .context("dpdk_maxtp measurement phase")?;
+    pump_round_robin(
+        cfg.engine,
+        cfg.conns,
+        cfg.payload,
+        measure_deadline,
+        Some(&mut accumulator),
+    )
+    .context("dpdk_maxtp measurement phase")?;
     let t_measure_end = Instant::now();
 
     // Drain any residual Readable events from the event queue so the
@@ -219,8 +236,11 @@ pub fn run_bucket(cfg: &DpdkMaxtpCfg<'_>) -> anyhow::Result<BucketRun> {
         let _ = drain_and_accumulate_readable(cfg.engine, conn, &mut _last);
     }
 
-    // Snapshot post-window state.
-    let post_snd_una_total: u64 = snapshot_snd_una_total(cfg.engine, cfg.conns);
+    // Final sample: fold the [last_sample .. window_close] delta into
+    // the accumulator so no tail sub-sample is lost.
+    // (Borrow released inside the helper before returning.)
+    let post_snd_una: Vec<u32> = snapshot_snd_una_per_conn(cfg.engine, cfg.conns);
+    accumulator.accumulate(&post_snd_una);
     let post_tx_payload = cfg
         .engine
         .counters()
@@ -236,7 +256,7 @@ pub fn run_bucket(cfg: &DpdkMaxtpCfg<'_>) -> anyhow::Result<BucketRun> {
 
     let inflight_bytes_at_end = snapshot_inflight_total(cfg.engine, cfg.conns);
 
-    let acked_bytes_in_window = post_snd_una_total.saturating_sub(pre_snd_una_total);
+    let acked_bytes_in_window = accumulator.total();
     let tx_payload_bytes_delta = post_tx_payload.saturating_sub(pre_tx_payload);
     let tx_pkts_delta = post_tx_pkts.saturating_sub(pre_tx_pkts);
 
@@ -258,6 +278,81 @@ pub fn run_bucket(cfg: &DpdkMaxtpCfg<'_>) -> anyhow::Result<BucketRun> {
     })
 }
 
+/// Mid-window `snd_una` sampling interval. Each interval the pump loop
+/// takes a per-conn `snd_una` snapshot and folds the wrapping delta
+/// since the previous sample into the accumulator. 1 s is short enough
+/// that a single conn cannot wrap (4 GiB would require >34 Gbps per
+/// conn for >1 s; the expected per-conn ceiling on c6in.metal is
+/// ~50-100 Gbps aggregate across all conns).
+const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Running accumulator for ACKed bytes during the measurement window.
+/// Folds per-conn `wrapping_sub` deltas between successive samples so
+/// even multi-GB/s sustained traffic cannot overflow the u32 sequence
+/// space silently. Used by `run_bucket`; exposed at module scope so
+/// unit tests can drive it with synthetic sample sequences.
+pub(crate) struct SndUnaAccumulator {
+    /// Last `snd_una` snapshot observed. One entry per conn.
+    last_sample: Vec<u32>,
+    /// Running byte totals per conn — widens u32 wrapping deltas to
+    /// u64 so multi-wrap sums survive the 60 s window.
+    accumulated_bytes: Vec<u64>,
+    /// Wall-clock of the next time we should take a sample during the
+    /// pump loop. Initialised to `None` so the first `maybe_sample`
+    /// call computes an absolute deadline from the caller's `now`.
+    next_sample_at: Option<Instant>,
+}
+
+impl SndUnaAccumulator {
+    pub(crate) fn new(initial_sample: Vec<u32>) -> Self {
+        let n = initial_sample.len();
+        Self {
+            last_sample: initial_sample,
+            accumulated_bytes: vec![0u64; n],
+            next_sample_at: None,
+        }
+    }
+
+    /// Fold a new per-conn sample into the accumulator. Each conn's
+    /// delta is the u32 wrapping-subtract between `new` and the last
+    /// sample; the delta is widened to u64 and saturating-added into
+    /// the running total so even pathological multi-wrap sequences
+    /// don't overflow. Lengths must match (caller asserts).
+    pub(crate) fn accumulate(&mut self, new: &[u32]) {
+        debug_assert_eq!(new.len(), self.last_sample.len());
+        for (i, (cur, prev)) in new.iter().zip(&self.last_sample).enumerate() {
+            let delta = cur.wrapping_sub(*prev) as u64;
+            self.accumulated_bytes[i] = self.accumulated_bytes[i].saturating_add(delta);
+        }
+        self.last_sample.copy_from_slice(new);
+    }
+
+    /// Sum of all per-conn byte totals — the ACKed bytes for the
+    /// window so far.
+    pub(crate) fn total(&self) -> u64 {
+        self.accumulated_bytes.iter().sum()
+    }
+
+    /// If `now` is past the next-sample deadline, fold a fresh sample
+    /// from the engine and reschedule. The first call schedules the
+    /// first sample `SAMPLE_INTERVAL` into the future so pump-loop
+    /// callers don't pay for a snapshot on every iteration.
+    fn maybe_sample(&mut self, now: Instant, engine: &Engine, conns: &[ConnHandle]) {
+        let due = match self.next_sample_at {
+            None => {
+                self.next_sample_at = Some(now + SAMPLE_INTERVAL);
+                return;
+            }
+            Some(t) => t,
+        };
+        if now >= due {
+            let current = snapshot_snd_una_per_conn(engine, conns);
+            self.accumulate(&current);
+            self.next_sample_at = Some(now + SAMPLE_INTERVAL);
+        }
+    }
+}
+
 /// Pump writes in a round-robin across `conns` until `deadline` fires.
 ///
 /// Each outer round writes `payload` to every connection in sequence,
@@ -267,6 +362,12 @@ pub fn run_bucket(cfg: &DpdkMaxtpCfg<'_>) -> anyhow::Result<BucketRun> {
 /// connection in the round — this keeps multiple connections moving in
 /// parallel rather than stalling on one.
 ///
+/// When `accumulator` is `Some`, a per-conn `snd_una` sample is
+/// folded into it every `SAMPLE_INTERVAL` (1 s). This handles
+/// sustained-rate u32 wraps during the measurement window; the
+/// warmup phase passes `None` because no wrap-tracking is needed
+/// before `t_measure_start`.
+///
 /// Returns `Ok(())` if the deadline was reached normally; `Err` on any
 /// underlying send error (malformed conn, closed conn, etc.).
 fn pump_round_robin(
@@ -274,12 +375,19 @@ fn pump_round_robin(
     conns: &[ConnHandle],
     payload: &[u8],
     deadline: Instant,
+    mut accumulator: Option<&mut SndUnaAccumulator>,
 ) -> anyhow::Result<()> {
     if conns.is_empty() {
         anyhow::bail!("dpdk_maxtp: pump_round_robin: conns is empty");
     }
+    // M1: for C>1 the outer-loop check is enough; we skip the inner
+    // per-conn check to shave Instant::now() calls in the hot path.
+    // For C=1 the outer body consumes the whole bucket if we don't
+    // bail mid-round, so we keep the inner check on that path.
+    let check_between_conns = conns.len() == 1;
     loop {
-        if Instant::now() >= deadline {
+        let now_outer = Instant::now();
+        if now_outer >= deadline {
             return Ok(());
         }
         // One full round across all conns.
@@ -299,8 +407,9 @@ fn pump_round_robin(
             }
             // Cheap deadline check between conns for the C=1 path —
             // otherwise a single conn's write + poll_once consumes the
-            // full outer loop body for the whole warmup/duration.
-            if Instant::now() >= deadline {
+            // full outer loop body for the whole warmup/duration. For
+            // C>1 we rely on the outer check (M1).
+            if check_between_conns && Instant::now() >= deadline {
                 return Ok(());
             }
         }
@@ -317,38 +426,43 @@ fn pump_round_robin(
             let mut _last: Option<u64> = None;
             let _ = drain_and_accumulate_readable(engine, conn, &mut _last);
         }
+        // Mid-window sample folding. Done after poll_once + drain so
+        // the sample reflects the most recent ACKs. `Instant::now()`
+        // here is a no-op on the warmup path (accumulator is None).
+        if let Some(acc) = accumulator.as_deref_mut() {
+            acc.maybe_sample(Instant::now(), engine, conns);
+        }
     }
 }
 
-/// Sum `snd_una` across every connection — the "total ACKed bytes so
-/// far" on this engine. Delta between two snapshots is ACKed bytes in
-/// the measurement window.
+/// Per-conn `snd_una` snapshot. Returns one `u32` per element of
+/// `conns`, preserving the order. The `RefMut` borrow on the engine's
+/// flow table is released before this function returns: the caller
+/// may issue drain / write calls on the same conn without triggering
+/// an `already borrowed` panic (I1).
 ///
-/// `snd_una` is a sequence number (u32, wrapping); summing raw seq
-/// numbers is only meaningful as a *per-connection delta* between two
-/// calls. We accumulate per-conn `(post - pre)` deltas at the call
-/// site via two calls here. Returns the sum of raw `snd_una` values
-/// across conns; the caller subtracts two sums.
-fn snapshot_snd_una_total(engine: &Engine, conns: &[ConnHandle]) -> u64 {
+/// A conn missing from the flow table yields `0` (the connection
+/// vanishing mid-window would surface as goodput=0 for that conn — a
+/// benign under-count rather than a panic).
+fn snapshot_snd_una_per_conn(engine: &Engine, conns: &[ConnHandle]) -> Vec<u32> {
+    // Materialise the per-conn snapshot into an owned Vec *before*
+    // the `RefMut` from `flow_table()` is dropped — no callback or
+    // re-entrant engine access can happen while the borrow is live
+    // (I1 / I6 safety note).
     let ft = engine.flow_table();
-    let mut total: u64 = 0;
+    let mut out = Vec::with_capacity(conns.len());
     for &conn in conns {
-        if let Some(c) = ft.get(conn) {
-            // snd_una is u32 sequence space; we accumulate as u64 so
-            // the (post - pre) delta on a single conn wraps correctly
-            // at the u32 level. Promote to u64, subtract with
-            // saturating semantics at the caller (same-conn wraps
-            // during 60 s at realistic rates are well under u32 span
-            // at low-GB/s).
-            total = total.wrapping_add(c.snd_una as u64);
-        }
+        let v = ft.get(conn).map(|c| c.snd_una).unwrap_or(0);
+        out.push(v);
     }
-    total
+    // Borrow `ft` drops here, before return.
+    out
 }
 
 /// Sum `snd_nxt - snd_una` across every connection at window close.
 /// Bytes handed to the stack but not yet ACKed; used by the caller's
-/// sanity-invariant check to bound ε.
+/// sanity-invariant check to bound ε. The `RefMut` borrow is released
+/// before this function returns — see `snapshot_snd_una_per_conn` (I1).
 fn snapshot_inflight_total(engine: &Engine, conns: &[ConnHandle]) -> u64 {
     let ft = engine.flow_table();
     let mut total: u64 = 0;
@@ -392,4 +506,82 @@ mod tests {
     // sister T6+T7). Pure-Rust unit tests for the sampling math live
     // in the `maxtp` module (`MaxtpSample::from_window`) and the grid
     // tests live in `tests/maxtp_grid.rs`.
+
+    // ----------------------------------------------------------------
+    // SndUnaAccumulator — C1 per-conn u32 wrapping-subtract behaviour.
+    //
+    // `snapshot_snd_una_per_conn` needs a live Engine; we drive the
+    // wrap-tracking math directly against the accumulator.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn per_conn_wrapping_subtract_basic() {
+        // Two conns — one small delta well inside u32, the other
+        // crossing the wrap boundary.
+        let pre = vec![0x0000_0100u32, 0xFFFF_FF00u32];
+        let post = vec![0x0000_0300u32, 0x0000_0100u32];
+        let mut acc = SndUnaAccumulator::new(pre);
+        acc.accumulate(&post);
+        // Conn 0: 0x300 - 0x100 = 0x200 = 512.
+        // Conn 1: wrapping 0x100 - 0xFFFF_FF00 = 0x200 = 512.
+        assert_eq!(acc.accumulated_bytes, vec![0x200u64, 0x200u64]);
+        assert_eq!(acc.total(), 1024);
+    }
+
+    #[test]
+    fn per_conn_wrapping_subtract_with_wrap() {
+        // Single conn crossing the u32 wrap — the old u32→u64
+        // promotion + u64 subtract would yield 0x1_0000_0200 − 0, but
+        // our per-conn wrapping_sub path gives the intended 0x200.
+        let pre = vec![0xFFFF_FF00u32];
+        let post = vec![0x0000_0100u32];
+        let mut acc = SndUnaAccumulator::new(pre);
+        acc.accumulate(&post);
+        assert_eq!(acc.total(), 512);
+    }
+
+    #[test]
+    fn accumulated_bytes_handles_multi_wrap_via_sampling() {
+        // A single conn's snd_una trajectory with two u32 wraps
+        // during the measurement window:
+        //   0 -> 0xFFFF_F000 -> 0x0000_0000 -> 0xFFFF_F000 -> 0x8000_0000
+        // Each hop is <4 GiB so the per-hop wrapping_sub catches the
+        // full delta. Per-hop wrapping-sub deltas:
+        //   hop1 = 0xFFFF_F000 - 0          = 0xFFFF_F000 (~4 GiB − 4 K)
+        //   hop2 = 0x0 - 0xFFFF_F000 wrap   = 0x0000_1000 (4 K)
+        //   hop3 = 0xFFFF_F000 - 0          = 0xFFFF_F000 (~4 GiB − 4 K)
+        //   hop4 = 0x8000_0000 - 0xFFFF_F000 wrap = 0x8000_1000 (~2 GiB+4 K)
+        //   Sum  = 2 × 0xFFFF_F000 + 0x1000 + 0x8000_1000
+        //        = 2 × (2^32 − 4 K) + 4 K + (2^31 + 4 K)
+        //        = 2 × 2^32 − 2 × 4 K + 4 K + 2^31 + 4 K
+        //        = 2^33 + 2^31 = 0x2_8000_0000 ≈ 10 GiB.
+        // This represents two full u32-span wraps (2 × 4 GiB) plus
+        // a tail of 2 GiB — exactly what a 100 Gbps NIC at C=1 would
+        // produce in ~1 s if the spec allowed sustained rates that
+        // high across a single conn.
+        let pre = vec![0u32];
+        let mid1 = vec![0xFFFF_F000u32];
+        let mid2 = vec![0x0000_0000u32];
+        let mid3 = vec![0xFFFF_F000u32];
+        let post = vec![0x8000_0000u32];
+        let mut acc = SndUnaAccumulator::new(pre);
+        acc.accumulate(&mid1);
+        acc.accumulate(&mid2);
+        acc.accumulate(&mid3);
+        acc.accumulate(&post);
+        let expected: u64 = 0x2_8000_0000u64;
+        assert_eq!(
+            acc.total(),
+            expected,
+            "multi-wrap sum should be {expected:#x}, got {:#x}",
+            acc.total()
+        );
+        // Cross-check the "naive" end-to-end u32 subtract on the same
+        // endpoints: post - pre = 0x8000_0000 (2 GiB). Mid-window
+        // sampling rescues the missing 8 GiB (two full wraps).
+        let naive = post[0].wrapping_sub(0u32) as u64;
+        assert_eq!(naive, 0x8000_0000u64);
+        assert!(acc.total() > naive);
+        assert_eq!(acc.total() - naive, 0x2_0000_0000u64);
+    }
 }
