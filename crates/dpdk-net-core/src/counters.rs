@@ -134,7 +134,6 @@ pub struct TcpCounters {
     pub rx_data: AtomicU64,
     pub rx_ack: AtomicU64,
     pub rx_rst: AtomicU64,
-    pub rx_out_of_order: AtomicU64,
     pub tx_retrans: AtomicU64,
     pub tx_rto: AtomicU64,
     pub tx_tlp: AtomicU64,
@@ -529,7 +528,6 @@ mod tests {
     #[test]
     fn tx_retrans_counters_zero_at_construction() {
         let c = Counters::new();
-        assert_eq!(c.tcp.rx_out_of_order.load(Ordering::Relaxed), 0);
         assert_eq!(c.tcp.tx_retrans.load(Ordering::Relaxed), 0);
         assert_eq!(c.tcp.tx_rto.load(Ordering::Relaxed), 0);
         assert_eq!(c.tcp.tx_tlp.load(Ordering::Relaxed), 0);
