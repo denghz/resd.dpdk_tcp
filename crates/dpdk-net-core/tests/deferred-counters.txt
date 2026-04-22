@@ -1,0 +1,10 @@
+# Explicit-deferred counters — declared fields with no current increment site.
+# Each entry: <name>  # <spec-citation>
+# Spec §5.1 states that post-A8 this file should be empty (every declared
+# counter has an increment site reachable in at least one of the two audit
+# builds). T3 discovered two residents that remain declared-but-unwired at
+# phase-a8 T3; they are tracked here as genuine deferred counters until the
+# relevant wiring task lands (see per-row citation).
+
+eth.rx_drop_nomem   # counters.rs:11 / engine.rs:486,2127 — declared A1, read by check_and_emit_rx_enomem() but never bumped; generic ethdev mempool-alloc-fail counter (the ENA-specific xstat rx_q0_mbuf_alloc_fail IS wired via ena_xstats.rs). Wiring to be added when rte_pktmbuf_alloc-failure path is instrumented.
+poll.iters_with_tx  # counters.rs:277,851 ("declared but not incremented until A6"); A6 landed without wiring this counter. Phase A8 T3 surfaces the gap.
