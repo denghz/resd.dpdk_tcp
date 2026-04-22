@@ -239,23 +239,54 @@ reason = "TIME_WAIT reuse / 2*MSL semantics not exercised via shim yet"
 
 # --- (3) Server-side lifecycle groups ---
 #
-# The A7 shim routes listen/accept/connect to the engine, but the
-# in-memory packet rx/tx path between the script and the engine
-# currently mis-synchronizes on server-side flows: SYN injection does
-# not lead to a drained SYN-ACK frame in the shim's TX queue (every
-# server-side corpus script times out at the first expected outbound
-# segment). Until T10/T16-era shim fixes land, every bind+listen+accept
-# script is skipped.
+# A8 T15 S2 wired packetdrill's per-script live_local_ip / live_remote_ip
+# through the shim's inject/drain IP-rewrite and routed the engine's
+# conn-peer FFI back through shim_accept, so the following subset of
+# listen/blocking/close/reset/shutdown scripts now run end-to-end. The
+# runnable allowlist is explicit because the remaining directory-mates
+# hit distinct engine-side gaps (FreeBSD-style silent drop, ISN=0
+# expectation, shutdown() wiring, scripts/defaults.sh dependency) that
+# stay on the A8+ backlog.
+
+[[rule]]
+matches_regex = ".*/listen/listen-incoming-syn-ack\\.pkt"
+verdict = "runnable"
+reason = "A8 T15 S2: listener rejects SYN-ACK with RST, then accepts retry SYN"
+
+[[rule]]
+matches_regex = ".*/listen/listen-incoming-ack\\.pkt"
+verdict = "runnable"
+reason = "A8 T15 S2: listener rejects bare ACK with RST, then accepts retry SYN"
+
+[[rule]]
+matches_regex = ".*/listen/listen-incoming-rst\\.pkt"
+verdict = "runnable"
+reason = "A8 T15 S2: listener drops unsolicited RST then accepts retry SYN"
+
+[[rule]]
+matches_regex = ".*/listen/listen-incoming-syn-rst\\.pkt"
+verdict = "runnable"
+reason = "A8 T15 S2: listener drops SYN|RST combo then accepts retry SYN"
+
+[[rule]]
+matches_regex = ".*/blocking/blocking-simple-server\\.pkt"
+verdict = "runnable"
+reason = "A8 T15 S2: minimal blocking listen->accept->close round-trip"
+
+[[rule]]
+matches_regex = ".*/close/simultaneous-close\\.pkt"
+verdict = "runnable"
+reason = "A8 T15 S2: simultaneous-close FIN exchange after accept"
 
 [[rule]]
 matches_regex = ".*/listen/.*\\.pkt"
 verdict = "skipped-untranslatable"
-reason = "server-side SYN->SYN-ACK round-trip not wired through shim (A8+)"
+reason = "server-side edge behavior (FreeBSD silent-drop on no-flags) needs engine parity (A8+)"
 
 [[rule]]
 matches_regex = ".*/blocking/.*\\.pkt"
 verdict = "skipped-untranslatable"
-reason = "server-side accept path not exercisable via shim yet (A8+)"
+reason = "requires scripts/defaults.sh init and blocking-accept timing deltas (A8+)"
 
 [[rule]]
 matches_regex = ".*/close/.*\\.pkt"

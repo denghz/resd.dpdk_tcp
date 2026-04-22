@@ -40,13 +40,12 @@ Dry-run evidence that drove this floor:
 
 #### Server-side lifecycle — shim SYN->SYN-ACK round-trip gap (A8+)
 
-  - testcases/tcp/blocking/blocking-accept.pkt — server-side accept path not exercisable via shim yet (A8+)
-  - testcases/tcp/blocking/blocking-accept_freebsd.pkt — server-side accept path not exercisable via shim yet (A8+)
-  - testcases/tcp/blocking/blocking-connect.pkt — server-side accept path not exercisable via shim yet (A8+)
-  - testcases/tcp/blocking/blocking-read.pkt — server-side accept path not exercisable via shim yet (A8+)
-  - testcases/tcp/blocking/blocking-read_freebsd.pkt — server-side accept path not exercisable via shim yet (A8+)
-  - testcases/tcp/blocking/blocking-simple-server.pkt — server-side accept path not exercisable via shim yet (A8+)
-  - testcases/tcp/blocking/blocking-write.pkt — server-side accept path not exercisable via shim yet (A8+)
+  - testcases/tcp/blocking/blocking-accept.pkt — requires scripts/defaults.sh init and blocking-accept timing deltas (A8+)
+  - testcases/tcp/blocking/blocking-accept_freebsd.pkt — requires scripts/defaults.sh init and blocking-accept timing deltas (A8+)
+  - testcases/tcp/blocking/blocking-connect.pkt — requires scripts/defaults.sh init and blocking-accept timing deltas (A8+)
+  - testcases/tcp/blocking/blocking-read.pkt — requires scripts/defaults.sh init and blocking-accept timing deltas (A8+)
+  - testcases/tcp/blocking/blocking-read_freebsd.pkt — requires scripts/defaults.sh init and blocking-accept timing deltas (A8+)
+  - testcases/tcp/blocking/blocking-write.pkt — requires scripts/defaults.sh init and blocking-accept timing deltas (A8+)
   - testcases/tcp/close/close-last-ack-lost.pkt — close() tests all require server-side accept path (A8+)
   - testcases/tcp/close/close-local-close-then-remote-fin.pkt — close() tests all require server-side accept path (A8+)
   - testcases/tcp/close/close-on-syn-sent.pkt — close() tests all require server-side accept path (A8+)
@@ -54,12 +53,7 @@ Dry-run evidence that drove this floor:
   - testcases/tcp/close/close-remote-fin-then-close.pkt — close() tests all require server-side accept path (A8+)
   - testcases/tcp/close/close-unread-data-rst.pkt — close() tests all require server-side accept path (A8+)
   - testcases/tcp/close/close-write-data-rst.pkt — close() tests all require server-side accept path (A8+)
-  - testcases/tcp/close/simultaneous-close.pkt — close() tests all require server-side accept path (A8+)
-  - testcases/tcp/listen/listen-incoming-ack.pkt — server-side SYN->SYN-ACK round-trip not wired through shim (A8+)
-  - testcases/tcp/listen/listen-incoming-no-tcp-flags.pkt — server-side SYN->SYN-ACK round-trip not wired through shim (A8+)
-  - testcases/tcp/listen/listen-incoming-rst.pkt — server-side SYN->SYN-ACK round-trip not wired through shim (A8+)
-  - testcases/tcp/listen/listen-incoming-syn-ack.pkt — server-side SYN->SYN-ACK round-trip not wired through shim (A8+)
-  - testcases/tcp/listen/listen-incoming-syn-rst.pkt — server-side SYN->SYN-ACK round-trip not wired through shim (A8+)
+  - testcases/tcp/listen/listen-incoming-no-tcp-flags.pkt — server-side edge behavior (FreeBSD silent-drop on no-flags) needs engine parity (A8+)
   - testcases/tcp/reset/rst-non-synchronized.pkt — RST tests depend on server-side accept path or wire-option parity
   - testcases/tcp/reset/rst-syn-sent.pkt — RST tests depend on server-side accept path or wire-option parity
   - testcases/tcp/reset/rst-sync-est-fin-wait-1.pkt — RST tests depend on server-side accept path or wire-option parity
