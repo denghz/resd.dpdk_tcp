@@ -368,7 +368,6 @@ pub struct dpdk_net_tcp_counters_t {
     pub rx_data: u64,
     pub rx_ack: u64,
     pub rx_rst: u64,
-    pub rx_out_of_order: u64,
     pub tx_retrans: u64,
     pub tx_rto: u64,
     pub tx_tlp: u64,

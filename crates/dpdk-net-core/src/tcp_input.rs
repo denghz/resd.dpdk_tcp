@@ -267,6 +267,60 @@ pub struct Outcome {
     pub in_order_delivered_from_seg: u32,
     pub connected: bool,
     pub closed: bool,
+    /// A8 T12 (S1(b)): signals the engine that a SYN_RCVD→Closed transition
+    /// happened and the listen slot's `in_progress` should be cleared so
+    /// subsequent SYNs on the same listen can land. Set `true` by
+    /// `handle_syn_received` on the bad-ACK arm (transitions to Closed).
+    /// The engine consumer calls
+    /// `Engine::clear_in_progress_for_conn(handle)` after the outcome-based
+    /// state transition has fired. Feature-gated: only the test-server
+    /// build carries a listen-slot table to clear.
+    ///
+    /// A8 T13 (S1(c)): the RST-in-SYN_RCVD arm now routes via
+    /// `re_listen_if_passive` instead (Option B — it records
+    /// SYN_RCVD→LISTEN in state_trans + tears down the conn; setting both
+    /// fields would double-clear the slot).
+    #[cfg(feature = "test-server")]
+    pub clear_listen_slot_on_close: bool,
+    /// A8 T13 (S1(c) per AD-A7-rst-in-syn-rcvd-close-not-relisten): signals
+    /// the engine that a RST landed on a passive-opened SYN_RCVD conn and
+    /// the connection should be returned to the LISTEN state per RFC 9293
+    /// §3.10.7.4 First. When `true`, the engine calls
+    /// `re_listen_if_from_passive(handle)` which clears the listen slot's
+    /// `in_progress`, records a synthetic SYN_RCVD→LISTEN transition in
+    /// `counters.tcp.state_trans`, and tears down the flow-table entry.
+    ///
+    /// Mutually exclusive with `clear_listen_slot_on_close` on the RST
+    /// arm: `handle_syn_received` sets this field only when
+    /// `conn.is_passive_open` is true. On active-opened (client-style)
+    /// SYN_RCVD conns — not yet reachable in Stage 1, but the guard is
+    /// defensive — the RST arm falls back to the T12 Closed-with-slot-
+    /// cleanup path. The engine supplies its own `handle` to
+    /// `re_listen_if_from_passive`; this field is plain bool so the
+    /// handler (which only has `&mut TcpConn`) can signal without
+    /// knowing its own handle — matching the T12 plumbing shape.
+    #[cfg(feature = "test-server")]
+    pub re_listen_if_passive: bool,
+    /// A8 T14 (S1(d) per AD-A7-dup-syn-in-syn-rcvd-silent-drop + mTCP AD-4):
+    /// signals the engine that a duplicate peer-SYN with SEG.SEQ == IRS
+    /// landed while we're in SYN_RCVD — the benign peer-SYN-retransmit
+    /// case (peer didn't see our SYN-ACK, re-sent its own SYN per RFC 9293
+    /// §3.8.1). The engine re-emits the SYN-ACK via
+    /// `emit_syn_ack_for_passive`, which is idempotent w.r.t. the
+    /// `SynRetrans` wheel: if `conn.syn_retrans_timer_id.is_some()`
+    /// (T11 armed it on initial emit), the wheel entry keeps ticking
+    /// and no new entry is added. See engine `emit_syn_ack_for_passive`
+    /// doc comment for the idempotency invariant.
+    ///
+    /// Mutually exclusive with `tx = TxAction::Rst` on the dup-SYN arm:
+    /// `handle_syn_received` sets this field only when
+    /// `seg.seq == conn.irs`. The other dup-SYN arm (seg.seq != irs)
+    /// takes the RST + Closed + `clear_listen_slot_on_close` path
+    /// (RFC 9293 §3.10.7.4 Fourth strict reading) and leaves this field
+    /// `false`. Feature-gated: the handler is itself `test-server`-only,
+    /// so the field's absence in the production build is a non-issue.
+    #[cfg(feature = "test-server")]
+    pub retransmit_syn_ack_for_passive: bool,
 }
 
 impl Outcome {
@@ -299,6 +353,12 @@ impl Outcome {
             in_order_delivered_from_seg: 0,
             connected: false,
             closed: false,
+            #[cfg(feature = "test-server")]
+            clear_listen_slot_on_close: false,
+            #[cfg(feature = "test-server")]
+            re_listen_if_passive: false,
+            #[cfg(feature = "test-server")]
+            retransmit_syn_ack_for_passive: false,
         }
     }
     pub fn none() -> Self {
@@ -369,19 +429,78 @@ fn handle_syn_received(
 ) -> Outcome {
     use crate::tcp_seq::seq_le;
 
-    // RST handling mirrors SYN_SENT (RFC 9293 §3.10.7.4).
+    // RST handling per RFC 9293 §3.10.7.4 First (SYN-RECEIVED):
+    //   - passive-opened conn: "return this connection to the LISTEN
+    //     state and return" → A8 T13 (S1(c)): signal the engine via
+    //     `re_listen_if_passive = true` so it records a synthetic
+    //     SYN_RCVD→LISTEN state_trans, clears the listen slot's
+    //     `in_progress`, and drops the conn. We do NOT set
+    //     `new_state = Some(Closed)` on this branch — Option B design:
+    //     only the SYN_RCVD→LISTEN edge fires, not SYN_RCVD→Closed.
+    //   - active-opened conn (defensive: not reachable in Stage 1 but
+    //     kept for future simultaneous-open coverage): fall back to
+    //     the T12 Closed + `clear_listen_slot_on_close` path.
+    //
+    // A8 T12 (S1(b)): `clear_listen_slot_on_close = true` continues to
+    // cover non-passive fallbacks + the bad-ACK arm below so a failed
+    // handshake does not wedge the listen slot.
+    // `handle_syn_received` is itself `#[cfg(feature = "test-server")]`
+    // (see fn signature above), so `re_listen_if_passive` +
+    // `clear_listen_slot_on_close` Outcome fields are always in scope
+    // here — no nested `#[cfg]` needed.
     if (seg.flags & TCP_RST) != 0 {
+        if conn.is_passive_open {
+            return Outcome {
+                tx: TxAction::None,
+                new_state: None, // conn teardown runs via re_listen_if_from_passive
+                closed: true,
+                re_listen_if_passive: true,
+                ..Outcome::base()
+            };
+        }
         return Outcome {
             tx: TxAction::None,
             new_state: Some(TcpState::Closed),
             closed: true,
+            clear_listen_slot_on_close: true,
             ..Outcome::base()
         };
     }
 
+    // A8 T14 (S1(d)): dup-SYN in SYN_RCVD dispatch per RFC 9293 §3.10.7.4
+    // Fourth + mTCP AD-4 reading of §3.8.1. Pre-T14, the silent-drop arm
+    // here swallowed every SYN-bearing segment (AD-A7-dup-syn-in-syn-rcvd-
+    // silent-drop). The corrected dispatch:
+    //   - SEG.SEQ == IRS → benign peer-SYN-retransmit (peer didn't see
+    //     our SYN-ACK, re-sent the same SYN). Retransmit SYN-ACK with
+    //     identical ISS via `retransmit_syn_ack_for_passive` signal.
+    //     The engine's dispatch site calls `emit_syn_ack_for_passive`,
+    //     which is idempotent on the `SynRetrans` wheel — the existing
+    //     wheel entry (armed by T11 S1(a)) keeps ticking.
+    //   - SEG.SEQ != IRS → in-window SYN with advanced seq. Peer is
+    //     confused (state-machine bug) or adversarial; RFC 9293 §3.10.7.4
+    //     Fourth mandates RST. Reuse the T12 `clear_listen_slot_on_close`
+    //     path so the listen slot is freed for a genuine retry.
+    // Retires AD-A7-dup-syn-in-syn-rcvd-silent-drop + mTCP AD-4.
+    if (seg.flags & TCP_SYN) != 0 {
+        if seg.seq == conn.irs {
+            return Outcome {
+                tx: TxAction::None,
+                retransmit_syn_ack_for_passive: true,
+                ..Outcome::base()
+            };
+        }
+        return Outcome {
+            tx: TxAction::Rst,
+            new_state: Some(TcpState::Closed),
+            closed: true,
+            clear_listen_slot_on_close: true,
+            ..Outcome::base()
+        };
+    }
     // The only acceptable next segment is the final-ACK of the handshake:
-    // ACK set, SYN clear, seq == rcv_nxt, ack covers our SYN-ACK.
-    if (seg.flags & TCP_ACK) == 0 || (seg.flags & TCP_SYN) != 0 {
+    // ACK set, seq == rcv_nxt, ack covers our SYN-ACK.
+    if (seg.flags & TCP_ACK) == 0 {
         return Outcome::none();
     }
     if seg.seq != conn.rcv_nxt {
@@ -391,11 +510,14 @@ fn handle_syn_received(
             ..Outcome::base()
         };
     }
+    // A8 T12 (S1(b)): bad-ACK → RST + Closed; also clear the listen slot
+    // so subsequent SYNs on the same listen can be accepted.
     if !seq_le(conn.snd_una.wrapping_add(1), seg.ack) || !seq_le(seg.ack, conn.snd_nxt) {
         return Outcome {
             tx: TxAction::Rst,
             new_state: Some(TcpState::Closed),
             closed: true,
+            clear_listen_slot_on_close: true,
             ..Outcome::base()
         };
     }
@@ -414,10 +536,18 @@ fn handle_syn_received(
         }
     }
 
+    // A8 T11: final ACK landed — hand the engine the passive SYN-retrans
+    // timer id so it can cancel the pending fire. `take()` zeros the
+    // field so a subsequent fire observes the cancelled-without-id path
+    // (Phase 1 `is_current` check returns false). Mirrors `handle_syn_sent`
+    // at line 555 for the active-open path.
+    let syn_retrans_timer_to_cancel = conn.syn_retrans_timer_id.take();
+
     Outcome {
         tx: TxAction::None,
         new_state: Some(TcpState::Established),
         connected: true,
+        syn_retrans_timer_to_cancel,
         ..Outcome::base()
     }
 }

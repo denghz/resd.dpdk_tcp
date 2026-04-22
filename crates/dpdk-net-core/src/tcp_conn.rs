@@ -8,6 +8,38 @@ use std::collections::VecDeque;
 use crate::flow_table::FourTuple;
 use crate::tcp_state::TcpState;
 
+/// A8 T17 (spec §5.2): static drift detector for the M3 knob-coverage audit.
+///
+/// Every `pub` field on `engine::ConnectOpts` (which mirrors the C ABI
+/// `dpdk_net_connect_opts_t`) listed here MUST either:
+///   - appear as a scenario entry in `tests/knob-coverage.rs` (behavioral
+///     knob: a non-default value produces an observable consequence), OR
+///   - appear in `tests/knob-coverage-informational.txt` (informational-
+///     only: identity / sizing field with no branching behavior).
+///
+/// Adding a field to `ConnectOpts` without updating one of those trips
+/// `knob_coverage_enumerates_every_behavioral_field` in CI. The runtime
+/// value of this slice is never read — the literal string list is parsed
+/// by the drift-detect test. Exposed on `tcp_conn.rs` (not `engine.rs`)
+/// per the A8 T17 plan so the connect-side knob registry lives beside
+/// the per-conn state type; `ConnectOpts` itself is in `engine.rs` for
+/// historical reasons (pre-A5.5 it was an inline argument bundle).
+pub const CONNECT_OPTS_FIELD_NAMES: &[&str] = &[
+    // A5: RACK / RTO aggressiveness knobs.
+    "rack_aggressive",
+    "rto_no_backoff",
+    // A5.5 Task 10: per-connect TLP tuning set.
+    "tlp_pto_min_floor_us",
+    "tlp_pto_srtt_multiplier_x100",
+    "tlp_skip_flight_size_gate",
+    "tlp_max_consecutive_probes",
+    "tlp_skip_rtt_sample_gate",
+    // bug_010 → feature: per-connection source IP (host byte order; 0 =
+    // engine primary). Informational — validation routes through
+    // `engine::select_source_ip`, which is covered by its own unit tests.
+    "local_addr",
+];
+
 /// Per-connection send buffer. In A3 this is a raw byte ring; A4 will
 /// gain a SACK scoreboard + in-flight tracking per spec §6.2.
 pub struct SendQueue {
@@ -244,6 +276,14 @@ pub struct TcpConn {
     pub syn_retrans_count: u8,
     /// Handle of the SYN retrans timer.
     pub syn_retrans_timer_id: Option<crate::tcp_timer_wheel::TimerId>,
+    /// A8 T11: true when this conn originated from a `LISTEN + peer SYN`
+    /// (see `new_passive`), false for the client-side active-open path
+    /// (see `new_client`). The `SynRetrans` timer-wheel fire handler
+    /// dispatches on this flag to retransmit the correct handshake
+    /// shape: plain `SYN` for active-open, `SYN|ACK` for passive-open
+    /// (RFC 9293 §3.8.1 + RFC 6298 §2). Retires AD-A7-no-syn-ack-retransmit
+    /// and mTCP AD-3 from the A7 review set.
+    pub is_passive_open: bool,
     /// Per-connect opt: when true, RACK `reo_wnd` forced to 0.
     pub rack_aggressive: bool,
     /// Per-connect opt: when true, RTO does not double on retransmit.
@@ -394,6 +434,10 @@ impl TcpConn {
             tlp_timer_id: None,
             syn_retrans_count: 0,
             syn_retrans_timer_id: None,
+            // A8 T11: active-open by default. `new_passive` overrides
+            // this to `true` so the SynRetrans fire handler retransmits
+            // `SYN|ACK` instead of plain `SYN`.
+            is_passive_open: false,
             rack_aggressive: false,
             rto_no_backoff: false,
             rack: crate::tcp_rack::RackState::new(),
@@ -476,12 +520,19 @@ impl TcpConn {
         );
         // Deltas from the active-open seed:
         c.state = TcpState::SynReceived;
+        // A8 T11: flag the conn as passive-open so the SynRetrans fire
+        // handler retransmits `SYN|ACK` on this tuple (not plain `SYN`).
+        c.is_passive_open = true;
         c.rcv_nxt = iss_peer.wrapping_add(1);
         c.irs = iss_peer;
         // Absorb peer options from the SYN.
-        if let Some(mss) = opts.mss {
-            c.peer_mss = mss;
-        }
+        // RFC 9293 §3.7.1 / RFC 6691 (MUST-15): if peer SYN omits the MSS
+        // option, send-MSS MUST fall back to 536 (the IPv4 default). Mirrors
+        // the active-open path in `handle_syn_sent` (tcp_input.rs ~632) which
+        // applies the same `unwrap_or(536)` on the SYN-ACK's MSS option.
+        // Before A8 T19 the passive path left `peer_mss` at the `our_mss`
+        // seed when MSS was absent, which violated MUST-15.
+        c.peer_mss = opts.mss.unwrap_or(536);
         c.ws_shift_in = opts.wscale.unwrap_or(0).min(14);
         c.ts_enabled = opts.timestamps.is_some();
         if let Some((tsval, _)) = opts.timestamps {

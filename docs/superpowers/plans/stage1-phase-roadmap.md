@@ -25,8 +25,8 @@
 | A6.6 | RX zero-copy (scatter-gather iovec API, in-order delivery-path mbuf-ref rework, LRO-compatible multi-segment, `rx_mempool_size` knob) | Complete[^a66fused] | phase-a6-6-7-complete |
 | A6.7 | FFI safety audit & hardening (miri, cbindgen header-drift CI, ABI snapshot, panic-firewall test, no-alloc-on-hot-path audit, C++ consumer under ASan/UBSan/LSan) | Complete | phase-a6-6-7-complete |
 | A7 | Loopback test server + packetdrill-shim | **Complete** ✓ | `2026-04-21-stage1-phase-a7-loopback-test-server-packetdrill-shim.md` |
-| A8 | tcpreq + observability gate | Not started | — |
-| A9 | Property + bespoke fuzzing + smoltcp FaultInjector | Complete | phase-a9-complete |
+| A8 | tcpreq + observability gate | **Complete** ✓ | `2026-04-22-stage1-phase-a8-tcpreq-observability-gate.md` |
+| A9 | Property + bespoke fuzzing + smoltcp FaultInjector | **Complete** ✓ | `phase-a9-complete` |
 | A10 | Benchmark harness (micro + e2e + stress) | Not started | — |
 | A10.5 | Layer H correctness under WAN-condition fault injection (netem matrix) | Not started | — |
 | A11 | Stage 1 ship gate verification | Not started | — |

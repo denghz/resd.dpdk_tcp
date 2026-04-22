@@ -393,6 +393,62 @@ impl Default for EngineConfig {
     }
 }
 
+/// A8 T17 (spec §5.2): static drift detector for the M3 knob-coverage audit.
+///
+/// Every `pub` field on `EngineConfig` listed here MUST either:
+///   - appear as a scenario entry in `tests/knob-coverage.rs` (behavioral
+///     knob: a non-default value produces an observable consequence), OR
+///   - appear in `tests/knob-coverage-informational.txt` (informational-
+///     only: sizing, identity, or no-branching-logic field).
+///
+/// Adding a field to `EngineConfig` without updating one of those trips
+/// `knob_coverage_enumerates_every_behavioral_field` in CI. The runtime
+/// value of this slice is never read — the literal string list is parsed
+/// by the drift-detect test. Keep this list in field-declaration order
+/// so diff review surfaces struct additions immediately above the slice
+/// edit.
+pub const ENGINE_CONFIG_FIELD_NAMES: &[&str] = &[
+    // DPDK lcore / port / queue identity + ring sizing.
+    "lcore_id",
+    "port_id",
+    "rx_queue_id",
+    "tx_queue_id",
+    "rx_ring_size",
+    "tx_ring_size",
+    "mbuf_data_room",
+    // A6.6-7: RX mempool sizing.
+    "rx_mempool_size",
+    // A2: L2/L3 identity + GARP cadence.
+    "local_ip",
+    "secondary_local_ips",
+    "gateway_ip",
+    "gateway_mac",
+    "garp_interval_sec",
+    // A3: connection + buffer + MSS + MSL sizing.
+    "max_connections",
+    "recv_buffer_bytes",
+    "send_buffer_bytes",
+    "tcp_mss",
+    "tcp_msl_ms",
+    // A3 + A6 behavioral TCP knobs (preset-controlled).
+    "tcp_nagle",
+    "tcp_delayed_ack",
+    "cc_mode",
+    // A5: RTO timing + retransmit budget + per-packet events.
+    "tcp_min_rto_us",
+    "tcp_initial_rto_us",
+    "tcp_max_rto_us",
+    "tcp_max_retrans_count",
+    "tcp_per_packet_events",
+    // A5.5: event-queue overflow guard.
+    "event_queue_soft_cap",
+    // A6: RTT histogram edges.
+    "rtt_histogram_bucket_edges_us",
+    // A-HW: ENA devarg knobs.
+    "ena_large_llq_hdr",
+    "ena_miss_txc_to_sec",
+];
+
 /// A dpdk-net engine. One per lcore; owns the NIC queues, mempools, and
 /// L2/L3 state for that lcore.
 pub struct Engine {
@@ -2060,6 +2116,16 @@ impl Engine {
         self.rx_drop_nomem_prev
             .set(self.counters.eth.rx_drop_nomem.load(Ordering::Relaxed));
 
+        // A8 T3.5 follow-up: snapshot `eth.tx_pkts` at top of poll so
+        // each exit path can bump `poll.iters_with_tx` iff any TX fired
+        // this iteration. Captures both inline control-frame emits
+        // (`tx_frame` / `tx_tcp_frame` / `tx_data_frame`, which bump
+        // `eth.tx_pkts` one-by-one) and the batched ring drain
+        // (`drain_tx_pending_data`, which adds `sent` to `eth.tx_pkts`).
+        // Matches `iters_with_rx` semantics: once-per-iteration, not
+        // per burst / per segment.
+        let tx_pkts_snapshot = self.counters.eth.tx_pkts.load(Ordering::Relaxed);
+
         // A6.6 T8: release the previous poll's delivered mbuf refs and
         // clear the per-conn scratch iovec arrays — enforces the "valid
         // until next dpdk_net_poll" contract at the C ABI boundary per
@@ -2106,6 +2172,12 @@ impl Engine {
             // Error event. Sited after the drain so it runs on every
             // exit path.
             self.check_and_emit_rx_enomem();
+            // A8 T3.5 follow-up: bump `iters_with_tx` once if any TX
+            // fired on this iteration (timer-driven retransmit can push
+            // into the ring even on the RX-idle path).
+            if self.counters.eth.tx_pkts.load(Ordering::Relaxed) > tx_pkts_snapshot {
+                inc(&self.counters.poll.iters_with_tx);
+            }
             return 0;
         }
 
@@ -2169,6 +2241,14 @@ impl Engine {
         // A6 (spec §3.6 Site 3): edge-triggered RX-mempool-drop Error
         // event. Sited after the drain so it runs on every exit path.
         self.check_and_emit_rx_enomem();
+        // A8 T3.5 follow-up: bump `iters_with_tx` once if any TX fired
+        // on this iteration (inline control frames from `rx_frame` and/or
+        // the batched ring drain). Mirrors `iters_with_rx` semantics —
+        // once per poll iteration, regardless of how many frames or
+        // bursts happened.
+        if self.counters.eth.tx_pkts.load(Ordering::Relaxed) > tx_pkts_snapshot {
+            inc(&self.counters.poll.iters_with_tx);
+        }
         n
     }
 
@@ -2751,12 +2831,19 @@ impl Engine {
         fired_id: crate::tcp_timer_wheel::TimerId,
     ) {
         // Phase 1: validate fired_id + capture current state.
-        let (is_current, in_syn_sent) = {
+        //
+        // A8 T11: passive-open path — `is_passive_open=true` conns sit in
+        // SynReceived until the final ACK lands; on a lost final ACK we
+        // need to retransmit the SYN-ACK. Accept either SynSent
+        // (active-open) or SynReceived (passive-open) as live retrans
+        // candidates; the shape distinction lives in `conn.is_passive_open`.
+        let (is_current, in_handshake_state, is_passive) = {
             let ft = self.flow_table.borrow();
             let Some(c) = ft.get(handle) else { return };
             let current = c.syn_retrans_timer_id == Some(fired_id);
-            let in_syn = c.state == TcpState::SynSent;
-            (current, in_syn)
+            let in_hs =
+                c.state == TcpState::SynSent || c.state == TcpState::SynReceived;
+            (current, in_hs, c.is_passive_open)
         };
         if !is_current {
             // Stale fire (cancel raced, or slot reused). Ignore.
@@ -2771,7 +2858,7 @@ impl Engine {
                 c.timer_ids.retain(|t| *t != fired_id);
             }
         }
-        if !in_syn_sent {
+        if !in_handshake_state {
             // SYN-ACK already landed (or conn already closed). The
             // Outcome-path cancel normally beats us, but on a race the
             // cleared id above is sufficient — nothing more to do.
@@ -2781,7 +2868,20 @@ impl Engine {
         // Phase 3: bump retrans count + check budget. Count semantics:
         // initial SYN = 0; fire 1/2/3 = 1/2/3 retransmit; fire 4 → > 3 →
         // abandon. Total: 3 retransmits + 1 initial = 4 SYN TXes ≈ 75 ms
-        // to ETIMEDOUT with 5 ms base (5+10+20+40).
+        // to ETIMEDOUT with 5 ms base (5+10+20+40). Budget is shared
+        // with the passive-open path (A8 T11) — same `> 3` cap, same
+        // `conn_timeout_syn_sent` counter, same `force_close_etimedout`
+        // teardown (emits `Error{err=-ETIMEDOUT}`).
+        //
+        // A8 T12 (S1(b)): on passive-open budget exhaust, clear the
+        // listen slot's `in_progress` BEFORE `force_close_etimedout`
+        // removes the conn slot. `clear_in_progress_for_conn` is
+        // idempotent and safe to call on active-open conns (no match),
+        // but we only call it when `is_passive` to keep the borrow
+        // scope narrow + self-document the intent. This is the third
+        // SYN_RCVD → Closed site (the other two route via the Outcome
+        // `clear_listen_slot_on_close` field in `handle_syn_received`).
+        // Retires AD-A7-listen-slot-leak-on-failed-handshake.
         let new_count = {
             let mut ft = self.flow_table.borrow_mut();
             match ft.get_mut(handle) {
@@ -2794,12 +2894,37 @@ impl Engine {
         };
         if new_count > 3 {
             crate::counters::inc(&self.counters.tcp.conn_timeout_syn_sent);
+            #[cfg(feature = "test-server")]
+            if is_passive {
+                self.clear_in_progress_for_conn(handle);
+            }
+            #[cfg(not(feature = "test-server"))]
+            let _ = is_passive;
             self.force_close_etimedout(handle);
             return;
         }
 
-        // Phase 4: re-TX SYN via the shared helper.
-        self.emit_syn(handle);
+        // Phase 4: re-TX the handshake segment. Shape dispatches on
+        // `is_passive_open`:
+        //   - active-open (`is_passive_open=false`): retransmit plain SYN
+        //     via `emit_syn` (also stashes `syn_tx_ts_ns` for Karn-safe
+        //     SRTT seeding on the first retransmit only).
+        //   - passive-open (`is_passive_open=true`): retransmit SYN|ACK
+        //     via `emit_syn_with_flags`. `emit_syn_with_flags` reuses the
+        //     exact option bundle + header-building pipeline of the
+        //     initial emit so the retransmit is byte-identical. We
+        //     bump `tx_retrans` (not `tx_syn`) since this is a
+        //     retransmission of a segment we already counted at
+        //     initial-SYN-ACK time.
+        if is_passive {
+            use crate::tcp_output::{TCP_ACK, TCP_SYN};
+            let now_ns_tx = crate::clock::now_ns();
+            if self.emit_syn_with_flags(handle, TCP_SYN | TCP_ACK, now_ns_tx) {
+                crate::counters::inc(&self.counters.tcp.tx_retrans);
+            }
+        } else {
+            self.emit_syn(handle);
+        }
 
         // Phase 5: re-arm with exponential backoff. `shl` clamp at 6
         // caps the backoff multiplier at 64× base (~320 ms), which is
@@ -3865,6 +3990,52 @@ impl Engine {
                 &self.counters,
             );
             inc(&self.counters.tcp.conn_open);
+        }
+
+        // A8 T12 (S1(b)): any SYN_RCVD → Closed transition (bad-ACK arm,
+        // and — pre-T13 — the RST arm) must clear the listen slot's
+        // `in_progress` so subsequent SYNs can land. `handle_syn_received`
+        // sets `clear_listen_slot_on_close = true` on those arms; the
+        // third site (SYN-retrans budget exhaust) clears the slot inline
+        // in `on_syn_retrans_fire` since it doesn't flow through the
+        // dispatch path. Retires AD-A7-listen-slot-leak-on-failed-handshake.
+        #[cfg(feature = "test-server")]
+        if outcome.clear_listen_slot_on_close {
+            self.clear_in_progress_for_conn(handle);
+        }
+
+        // A8 T13 (S1(c)): passive-opened SYN_RCVD + RST → return to LISTEN
+        // per RFC 9293 §3.10.7.4 First. Mutually exclusive with the T12
+        // `clear_listen_slot_on_close` branch above: `handle_syn_received`
+        // sets exactly one of the two flags on the RST arm depending on
+        // `conn.is_passive_open`. This helper does all three pieces —
+        // clear slot `in_progress`, record SYN_RCVD→LISTEN in
+        // state_trans, tear down the flow-table entry. Retires
+        // AD-A7-rst-in-syn-rcvd-close-not-relisten. Must run BEFORE the
+        // `outcome.closed` block below so the Closed event can still
+        // reference the handle (by value — `handle` is a `u32`, the
+        // event push doesn't re-borrow the flow table on the conn
+        // slot). The closed-path's own `flow_table.remove` at the
+        // "state == Some(Closed)" guard is a no-op here because we
+        // skipped the SYN_RCVD→Closed transition on this branch.
+        #[cfg(feature = "test-server")]
+        if outcome.re_listen_if_passive {
+            self.re_listen_if_from_passive(handle);
+        }
+
+        // A8 T14 (S1(d)): dup-SYN-in-SYN_RCVD with SEG.SEQ == IRS →
+        // retransmit SYN-ACK per RFC 9293 §3.8.1 + mTCP AD-4 reading.
+        // `emit_syn_ack_for_passive` is idempotent on the SynRetrans
+        // wheel: it checks `conn.syn_retrans_timer_id.is_some()` and
+        // skips the re-arm (T11's original arm from
+        // `handle_inbound_syn_listen` is still ticking). Only the wire
+        // frame is re-emitted. Retires AD-A7-dup-syn-in-syn-rcvd-silent-drop
+        // + mTCP AD-4. Mutually exclusive with the RST arm on this same
+        // handler (that arm sets `tx = TxAction::Rst` +
+        // `clear_listen_slot_on_close = true`; this field stays false).
+        #[cfg(feature = "test-server")]
+        if outcome.retransmit_syn_ack_for_passive {
+            self.emit_syn_ack_for_passive(handle);
         }
 
         if outcome.delivered > 0 {
@@ -5826,6 +5997,18 @@ impl Engine {
         self.flow_table.borrow().get(h).map(|c| c.state)
     }
 
+    /// A8 T19: snapshot a conn's negotiated `peer_mss`. Consumed by
+    /// `tcpreq-runner`'s MissingMSS probe (RFC 9293 §3.7.1 MUST-15) to
+    /// verify the 536-byte fallback applies when the peer's SYN omits
+    /// the MSS option. `None` if the handle is unknown. Mirrors
+    /// `state_of` — a thin read-only accessor on internal conn state
+    /// exposed only under the test-server feature so the production
+    /// build keeps `FlowTable` fully private.
+    #[cfg(feature = "test-server")]
+    pub fn conn_peer_mss(&self, h: crate::flow_table::ConnHandle) -> Option<u16> {
+        self.flow_table.borrow().get(h).map(|c| c.peer_mss)
+    }
+
     /// A7 Task 5: inject a single Ethernet-framed bytes buffer into the
     /// engine's RX pipeline. Allocates an mbuf from the RX mempool, copies
     /// the caller's frame bytes in, and invokes `rx_frame` on it (same
@@ -5865,6 +6048,13 @@ impl Engine {
         unsafe {
             std::ptr::copy_nonoverlapping(frame.as_ptr(), dst as *mut u8, frame.len());
         }
+        // Mirror poll_once's per-burst counter bumps on the test-server inject
+        // path. Counter semantics: "frames received on this engine, regardless
+        // of RX source (real rx_burst in production or test-only inject here)."
+        // Without this, dynamic counter-coverage (T4+) would need to fake the
+        // bump from test-side, which would be tautological coverage.
+        crate::counters::inc(&self.counters.eth.rx_pkts);
+        crate::counters::add(&self.counters.eth.rx_bytes, frame.len() as u64);
         // Matches poll_once: the RX path reads a byte slice (via
         // `mbuf_data_slice`) and hands the mbuf pointer through for the
         // OOO reorder path. We skip the HW timestamp / ol_flags / RSS
@@ -5873,7 +6063,22 @@ impl Engine {
         // The bytes slice borrows the mbuf's data; the rx_frame chain
         // holds it for the duration of the call.
         let rx_mbuf = std::ptr::NonNull::new(m);
-        let _ = self.rx_frame(bytes, 0, 0, 0, rx_mbuf);
+        let _accepted = self.rx_frame(bytes, 0, 0, 0, rx_mbuf);
+        // A8 T9: mirror poll_once's obs-byte-counters per-burst accumulator.
+        // `rx_frame` returns accepted-payload-byte count; the real bump in
+        // poll_once (~engine.rs:2106) is a single fetch_add per burst after
+        // the loop. For the single-frame inject path the "per-burst" sum is
+        // just `_accepted`. Without this mirror, `cover_tcp_rx_payload_bytes`
+        // would have no drive path under the test-server bypass.
+        #[cfg(feature = "obs-byte-counters")]
+        {
+            if _accepted > 0 {
+                crate::counters::add(
+                    &self.counters.tcp.rx_payload_bytes,
+                    _accepted as u64,
+                );
+            }
+        }
         // Free the RX mbuf ref; if OOO-insert up-bumped the refcount
         // (parallel to poll_once's behavior), the reorder queue still
         // holds a live ref and the mbuf survives until drained.
@@ -5968,12 +6173,82 @@ impl Engine {
     /// Build + tx the SYN-ACK for a SYN_RCVD conn. Thin wrapper around
     /// `emit_syn_with_flags` with `flags = SYN|ACK`; the helper auto-fills
     /// `ack = rcv_nxt` (peer's iss + 1) when the ACK bit is set.
+    ///
+    /// A8 T11 (S1(a)): arms the `SynRetrans` timer wheel on successful
+    /// TX so a lost final ACK doesn't wedge the passive-open conn in
+    /// SYN_RCVD forever (retires AD-A7-no-syn-ack-retransmit + mTCP AD-3;
+    /// RFC 9293 §3.8.1 + RFC 6298 §2). Retransmit shape is handled by
+    /// the fire handler via `conn.is_passive_open`. Called from both
+    /// the initial SYN-ACK emit (`handle_inbound_syn_listen`) and the
+    /// retransmit branch of `on_syn_retrans_fire` — in the latter case
+    /// the caller drives the arm explicitly with `new_count` from the
+    /// fire path, so this entry point arms only for the initial emit.
+    ///
+    /// A8 T14 (S1(d)): also called from the dup-SYN-in-SYN_RCVD dispatch
+    /// branch of `handle_syn_received` when a peer retransmits its SYN
+    /// with `SEG.SEQ == IRS` (benign loss-retransmit per RFC 9293 §3.8.1 +
+    /// mTCP AD-4 reading). Idempotency invariant for the T14 reuse:
+    /// `conn.syn_retrans_timer_id.is_some()` iff a SynRetrans wheel
+    /// entry is already ticking for this conn. Only arm a fresh entry
+    /// when `is_none()` — the T11 arm from `handle_inbound_syn_listen`
+    /// is still live when the dup-SYN lands, and double-arming would
+    /// leak the old entry + confuse the `> 3` budget count tracked in
+    /// `on_syn_retrans_fire`'s Phase 3. This means a dup-SYN during
+    /// SYN_RCVD only re-emits the wire frame; the wheel deadline,
+    /// backoff, and budget state are untouched — the existing T11
+    /// entry keeps ticking and the ETIMEDOUT path still fires at the
+    /// original deadline regardless of how many dup-SYNs the peer
+    /// sends. `on_syn_retrans_fire`'s Phase 5 arms the wheel inline
+    /// (does NOT call this helper) so the `already_armed` branch below
+    /// does not gate that path.
     fn emit_syn_ack_for_passive(&self, handle: crate::flow_table::ConnHandle) {
         use crate::counters::inc;
         use crate::tcp_output::{TCP_ACK, TCP_SYN};
+        // A8 T14 (S1(d)): check if a SynRetrans wheel entry is already
+        // live BEFORE the TX. The T11 path arms on initial emit; the
+        // T14 dup-SYN path reuses this function to re-emit the SYN-ACK
+        // but must NOT double-arm the wheel. `already_armed == true`
+        // also disambiguates the TX counter choice: initial emit is a
+        // fresh SYN (bump `tx_syn`), retransmit is a retransmission
+        // (bump `tx_retrans` — matches `on_syn_retrans_fire`'s Phase 4
+        // convention).
+        let already_armed = {
+            let ft = self.flow_table.borrow();
+            ft.get(handle)
+                .map(|c| c.syn_retrans_timer_id.is_some())
+                .unwrap_or(false)
+        };
         let now_ns = crate::clock::now_ns();
         if self.emit_syn_with_flags(handle, TCP_SYN | TCP_ACK, now_ns) {
+            if already_armed {
+                inc(&self.counters.tcp.tx_retrans);
+                return;
+            }
             inc(&self.counters.tcp.tx_syn);
+            // A8 T11: arm SynRetrans with the same initial delay the
+            // active-open path uses (see `connect` ~ engine.rs:4393).
+            // Budget + backoff + re-arm live inside `on_syn_retrans_fire`
+            // and are shared with the active path; the fire handler
+            // dispatches on `conn.is_passive_open` to pick the right
+            // retransmit shape.
+            let initial_delay_us = self.cfg.tcp_initial_rto_us.max(self.cfg.tcp_min_rto_us);
+            let fire_at_ns = now_ns + (initial_delay_us as u64 * 1_000);
+            let id = self.timer_wheel.borrow_mut().add(
+                now_ns,
+                crate::tcp_timer_wheel::TimerNode {
+                    fire_at_ns,
+                    owner_handle: handle,
+                    kind: crate::tcp_timer_wheel::TimerKind::SynRetrans,
+                    user_data: 0,
+                    generation: 0,
+                    cancelled: false,
+                },
+            );
+            let mut ft = self.flow_table.borrow_mut();
+            if let Some(c) = ft.get_mut(handle) {
+                c.syn_retrans_timer_id = Some(id);
+                c.timer_ids.push(id);
+            }
         }
     }
 
@@ -6035,6 +6310,120 @@ impl Engine {
         }
     }
 
+    /// A8 T12 (S1(b) per AD-A7-listen-slot-leak-on-failed-handshake):
+    /// clear any listen slot's `in_progress` if it currently pairs with
+    /// `handle`. Idempotent + safe to call on handles that weren't
+    /// passive-opened (active-open conns never appear in a listen slot).
+    ///
+    /// Called from every SYN_RCVD → Closed site so the listen slot
+    /// accepts fresh SYNs after any failed handshake:
+    ///   1. RST-in-SYN_RCVD (tcp_input `handle_syn_received` RST arm)
+    ///   2. bad-ACK in SYN_RCVD (same handler, bad-ACK arm → RST + Closed)
+    ///   3. SYN-retrans budget exhaust (`on_syn_retrans_fire` `> 3` arm,
+    ///      which invokes `force_close_etimedout`; this helper is called
+    ///      right before the force-close on passive-open conns).
+    pub(crate) fn clear_in_progress_for_conn(
+        &self,
+        handle: crate::flow_table::ConnHandle,
+    ) {
+        let mut slots = self.listen_slots.borrow_mut();
+        for (_, slot) in slots.iter_mut() {
+            if slot.in_progress == Some(handle) {
+                slot.in_progress = None;
+                return;
+            }
+        }
+    }
+
+    /// A8 T13 (S1(c) per AD-A7-rst-in-syn-rcvd-close-not-relisten):
+    /// return a passive-opened SYN_RCVD conn to the LISTEN state on RST
+    /// per RFC 9293 §3.10.7.4 First. Does three things:
+    ///   1. Clear the matching listen slot's `in_progress` (redundant
+    ///      with `clear_in_progress_for_conn` — called explicitly here
+    ///      rather than via the T12 helper so the three steps read as
+    ///      one atomic "return to LISTEN" unit, and so the caller sees
+    ///      a single entry point).
+    ///   2. Record a synthetic `SYN_RCVD → LISTEN` transition in
+    ///      `counters.tcp.state_trans[3][1]`. The T8 audit matrix
+    ///      previously marked this cell Unreachable("awaits T13
+    ///      S1(c)"); T13 opens the edge and T8 flips it to Reached.
+    ///   3. Tear down the conn by removing its flow-table entry. The
+    ///      listen slot itself stays live, so `match_listen_slot` will
+    ///      find it on a subsequent SYN (even on the same 4-tuple);
+    ///      that SYN lands on a fresh `new_passive` conn.
+    ///
+    /// Guarded by `conn.is_passive_open`: no-op on active-opened conns.
+    /// Stage 1's FSM only reaches SYN_RCVD via the passive path (see
+    /// AD-6 simultaneous-open deferred), so the guard is defensive but
+    /// the production no-op branch is currently unreachable.
+    ///
+    /// Project rule preserved (spec §6 line 365): the LISTEN transition
+    /// only ever fires under `feature = "test-server"`; the production
+    /// build has no listen path and this helper is not compiled in.
+    #[cfg(feature = "test-server")]
+    pub(crate) fn re_listen_if_from_passive(
+        &self,
+        handle: crate::flow_table::ConnHandle,
+    ) {
+        use crate::tcp_state::TcpState;
+        // Gate on passive-open — active-opened SYN_RCVD conns (not yet
+        // reachable in Stage 1) fall through to the T12 Closed path at
+        // the call site, not here. We also verify the conn is still
+        // in the flow table: in theory a race could have removed it
+        // already, but on the current single-lcore + RefCell shape
+        // this is impossible.
+        let is_passive = {
+            let ft = self.flow_table.borrow();
+            match ft.get(handle) {
+                Some(c) => c.is_passive_open,
+                None => return,
+            }
+        };
+        if !is_passive {
+            return;
+        }
+
+        // Step 1: clear the listen slot's `in_progress` (single pass).
+        self.clear_in_progress_for_conn(handle);
+
+        // Step 2: record the synthetic SYN_RCVD → LISTEN edge so the
+        // state_trans audit sees it. We bypass `transition_conn` on
+        // purpose: that helper writes `conn.state` + emits a
+        // `StateChange` event, neither of which is appropriate here —
+        // the conn is about to be torn down, and we never actually
+        // land in `TcpState::Listen` per project rule spec §6.
+        let from = TcpState::SynReceived as usize;
+        let to = TcpState::Listen as usize;
+        crate::counters::inc(&self.counters.tcp.state_trans[from][to]);
+
+        // Step 3: tear down the conn. Remove from the flow table so a
+        // fresh same-4-tuple SYN lands on a new `new_passive` conn via
+        // `handle_inbound_syn_listen`. No wire frames are emitted
+        // (RFC 9293 §3.10.7.4 First: passive-OPEN RST is absorbed
+        // silently, no RST-on-RST response). No timers to cancel:
+        // SYN_RCVD conns carry at most a `syn_retrans_timer_id` which
+        // the caller-side dispatch plumbing cancels via the usual
+        // Outcome path once the conn is gone; a stale fire lands on
+        // the is_current/get-mut guards and is a no-op.
+        //
+        // A8 T11 hand-off: if the passive-open SYN-retrans timer was
+        // still armed, cancel it here before the flow-table remove
+        // releases the conn (the fire handler's Phase-1 lookup would
+        // then observe `None` and early-return). This keeps the wheel
+        // from firing on a stale handle after removal.
+        let timer_id = {
+            let mut ft = self.flow_table.borrow_mut();
+            match ft.get_mut(handle) {
+                Some(c) => c.syn_retrans_timer_id.take(),
+                None => None,
+            }
+        };
+        if let Some(id) = timer_id {
+            self.timer_wheel.borrow_mut().cancel(id);
+        }
+        self.flow_table.borrow_mut().remove(handle);
+    }
+
     /// A7 Task 8: run the per-conn TX flush path once. Returns `true`
     /// iff the TX-intercept queue transitioned from empty to non-empty
     /// during this call. Used by the test-FFI `pump_until_quiescent`
@@ -6055,6 +6444,54 @@ impl Engine {
     /// with the always-on `advance_timer_wheel` production path.
     pub fn pump_timers(&self, now_ns: u64) -> usize {
         self.fire_timers_at(now_ns)
+    }
+
+    /// A8 Task 6: test-server-only teardown helper. Clears every conn's
+    /// `recv.bytes` + `delivered_segments` + `readable_scratch_iovecs`,
+    /// dropping held `MbufHandle` refcounts. Must be called before drop
+    /// in test-server scenarios that injected payload-carrying segments.
+    ///
+    /// Why: in test-server mode (`port_id == u16::MAX`) `poll_once` is UB
+    /// (walks past `RTE_MAX_ETHPORTS` in `rte_eth_fp_ops`), so the
+    /// production top-of-poll drain at engine.rs:2002 never runs and any
+    /// pinned mbuf refs live until `Engine::drop`. `Engine` drops
+    /// `_rx_mempool` (declaration-order) BEFORE `flow_table`, so the
+    /// flow-table's tear-down would call `shim_rte_mbuf_refcnt_update(-1)`
+    /// on mbufs whose mempool backing has already been released → UAF
+    /// SIGSEGV. This helper replicates the top-of-poll drain logic
+    /// without touching rx_burst, making test-server teardown safe
+    /// whenever payload-carrying segments were injected.
+    ///
+    /// No-op when no conn holds pinned mbuf refs. Cheap — one pass over
+    /// the flow table.
+    pub fn test_clear_pinned_rx_mbufs(&self) {
+        let mut ft = self.flow_table.borrow_mut();
+        let handles: Vec<_> = ft.iter_handles().collect();
+        for h in handles {
+            if let Some(c) = ft.get_mut(h) {
+                c.recv.bytes.clear();
+                c.delivered_segments.clear();
+                c.readable_scratch_iovecs.clear();
+                // A8 T7: reorder queue holds independent pinned refs on
+                // RX mbufs (OooSegment stores a raw `NonNull<rte_mbuf>`
+                // with a `drop_segment_mbuf_ref` contract on drop). If
+                // left populated through teardown, the ReorderQueue's
+                // Drop would decrement refcount on mbufs whose mempool
+                // has already been freed → UAF SIGSEGV. `clear()`
+                // releases the refs while the mempool is still alive.
+                c.recv.reorder.clear();
+            }
+        }
+    }
+
+    /// A8 T8: test-server-only shim that invokes the private
+    /// `reap_time_wait` so counter-coverage scenarios can drive the
+    /// TIME_WAIT → CLOSED `state_trans[10][0]` transition without
+    /// going through `poll_once`, which is UB on `port_id == u16::MAX`.
+    /// Production callers never need this — `poll_once` invokes
+    /// `reap_time_wait` on every tick.
+    pub fn test_reap_time_wait(&self) {
+        self.reap_time_wait();
     }
 }
 

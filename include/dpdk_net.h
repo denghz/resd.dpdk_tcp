@@ -289,7 +289,6 @@ struct DPDK_NET_ALIGNED(64) dpdk_net_tcp_counters_t {
   uint64_t rx_data;
   uint64_t rx_ack;
   uint64_t rx_rst;
-  uint64_t rx_out_of_order;
   uint64_t tx_retrans;
   uint64_t tx_rto;
   uint64_t tx_tlp;

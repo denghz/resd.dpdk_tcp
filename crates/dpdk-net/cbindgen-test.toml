@@ -55,7 +55,7 @@ include = [
 # dpdk_net.h (discovered via `grep -oE 'dpdk_net_[a-zA-Z_]+'` on the
 # generated file). If dpdk_net.h grows a new production symbol, add
 # it here too; the `test_header_excluded::test_header_present_when_feature_on`
-# integration test verifies the 9 test functions remain emitted.
+# integration test verifies the 10 test functions remain emitted.
 exclude = [
     "EngineConfigRustOnly",
     "dpdk_net_panic_for_test",

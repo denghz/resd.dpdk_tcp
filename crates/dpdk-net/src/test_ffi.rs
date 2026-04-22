@@ -287,3 +287,45 @@ pub unsafe extern "C" fn dpdk_net_test_close(
     }
     rc
 }
+
+/// A8 T15 (S2): look up a connection's peer IP and port by handle. Host
+/// byte order for both (same convention as `EngineConfig::local_ip`).
+/// Writes into the caller's out-params on success and returns `0`;
+/// returns `-EINVAL` (as `i32`) on null engine / unknown handle, leaving
+/// out-params untouched. The packetdrill shim uses this after
+/// `accept_next` to surface the peer tuple back through the syscall
+/// `accept()` sockaddr — without this, `run_syscall_accept` fires its
+/// `is_equal_port(socket->live.remote.port, htons(port))` assertion on
+/// every server-side script.
+#[no_mangle]
+pub unsafe extern "C" fn dpdk_net_test_conn_peer(
+    engine: *mut dpdk_net_engine,
+    h: dpdk_net_conn_t,
+    peer_ip_out: *mut u32,
+    peer_port_out: *mut u16,
+) -> i32 {
+    let Some(eng) = super::engine_from_raw_mut(engine) else {
+        return -libc::EINVAL;
+    };
+    // `h` is u64 at the FFI boundary but u32 internally.
+    if h > u32::MAX as u64 {
+        return -libc::EINVAL;
+    }
+    let handle = h as u32;
+    // Scope the RefMut: we only need a read-only snapshot of the
+    // 4-tuple, but flow_table() returns RefMut so we drop it promptly.
+    let ft = {
+        let flow_table = eng.flow_table();
+        let Some(conn) = flow_table.get(handle) else {
+            return -libc::EINVAL;
+        };
+        conn.four_tuple()
+    };
+    if !peer_ip_out.is_null() {
+        *peer_ip_out = ft.peer_ip;
+    }
+    if !peer_port_out.is_null() {
+        *peer_port_out = ft.peer_port;
+    }
+    0
+}

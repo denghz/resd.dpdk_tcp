@@ -124,4 +124,20 @@ intptr_t dpdk_net_test_recv(dpdk_net_engine *engine,
  */
 int32_t dpdk_net_test_close(dpdk_net_engine *engine, dpdk_net_conn_t h, uint32_t flags);
 
+/**
+ * A8 T15 (S2): look up a connection's peer IP and port by handle. Host
+ * byte order for both (same convention as `EngineConfig::local_ip`).
+ * Writes into the caller's out-params on success and returns `0`;
+ * returns `-EINVAL` (as `i32`) on null engine / unknown handle, leaving
+ * out-params untouched. The packetdrill shim uses this after
+ * `accept_next` to surface the peer tuple back through the syscall
+ * `accept()` sockaddr — without this, `run_syscall_accept` fires its
+ * `is_equal_port(socket->live.remote.port, htons(port))` assertion on
+ * every server-side script.
+ */
+int32_t dpdk_net_test_conn_peer(dpdk_net_engine *engine,
+                                dpdk_net_conn_t h,
+                                uint32_t *peer_ip_out,
+                                uint16_t *peer_port_out);
+
 #endif /* DPDK_NET_TEST_H */
