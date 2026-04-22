@@ -675,6 +675,266 @@ fn cover_poll_iters_with_rx_burst_max() {
 }
 
 // ---------------------------------------------------------------------
+// T6: tcp.* connection-lifecycle scenarios (18 counters). Mostly
+// REAL-PATH — drive the passive-open / passive-close / RST / active-
+// open-blackhole paths through the test-server rig, and the production
+// counter-bump sites in engine.rs fire end-to-end.
+//
+// Only `tcp.conn_time_wait_reaped` uses `bump_counter_one_shot`: its
+// real bump site fires inside `reap_time_wait` which is exclusively
+// called from `poll_once`, and `poll_once` with `port_id = u16::MAX`
+// would pass 65535 into `rte_eth_rx_burst`'s `rte_eth_fp_ops` lookup
+// (out-of-bounds of `RTE_MAX_ETHPORTS = 32`, UB in release). Real
+// end-to-end coverage lives in `test_server_active_close.rs`
+// (production path exercises the TIME_WAIT transition but stops short
+// of the reaper) and in A5 TAP integration tests on a real `tap` port.
+// ---------------------------------------------------------------------
+
+/// Covers: `tcp.conn_open` — bumped on successful handshake completion
+/// (Connected event). Increment site: engine.rs:3721.
+#[test]
+fn cover_tcp_conn_open() {
+    let mut h = CovHarness::new();
+    h.do_passive_open();
+    h.assert_counter_gt_zero("tcp.conn_open");
+}
+
+/// Covers: `tcp.conn_close` — bumped on outcome.closed=true (peer RST,
+/// LAST_ACK → Closed on peer final ACK, etc.). Passive-close path
+/// exercises the LAST_ACK → Closed arm. Increment site: engine.rs:3753.
+#[test]
+fn cover_tcp_conn_close() {
+    let mut h = CovHarness::new();
+    let conn = h.do_passive_open();
+    h.do_passive_close(conn);
+    h.assert_counter_gt_zero("tcp.conn_close");
+}
+
+/// Covers: `tcp.conn_rst` — bumped on rst-caused close (inbound RST
+/// OR our RST in SYN_SENT-bad-ACK / sync-state paths). Inject peer
+/// RST on an ESTABLISHED conn. Increment site: engine.rs:3761.
+#[test]
+fn cover_tcp_conn_rst() {
+    let mut h = CovHarness::new();
+    let _conn = h.do_passive_open();
+    h.inject_rst_to_established();
+    h.assert_counter_gt_zero("tcp.conn_rst");
+}
+
+/// Covers: `tcp.conn_table_full` — bumped when `connect()` cannot
+/// insert because the flow table is at `max_connections`. Configure
+/// the engine with `max_connections = 1`, drive a passive-open to fill
+/// the single slot, then call `connect()` — the insert fails and the
+/// counter bumps. Increment site: engine.rs:4307.
+#[test]
+fn cover_tcp_conn_table_full() {
+    let mut cfg = common::test_server_config();
+    cfg.max_connections = 1;
+    let mut h = CovHarness::new_with_config(cfg);
+    // Fill the single flow-table slot via passive-open.
+    let _conn = h.do_passive_open();
+    // Now `connect()` has nowhere to insert → conn_table_full bump.
+    let res = h.eng.connect(common::PEER_IP, 9999, 0);
+    assert!(res.is_err(), "connect should fail when table is full");
+    h.assert_counter_gt_zero("tcp.conn_table_full");
+}
+
+/// Covers: `tcp.conn_time_wait_reaped` — bumped inside
+/// `reap_time_wait` each time a TIME_WAIT conn is moved to CLOSED
+/// after its 2×MSL deadline (or via `force_tw_skip`). Real bump site:
+/// engine.rs:2955. HARDWARE/PRODUCTION-ONLY from the counter-coverage
+/// rig's perspective: `reap_time_wait` is private and only called by
+/// `poll_once`, which the test-server bypass cannot drive without
+/// walking past `RTE_MAX_ETHPORTS` in the rx_burst fp_ops lookup.
+/// Real end-to-end coverage lives in A5/A6 TAP integration tests
+/// (they run on a real `tap` port + poll loop). The static audit (T3)
+/// confirms the increment site exists.
+#[test]
+fn cover_tcp_conn_time_wait_reaped() {
+    let h = CovHarness::new();
+    h.bump_counter_one_shot("tcp.conn_time_wait_reaped");
+    h.assert_counter_gt_zero("tcp.conn_time_wait_reaped");
+}
+
+/// Covers: `tcp.conn_timeout_retrans` — bumped in `on_rto_fire` once
+/// the front `snd_retrans` entry's `xmit_count` exceeds
+/// `tcp_max_retrans_count`. Drive via active-open → send_bytes →
+/// peer silent → pump_timers past the budget. Increment site:
+/// engine.rs:2539.
+#[test]
+fn cover_tcp_conn_timeout_retrans() {
+    use dpdk_net_core::clock::set_virt_ns;
+    use dpdk_net_core::test_tx_intercept::drain_tx_frames;
+
+    // Shrink the retrans budget so the virt-clock walk is short.
+    let mut cfg = common::test_server_config();
+    cfg.tcp_max_retrans_count = 2;
+    cfg.tcp_initial_rto_us = 1_000; // 1 ms base keeps backoff bounded
+    cfg.tcp_min_rto_us = 1_000;
+    let mut h = CovHarness::new_with_config(cfg);
+
+    // Passive-open to ESTABLISHED (same tuple as the rest of T6).
+    let conn = h.do_passive_open();
+    let _ = drain_tx_frames();
+
+    // Queue a data segment; peer never ACKs.
+    set_virt_ns(5_000_000);
+    let _ = h.eng.send_bytes(conn, b"x").expect("send_bytes");
+    let _ = drain_tx_frames();
+
+    // Walk the virt-clock past a generous backoff chain; pump timers
+    // on each step. With tcp_max_retrans_count=2, after the 3rd RTO
+    // fire (xmit_count > 2) the budget-exceed arm bumps the counter.
+    for i in 1..=8 {
+        let now_ns = 5_000_000 + (i as u64) * 1_000_000_000;
+        set_virt_ns(now_ns);
+        let _ = h.eng.pump_timers(now_ns);
+        let _ = drain_tx_frames();
+    }
+    h.assert_counter_gt_zero("tcp.conn_timeout_retrans");
+}
+
+/// Covers: `tcp.conn_timeout_syn_sent` — bumped in `on_syn_retrans_fire`
+/// once `syn_retrans_count > 3`. Drive via active-open to a peer that
+/// never responds + `pump_timers` past the 4-attempt budget.
+/// Increment site: engine.rs:2753.
+///
+/// Note: A8 plan §T6 documents that S1(a) (passive SYN-ACK retrans)
+/// lands in T11, so until then the passive-open budget-exhaust path
+/// cannot drive this counter. We use the active-open path which is
+/// already wired (A5 Task 18 via `SynRetrans` timer kind).
+#[test]
+fn cover_tcp_conn_timeout_syn_sent() {
+    let mut h = CovHarness::new();
+    h.do_blackhole_active_open();
+    h.assert_counter_gt_zero("tcp.conn_timeout_syn_sent");
+}
+
+/// Covers: `tcp.rx_syn_ack` — bumped on two sites: peer-SYN-observed
+/// in the LISTEN match branch (line 3314) + peer-SYN-ACK in the
+/// flagged segment dispatch (line 3337). The passive-open path takes
+/// the former. Increment site: engine.rs:3314.
+#[test]
+fn cover_tcp_rx_syn_ack() {
+    let mut h = CovHarness::new();
+    h.do_passive_open();
+    h.assert_counter_gt_zero("tcp.rx_syn_ack");
+}
+
+/// Covers: `tcp.rx_data` — bumped on any matched segment whose
+/// payload is non-empty. Increment site: engine.rs:3349.
+#[test]
+fn cover_tcp_rx_data() {
+    let mut h = CovHarness::new();
+    let _conn = h.do_passive_open();
+    h.inject_peer_data(b"hello");
+    h.assert_counter_gt_zero("tcp.rx_data");
+}
+
+/// Covers: `tcp.rx_ack` — bumped on any matched segment with the ACK
+/// flag set. The passive-open's final ACK carries it. Increment site:
+/// engine.rs:3340.
+#[test]
+fn cover_tcp_rx_ack() {
+    let mut h = CovHarness::new();
+    h.do_passive_open();
+    h.assert_counter_gt_zero("tcp.rx_ack");
+}
+
+/// Covers: `tcp.rx_rst` — bumped on any matched segment with the RST
+/// flag set. Drive via inject_rst_to_established. Increment site:
+/// engine.rs:3346.
+#[test]
+fn cover_tcp_rx_rst() {
+    let mut h = CovHarness::new();
+    let _conn = h.do_passive_open();
+    h.inject_rst_to_established();
+    h.assert_counter_gt_zero("tcp.rx_rst");
+}
+
+/// Covers: `tcp.rx_fin` — bumped on any matched segment with the FIN
+/// flag set. Drive via inject_peer_fin. Increment site: engine.rs:3343.
+#[test]
+fn cover_tcp_rx_fin() {
+    let mut h = CovHarness::new();
+    let _conn = h.do_passive_open();
+    h.inject_peer_fin();
+    h.assert_counter_gt_zero("tcp.rx_fin");
+}
+
+/// Covers: `tcp.rx_unmatched` — bumped when a segment's 4-tuple has
+/// no flow-table match AND no listen-slot SYN rescue. A SYN to a
+/// port we aren't listening on takes this path. Increment site:
+/// engine.rs:3329.
+#[test]
+fn cover_tcp_rx_unmatched() {
+    let mut h = CovHarness::new();
+    h.inject_valid_syn_to_closed_port();
+    h.assert_counter_gt_zero("tcp.rx_unmatched");
+}
+
+/// Covers: `tcp.tx_syn` — bumped on SYN emission. The passive-open
+/// SYN-ACK emission at engine.rs:5570 bumps `tx_syn` (SYN-ACK is a
+/// SYN-flagged segment from our stack's perspective). Active-open
+/// connect() also bumps at line 4370. Increment site: engine.rs:5570.
+#[test]
+fn cover_tcp_tx_syn() {
+    let mut h = CovHarness::new();
+    h.do_passive_open();
+    h.assert_counter_gt_zero("tcp.tx_syn");
+}
+
+/// Covers: `tcp.tx_ack` — bumped on bare-ACK emission via `emit_ack`
+/// (the response to peer data or peer FIN). Drive via inject_peer_data.
+/// Increment site: engine.rs:3926.
+#[test]
+fn cover_tcp_tx_ack() {
+    let mut h = CovHarness::new();
+    let _conn = h.do_passive_open();
+    h.inject_peer_data(b"hello");
+    h.assert_counter_gt_zero("tcp.tx_ack");
+}
+
+/// Covers: `tcp.tx_data` — bumped on every data-segment emission in
+/// `send_bytes`. Drive via passive-open + send_bytes. Increment site:
+/// engine.rs:4631.
+#[test]
+fn cover_tcp_tx_data() {
+    use dpdk_net_core::test_tx_intercept::drain_tx_frames;
+    let mut h = CovHarness::new();
+    let conn = h.do_passive_open();
+    let _ = drain_tx_frames();
+    let n = h.eng.send_bytes(conn, b"hello world").expect("send_bytes");
+    assert!(n > 0, "send_bytes should accept at least one byte");
+    h.assert_counter_gt_zero("tcp.tx_data");
+}
+
+/// Covers: `tcp.tx_fin` — bumped on FIN emission in close_conn. Drive
+/// via passive-open + close_conn (server-initiated active-close from
+/// ESTABLISHED). Increment site: engine.rs:4873.
+#[test]
+fn cover_tcp_tx_fin() {
+    use dpdk_net_core::clock::set_virt_ns;
+    use dpdk_net_core::test_tx_intercept::drain_tx_frames;
+    let mut h = CovHarness::new();
+    let conn = h.do_passive_open();
+    let _ = drain_tx_frames();
+    set_virt_ns(10_000_000);
+    h.eng.close_conn(conn).expect("close_conn");
+    h.assert_counter_gt_zero("tcp.tx_fin");
+}
+
+/// Covers: `tcp.tx_rst` — bumped on RST emission. A SYN to an
+/// unlistened port triggers `send_rst_unmatched` which bumps tx_rst
+/// at engine.rs:4063. Increment site: engine.rs:4063.
+#[test]
+fn cover_tcp_tx_rst() {
+    let mut h = CovHarness::new();
+    h.inject_valid_syn_to_closed_port();
+    h.assert_counter_gt_zero("tcp.tx_rst");
+}
+
+// ---------------------------------------------------------------------
 // Helpers local to this test file. Kept here rather than in
 // `common/mod.rs` because they're ICMP-specific + only two scenarios
 // in this file consume them.

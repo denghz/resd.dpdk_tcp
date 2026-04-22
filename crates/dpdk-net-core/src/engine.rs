@@ -5650,6 +5650,36 @@ impl Engine {
     pub fn pump_timers(&self, now_ns: u64) -> usize {
         self.fire_timers_at(now_ns)
     }
+
+    /// A8 Task 6: test-server-only teardown helper. Clears every conn's
+    /// `recv.bytes` + `delivered_segments` + `readable_scratch_iovecs`,
+    /// dropping held `MbufHandle` refcounts. Must be called before drop
+    /// in test-server scenarios that injected payload-carrying segments.
+    ///
+    /// Why: in test-server mode (`port_id == u16::MAX`) `poll_once` is UB
+    /// (walks past `RTE_MAX_ETHPORTS` in `rte_eth_fp_ops`), so the
+    /// production top-of-poll drain at engine.rs:2002 never runs and any
+    /// pinned mbuf refs live until `Engine::drop`. `Engine` drops
+    /// `_rx_mempool` (declaration-order) BEFORE `flow_table`, so the
+    /// flow-table's tear-down would call `shim_rte_mbuf_refcnt_update(-1)`
+    /// on mbufs whose mempool backing has already been released → UAF
+    /// SIGSEGV. This helper replicates the top-of-poll drain logic
+    /// without touching rx_burst, making test-server teardown safe
+    /// whenever payload-carrying segments were injected.
+    ///
+    /// No-op when no conn holds pinned mbuf refs. Cheap — one pass over
+    /// the flow table.
+    pub fn test_clear_pinned_rx_mbufs(&self) {
+        let mut ft = self.flow_table.borrow_mut();
+        let handles: Vec<_> = ft.iter_handles().collect();
+        for h in handles {
+            if let Some(c) = ft.get_mut(h) {
+                c.recv.bytes.clear();
+                c.delivered_segments.clear();
+                c.readable_scratch_iovecs.clear();
+            }
+        }
+    }
 }
 
 #[cfg(test)]

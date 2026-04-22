@@ -328,7 +328,31 @@ pub struct CovHarness {
     // the guard across `Engine` drop guarantees the mempool names are
     // back in DPDK's pool before the next scenario's `Engine::new`.
     pub eng: dpdk_net_core::engine::Engine,
+    /// A8 T6: our server-side ISS captured from the SYN-ACK during
+    /// `do_passive_open`. Zero outside of a live handshake.
+    pub our_iss: std::cell::Cell<u32>,
+    /// A8 T6: next peer seq-number to use on injected segments; each
+    /// helper (`inject_peer_data`, `inject_peer_fin`) advances this
+    /// by `seg_len` so the consumer doesn't have to thread it.
+    pub peer_seq: std::cell::Cell<u32>,
     _serialize_guard: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(feature = "test-server")]
+impl Drop for CovHarness {
+    /// A8 T6: ensure pinned RX mbuf refcounts are released BEFORE the
+    /// engine's inner `_rx_mempool` field drops. Rust drops fields in
+    /// declaration order, so `Engine._rx_mempool` (line ~406 in
+    /// engine.rs) is freed before `Engine.flow_table` (line ~426) ever
+    /// runs its `TcpConn::drop` → `MbufHandle::Drop` chain. Any scenario
+    /// that injects a payload-carrying segment leaves a live refcount
+    /// on an RX mbuf inside `conn.delivered_segments`, so the drop-time
+    /// `shim_rte_mbuf_refcnt_update(-1)` would touch a released mempool
+    /// (UAF → SIGSEGV). This Drop hook runs before any Engine field
+    /// drops, replicating the production top-of-poll drain sequence.
+    fn drop(&mut self) {
+        self.eng.test_clear_pinned_rx_mbufs();
+    }
 }
 
 #[cfg(feature = "test-server")]
@@ -338,6 +362,13 @@ impl CovHarness {
     /// from a previous scenario (the intercept queue is thread-local;
     /// serial-running tests on the same thread share the queue).
     pub fn new() -> Self {
+        Self::new_with_config(test_server_config())
+    }
+
+    /// Like `new` but with a caller-supplied `EngineConfig`. Used by
+    /// T6 scenarios that need to override `max_connections` (e.g. to
+    /// trigger `tcp.conn_table_full`) or other knobs.
+    pub fn new_with_config(cfg: dpdk_net_core::engine::EngineConfig) -> Self {
         use dpdk_net_core::clock::set_virt_ns;
         use dpdk_net_core::engine::{eal_init, Engine};
         use dpdk_net_core::test_tx_intercept::drain_tx_frames;
@@ -350,13 +381,15 @@ impl CovHarness {
             .unwrap_or_else(|p| p.into_inner());
         set_virt_ns(0);
         eal_init(&test_eal_args()).expect("eal_init");
-        let eng = Engine::new(test_server_config()).expect("Engine::new");
+        let eng = Engine::new(cfg).expect("Engine::new");
         // Thread-local TX intercept queue may contain stale frames from
         // a previous scenario on this same thread. Drain so any post-
         // inject `drain_tx_frames` sees only this scenario's frames.
         let _ = drain_tx_frames();
         Self {
             eng,
+            our_iss: std::cell::Cell::new(0),
+            peer_seq: std::cell::Cell::new(0),
             _serialize_guard: guard,
         }
     }
@@ -545,6 +578,212 @@ impl CovHarness {
         v[11] = (c & 0xff) as u8;
         v.extend_from_slice(payload);
         v
+    }
+
+    // -----------------------------------------------------------------
+    // A8 Task 6: TCP connection-lifecycle helpers. Drive the real TCP
+    // state machine paths so `tcp.conn_*` / `tcp.rx_*` / `tcp.tx_*`
+    // counters bump via production code (not one-shot). All helpers
+    // use `PEER_IP:40000 → OUR_IP:5555` as the canonical tuple so
+    // scenarios compose (listen on 5555, handshake, inject further
+    // segments on the same tuple).
+    // -----------------------------------------------------------------
+
+    /// Drive a full passive-open handshake: listen on 5555, inject SYN,
+    /// drain SYN-ACK, inject final ACK. Returns the accepted
+    /// `ConnHandle` + our server-side ISS so follow-up helpers
+    /// (`inject_peer_fin`, `inject_rst_to_established`, etc.) can
+    /// craft segments with correct seq/ack values.
+    ///
+    /// Counter bumps exercised by this path (per spec §6 FSM):
+    ///   - `tcp.rx_syn_ack` (line 3314: peer SYN observed in LISTEN)
+    ///   - `tcp.tx_syn` (line 5570: SYN-ACK emission)
+    ///   - `tcp.rx_ack` (line 3340: final ACK bit)
+    ///   - `tcp.conn_open` (line 3721: Connected event)
+    pub fn do_passive_open(&mut self) -> dpdk_net_core::flow_table::ConnHandle {
+        use dpdk_net_core::clock::set_virt_ns;
+        use dpdk_net_core::test_tx_intercept::drain_tx_frames;
+
+        let listen_h = self.eng.listen(OUR_IP, 5555).expect("listen");
+        // Drain any lingering TX from earlier steps.
+        let _ = drain_tx_frames();
+        set_virt_ns(1_000_000);
+        let syn = build_tcp_syn(PEER_IP, 40_000, OUR_IP, 5555, 0x10000000, 1460);
+        self.eng.inject_rx_frame(&syn).expect("inject SYN");
+        let frames = drain_tx_frames();
+        assert_eq!(frames.len(), 1, "exactly one SYN-ACK expected");
+        let (our_iss, _ack) = parse_syn_ack(&frames[0]).expect("parse SYN-ACK");
+
+        set_virt_ns(2_000_000);
+        let final_ack = build_tcp_ack(
+            PEER_IP,
+            40_000,
+            OUR_IP,
+            5555,
+            0x10000001,
+            our_iss.wrapping_add(1),
+        );
+        self.eng.inject_rx_frame(&final_ack).expect("inject final ACK");
+        let _ = drain_tx_frames();
+        let conn = self
+            .eng
+            .accept_next(listen_h)
+            .expect("accept_next yields conn");
+        self.our_iss.set(our_iss);
+        self.peer_seq.set(0x10000001);
+        conn
+    }
+
+    /// Inject a payload-carrying segment from peer to us on the
+    /// 3WHS-established conn. Uses the tuple from `do_passive_open`.
+    /// Counter bumps: `tcp.rx_data` (payload non-empty) + `tcp.rx_ack`
+    /// (ACK bit always set in non-SYN segments from a live peer) +
+    /// `tcp.tx_ack` (our emit_ack response covers the received data).
+    pub fn inject_peer_data(&mut self, payload: &[u8]) {
+        use dpdk_net_core::clock::set_virt_ns;
+        use dpdk_net_core::tcp_options::TcpOpts;
+        use dpdk_net_core::tcp_output::{TCP_ACK, TCP_PSH};
+
+        set_virt_ns(3_000_000);
+        let peer_seq = self.peer_seq.get();
+        let our_iss = self.our_iss.get();
+        let frame = build_tcp_frame(
+            PEER_IP,
+            40_000,
+            OUR_IP,
+            5555,
+            peer_seq,
+            our_iss.wrapping_add(1),
+            TCP_ACK | TCP_PSH,
+            u16::MAX,
+            TcpOpts::default(),
+            payload,
+        );
+        self.eng.inject_rx_frame(&frame).expect("inject data");
+        self.peer_seq
+            .set(peer_seq.wrapping_add(payload.len() as u32));
+    }
+
+    /// Inject a peer FIN (flags 0x11) on the ESTABLISHED conn. The
+    /// engine replies with a bare ACK (→ `tcp.tx_ack` bump) and moves
+    /// the conn to CLOSE_WAIT. Counter bumps: `tcp.rx_fin` (line 3343)
+    /// + `tcp.rx_ack`.
+    pub fn inject_peer_fin(&mut self) {
+        use dpdk_net_core::clock::set_virt_ns;
+        set_virt_ns(10_000_000);
+        let peer_seq = self.peer_seq.get();
+        let our_iss = self.our_iss.get();
+        let fin = build_tcp_fin(
+            PEER_IP,
+            40_000,
+            OUR_IP,
+            5555,
+            peer_seq,
+            our_iss.wrapping_add(1),
+        );
+        self.eng.inject_rx_frame(&fin).expect("inject peer FIN");
+        self.peer_seq.set(peer_seq.wrapping_add(1));
+    }
+
+    /// Inject a peer RST on the ESTABLISHED conn. The engine closes
+    /// the conn without replying. Counter bumps: `tcp.rx_rst` (line
+    /// 3346) + `tcp.conn_close` (line 3753) + `tcp.conn_rst` (line
+    /// 3761 — the rst_close branch).
+    pub fn inject_rst_to_established(&mut self) {
+        use dpdk_net_core::clock::set_virt_ns;
+        use dpdk_net_core::tcp_options::TcpOpts;
+        use dpdk_net_core::tcp_output::{TCP_ACK, TCP_RST};
+
+        set_virt_ns(10_000_000);
+        let peer_seq = self.peer_seq.get();
+        let our_iss = self.our_iss.get();
+        let rst = build_tcp_frame(
+            PEER_IP,
+            40_000,
+            OUR_IP,
+            5555,
+            peer_seq,
+            our_iss.wrapping_add(1),
+            TCP_RST | TCP_ACK,
+            0,
+            TcpOpts::default(),
+            &[],
+        );
+        self.eng.inject_rx_frame(&rst).expect("inject peer RST");
+    }
+
+    /// Drive a full passive-close sequence on an ESTABLISHED conn:
+    /// peer FIN → CLOSE_WAIT → server close_conn → LAST_ACK → peer
+    /// final ACK → CLOSED (conn slot released). Counter bump:
+    /// `tcp.conn_close` at the LAST_ACK → Closed transition (line
+    /// 3753, outcome.closed=true) + `tcp.tx_fin` on our close_conn.
+    pub fn do_passive_close(&mut self, conn: dpdk_net_core::flow_table::ConnHandle) {
+        use dpdk_net_core::clock::set_virt_ns;
+        use dpdk_net_core::test_tx_intercept::drain_tx_frames;
+
+        // Peer FINs first → CLOSE_WAIT.
+        self.inject_peer_fin();
+        let _ = drain_tx_frames();
+
+        // Server closes → LAST_ACK, FIN in flight.
+        set_virt_ns(20_000_000);
+        self.eng.close_conn(conn).expect("close_conn");
+        let fin_frames = drain_tx_frames();
+        assert_eq!(fin_frames.len(), 1, "server FIN frame expected");
+        let (our_fin_seq, _) = parse_tcp_seq_ack(&fin_frames[0]);
+
+        // Peer ACKs our FIN → CLOSED + conn_close++.
+        set_virt_ns(30_000_000);
+        let peer_seq = self.peer_seq.get();
+        let final_ack = build_tcp_ack(
+            PEER_IP,
+            40_000,
+            OUR_IP,
+            5555,
+            peer_seq,
+            our_fin_seq.wrapping_add(1),
+        );
+        self.eng.inject_rx_frame(&final_ack).expect("inject peer final ACK");
+    }
+
+    /// Active-open path: call `eng.connect()` to a peer that never
+    /// responds, then advance the virt-clock past 4 SYN retrans
+    /// budget-exhaust fires (`> 3` hits `conn_timeout_syn_sent`
+    /// bump at engine.rs:2753). Uses `pump_timers` to drive the
+    /// timer wheel — `poll_once` is UB on `port_id == u16::MAX`.
+    ///
+    /// The timer wheel (`tcp_timer_wheel.rs`) caps each `advance()`
+    /// call at `BUCKETS * LEVELS = 2048` ticks (20.48 ms at the default
+    /// 10 µs `TICK_NS`). We therefore pump in small steps: 1 ms per
+    /// step for 200 steps covers 200 ms of virt-time, well past the
+    /// base 5 ms default `tcp_initial_rto_us` × 2^4 = 80 ms backoff.
+    ///
+    /// Counter bumps: `tcp.tx_syn` (initial + each re-emit) →
+    /// `tcp.conn_timeout_syn_sent` (after the 4th retrans budget
+    /// exhaust).
+    pub fn do_blackhole_active_open(&mut self) {
+        use dpdk_net_core::clock::set_virt_ns;
+        use dpdk_net_core::test_tx_intercept::drain_tx_frames;
+
+        set_virt_ns(0);
+        let _ = self.eng.connect(PEER_IP, 7777, 0).expect("connect");
+        // Drain the initial SYN emission so intercept queue doesn't
+        // grow unbounded across retrans fires.
+        let _ = drain_tx_frames();
+
+        // Walk the virt-clock in 1 ms steps. SYN retrans fires at
+        // t = base * 2^n; default base 5 ms → fires at 5/10/20/40/80 ms.
+        // 200 steps = 200 ms total covers the full 4-fire budget with
+        // wide margin. Each step advances under the 20.48 ms advance()
+        // cap, so each pump_timers call fires any timers in-range.
+        for i in 1..=200 {
+            let now_ns = (i as u64) * 1_000_000; // 1 ms per step
+            set_virt_ns(now_ns);
+            let _ = self.eng.pump_timers(now_ns);
+            // Drain each SYN re-emit so the intercept queue doesn't
+            // hold stale frames from prior steps.
+            let _ = drain_tx_frames();
+        }
     }
 }
 
