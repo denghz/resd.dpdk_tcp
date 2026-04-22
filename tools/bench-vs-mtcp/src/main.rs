@@ -1,8 +1,9 @@
 //! bench-vs-mtcp — dpdk_net vs. mTCP comparison harness.
 //!
-//! A10 Plan B Task 12 (spec §11.1, parent spec §11.5.1). T13 will add
-//! the `maxtp` sub-workload on this same binary. T12 only accepts
-//! `--workload burst`.
+//! A10 Plan B Task 12 (spec §11.1, parent spec §11.5.1) +
+//! Task 13 (spec §11.2, parent spec §11.5.2) — same binary
+//! dispatches on `--workload burst` (K × G = 20 grid) or
+//! `--workload maxtp` (W × C = 28 grid).
 //!
 //! # MVP scope flex (T12)
 //!
@@ -44,6 +45,8 @@ use bench_vs_mtcp::burst::{
     emit_bucket_rows, enumerate_filtered_grid, BucketAggregate,
 };
 use bench_vs_mtcp::dpdk_burst::{self, DpdkBurstCfg, TxTsMode};
+use bench_vs_mtcp::dpdk_maxtp::{self, DpdkMaxtpCfg};
+use bench_vs_mtcp::maxtp;
 use bench_vs_mtcp::preflight::{
     check_mss_and_burst_agreement, check_nic_saturation_bps, check_peer_window,
     check_sanity_invariant, BucketVerdict,
@@ -131,13 +134,32 @@ struct Args {
     /// Grid subset filter — comma-separated K values in bytes to run.
     /// Empty = run all 5 K values. Must match a subset of spec §11.1's
     /// {65536, 262144, 1048576, 4194304, 16777216}.
+    /// Applies when `--workload burst` is selected.
     #[arg(long, default_value = "")]
     burst_sizes: String,
 
     /// Grid subset filter — comma-separated G values in ms to run.
-    /// Empty = run all 4 G values.
+    /// Empty = run all 4 G values. Applies when `--workload burst`.
     #[arg(long, default_value = "")]
     gap_mss: String,
+
+    /// Maxtp grid subset — comma-separated W values in bytes.
+    /// Empty = run all 7 W values.
+    #[arg(long, default_value = "")]
+    write_sizes: String,
+
+    /// Maxtp grid subset — comma-separated C values (connection counts).
+    /// Empty = run all 4 C values.
+    #[arg(long, default_value = "")]
+    conn_counts: String,
+
+    /// Maxtp warmup duration in seconds. Spec §11.2 locks at 10.
+    #[arg(long, default_value_t = maxtp::WARMUP_SECS)]
+    maxtp_warmup_secs: u64,
+
+    /// Maxtp measurement duration in seconds. Spec §11.2 locks at 60.
+    #[arg(long, default_value_t = maxtp::DURATION_SECS)]
+    maxtp_duration_secs: u64,
 
     /// mTCP peer binary absolute path on the baked AMI. Default
     /// tracks spec §11 ("`/opt/mtcp-peer/bench-peer` pre-installed").
@@ -162,15 +184,6 @@ fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let mode = parse_precondition_mode(&args.precondition_mode)?;
     let workload = Workload::parse(&args.workload).map_err(|e| anyhow::anyhow!(e))?;
-
-    // T12 only implements `burst`. `maxtp` lands in T13.
-    if workload != Workload::Burst {
-        anyhow::bail!(
-            "workload `{}` is not implemented in T12 (only `burst`); \
-             `maxtp` lands in Plan B Task 13 (see src/maxtp.rs module docs)",
-            args.workload
-        );
-    }
 
     let mut stacks = parse_stacks(&args.stacks)?;
 
@@ -202,12 +215,6 @@ fn main() -> anyhow::Result<()> {
         }
         std::process::exit(1);
     }
-
-    // Parse grid subset filters (empty = full grid).
-    let k_filter = parse_u64_list(&args.burst_sizes)?;
-    let g_filter = parse_u64_list(&args.gap_mss)?;
-    let grid = enumerate_filtered_grid(k_filter.as_deref(), g_filter.as_deref())
-        .map_err(|e| anyhow::anyhow!(e))?;
 
     // EAL init + engine bring-up — only if dpdk_net is selected.
     //
@@ -246,28 +253,68 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
-    for stack in stacks {
-        match stack {
-            Stack::DpdkNet => {
-                let engine = engine.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "DpdkNet stack selected but engine not provided — main.rs invariant violated"
-                    )
-                })?;
-                run_burst_grid_dpdk(
-                    engine,
-                    peer_ip,
-                    args.peer_port,
-                    &grid,
-                    &args,
-                    &metadata,
-                    tsc_hz,
-                    nic_max_bps,
-                    &mut writer,
-                )?;
+    match workload {
+        Workload::Burst => {
+            // Parse burst-specific grid subset filters.
+            let k_filter = parse_u64_list(&args.burst_sizes)?;
+            let g_filter = parse_u64_list(&args.gap_mss)?;
+            let grid = enumerate_filtered_grid(k_filter.as_deref(), g_filter.as_deref())
+                .map_err(|e| anyhow::anyhow!(e))?;
+            for stack in stacks {
+                match stack {
+                    Stack::DpdkNet => {
+                        let engine = engine.as_ref().ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "DpdkNet stack selected but engine not provided — main.rs invariant violated"
+                            )
+                        })?;
+                        run_burst_grid_dpdk(
+                            engine,
+                            peer_ip,
+                            args.peer_port,
+                            &grid,
+                            &args,
+                            &metadata,
+                            tsc_hz,
+                            nic_max_bps,
+                            &mut writer,
+                        )?;
+                    }
+                    Stack::Mtcp => {
+                        run_burst_grid_mtcp_stub(&args, &grid, &metadata, mode, &mut writer)?;
+                    }
+                }
             }
-            Stack::Mtcp => {
-                run_burst_grid_mtcp_stub(&args, &grid, &metadata, mode, &mut writer)?;
+        }
+        Workload::Maxtp => {
+            // Parse maxtp-specific grid subset filters.
+            let w_filter = parse_u64_list(&args.write_sizes)?;
+            let c_filter = parse_u64_list(&args.conn_counts)?;
+            let grid = maxtp::enumerate_filtered_grid(w_filter.as_deref(), c_filter.as_deref())
+                .map_err(|e| anyhow::anyhow!(e))?;
+            for stack in stacks {
+                match stack {
+                    Stack::DpdkNet => {
+                        let engine = engine.as_ref().ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "DpdkNet stack selected but engine not provided — main.rs invariant violated"
+                            )
+                        })?;
+                        run_maxtp_grid_dpdk(
+                            engine,
+                            peer_ip,
+                            args.peer_port,
+                            &grid,
+                            &args,
+                            &metadata,
+                            nic_max_bps,
+                            &mut writer,
+                        )?;
+                    }
+                    Stack::Mtcp => {
+                        run_maxtp_grid_mtcp_stub(&args, &grid, &metadata, mode, &mut writer)?;
+                    }
+                }
             }
         }
     }
@@ -536,6 +583,208 @@ fn run_burst_grid_mtcp_stub<W: std::io::Write>(
                     );
                     emit_bucket_rows(writer, metadata, &args.tool, &args.feature_set, &agg)
                         .context("emit mtcp-stub marker row")?;
+                }
+            },
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// dpdk_net maxtp grid driver (spec §11.2).
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+fn run_maxtp_grid_dpdk<W: std::io::Write>(
+    engine: &Engine,
+    peer_ip: u32,
+    peer_port: u16,
+    grid: &[maxtp::Bucket],
+    args: &Args,
+    metadata: &RunMetadata,
+    nic_max_bps: Option<u64>,
+    writer: &mut csv::Writer<W>,
+) -> anyhow::Result<()> {
+    // Pre-allocate one payload buffer per W (reused across the bucket).
+    let mut payload_cache: std::collections::HashMap<u64, Vec<u8>> = std::collections::HashMap::new();
+
+    for bucket in grid {
+        eprintln!("bench-vs-mtcp: running dpdk_net maxtp bucket {}", bucket.label());
+
+        let payload = payload_cache
+            .entry(bucket.write_bytes)
+            .or_insert_with(|| vec![0u8; bucket.write_bytes as usize]);
+
+        // Pre-run check (2): MSS + TX burst size agreement.
+        let mss_verdict =
+            check_mss_and_burst_agreement(args.mss, args.mss, 32, 32);
+
+        // Pre-run check (1): peer receive window. Same T15 TODO as the
+        // burst path — peer_rwnd introspection lands with the harness
+        // + peer integration in Task 15. The per-conn `W` bound is a
+        // placebo-pass (W <= peer_rwnd is always true when we use W
+        // itself as the peer_rwnd estimate). Real peer rwnd discovery
+        // parses the last observed ACK's scaled window.
+        let peer_rwnd = bucket.write_bytes; // Placebo; see T15 TODO.
+        let rwnd_verdict = check_peer_window(peer_rwnd, bucket.write_bytes);
+
+        let verdict = if !mss_verdict.is_ok() {
+            mss_verdict
+        } else if !rwnd_verdict.is_ok() {
+            rwnd_verdict
+        } else {
+            BucketVerdict::Ok
+        };
+
+        // Same rationale as burst: ENA does not advertise the TX HW-TS
+        // dynfield; tag rows with TscFallback. For maxtp the tag is
+        // informational only (the measurement window is delimited by
+        // TSC reads at the window boundaries; there's no per-iteration
+        // HW TS used in the sample math).
+        let tx_ts_mode = dpdk_maxtp::TxTsMode::TscFallback;
+
+        if !verdict.is_ok() {
+            eprintln!(
+                "bench-vs-mtcp: maxtp bucket {} invalidated pre-run: {}",
+                bucket.label(),
+                verdict.reason().unwrap_or("<unknown>")
+            );
+            let agg = maxtp::BucketAggregate::from_sample(
+                *bucket,
+                Stack::DpdkNet,
+                None,
+                verdict,
+                Some(tx_ts_mode),
+            );
+            maxtp::emit_bucket_rows(writer, metadata, &args.tool, &args.feature_set, &agg)
+                .context("emit invalidated maxtp bucket row")?;
+            continue;
+        }
+
+        // Open C persistent connections.
+        let conns = dpdk_maxtp::open_persistent_connections(
+            engine,
+            peer_ip,
+            peer_port,
+            bucket.conn_count,
+        )?;
+
+        let cfg = DpdkMaxtpCfg {
+            engine,
+            conns: &conns,
+            bucket: *bucket,
+            warmup: std::time::Duration::from_secs(args.maxtp_warmup_secs),
+            duration: std::time::Duration::from_secs(args.maxtp_duration_secs),
+            tsc_hz: 0, // Unused — maxtp window math is Instant-based.
+            payload,
+            tx_ts_mode,
+        };
+        let run = dpdk_maxtp::run_bucket(&cfg).with_context(|| {
+            format!("dpdk_maxtp::run_bucket for {}", bucket.label())
+        })?;
+
+        // Sanity invariant (spec §11.2): ACKed bytes during window ==
+        // `tx_payload_bytes` delta, minus in-flight bound. The
+        // `tx_payload_bytes` counter only increments with the
+        // `obs-byte-counters` feature (OFF by default) — when it's off
+        // the delta is 0 and we skip the check with a log line.
+        if run.tx_payload_bytes_delta > 0 {
+            if let Err(e) = maxtp::check_sanity_invariant(
+                run.acked_bytes_in_window,
+                run.tx_payload_bytes_delta,
+                run.inflight_bytes_at_end,
+            ) {
+                eprintln!(
+                    "bench-vs-mtcp: maxtp sanity invariant violated for bucket {}: {e}",
+                    bucket.label()
+                );
+                anyhow::bail!(e);
+            }
+        } else {
+            eprintln!(
+                "bench-vs-mtcp: maxtp sanity invariant check skipped for bucket {} \
+                 (tx_payload_bytes counter is 0 — build with \
+                 `--features obs-byte-counters` to enable)",
+                bucket.label()
+            );
+        }
+
+        // Post-run check (spec §11.1 check 3, reused for §11.2): NIC
+        // saturation. Same 70% ceiling.
+        let mut agg = maxtp::BucketAggregate::from_sample(
+            *bucket,
+            Stack::DpdkNet,
+            Some(run.sample),
+            BucketVerdict::Ok,
+            Some(tx_ts_mode),
+        );
+        if let Some(max_bps) = nic_max_bps {
+            let sat_verdict =
+                check_nic_saturation_bps(run.sample.goodput_bps as u64, max_bps);
+            if !sat_verdict.is_ok() {
+                eprintln!(
+                    "bench-vs-mtcp: maxtp bucket {} NIC-bound post-run: {}",
+                    bucket.label(),
+                    sat_verdict.reason().unwrap_or("<unknown>")
+                );
+                agg.override_verdict(sat_verdict);
+            }
+        }
+        maxtp::emit_bucket_rows(writer, metadata, &args.tool, &args.feature_set, &agg)
+            .context("emit maxtp bucket rows")?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// mTCP maxtp stub driver.
+// ---------------------------------------------------------------------------
+
+fn run_maxtp_grid_mtcp_stub<W: std::io::Write>(
+    args: &Args,
+    grid: &[maxtp::Bucket],
+    metadata: &RunMetadata,
+    mode: PreconditionMode,
+    writer: &mut csv::Writer<W>,
+) -> anyhow::Result<()> {
+    for bucket in grid {
+        let cfg = mtcp::MaxtpConfig {
+            peer_ip: &args.peer_ip,
+            peer_port: args.peer_port,
+            peer_binary: &args.mtcp_peer_binary,
+            write_bytes: bucket.write_bytes,
+            conn_count: bucket.conn_count,
+            warmup_secs: args.maxtp_warmup_secs,
+            duration_secs: args.maxtp_duration_secs,
+            mss: args.mss,
+        };
+        if let Err(reason) = mtcp::validate_maxtp_config(&cfg) {
+            anyhow::bail!("mTCP maxtp config validation failed: {reason}");
+        }
+        match mtcp::run_maxtp_workload(&cfg) {
+            Ok(_) => {
+                unreachable!(
+                    "mtcp::run_maxtp_workload should return Unimplemented in T13"
+                );
+            }
+            Err(e) => match mode {
+                PreconditionMode::Strict => {
+                    anyhow::bail!(
+                        "mTCP stack is stubbed in T13: {e}. Pass \
+                         `--precondition-mode lenient` to skip with a CSV \
+                         marker, or wait for Plan A AMI T6+T7 to land."
+                    );
+                }
+                PreconditionMode::Lenient => {
+                    let agg = maxtp::BucketAggregate::from_sample(
+                        *bucket,
+                        Stack::Mtcp,
+                        None,
+                        BucketVerdict::Invalid(format!("mtcp stub: {e}")),
+                        None,
+                    );
+                    maxtp::emit_bucket_rows(writer, metadata, &args.tool, &args.feature_set, &agg)
+                        .context("emit mtcp-stub maxtp marker row")?;
                 }
             },
         }

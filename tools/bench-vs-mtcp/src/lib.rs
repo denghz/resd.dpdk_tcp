@@ -19,12 +19,12 @@
 //!
 //! # Sub-workloads
 //!
-//! - `burst` (T12, this landing) — K × G = 20 buckets (spec §11.1).
-//! - `maxtp` (T13, follow-up) — W × C = 28 buckets (spec §11.2).
-//!   Placeholder module only; runner is `todo!()`.
+//! - `burst` (T12) — K × G = 20 buckets (spec §11.1).
+//! - `maxtp` (T13) — W × C = 28 buckets (spec §11.2).
 
 pub mod burst;
 pub mod dpdk_burst;
+pub mod dpdk_maxtp;
 pub mod maxtp;
 pub mod mtcp;
 pub mod preflight;

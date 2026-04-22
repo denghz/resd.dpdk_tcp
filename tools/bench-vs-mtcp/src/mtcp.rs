@@ -23,6 +23,10 @@
 //!   then returns `Error::Unimplemented`. Returns `Vec<f64>` of raw
 //!   throughput samples in bits-per-second when real, matching the
 //!   dpdk_burst runner's shape.
+//! - [`MaxtpConfig`] + [`validate_maxtp_config`] + [`run_maxtp_workload`]
+//!   — T13 analogue for the maxtp workload. Same stub shape;
+//!   configures the W × C grid's per-bucket parameters
+//!   (write size + connection count + warmup + duration).
 //!
 //! # Follow-up
 //!
@@ -124,6 +128,80 @@ pub fn run_burst_workload(cfg: &MtcpConfig<'_>) -> Result<Vec<f64>, Error> {
     Err(Error::Unimplemented)
 }
 
+/// Configuration for an mTCP maxtp (W × C) run. Mirrors
+/// [`MtcpConfig`] for the burst workload — the real implementation
+/// will SSH to the peer host and start `/opt/mtcp-peer/bench-peer`.
+#[derive(Debug, Clone)]
+pub struct MaxtpConfig<'a> {
+    /// Peer host — SSH target + IPv4 address for data-plane traffic.
+    pub peer_ip: &'a str,
+    pub peer_port: u16,
+    /// Absolute path to the pre-installed mTCP peer binary on the AMI.
+    pub peer_binary: &'a str,
+    /// Application write size W in bytes.
+    pub write_bytes: u64,
+    /// Concurrent connection count C.
+    pub conn_count: u64,
+    /// Warmup window in seconds (spec §11.2: 10 s).
+    pub warmup_secs: u64,
+    /// Measurement window in seconds (spec §11.2: 60 s).
+    pub duration_secs: u64,
+    /// MSS — must match dpdk_net side for the comparison to be valid.
+    pub mss: u16,
+}
+
+/// Validate a [`MaxtpConfig`] at the shape level. Returns `Err` with a
+/// human-readable reason on any malformed field. Does NOT touch
+/// libmtcp or SSH — safe to call in unit tests.
+pub fn validate_maxtp_config(cfg: &MaxtpConfig<'_>) -> Result<(), String> {
+    if cfg.peer_ip.is_empty() {
+        return Err("mtcp: --peer-ip must be a non-empty address".to_string());
+    }
+    if cfg.peer_port == 0 {
+        return Err("mtcp: --peer-port must be non-zero".to_string());
+    }
+    if cfg.peer_binary.is_empty() {
+        return Err(
+            "mtcp: --mtcp-peer-binary must be a non-empty path (expected \
+             /opt/mtcp-peer/bench-peer on the baked AMI)"
+                .to_string(),
+        );
+    }
+    if !cfg.peer_binary.starts_with('/') {
+        return Err(format!(
+            "mtcp: --mtcp-peer-binary must be an absolute path, got `{}`",
+            cfg.peer_binary
+        ));
+    }
+    if cfg.write_bytes == 0 {
+        return Err("mtcp: write_bytes (W) must be non-zero".to_string());
+    }
+    if cfg.conn_count == 0 {
+        return Err("mtcp: conn_count (C) must be non-zero".to_string());
+    }
+    if cfg.duration_secs == 0 {
+        return Err("mtcp: duration_secs (T) must be non-zero".to_string());
+    }
+    if cfg.mss == 0 {
+        return Err("mtcp: mss must be non-zero".to_string());
+    }
+    Ok(())
+}
+
+/// Stub entry point for the mTCP maxtp workload. Returns
+/// `Error::Unimplemented` until the real implementation lands — see
+/// the module docs for rationale + follow-up plan.
+///
+/// Signature returns `Result<(f64, f64), Error>` — `(goodput_bps,
+/// pps)` to match the `MaxtpSample` shape that
+/// `crate::maxtp::BucketAggregate` expects.
+pub fn run_maxtp_workload(cfg: &MaxtpConfig<'_>) -> Result<(f64, f64), Error> {
+    if validate_maxtp_config(cfg).is_err() {
+        return Err(Error::Unimplemented);
+    }
+    Err(Error::Unimplemented)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,6 +288,93 @@ mod tests {
         let mut c = good_cfg();
         c.peer_ip = "";
         let err = run_burst_workload(&c).unwrap_err();
+        assert!(matches!(err, Error::Unimplemented));
+    }
+
+    // -----------------------------------------------------------------
+    // Maxtp stub — T13 analogue of the burst stub.
+    // -----------------------------------------------------------------
+
+    fn good_maxtp_cfg() -> MaxtpConfig<'static> {
+        MaxtpConfig {
+            peer_ip: "10.0.0.42",
+            peer_port: 10_001,
+            peer_binary: "/opt/mtcp-peer/bench-peer",
+            write_bytes: 4096,
+            conn_count: 4,
+            warmup_secs: 10,
+            duration_secs: 60,
+            mss: 1460,
+        }
+    }
+
+    #[test]
+    fn validate_maxtp_config_accepts_good_cfg() {
+        assert!(validate_maxtp_config(&good_maxtp_cfg()).is_ok());
+    }
+
+    #[test]
+    fn validate_maxtp_config_rejects_empty_peer_ip() {
+        let mut c = good_maxtp_cfg();
+        c.peer_ip = "";
+        assert!(validate_maxtp_config(&c).is_err());
+    }
+
+    #[test]
+    fn validate_maxtp_config_rejects_zero_port() {
+        let mut c = good_maxtp_cfg();
+        c.peer_port = 0;
+        assert!(validate_maxtp_config(&c).is_err());
+    }
+
+    #[test]
+    fn validate_maxtp_config_rejects_relative_peer_binary() {
+        let mut c = good_maxtp_cfg();
+        c.peer_binary = "bench-peer";
+        let err = validate_maxtp_config(&c).unwrap_err();
+        assert!(err.contains("absolute path"));
+    }
+
+    #[test]
+    fn validate_maxtp_config_rejects_zero_write_bytes() {
+        let mut c = good_maxtp_cfg();
+        c.write_bytes = 0;
+        assert!(validate_maxtp_config(&c).is_err());
+    }
+
+    #[test]
+    fn validate_maxtp_config_rejects_zero_conn_count() {
+        let mut c = good_maxtp_cfg();
+        c.conn_count = 0;
+        assert!(validate_maxtp_config(&c).is_err());
+    }
+
+    #[test]
+    fn validate_maxtp_config_rejects_zero_duration() {
+        let mut c = good_maxtp_cfg();
+        c.duration_secs = 0;
+        assert!(validate_maxtp_config(&c).is_err());
+    }
+
+    #[test]
+    fn validate_maxtp_config_rejects_zero_mss() {
+        let mut c = good_maxtp_cfg();
+        c.mss = 0;
+        assert!(validate_maxtp_config(&c).is_err());
+    }
+
+    #[test]
+    fn run_maxtp_workload_returns_unimplemented_for_good_cfg() {
+        let c = good_maxtp_cfg();
+        let err = run_maxtp_workload(&c).unwrap_err();
+        assert!(matches!(err, Error::Unimplemented));
+    }
+
+    #[test]
+    fn run_maxtp_workload_returns_unimplemented_for_bad_cfg() {
+        let mut c = good_maxtp_cfg();
+        c.peer_ip = "";
+        let err = run_maxtp_workload(&c).unwrap_err();
         assert!(matches!(err, Error::Unimplemented));
     }
 }
