@@ -14,6 +14,7 @@ members = [
     "tools/bench-rx-zero-copy",
     "tools/bench-stress",
     "tools/bench-vs-linux",
+    "tools/bench-vs-mtcp",
     "tools/scapy-fuzz-runner",
 ]
 # fuzz/ is a sibling sub-Cargo-project pinned to nightly; kept out of the
