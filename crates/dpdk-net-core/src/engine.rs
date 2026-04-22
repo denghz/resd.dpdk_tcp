@@ -393,6 +393,62 @@ impl Default for EngineConfig {
     }
 }
 
+/// A8 T17 (spec §5.2): static drift detector for the M3 knob-coverage audit.
+///
+/// Every `pub` field on `EngineConfig` listed here MUST either:
+///   - appear as a scenario entry in `tests/knob-coverage.rs` (behavioral
+///     knob: a non-default value produces an observable consequence), OR
+///   - appear in `tests/knob-coverage-informational.txt` (informational-
+///     only: sizing, identity, or no-branching-logic field).
+///
+/// Adding a field to `EngineConfig` without updating one of those trips
+/// `knob_coverage_enumerates_every_behavioral_field` in CI. The runtime
+/// value of this slice is never read — the literal string list is parsed
+/// by the drift-detect test. Keep this list in field-declaration order
+/// so diff review surfaces struct additions immediately above the slice
+/// edit.
+pub const ENGINE_CONFIG_FIELD_NAMES: &[&str] = &[
+    // DPDK lcore / port / queue identity + ring sizing.
+    "lcore_id",
+    "port_id",
+    "rx_queue_id",
+    "tx_queue_id",
+    "rx_ring_size",
+    "tx_ring_size",
+    "mbuf_data_room",
+    // A6.6-7: RX mempool sizing.
+    "rx_mempool_size",
+    // A2: L2/L3 identity + GARP cadence.
+    "local_ip",
+    "secondary_local_ips",
+    "gateway_ip",
+    "gateway_mac",
+    "garp_interval_sec",
+    // A3: connection + buffer + MSS + MSL sizing.
+    "max_connections",
+    "recv_buffer_bytes",
+    "send_buffer_bytes",
+    "tcp_mss",
+    "tcp_msl_ms",
+    // A3 + A6 behavioral TCP knobs (preset-controlled).
+    "tcp_nagle",
+    "tcp_delayed_ack",
+    "cc_mode",
+    // A5: RTO timing + retransmit budget + per-packet events.
+    "tcp_min_rto_us",
+    "tcp_initial_rto_us",
+    "tcp_max_rto_us",
+    "tcp_max_retrans_count",
+    "tcp_per_packet_events",
+    // A5.5: event-queue overflow guard.
+    "event_queue_soft_cap",
+    // A6: RTT histogram edges.
+    "rtt_histogram_bucket_edges_us",
+    // A-HW: ENA devarg knobs.
+    "ena_large_llq_hdr",
+    "ena_miss_txc_to_sec",
+];
+
 /// A dpdk-net engine. One per lcore; owns the NIC queues, mempools, and
 /// L2/L3 state for that lcore.
 pub struct Engine {

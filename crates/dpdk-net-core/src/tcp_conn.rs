@@ -8,6 +8,38 @@ use std::collections::VecDeque;
 use crate::flow_table::FourTuple;
 use crate::tcp_state::TcpState;
 
+/// A8 T17 (spec §5.2): static drift detector for the M3 knob-coverage audit.
+///
+/// Every `pub` field on `engine::ConnectOpts` (which mirrors the C ABI
+/// `dpdk_net_connect_opts_t`) listed here MUST either:
+///   - appear as a scenario entry in `tests/knob-coverage.rs` (behavioral
+///     knob: a non-default value produces an observable consequence), OR
+///   - appear in `tests/knob-coverage-informational.txt` (informational-
+///     only: identity / sizing field with no branching behavior).
+///
+/// Adding a field to `ConnectOpts` without updating one of those trips
+/// `knob_coverage_enumerates_every_behavioral_field` in CI. The runtime
+/// value of this slice is never read — the literal string list is parsed
+/// by the drift-detect test. Exposed on `tcp_conn.rs` (not `engine.rs`)
+/// per the A8 T17 plan so the connect-side knob registry lives beside
+/// the per-conn state type; `ConnectOpts` itself is in `engine.rs` for
+/// historical reasons (pre-A5.5 it was an inline argument bundle).
+pub const CONNECT_OPTS_FIELD_NAMES: &[&str] = &[
+    // A5: RACK / RTO aggressiveness knobs.
+    "rack_aggressive",
+    "rto_no_backoff",
+    // A5.5 Task 10: per-connect TLP tuning set.
+    "tlp_pto_min_floor_us",
+    "tlp_pto_srtt_multiplier_x100",
+    "tlp_skip_flight_size_gate",
+    "tlp_max_consecutive_probes",
+    "tlp_skip_rtt_sample_gate",
+    // bug_010 → feature: per-connection source IP (host byte order; 0 =
+    // engine primary). Informational — validation routes through
+    // `engine::select_source_ip`, which is covered by its own unit tests.
+    "local_addr",
+];
+
 /// Per-connection send buffer. In A3 this is a raw byte ring; A4 will
 /// gain a SACK scoreboard + in-flight tracking per spec §6.2.
 pub struct SendQueue {
