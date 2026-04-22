@@ -1,6 +1,8 @@
 //! Round-trip: write CsvRow → read back → assert equal.
 
-use bench_common::csv_row::{CsvRow, MetricAggregation, PreconditionValue, COLUMNS};
+use bench_common::csv_row::{
+    CsvRow, MetricAggregation, PreconditionValue, COLUMNS, PRECONDITION_COLUMNS,
+};
 use bench_common::run_metadata::RunMetadata;
 
 fn sample_row() -> CsvRow {
@@ -173,4 +175,65 @@ fn csv_row_deserialize_errors_on_missing_precondition_column() {
         msg.contains(dropped_col),
         "error message should mention the missing column {dropped_col}, got: {msg}"
     );
+}
+
+/// I3 (T14 code-quality review): the single-column drift-guard above covers
+/// one representative precondition column. This test iterates over every
+/// entry in `PRECONDITION_COLUMNS` so a future refactor that drops the
+/// missing-field error on any of the 14 can't regress silently — the list
+/// is the single source of truth exported for exactly this purpose.
+#[test]
+fn csv_row_deserialize_errors_on_any_missing_precondition_column() {
+    // Serialise a known-good row once — we strip one column per iteration
+    // and feed the drifted CSV back through the visitor.
+    let row = sample_row();
+    let mut buf = Vec::new();
+    {
+        let mut wtr = csv::Writer::from_writer(&mut buf);
+        row.write_with_header(&mut wtr).unwrap();
+    }
+    let text = std::str::from_utf8(&buf).unwrap();
+    let mut lines = text.lines();
+    let header_line = lines.next().unwrap();
+    let data_line = lines.next().unwrap();
+    let header_fields: Vec<&str> = header_line.split(',').collect();
+    let data_fields: Vec<&str> = data_line.split(',').collect();
+    assert_eq!(
+        header_fields.len(),
+        COLUMNS.len(),
+        "header arity must match COLUMNS before drop"
+    );
+
+    for missing_col in PRECONDITION_COLUMNS {
+        let drop_index = COLUMNS
+            .iter()
+            .position(|c| c == missing_col)
+            .unwrap_or_else(|| panic!("precondition column {missing_col} missing from COLUMNS"));
+        assert_eq!(
+            header_fields[drop_index], *missing_col,
+            "drop_index must land on the column we intended to strip ({missing_col})"
+        );
+
+        let mut drifted_header: Vec<&str> = header_fields.clone();
+        drifted_header.remove(drop_index);
+        let mut drifted_data: Vec<&str> = data_fields.clone();
+        drifted_data.remove(drop_index);
+
+        let mut drifted_csv = String::new();
+        drifted_csv.push_str(&drifted_header.join(","));
+        drifted_csv.push('\n');
+        drifted_csv.push_str(&drifted_data.join(","));
+        drifted_csv.push('\n');
+
+        let mut rdr = csv::Reader::from_reader(drifted_csv.as_bytes());
+        let parsed: Result<CsvRow, _> = rdr.deserialize().next().unwrap();
+        let err = parsed.expect_err(&format!(
+            "drifted CSV missing {missing_col} unexpectedly deserialised OK"
+        ));
+        let msg = err.to_string();
+        assert!(
+            msg.contains(missing_col),
+            "error message for missing {missing_col} should mention the column name; got: {msg}"
+        );
+    }
 }

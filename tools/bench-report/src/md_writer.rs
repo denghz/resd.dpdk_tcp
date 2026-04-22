@@ -47,23 +47,28 @@ pub fn write_md(rows: &[CsvRow], path: &Path) -> anyhow::Result<()> {
 
 fn render_header(out: &mut String, row: &CsvRow) {
     let m = &row.run_metadata;
-    out.push_str(&format!("**Run:** `{}`\n", m.run_id));
-    out.push_str(&format!("**Commit:** `{}`\n", m.commit_sha));
-    out.push_str(&format!("**Branch:** `{}`\n", m.branch));
-    out.push_str(&format!("**Date:** {}\n", m.run_started_at));
+    // Backtick-wrapped values (`run_id`, `commit_sha`, `branch`) use the code-
+    // cell escape so an unexpected backtick inside the value can't close the
+    // inline-code span prematurely. Plain-text values use the inline escape
+    // so `*`, `_`, `#`, `\`, and newlines can't mangle the header.
+    out.push_str(&format!("**Run:** `{}`\n", md_escape(&m.run_id.to_string())));
+    out.push_str(&format!("**Commit:** `{}`\n", md_escape(&m.commit_sha)));
+    out.push_str(&format!("**Branch:** `{}`\n", md_escape(&m.branch)));
+    out.push_str(&format!("**Date:** {}\n", md_escape_inline(&m.run_started_at)));
     out.push_str(&format!(
         "**Host:** {} ({})\n",
-        m.host, m.instance_type
+        md_escape_inline(&m.host),
+        md_escape_inline(&m.instance_type)
     ));
-    out.push_str(&format!("**CPU:** {}\n", m.cpu_model));
-    out.push_str(&format!("**DPDK:** {}\n", m.dpdk_version));
-    out.push_str(&format!("**Kernel:** {}\n", m.kernel));
-    out.push_str(&format!("**NIC:** {}", m.nic_model));
+    out.push_str(&format!("**CPU:** {}\n", md_escape_inline(&m.cpu_model)));
+    out.push_str(&format!("**DPDK:** {}\n", md_escape_inline(&m.dpdk_version)));
+    out.push_str(&format!("**Kernel:** {}\n", md_escape_inline(&m.kernel)));
+    out.push_str(&format!("**NIC:** {}", md_escape_inline(&m.nic_model)));
     if !m.nic_fw.is_empty() {
-        out.push_str(&format!(" (fw={})", m.nic_fw));
+        out.push_str(&format!(" (fw={})", md_escape_inline(&m.nic_fw)));
     }
     out.push('\n');
-    out.push_str(&format!("**AMI:** {}\n", m.ami_id));
+    out.push_str(&format!("**AMI:** {}\n", md_escape_inline(&m.ami_id)));
     out.push_str(&format!(
         "**Precondition mode:** {}\n",
         m.precondition_mode
@@ -148,14 +153,43 @@ fn unique_tools_in_order(rows: &[CsvRow]) -> Vec<String> {
 }
 
 /// Escape Markdown's table metacharacters in a text cell. Specifically `|`
-/// (which would end a cell early) and `\n` (which would break the table).
-/// Backticks are intentionally left alone — this writer wraps raw JSON in
-/// backticks deliberately so the caller can see the structure.
+/// (which would end a cell early), `\n` (which would break the table), and
+/// `` ` `` (which, when the cell content is wrapped in single backticks by the
+/// caller, would terminate the inline-code span early and corrupt the row).
+///
+/// CommonMark allows a literal backtick inside a single-backtick code span via
+/// the `\`` escape — most renderers honour it. Any caller that emits this
+/// output inside a backtick wrapper still produces a valid row.
 fn md_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
             '|' => out.push_str("\\|"),
+            '\n' => out.push(' '),
+            '\r' => {}
+            '`' => out.push_str("\\`"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Escape Markdown metacharacters for interpolation outside of code spans —
+/// e.g. header values like `**Branch:** {}`. A branch containing `_` would
+/// otherwise render italic; `*`, `#`, and `\` are similarly reinterpreted.
+/// Newlines must also be flattened so a stray one can't promote the next
+/// header field into list / heading syntax.
+///
+/// Backslash is escaped first so the subsequent `\`-prefixed escapes don't
+/// accidentally double-escape.
+fn md_escape_inline(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '*' => out.push_str("\\*"),
+            '_' => out.push_str("\\_"),
+            '#' => out.push_str("\\#"),
             '\n' => out.push(' '),
             '\r' => {}
             other => out.push(other),
@@ -234,6 +268,92 @@ mod tests {
     #[test]
     fn md_escape_flattens_newlines() {
         assert_eq!(md_escape("a\nb"), "a b");
+    }
+
+    #[test]
+    fn md_escape_handles_backtick_in_cell_content() {
+        // A backtick inside an inline-code cell (which this writer renders as
+        // `{dimensions_json}`) used to terminate the span early and corrupt the
+        // row. It must now be escaped to a literal backtick.
+        assert_eq!(md_escape("a`b"), "a\\`b");
+    }
+
+    #[test]
+    fn md_renders_row_intact_when_dimensions_json_has_backtick() {
+        // End-to-end guard: a dimensions_json value with a stray backtick must
+        // not break the 8-column structure of the per-tool table row. The
+        // rendered row should still contain exactly 9 pipes (one opening, 7
+        // inter-cell, one closing).
+        let mut r = sample("bench-micro");
+        r.dimensions_json = r#"{"cmd":"echo `uname`"}"#.into();
+        let md = render_md(&[r]);
+        let row_line = md
+            .lines()
+            .find(|l| l.starts_with("| tc "))
+            .expect("per-tool row should be present");
+        assert_eq!(
+            row_line.matches('|').count(),
+            9,
+            "row must have 9 pipes (8 cells) even when dimensions_json contains a backtick; got: {row_line}"
+        );
+    }
+
+    #[test]
+    fn md_escape_inline_escapes_markdown_metacharacters() {
+        // Underscore and asterisk would otherwise render italic / bold.
+        assert_eq!(md_escape_inline("feat_test_harness"), "feat\\_test\\_harness");
+        assert_eq!(md_escape_inline("a*b"), "a\\*b");
+        assert_eq!(md_escape_inline("# hdr"), "\\# hdr");
+        // Backslash escaped first so the subsequent \x escapes aren't
+        // doubled accidentally.
+        assert_eq!(md_escape_inline("a\\b"), "a\\\\b");
+        assert_eq!(md_escape_inline("line\nbreak"), "line break");
+    }
+
+    #[test]
+    fn md_header_values_with_underscores_do_not_render_italic() {
+        // Regression guard for I2: header values that are NOT wrapped in
+        // backticks (host, cpu_model, kernel, nic_model, etc.) used to be
+        // interpolated raw, and most CommonMark renderers (GitHub's included)
+        // would treat the `_..._` pair as emphasis. After the escape fix the
+        // host / kernel lines must carry escaped underscores.
+        let mut r = sample("bench-micro");
+        r.run_metadata.host = "ip_10_0_0_42".into();
+        r.run_metadata.kernel = "6.17_generic".into();
+        r.run_metadata.cpu_model = "AMD*EPYC#7R13".into();
+        let md = render_md(&[r]);
+        assert!(
+            md.contains("**Host:** ip\\_10\\_0\\_0\\_42"),
+            "header host value should be inline-escaped; got:\n{md}"
+        );
+        assert!(
+            md.contains("**Kernel:** 6.17\\_generic"),
+            "header kernel value should be inline-escaped; got:\n{md}"
+        );
+        assert!(
+            md.contains("**CPU:** AMD\\*EPYC\\#7R13"),
+            "header cpu_model should inline-escape *, # metacharacters; got:\n{md}"
+        );
+    }
+
+    #[test]
+    fn md_header_backticked_values_escape_embedded_backtick() {
+        // Regression guard for I1 on the header side: the run_id / commit_sha /
+        // branch fields are wrapped in backticks. A value carrying a stray
+        // backtick used to terminate the inline-code span early and corrupt
+        // the header line. The escape fix must protect that with `\``.
+        let mut r = sample("bench-micro");
+        r.run_metadata.commit_sha = "abc`def".into();
+        r.run_metadata.branch = "br`anch".into();
+        let md = render_md(&[r]);
+        assert!(
+            md.contains("**Commit:** `abc\\`def`"),
+            "header commit_sha value should escape embedded backtick; got:\n{md}"
+        );
+        assert!(
+            md.contains("**Branch:** `br\\`anch`"),
+            "header branch value should escape embedded backtick; got:\n{md}"
+        );
     }
 
     #[test]
