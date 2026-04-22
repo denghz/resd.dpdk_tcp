@@ -785,5 +785,529 @@ impl CovHarness {
             let _ = drain_tx_frames();
         }
     }
+
+    // -----------------------------------------------------------------
+    // A8 Task 7: helpers for the TCP protocol-features group
+    // (PAWS / SACK / DSACK / retrans / RACK / TLP / windows /
+    // reassembly / validation / iovec). Each helper sets up a specific
+    // segment / call sequence that lights one bump site inside
+    // `tcp_input::dispatch` or `engine::emit_ack` / `send_bytes` /
+    // `deliver_readable` / `fire_timers_at`.
+    // -----------------------------------------------------------------
+
+    /// Like `do_passive_open` but the SYN we inject carries the full
+    /// option bundle (MSS + WS + SACK-perm + Timestamps). This flips
+    /// `conn.ts_enabled = true` + `conn.sack_enabled = true` on the
+    /// accepted conn, so subsequent scenarios can drive PAWS,
+    /// `ts_recent_expired`, `rtt_samples`, and DSACK.
+    pub fn do_passive_open_with_ts(&mut self) -> dpdk_net_core::flow_table::ConnHandle {
+        use dpdk_net_core::clock::set_virt_ns;
+        use dpdk_net_core::tcp_options::TcpOpts;
+        use dpdk_net_core::tcp_output::{TCP_ACK, TCP_SYN};
+        use dpdk_net_core::test_tx_intercept::drain_tx_frames;
+
+        let listen_h = self.eng.listen(OUR_IP, 5555).expect("listen");
+        let _ = drain_tx_frames();
+
+        set_virt_ns(1_000_000);
+        let mut opts = TcpOpts::default();
+        opts.mss = Some(1460);
+        opts.wscale = Some(7);
+        opts.sack_permitted = true;
+        opts.timestamps = Some((1_000u32, 0));
+        let syn = build_tcp_frame(
+            PEER_IP,
+            40_000,
+            OUR_IP,
+            5555,
+            0x10000000,
+            0,
+            TCP_SYN,
+            u16::MAX,
+            opts,
+            &[],
+        );
+        self.eng.inject_rx_frame(&syn).expect("inject SYN");
+        let frames = drain_tx_frames();
+        assert_eq!(frames.len(), 1, "one SYN-ACK expected");
+        let (our_iss, _ack) = parse_syn_ack(&frames[0]).expect("parse SYN-ACK");
+
+        set_virt_ns(2_000_000);
+        // Final ACK mirrors the TS option (engine echoes its own TSval
+        // on the SYN-ACK; we pass zero for simplicity — handle_syn_received
+        // tolerates it).
+        let mut ack_opts = TcpOpts::default();
+        ack_opts.timestamps = Some((1_001u32, 0));
+        let final_ack = build_tcp_frame(
+            PEER_IP,
+            40_000,
+            OUR_IP,
+            5555,
+            0x10000001,
+            our_iss.wrapping_add(1),
+            TCP_ACK,
+            u16::MAX,
+            ack_opts,
+            &[],
+        );
+        self.eng.inject_rx_frame(&final_ack).expect("inject final ACK");
+        let _ = drain_tx_frames();
+        let conn = self.eng.accept_next(listen_h).expect("accept_next");
+        self.our_iss.set(our_iss);
+        self.peer_seq.set(0x10000001);
+        conn
+    }
+
+    /// Inject a peer data segment carrying the Timestamps option with a
+    /// caller-supplied (tsval, tsecr). Used by PAWS + `ts_recent_expired`
+    /// scenarios to advance / rewind ts values relative to `conn.ts_recent`.
+    /// Requires the conn to have been established with
+    /// `do_passive_open_with_ts` (so `conn.ts_enabled == true`).
+    pub fn inject_peer_data_with_ts(&mut self, payload: &[u8], tsval: u32, tsecr: u32) {
+        use dpdk_net_core::clock::now_ns;
+        use dpdk_net_core::tcp_options::TcpOpts;
+        use dpdk_net_core::tcp_output::{TCP_ACK, TCP_PSH};
+
+        let peer_seq = self.peer_seq.get();
+        let our_iss = self.our_iss.get();
+        let mut opts = TcpOpts::default();
+        opts.timestamps = Some((tsval, tsecr));
+        let frame = build_tcp_frame(
+            PEER_IP,
+            40_000,
+            OUR_IP,
+            5555,
+            peer_seq,
+            our_iss.wrapping_add(1),
+            TCP_ACK | TCP_PSH,
+            u16::MAX,
+            opts,
+            payload,
+        );
+        // Touch the virt-clock so `now_ns()` reads a stable value (the
+        // caller manages the clock for expiration-based scenarios; we
+        // avoid perturbing it here).
+        let _ = now_ns();
+        self.eng.inject_rx_frame(&frame).expect("inject TS data");
+        self.peer_seq
+            .set(peer_seq.wrapping_add(payload.len() as u32));
+    }
+
+    /// Inject a peer ACK carrying one SACK block. The ACK number stays
+    /// at `our_iss + 1` (no cum-ACK advance); the SACK range is a
+    /// byte-stream seq range. Exercises `tcp.rx_sack_blocks` on decode
+    /// and populates the scoreboard.
+    ///
+    /// TS value is `1_002` — monotonically after the handshake's
+    /// last-seen tsval (final ACK carries `1_001`), so PAWS does not
+    /// reject. `do_passive_open_with_ts` sets `ts_recent = 1_001` via
+    /// the final ACK before releasing the connection to the scenario.
+    pub fn inject_peer_ack_with_sack(&mut self, sack_left: u32, sack_right: u32) {
+        let peer_seq = self.peer_seq.get();
+        let our_iss = self.our_iss.get();
+        let frame = build_tcp_ack_with_sack(
+            PEER_IP,
+            40_000,
+            OUR_IP,
+            5555,
+            peer_seq,
+            our_iss.wrapping_add(1),
+            sack_left,
+            sack_right,
+            /*tsval*/ 1_002,
+        );
+        self.eng.inject_rx_frame(&frame).expect("inject SACK ACK");
+    }
+
+    /// Inject a peer ACK carrying a DSACK block (covers already-ACKed
+    /// data). DSACK is recognized when the SACK block lies entirely
+    /// below `snd_una` — see `is_dsack` at tcp_input.rs ~570. The block
+    /// falls inside the initial 1-byte region `[our_iss, our_iss+1)`
+    /// which `snd_una` has already advanced past after the handshake,
+    /// so `is_dsack` returns true and `tcp.rx_dsack` bumps.
+    pub fn inject_peer_ack_with_dsack(&mut self) {
+        let our_iss = self.our_iss.get();
+        // DSACK covers [our_iss, our_iss+1) — a single byte before snd_una.
+        self.inject_peer_ack_with_sack(our_iss, our_iss.wrapping_add(1));
+    }
+
+    /// Inject a SYN carrying a malformed/unknown option (kind=99 with
+    /// len=0). `parse_options` returns `BadKnownLen` on any unrecognized
+    /// kind whose length byte is <2; `handle_syn_sent` / `handle_listen`
+    /// both propagate that into `Outcome.bad_option` → `tcp.rx_bad_option`.
+    ///
+    /// NOTE: this path targets `tcp.rx_bad_option` via the established
+    /// PAWS-gate code path. The simpler approach: send a TS-bearing data
+    /// segment to a non-TS-enabled conn AFTER establishing without TS
+    /// — but we can more directly force it by constructing a raw TCP
+    /// header with a bad options block and letting `parse_options` fail
+    /// during `handle_established`. See
+    /// `inject_peer_data_with_bad_option` below.
+    pub fn inject_peer_data_with_bad_option(&mut self, payload: &[u8]) {
+        use dpdk_net_core::l3_ip::internet_checksum;
+        use dpdk_net_core::tcp_output::{TCP_ACK, TCP_PSH};
+
+        let peer_seq = self.peer_seq.get();
+        let our_iss = self.our_iss.get();
+        // Build a minimal TCP header + 4-byte bad options block. Opts
+        // layout: [kind=99 (unknown), len=1 (<2 → BadKnownLen), nop, nop]
+        // Data offset = (20 + 4) / 4 = 6 words.
+        let mut tcp = Vec::with_capacity(24 + payload.len());
+        tcp.extend_from_slice(&40_000u16.to_be_bytes()); // src_port
+        tcp.extend_from_slice(&5555u16.to_be_bytes()); // dst_port
+        tcp.extend_from_slice(&peer_seq.to_be_bytes()); // seq
+        tcp.extend_from_slice(&our_iss.wrapping_add(1).to_be_bytes()); // ack
+        tcp.push(6u8 << 4); // data offset = 6
+        tcp.push(TCP_ACK | TCP_PSH); // flags
+        tcp.extend_from_slice(&u16::MAX.to_be_bytes()); // window
+        tcp.extend_from_slice(&[0, 0]); // csum placeholder
+        tcp.extend_from_slice(&[0, 0]); // urg ptr
+        // Bad options: kind=99, len=1 (invalid, < 2) → parse_options
+        // bails with BadKnownLen on the first unrecognized kind's len
+        // byte, which triggers `bad_option = true`.
+        tcp.extend_from_slice(&[99, 1, 0, 0]);
+        tcp.extend_from_slice(payload);
+
+        // TCP pseudo-header + csum.
+        let mut pseudo = [0u8; 12];
+        pseudo[0..4].copy_from_slice(&PEER_IP.to_be_bytes());
+        pseudo[4..8].copy_from_slice(&OUR_IP.to_be_bytes());
+        pseudo[8] = 0;
+        pseudo[9] = 6; // TCP
+        pseudo[10..12].copy_from_slice(&(tcp.len() as u16).to_be_bytes());
+        let csum = internet_checksum(&[&pseudo, &tcp]);
+        tcp[16] = (csum >> 8) as u8;
+        tcp[17] = (csum & 0xff) as u8;
+
+        // Wrap in IP + L2.
+        let ip_hdr = Self::build_ipv4_header(6, PEER_IP, OUR_IP, 64, &tcp);
+        self.inject_eth_ip_frame(&ip_hdr);
+        self.peer_seq
+            .set(peer_seq.wrapping_add(payload.len() as u32));
+    }
+
+    /// Drive an active-open whose peer SYN-ACK carries Window Scale = 15
+    /// (> RFC 7323's max of 14). `handle_syn_sent` consumes
+    /// `parsed_opts.ws_clamped == true` and sets
+    /// `outcome.ws_shift_clamped`, which bumps `tcp.rx_ws_shift_clamped`.
+    ///
+    /// `TcpOpts::encode` writes the wscale raw byte, so setting
+    /// `wscale = Some(15)` on the injected SYN-ACK lands the out-of-range
+    /// value on the wire.
+    pub fn do_active_open_with_ws_clamp(&mut self) {
+        use dpdk_net_core::clock::set_virt_ns;
+        use dpdk_net_core::tcp_options::TcpOpts;
+        use dpdk_net_core::tcp_output::{TCP_ACK, TCP_SYN};
+        use dpdk_net_core::test_tx_intercept::drain_tx_frames;
+
+        set_virt_ns(0);
+        let _ = self.eng.connect(PEER_IP, 7777, 0).expect("connect");
+        // Drain our active-open SYN so the intercept queue has only the
+        // response frame after we inject.
+        let frames = drain_tx_frames();
+        assert_eq!(frames.len(), 1, "one active-open SYN expected");
+        let (_our_src_port, our_iss_plus_one) =
+            parse_tcp_seq_ack(&frames[0]);
+        // seq in our SYN = our ISS. We injected it; no reliable way to
+        // parse back src_port without a richer parser, but the engine
+        // currently uses the next ephemeral port. We cheat: the test
+        // only needs ws_shift_clamped to bump — we don't need to reach
+        // ESTABLISHED. handle_syn_sent processes the SYN-ACK based on
+        // the conn's four_tuple; since we don't know the src_port easily,
+        // parse it from the emitted SYN.
+        let emitted = &frames[0];
+        // Ethernet(14) + IPv4 (min 20); TCP starts at 14 + ihl*4.
+        let ihl = (emitted[14] & 0x0f) as usize;
+        let tcp_off = 14 + ihl * 4;
+        let our_src_port = u16::from_be_bytes([emitted[tcp_off], emitted[tcp_off + 1]]);
+        let our_iss = u32::from_be_bytes([
+            emitted[tcp_off + 4],
+            emitted[tcp_off + 5],
+            emitted[tcp_off + 6],
+            emitted[tcp_off + 7],
+        ]);
+        let _ = our_iss_plus_one;
+
+        // Build SYN-ACK with WS = 15 (triggers clamp).
+        set_virt_ns(1_000_000);
+        let peer_iss: u32 = 0x20000000;
+        let mut opts = TcpOpts::default();
+        opts.mss = Some(1460);
+        opts.wscale = Some(15); // > 14 → ws_clamped on peer-side parse
+        let syn_ack = build_tcp_frame(
+            PEER_IP,
+            7777,
+            OUR_IP,
+            our_src_port,
+            peer_iss,
+            our_iss.wrapping_add(1),
+            TCP_SYN | TCP_ACK,
+            u16::MAX,
+            opts,
+            &[],
+        );
+        self.eng.inject_rx_frame(&syn_ack).expect("inject SYN-ACK");
+        // Drain any responses; we only care about the counter bump.
+        let _ = drain_tx_frames();
+    }
+
+    /// Inject a peer data segment whose advertised window is 0. Drives
+    /// `outcome.rx_zero_window = true` in `handle_established` → bumps
+    /// `tcp.rx_zero_window`.
+    pub fn inject_peer_zero_window(&mut self, payload: &[u8]) {
+        use dpdk_net_core::tcp_options::TcpOpts;
+        use dpdk_net_core::tcp_output::{TCP_ACK, TCP_PSH};
+
+        let peer_seq = self.peer_seq.get();
+        let our_iss = self.our_iss.get();
+        let frame = build_tcp_frame(
+            PEER_IP,
+            40_000,
+            OUR_IP,
+            5555,
+            peer_seq,
+            our_iss.wrapping_add(1),
+            TCP_ACK | TCP_PSH,
+            /*window=*/ 0,
+            TcpOpts::default(),
+            payload,
+        );
+        self.eng.inject_rx_frame(&frame).expect("inject zero-wnd");
+        self.peer_seq
+            .set(peer_seq.wrapping_add(payload.len() as u32));
+    }
+
+    /// Inject an OOO (out-of-order) data segment from the peer at
+    /// `rcv_nxt + offset`. Lands in `conn.recv.reorder` → bumps
+    /// `tcp.rx_reassembly_queued` and parks bytes against the reorder
+    /// cap. Used by the zero-window / hole-fill / reassembly scenarios.
+    ///
+    /// Includes a TS option with `tsval = 1_002 > ts_recent=1_001`
+    /// (the handshake final ACK's tsval) so scenarios built on
+    /// `do_passive_open_with_ts` pass PAWS. Plain `do_passive_open`
+    /// conns have `ts_enabled=false` and ignore the option.
+    pub fn inject_peer_ooo_data(&mut self, offset: u32, payload: &[u8]) {
+        use dpdk_net_core::tcp_options::TcpOpts;
+        use dpdk_net_core::tcp_output::{TCP_ACK, TCP_PSH};
+
+        let peer_seq = self.peer_seq.get().wrapping_add(offset);
+        let our_iss = self.our_iss.get();
+        let mut opts = TcpOpts::default();
+        opts.timestamps = Some((1_002u32, 0));
+        let frame = build_tcp_frame(
+            PEER_IP,
+            40_000,
+            OUR_IP,
+            5555,
+            peer_seq,
+            our_iss.wrapping_add(1),
+            TCP_ACK | TCP_PSH,
+            u16::MAX,
+            opts,
+            payload,
+        );
+        self.eng.inject_rx_frame(&frame).expect("inject OOO");
+        // Do NOT advance peer_seq — OOO data doesn't move the in-order
+        // pointer; the caller may follow up with a hole-filler.
+    }
+
+    /// Inject a segment whose seq is far outside the receive window
+    /// (`rcv_nxt + 1_000_000`). `handle_established`'s `in_window` check
+    /// rejects → `bad_seq = true` → `tcp.rx_bad_seq` bump + challenge ACK.
+    pub fn inject_oob_seq_segment(&mut self) {
+        use dpdk_net_core::tcp_options::TcpOpts;
+        use dpdk_net_core::tcp_output::{TCP_ACK, TCP_PSH};
+
+        let peer_seq = self.peer_seq.get().wrapping_add(1_000_000);
+        let our_iss = self.our_iss.get();
+        let frame = build_tcp_frame(
+            PEER_IP,
+            40_000,
+            OUR_IP,
+            5555,
+            peer_seq,
+            our_iss.wrapping_add(1),
+            TCP_ACK | TCP_PSH,
+            u16::MAX,
+            TcpOpts::default(),
+            b"x",
+        );
+        self.eng.inject_rx_frame(&frame).expect("inject oob-seq");
+    }
+
+    /// Inject a segment with the URG flag set. `handle_established`
+    /// short-circuits to `urgent_dropped = true` → `tcp.rx_urgent_dropped`
+    /// bump.
+    pub fn inject_segment_with_urg(&mut self) {
+        use dpdk_net_core::tcp_options::TcpOpts;
+        use dpdk_net_core::tcp_output::{TCP_ACK, TCP_URG};
+
+        let peer_seq = self.peer_seq.get();
+        let our_iss = self.our_iss.get();
+        let frame = build_tcp_frame(
+            PEER_IP,
+            40_000,
+            OUR_IP,
+            5555,
+            peer_seq,
+            our_iss.wrapping_add(1),
+            TCP_ACK | TCP_URG,
+            u16::MAX,
+            TcpOpts::default(),
+            b"x",
+        );
+        self.eng.inject_rx_frame(&frame).expect("inject URG");
+    }
+
+    /// Inject an ACK whose ack-number is ahead of our `snd_nxt`.
+    /// `handle_established` returns `bad_ack = true` → bumps
+    /// `tcp.rx_bad_ack`.
+    pub fn inject_segment_with_bad_ack(&mut self) {
+        use dpdk_net_core::tcp_options::TcpOpts;
+        use dpdk_net_core::tcp_output::TCP_ACK;
+
+        let peer_seq = self.peer_seq.get();
+        let our_iss = self.our_iss.get();
+        let frame = build_tcp_frame(
+            PEER_IP,
+            40_000,
+            OUR_IP,
+            5555,
+            peer_seq,
+            our_iss.wrapping_add(1_000_000), // way ahead of snd_nxt
+            TCP_ACK,
+            u16::MAX,
+            TcpOpts::default(),
+            &[],
+        );
+        self.eng.inject_rx_frame(&frame).expect("inject bad-ack");
+    }
+
+    /// Inject a duplicate-ACK sequence (RFC 5681 §2 strict dup). The 5
+    /// conditions are: ack==snd_una, no payload, window unchanged,
+    /// snd_una != snd_nxt, no SYN/FIN. The caller must have already
+    /// moved `snd_una != snd_nxt` by calling `send_bytes` on the conn
+    /// prior to this injection.
+    pub fn inject_dup_ack(&mut self) {
+        use dpdk_net_core::tcp_options::TcpOpts;
+        use dpdk_net_core::tcp_output::TCP_ACK;
+
+        let peer_seq = self.peer_seq.get();
+        let our_iss = self.our_iss.get();
+        // Bare ACK with no payload, ack == snd_una (= our_iss+1, since
+        // the handshake final ACK left snd_una at iss+1 and our send_bytes
+        // advanced snd_nxt past it). Window u16::MAX matches what the
+        // prior ACK carried.
+        let frame = build_tcp_frame(
+            PEER_IP,
+            40_000,
+            OUR_IP,
+            5555,
+            peer_seq,
+            our_iss.wrapping_add(1),
+            TCP_ACK,
+            u16::MAX,
+            TcpOpts::default(),
+            &[],
+        );
+        self.eng.inject_rx_frame(&frame).expect("inject dup-ack");
+    }
+
+    /// Inject a TCP frame with a deliberately corrupted checksum. `tcp_input`
+    /// returns `TcpParseError::Csum` → bumps `tcp.rx_bad_csum`. The
+    /// wire layout is ETH(14) + IP(20) + TCP(20)... and the TCP csum
+    /// lives at offset 14+20+16 = 50.
+    pub fn inject_tcp_frame_bad_csum(&mut self) {
+        use dpdk_net_core::tcp_options::TcpOpts;
+        use dpdk_net_core::tcp_output::TCP_ACK;
+
+        let peer_seq = self.peer_seq.get();
+        let our_iss = self.our_iss.get();
+        let mut frame = build_tcp_frame(
+            PEER_IP,
+            40_000,
+            OUR_IP,
+            5555,
+            peer_seq,
+            our_iss.wrapping_add(1),
+            TCP_ACK,
+            u16::MAX,
+            TcpOpts::default(),
+            &[],
+        );
+        // TCP csum bytes live at offset eth(14) + ip(20) + tcp_header[16..18].
+        frame[14 + 20 + 16] ^= 0xff;
+        frame[14 + 20 + 17] ^= 0xff;
+        let _ = self.eng.inject_rx_frame(&frame);
+    }
+
+    /// Inject a truncated TCP header (< 20 bytes). `parse_segment`
+    /// returns `TcpParseError::Short` → bumps `tcp.rx_short`.
+    pub fn inject_tcp_short_header(&mut self) {
+        // 10-byte TCP "header" — below the 20-byte minimum.
+        let tcp_bytes: &[u8] = &[0u8; 10];
+        let ip_hdr = Self::build_ipv4_header(6, PEER_IP, OUR_IP, 64, tcp_bytes);
+        self.inject_eth_ip_frame(&ip_hdr);
+    }
+
+    /// Inject a TCP segment with bad flag combination (SYN + FIN).
+    /// `parse_segment` returns `TcpParseError::BadFlags` → bumps
+    /// `tcp.rx_bad_flags`.
+    pub fn inject_tcp_bad_flags(&mut self) {
+        use dpdk_net_core::tcp_options::TcpOpts;
+        use dpdk_net_core::tcp_output::{TCP_FIN, TCP_SYN};
+
+        let peer_seq = self.peer_seq.get();
+        let our_iss = self.our_iss.get();
+        let frame = build_tcp_frame(
+            PEER_IP,
+            40_000,
+            OUR_IP,
+            5555,
+            peer_seq,
+            our_iss.wrapping_add(1),
+            TCP_SYN | TCP_FIN, // illegal combo per RFC 9293 §3.5
+            u16::MAX,
+            TcpOpts::default(),
+            &[],
+        );
+        let _ = self.eng.inject_rx_frame(&frame);
+    }
+
+    /// Advance the virt-clock by more than the 24-day RFC 7323 §5.5
+    /// `TS.Recent` expiration threshold. `TS_RECENT_EXPIRY_NS` =
+    /// 24 × 86400 × 1e9 ≈ 2.07e15 ns; we jump 25 days to be safe. The
+    /// next TS-bearing segment on a TS-enabled conn takes the expiration
+    /// branch, bumping `tcp.ts_recent_expired`.
+    pub fn advance_virt_past_ts_recent_expiration(&self) {
+        use dpdk_net_core::clock::set_virt_ns;
+        const DAY_NS: u64 = 86_400u64 * 1_000_000_000;
+        set_virt_ns(25 * DAY_NS);
+    }
+
+    /// Inject a peer ACK carrying a TS option with (tsval, tsecr). The
+    /// ack number is `new_ack` so the caller can advance `snd_una` to
+    /// trigger the RTT-sample path. Used by `cover_tcp_rtt_samples`.
+    pub fn inject_peer_ack_with_ts(&mut self, new_ack: u32, tsval: u32, tsecr: u32) {
+        use dpdk_net_core::tcp_options::TcpOpts;
+        use dpdk_net_core::tcp_output::TCP_ACK;
+
+        let peer_seq = self.peer_seq.get();
+        let mut opts = TcpOpts::default();
+        opts.timestamps = Some((tsval, tsecr));
+        let frame = build_tcp_frame(
+            PEER_IP,
+            40_000,
+            OUR_IP,
+            5555,
+            peer_seq,
+            new_ack,
+            TCP_ACK,
+            u16::MAX,
+            opts,
+            &[],
+        );
+        self.eng.inject_rx_frame(&frame).expect("inject ts-ack");
+    }
 }
 

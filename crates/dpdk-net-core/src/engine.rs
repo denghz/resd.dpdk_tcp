@@ -5677,6 +5677,14 @@ impl Engine {
                 c.recv.bytes.clear();
                 c.delivered_segments.clear();
                 c.readable_scratch_iovecs.clear();
+                // A8 T7: reorder queue holds independent pinned refs on
+                // RX mbufs (OooSegment stores a raw `NonNull<rte_mbuf>`
+                // with a `drop_segment_mbuf_ref` contract on drop). If
+                // left populated through teardown, the ReorderQueue's
+                // Drop would decrement refcount on mbufs whose mempool
+                // has already been freed → UAF SIGSEGV. `clear()`
+                // releases the refs while the mempool is still alive.
+                c.recv.reorder.clear();
             }
         }
     }
