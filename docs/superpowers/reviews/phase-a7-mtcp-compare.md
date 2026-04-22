@@ -93,6 +93,7 @@ _None._ (see AD-3 / AD-4 — retransmit scope is explicitly out of A7 per commit
   - mTCP: `tcp_in.c:1308-1311` detects `tcph->syn && seq == cur_stream->rcvvar->irs` in SYN_RCVD and jumps to `Handle_TCP_ST_LISTEN`, retransmitting SYN-ACK via control list.
   - Ours: `tcp_input.rs:384-386` `handle_syn_received` returns `Outcome::none()` for any segment with SYN set — regardless of whether SEQ matches `irs`. No retransmit.
   - Citation: A7 plan T5 acceptance criterion is "final-ACK lands → ESTABLISHED"; retransmit-peer-SYN case is explicitly deferred to A8+ along with AD-3's timer wiring. Test-server loopback is deterministic; retransmitted-SYN arrives only if both sides are aware of a drop, which does not happen under the virtual-clock + TX-intercept design. RFC 9293 §3.10.7.3 does require retransmit-SYN-ACK under real-loss conditions — A8+ scope.
+  - **RETIRED 2026-04-22 (A8 T14):** dup-SYN-in-SYN_RCVD now matches mTCP's dispatch. `handle_syn_received` checks `seg.seq == conn.irs` (mirroring mTCP's `seq == cur_stream->rcvvar->irs` at `tcp_in.c:1308-1311`): match → retransmit SYN-ACK with identical ISS via the new `Outcome::retransmit_syn_ack_for_passive` signal (engine calls `emit_syn_ack_for_passive`, reusing the T11 SynRetrans wheel entry — idempotent via the `conn.syn_retrans_timer_id.is_some()` guard so no double-arm); mismatch → RST + Closed + `clear_listen_slot_on_close = true` (stricter than mTCP's unconditional jump-to-LISTEN — RFC 9293 §3.10.7.4 Fourth permits the strict reading, and aligns with our capacity-1 listen-slot scope where a same-tuple advanced-ISS SYN is unambiguously adversarial). T11 (AD-3) closed the retransmit-infrastructure gap; T14 (AD-4) closes the dispatch gap. Regression: `crates/dpdk-net-core/tests/ad_a7_dup_syn_retrans_synack.rs`. Completes the four-item S1 AD-A7 promotion set.
 
 - **AD-5** — SYN-ACK option bundle: unconditional MSS+WS+SACK+TS vs peer-gated
   - mTCP: `tcp_in.c:79` `HandlePassiveOpen` calls `ParseTCPOptions`, setting sndvar fields only when the option was present; `tcp_out.c` `GenerateTCPOptions` then emits only peer-advertised options — RFC 7323 §1.3 / §2.2 gating.
@@ -125,7 +126,7 @@ _None._
 - [x] **AD-1** — Citation attached: A7 spec §10.12 (listen-slot scope) — capacity-1 is test-server goal; A8+ deferred.
 - [x] **AD-2** — Citation attached: RFC 9293 §3.10.7.1 (RST latitude) + A7 AD-1 coupling.
 - [x] **AD-3** — Citation attached: A7 commit message (pragmatic floor) + T15 0-script classification + A8+ retransmit hardening. **RETIRED 2026-04-22 (A8 T11).**
-- [x] **AD-4** — Citation attached: A7 plan T5 acceptance + A8+ deferred + RFC 9293 §3.10.7.3 scope narrowing.
+- [x] **AD-4** — Citation attached: A7 plan T5 acceptance + A8+ deferred + RFC 9293 §3.10.7.3 scope narrowing. **RETIRED 2026-04-22 (A8 T14).**
 - [x] **AD-5** — Citation attached: A7 plan T5 option-bundle scope + RFC 7323 §1.3/§2.2 header-hygiene vs behavioural-inert.
 
 ### FYI

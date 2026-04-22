@@ -1834,5 +1834,133 @@ impl CovHarness {
         // --- Step H: advance past 2×MSL + reap → TimeWait → Closed ---
         self.advance_virt_past_2msl_and_reap();
     }
+
+    // -----------------------------------------------------------------
+    // A8 T14 (S1(d)): dup-SYN-in-SYN_RCVD dispatch helpers.
+    //
+    // Three helpers to drive the retires-AD-A7-dup-syn-in-syn-rcvd-silent-drop
+    // + mTCP AD-4 regression in `tests/ad_a7_dup_syn_retrans_synack.rs`:
+    //   - `do_listen_then_peer_syn`: drives listen + injects the initial
+    //     peer SYN. Unlike `do_passive_open_syn_ack_only`, this version
+    //     DOES NOT drain the emitted SYN-ACK — the caller is expected to
+    //     call `drain_tx_frames()` to consume it, so subsequent
+    //     dup-SYN tests can assert on the second SYN-ACK's shape.
+    //     Captures `our_iss` + `peer_seq` for later helpers.
+    //   - `inject_duplicate_peer_syn_same_iss`: re-injects the exact same
+    //     SYN (same peer_ip/port/iss) that `do_listen_then_peer_syn` used.
+    //     Exercises the benign peer-SYN-retransmit path.
+    //   - `inject_duplicate_peer_syn_different_iss`: SYN from the same
+    //     peer_ip+peer_port with a different `new_iss`. Exercises the
+    //     peer-confused path → RST per RFC 9293 §3.10.7.4 Fourth.
+    //
+    // Shared shape with existing T11/T12/T13 helpers: peer_ip=PEER_IP,
+    // peer_port=40_000, our_port=5555, peer_iss=0x10000000.
+    // -----------------------------------------------------------------
+
+    /// A8 T14 (S1(d)): listen + inject initial peer SYN. Leaves the
+    /// emitted SYN-ACK in the TX intercept queue for the caller to drain
+    /// (unlike `do_passive_open_syn_ack_only`, which drains + parses).
+    /// Returns the `ListenHandle` so the caller can keep the slot alive
+    /// across dup-SYN follow-ups. Captures `peer_seq = peer_iss + 1`
+    /// so `inject_rst_to_syn_rcvd` + friends still work if the caller
+    /// wants to probe additional SYN_RCVD arms.
+    pub fn do_listen_then_peer_syn(&mut self) -> dpdk_net_core::test_server::ListenHandle {
+        use dpdk_net_core::clock::set_virt_ns;
+        use dpdk_net_core::test_tx_intercept::drain_tx_frames;
+
+        let listen_h = self.eng.listen(OUR_IP, 5555).expect("listen");
+        // Drain any lingering TX before the scenario's first SYN-ACK
+        // lands, so the follow-up drain sees exactly one frame.
+        let _ = drain_tx_frames();
+        set_virt_ns(1_000_000);
+        let syn = build_tcp_syn(PEER_IP, 40_000, OUR_IP, 5555, 0x10000000, 1460);
+        self.eng
+            .inject_rx_frame(&syn)
+            .expect("inject initial peer SYN");
+        // Record peer_seq so inject_rst_to_syn_rcvd-style follow-ups work.
+        self.peer_seq.set(0x10000001);
+        listen_h
+    }
+
+    /// A8 T14 (S1(d)): drain + return the accumulated TX frames. Thin
+    /// wrapper around `test_tx_intercept::drain_tx_frames` so tests that
+    /// use `h.do_listen_then_peer_syn()` can stay method-chained.
+    pub fn drain_tx_frames(&mut self) -> Vec<Vec<u8>> {
+        dpdk_net_core::test_tx_intercept::drain_tx_frames()
+    }
+
+    /// A8 T14 (S1(d)): re-inject the SAME peer SYN (same peer_ip, port,
+    /// iss) that `do_listen_then_peer_syn` used. Mirrors a peer that
+    /// retransmits its SYN because our SYN-ACK was dropped — benign loss
+    /// case per RFC 9293 §3.8.1 + mTCP AD-4 reading.
+    pub fn inject_duplicate_peer_syn_same_iss(&mut self) {
+        use dpdk_net_core::clock::set_virt_ns;
+
+        set_virt_ns(2_000_000);
+        let syn = build_tcp_syn(PEER_IP, 40_000, OUR_IP, 5555, 0x10000000, 1460);
+        self.eng
+            .inject_rx_frame(&syn)
+            .expect("inject duplicate peer SYN (same ISS)");
+    }
+
+    /// A8 T14 (S1(d)): inject a SYN from the same peer 4-tuple but with
+    /// a DIFFERENT `new_iss`. Represents a peer that has somehow
+    /// advanced its ISS while our conn is still in SYN_RCVD — either
+    /// confused state machine or malicious. RFC 9293 §3.10.7.4 Fourth
+    /// mandates RST on this branch.
+    pub fn inject_duplicate_peer_syn_different_iss(&mut self, new_iss: u32) {
+        use dpdk_net_core::clock::set_virt_ns;
+
+        set_virt_ns(2_000_000);
+        let syn = build_tcp_syn(PEER_IP, 40_000, OUR_IP, 5555, new_iss, 1460);
+        self.eng
+            .inject_rx_frame(&syn)
+            .expect("inject duplicate peer SYN (different ISS)");
+    }
+}
+
+/// A8 T14 (S1(d)): extract the TCP seq from a frame (wire format). Used
+/// to assert the SYN-ACK retransmit carries the same ISS as the first
+/// emission. Returns the raw seq word; caller validates flags separately.
+#[cfg(feature = "test-server")]
+pub fn parse_syn_seq(frame: &[u8]) -> u32 {
+    let ip_ihl = (frame[14] & 0x0f) as usize * 4;
+    let tcp = &frame[14 + ip_ihl..];
+    u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]])
+}
+
+/// A8 T14 (S1(d)): verify a frame is a SYN-ACK (flags byte has SYN|ACK
+/// bits set). Shared across `ad_a7_dup_syn_retrans_synack.rs` +
+/// `ad_a7_slot_cleanup.rs` / `ad_a7_rst_relisten.rs`-style follow-ups.
+#[cfg(feature = "test-server")]
+pub fn is_syn_ack(frame: &[u8]) -> bool {
+    if frame.len() < 14 + 20 + 20 {
+        return false;
+    }
+    let ip_ihl = (frame[14] & 0x0f) as usize * 4;
+    let tcp_off = 14 + ip_ihl;
+    if frame.len() < tcp_off + 14 {
+        return false;
+    }
+    let flags = frame[tcp_off + 13];
+    (flags & 0x12) == 0x12 // SYN|ACK = 0x02 | 0x10
+}
+
+/// A8 T14 (S1(d)): verify a frame is a RST (RST flag bit set). The S1(d)
+/// dup-SYN-different-ISS path emits RST+ACK per RFC 9293 §3.10.7.4 Fourth;
+/// we just test the RST bit here since ACK pairing is RFC-prescribed but
+/// not load-bearing for this regression.
+#[cfg(feature = "test-server")]
+pub fn is_rst(frame: &[u8]) -> bool {
+    if frame.len() < 14 + 20 + 20 {
+        return false;
+    }
+    let ip_ihl = (frame[14] & 0x0f) as usize * 4;
+    let tcp_off = 14 + ip_ihl;
+    if frame.len() < tcp_off + 14 {
+        return false;
+    }
+    let flags = frame[tcp_off + 13];
+    (flags & 0x04) != 0 // RST = 0x04
 }
 

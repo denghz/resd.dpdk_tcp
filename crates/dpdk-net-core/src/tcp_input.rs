@@ -301,6 +301,26 @@ pub struct Outcome {
     /// knowing its own handle — matching the T12 plumbing shape.
     #[cfg(feature = "test-server")]
     pub re_listen_if_passive: bool,
+    /// A8 T14 (S1(d) per AD-A7-dup-syn-in-syn-rcvd-silent-drop + mTCP AD-4):
+    /// signals the engine that a duplicate peer-SYN with SEG.SEQ == IRS
+    /// landed while we're in SYN_RCVD — the benign peer-SYN-retransmit
+    /// case (peer didn't see our SYN-ACK, re-sent its own SYN per RFC 9293
+    /// §3.8.1). The engine re-emits the SYN-ACK via
+    /// `emit_syn_ack_for_passive`, which is idempotent w.r.t. the
+    /// `SynRetrans` wheel: if `conn.syn_retrans_timer_id.is_some()`
+    /// (T11 armed it on initial emit), the wheel entry keeps ticking
+    /// and no new entry is added. See engine `emit_syn_ack_for_passive`
+    /// doc comment for the idempotency invariant.
+    ///
+    /// Mutually exclusive with `tx = TxAction::Rst` on the dup-SYN arm:
+    /// `handle_syn_received` sets this field only when
+    /// `seg.seq == conn.irs`. The other dup-SYN arm (seg.seq != irs)
+    /// takes the RST + Closed + `clear_listen_slot_on_close` path
+    /// (RFC 9293 §3.10.7.4 Fourth strict reading) and leaves this field
+    /// `false`. Feature-gated: the handler is itself `test-server`-only,
+    /// so the field's absence in the production build is a non-issue.
+    #[cfg(feature = "test-server")]
+    pub retransmit_syn_ack_for_passive: bool,
 }
 
 impl Outcome {
@@ -337,6 +357,8 @@ impl Outcome {
             clear_listen_slot_on_close: false,
             #[cfg(feature = "test-server")]
             re_listen_if_passive: false,
+            #[cfg(feature = "test-server")]
+            retransmit_syn_ack_for_passive: false,
         }
     }
     pub fn none() -> Self {
@@ -445,9 +467,40 @@ fn handle_syn_received(
         };
     }
 
+    // A8 T14 (S1(d)): dup-SYN in SYN_RCVD dispatch per RFC 9293 §3.10.7.4
+    // Fourth + mTCP AD-4 reading of §3.8.1. Pre-T14, the silent-drop arm
+    // here swallowed every SYN-bearing segment (AD-A7-dup-syn-in-syn-rcvd-
+    // silent-drop). The corrected dispatch:
+    //   - SEG.SEQ == IRS → benign peer-SYN-retransmit (peer didn't see
+    //     our SYN-ACK, re-sent the same SYN). Retransmit SYN-ACK with
+    //     identical ISS via `retransmit_syn_ack_for_passive` signal.
+    //     The engine's dispatch site calls `emit_syn_ack_for_passive`,
+    //     which is idempotent on the `SynRetrans` wheel — the existing
+    //     wheel entry (armed by T11 S1(a)) keeps ticking.
+    //   - SEG.SEQ != IRS → in-window SYN with advanced seq. Peer is
+    //     confused (state-machine bug) or adversarial; RFC 9293 §3.10.7.4
+    //     Fourth mandates RST. Reuse the T12 `clear_listen_slot_on_close`
+    //     path so the listen slot is freed for a genuine retry.
+    // Retires AD-A7-dup-syn-in-syn-rcvd-silent-drop + mTCP AD-4.
+    if (seg.flags & TCP_SYN) != 0 {
+        if seg.seq == conn.irs {
+            return Outcome {
+                tx: TxAction::None,
+                retransmit_syn_ack_for_passive: true,
+                ..Outcome::base()
+            };
+        }
+        return Outcome {
+            tx: TxAction::Rst,
+            new_state: Some(TcpState::Closed),
+            closed: true,
+            clear_listen_slot_on_close: true,
+            ..Outcome::base()
+        };
+    }
     // The only acceptable next segment is the final-ACK of the handshake:
-    // ACK set, SYN clear, seq == rcv_nxt, ack covers our SYN-ACK.
-    if (seg.flags & TCP_ACK) == 0 || (seg.flags & TCP_SYN) != 0 {
+    // ACK set, seq == rcv_nxt, ack covers our SYN-ACK.
+    if (seg.flags & TCP_ACK) == 0 {
         return Outcome::none();
     }
     if seg.seq != conn.rcv_nxt {

@@ -3797,6 +3797,21 @@ impl Engine {
             self.re_listen_if_from_passive(handle);
         }
 
+        // A8 T14 (S1(d)): dup-SYN-in-SYN_RCVD with SEG.SEQ == IRS →
+        // retransmit SYN-ACK per RFC 9293 §3.8.1 + mTCP AD-4 reading.
+        // `emit_syn_ack_for_passive` is idempotent on the SynRetrans
+        // wheel: it checks `conn.syn_retrans_timer_id.is_some()` and
+        // skips the re-arm (T11's original arm from
+        // `handle_inbound_syn_listen` is still ticking). Only the wire
+        // frame is re-emitted. Retires AD-A7-dup-syn-in-syn-rcvd-silent-drop
+        // + mTCP AD-4. Mutually exclusive with the RST arm on this same
+        // handler (that arm sets `tx = TxAction::Rst` +
+        // `clear_listen_slot_on_close = true`; this field stays false).
+        #[cfg(feature = "test-server")]
+        if outcome.retransmit_syn_ack_for_passive {
+            self.emit_syn_ack_for_passive(handle);
+        }
+
         if outcome.delivered > 0 {
             // A6.6 Task 3/T7/T8: segments (both in-order + drained)
             // landed in `conn.recv.bytes` at tcp_input ingest;
@@ -5663,11 +5678,47 @@ impl Engine {
     /// retransmit branch of `on_syn_retrans_fire` — in the latter case
     /// the caller drives the arm explicitly with `new_count` from the
     /// fire path, so this entry point arms only for the initial emit.
+    ///
+    /// A8 T14 (S1(d)): also called from the dup-SYN-in-SYN_RCVD dispatch
+    /// branch of `handle_syn_received` when a peer retransmits its SYN
+    /// with `SEG.SEQ == IRS` (benign loss-retransmit per RFC 9293 §3.8.1 +
+    /// mTCP AD-4 reading). Idempotency invariant for the T14 reuse:
+    /// `conn.syn_retrans_timer_id.is_some()` iff a SynRetrans wheel
+    /// entry is already ticking for this conn. Only arm a fresh entry
+    /// when `is_none()` — the T11 arm from `handle_inbound_syn_listen`
+    /// is still live when the dup-SYN lands, and double-arming would
+    /// leak the old entry + confuse the `> 3` budget count tracked in
+    /// `on_syn_retrans_fire`'s Phase 3. This means a dup-SYN during
+    /// SYN_RCVD only re-emits the wire frame; the wheel deadline,
+    /// backoff, and budget state are untouched — the existing T11
+    /// entry keeps ticking and the ETIMEDOUT path still fires at the
+    /// original deadline regardless of how many dup-SYNs the peer
+    /// sends. `on_syn_retrans_fire`'s Phase 5 arms the wheel inline
+    /// (does NOT call this helper) so the `already_armed` branch below
+    /// does not gate that path.
     fn emit_syn_ack_for_passive(&self, handle: crate::flow_table::ConnHandle) {
         use crate::counters::inc;
         use crate::tcp_output::{TCP_ACK, TCP_SYN};
+        // A8 T14 (S1(d)): check if a SynRetrans wheel entry is already
+        // live BEFORE the TX. The T11 path arms on initial emit; the
+        // T14 dup-SYN path reuses this function to re-emit the SYN-ACK
+        // but must NOT double-arm the wheel. `already_armed == true`
+        // also disambiguates the TX counter choice: initial emit is a
+        // fresh SYN (bump `tx_syn`), retransmit is a retransmission
+        // (bump `tx_retrans` — matches `on_syn_retrans_fire`'s Phase 4
+        // convention).
+        let already_armed = {
+            let ft = self.flow_table.borrow();
+            ft.get(handle)
+                .map(|c| c.syn_retrans_timer_id.is_some())
+                .unwrap_or(false)
+        };
         let now_ns = crate::clock::now_ns();
         if self.emit_syn_with_flags(handle, TCP_SYN | TCP_ACK, now_ns) {
+            if already_armed {
+                inc(&self.counters.tcp.tx_retrans);
+                return;
+            }
             inc(&self.counters.tcp.tx_syn);
             // A8 T11: arm SynRetrans with the same initial delay the
             // active-open path uses (see `connect` ~ engine.rs:4393).
