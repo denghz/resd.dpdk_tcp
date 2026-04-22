@@ -4,16 +4,20 @@ End-to-end orchestrator for the A10 Stage 1 benchmark harness (spec §12 / §14)
 
 ## What it does
 
-1. Provisions a `bench-pair` fleet (DUT + peer, shared `/24`, placement group)
-   via `resd-aws-infra setup bench-pair --json` from the sister project
-   `resd.aws-infra-setup`.
-2. `cargo build --release --workspace`.
-3. SCPs compiled bench binaries + `check-bench-preconditions.sh` + peer
+1. Builds the peer C binaries locally:
+   `make -C tools/bench-e2e/peer echo-server` and
+   `make -C tools/bench-vs-linux/peer linux-tcp-sink`.
+2. `cargo build --release --workspace`. Steps 1 + 2 run **before** any
+   AWS provisioning, so a local build failure costs $0 in AWS spend.
+3. Provisions a `bench-pair` fleet (DUT + peer, shared `/24`, placement
+   group) via `resd-aws-infra setup bench-pair --json` from the sister
+   project `resd.aws-infra-setup`.
+4. SCPs compiled bench binaries + `check-bench-preconditions.sh` + peer
    binaries (`echo-server`, `linux-tcp-sink`) to DUT + peer under `/tmp/`.
-4. Starts peer services:
+5. Starts peer services:
    - `echo-server` on port 10001 (bench-e2e, bench-stress, bench-vs-mtcp)
    - `linux-tcp-sink` on port 10002 (bench-vs-linux mode A)
-5. Runs on the DUT over SSH:
+6. Runs on the DUT over SSH:
    - `bench-e2e --assert-hw-task-18`
    - `bench-stress` (netem + FaultInjector sweep)
    - `bench-vs-linux --mode rtt`
@@ -22,12 +26,12 @@ End-to-end orchestrator for the A10 Stage 1 benchmark harness (spec §12 / §14)
    - `bench-obs-overhead` (A/B obs-feature-matrix driver with `--skip-rebuild`)
    - `bench-vs-mtcp --workload burst`
    - `bench-vs-mtcp --workload maxtp`
-6. Runs locally:
-   - `cargo bench -p bench-micro --no-default-features`
+7. Runs locally:
+   - `cargo bench -p bench-micro`
    - `target/release/summarize target/criterion $OUT_DIR/bench-micro.csv`
-7. Invokes `target/release/bench-report` to produce
+8. Invokes `target/release/bench-report` to produce
    `report.{json,html,md}` under `$OUT_DIR`.
-8. Tears the fleet down (`trap EXIT`), even on partial failure.
+9. Tears the fleet down (`trap EXIT`), even on partial failure.
 
 ## Prerequisites
 
@@ -38,10 +42,31 @@ Installed + on `PATH`:
   The first AMI must be baked (`resd-aws-infra bake-image --recipe-version 1.0.0`);
   `cdk bootstrap` run once per AWS account/region.
 - `cargo` — Rust toolchain (latest stable via `rustup`).
+- `make` + a C compiler (`gcc` or `clang`) — peer `echo-server` +
+  `linux-tcp-sink` are plain C, compiled before provisioning.
 - `jq` — JSON scraping from the `--json` stack output.
 - `ssh`, `scp`, `curl` — SSH into the provisioned hosts.
 - `aws` — AWS CLI with credentials; `aws sts get-caller-identity` must succeed.
 - `shellcheck` (dev-only) — pre-commit check.
+
+### SSH key setup
+
+`bench-nightly.sh` assumes:
+
+- Your operator SSH private key is available to `ssh` (via
+  `~/.ssh/config`, `ssh-agent`, or an `IdentityFile` pointed at the
+  correct key).
+- The sister `resd-aws-infra` project injects your public key into
+  both DUT and peer via the stack's launch template. Check the sister
+  repo's `bench-pair` preset for the key-name it expects (typically
+  `AWS_KEY_PAIR_NAME` env var).
+- The first connection accepts the hosts' fingerprints via
+  `StrictHostKeyChecking=accept-new` — no `known_hosts` setup needed,
+  but the first run records them.
+
+If you have multiple SSH configs, set
+`AWS_SSH_KEY_PATH=~/.ssh/id_ed25519` (or whichever) before invoking
+the script.
 
 ## Env vars
 
@@ -52,7 +77,7 @@ Installed + on `PATH`:
 | `GATEWAY_IP` | `<DUT /24>.1` | data-subnet default gateway; override if the CDK stack diverges |
 | `NIC_MAX_BPS` | `100000000000` (100 Gbps) | NIC line-rate cap for bench-vs-mtcp saturation guard (spec §11.1 check 3) |
 | `EAL_ARGS` | `-l 2-3 -n 4 -a 0000:00:06.0,large_llq_hdr=1,miss_txc_to=3` | DPDK EAL args; c6in.metal ENA defaults |
-| `BENCH_MICRO_ARGS` | `--no-default-features` | extra args for `cargo bench -p bench-micro` |
+| `BENCH_MICRO_ARGS` | `` (empty) | extra args for `cargo bench -p bench-micro`; `bench-micro` has no `[features]` section so `--no-default-features` is a no-op for it |
 | `SKIP_TEARDOWN` | `0` | set to `1` to leave the stack running after exit (debug) |
 
 ## Running

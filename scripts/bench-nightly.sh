@@ -3,18 +3,20 @@
 #
 # Spec §12 / §14 end-to-end pipeline:
 #   1. Prereq check (resd-aws-infra, cargo, jq, ssh, aws creds).
-#   2. Provision bench-pair fleet (DUT + peer) via resd-aws-infra.
+#   2. Build peer C binaries (echo-server, linux-tcp-sink).
 #   3. cargo build --release --workspace.
-#   4. SCP compiled bench binaries + preconditions checker + peer binaries
+#   4. Provision bench-pair fleet (DUT + peer) via resd-aws-infra.
+#      Build precedes provisioning so a local build failure costs $0.
+#   5. SCP compiled bench binaries + preconditions checker + peer binaries
 #      to DUT and peer hosts (under /tmp).
-#   5. Start peer echo-server (bench-e2e/bench-stress/bench-vs-mtcp) +
+#   6. Start peer echo-server (bench-e2e/bench-stress/bench-vs-mtcp) +
 #      linux-tcp-sink (bench-vs-linux) on the peer host.
-#   6. Run on DUT: bench-e2e, bench-stress, bench-vs-linux (mode A+B),
+#   7. Run on DUT: bench-e2e, bench-stress, bench-vs-linux (mode A+B),
 #      bench-offload-ab, bench-obs-overhead, bench-vs-mtcp (burst+maxtp).
-#   7. Run locally: cargo bench -p bench-micro + summarize.
-#   8. Pull CSVs back to target/bench-results/<timestamp>/.
-#   9. Invoke bench-report → JSON + HTML + Markdown.
-#  10. Teardown fleet (trap EXIT so partial runs still deprovision).
+#   8. Run locally: cargo bench -p bench-micro + summarize.
+#   9. Pull CSVs back to target/bench-results/<timestamp>/.
+#  10. Invoke bench-report → JSON + HTML + Markdown.
+#  11. Teardown fleet (trap EXIT so partial runs still deprovision).
 #
 # Entry points:
 #   ./scripts/bench-nightly.sh                  # full orchestrated run
@@ -44,7 +46,7 @@ while (($#)); do
       shift
       ;;
     -h|--help)
-      sed -n '2,33p' "$0"
+      sed -n '2,35p' "$0"
       exit 0
       ;;
     *)
@@ -60,9 +62,9 @@ mkdir -p "$OUT_DIR"
 log() { echo "[bench-nightly] $*" >&2; }
 
 # ---------------------------------------------------------------------------
-# [1/11] Prereq check — fail fast if anything required is missing.
+# [1/12] Prereq check — fail fast if anything required is missing.
 # ---------------------------------------------------------------------------
-log "[1/11] prereq check"
+log "[1/12] prereq check"
 
 REQUIRED_BINS=(resd-aws-infra cargo jq ssh scp curl aws)
 missing=0
@@ -87,16 +89,32 @@ log "  all prereqs present"
 
 # Dry-run exits here — the caller just wanted the prereq gate + plan.
 if ((DRY_RUN)); then
-  log "--dry-run: prereq check OK; would now provision bench-pair"
+  log "--dry-run: prereq check OK; would now build locally, then provision bench-pair"
   log "--dry-run: output dir would be $OUT_DIR"
   rmdir "$OUT_DIR" 2>/dev/null || true
   exit 0
 fi
 
 # ---------------------------------------------------------------------------
-# [2/11] Provision bench-pair fleet via resd-aws-infra.
+# [2/12] Build peer C binaries (echo-server, linux-tcp-sink).
+# Built BEFORE provisioning so a local build failure costs $0 AWS spend.
 # ---------------------------------------------------------------------------
-log "[2/11] provisioning bench-pair fleet via resd-aws-infra"
+log "[2/12] building peer C binaries"
+make -C tools/bench-e2e/peer echo-server
+make -C tools/bench-vs-linux/peer linux-tcp-sink
+
+# ---------------------------------------------------------------------------
+# [3/12] cargo build --release --workspace.
+# Built BEFORE provisioning so a local build failure costs $0 AWS spend.
+# ---------------------------------------------------------------------------
+log "[3/12] cargo build --release --workspace"
+cargo build --release --workspace
+
+# ---------------------------------------------------------------------------
+# [4/12] Provision bench-pair fleet via resd-aws-infra.
+# First AWS operation — local build must have succeeded above.
+# ---------------------------------------------------------------------------
+log "[4/12] provisioning bench-pair fleet via resd-aws-infra"
 
 OPERATOR_CIDR="${MY_CIDR:-$(curl -fsS https://ifconfig.me)/32}"
 log "  operator-ssh-cidr=$OPERATOR_CIDR"
@@ -153,15 +171,9 @@ SCP_OPTS=(-o StrictHostKeyChecking=accept-new)
 EAL_ARGS="${EAL_ARGS:--l 2-3 -n 4 -a 0000:00:06.0,large_llq_hdr=1,miss_txc_to=3}"
 
 # ---------------------------------------------------------------------------
-# [3/11] Build all release binaries.
+# [5/12] SCP binaries + scripts to DUT and peer hosts.
 # ---------------------------------------------------------------------------
-log "[3/11] cargo build --release --workspace"
-cargo build --release --workspace
-
-# ---------------------------------------------------------------------------
-# [4/11] SCP binaries + scripts to DUT and peer hosts.
-# ---------------------------------------------------------------------------
-log "[4/11] deploying binaries to DUT + peer"
+log "[5/12] deploying binaries to DUT + peer"
 
 DUT_BINS=(
   target/release/bench-e2e
@@ -196,15 +208,18 @@ scp "${SCP_OPTS[@]}" \
     "ubuntu@${PEER_SSH}:/tmp/"
 
 # ---------------------------------------------------------------------------
-# [5/11] Start peer services (echo-server for bench-e2e/stress/vs-mtcp;
+# [6/12] Start peer services (echo-server for bench-e2e/stress/vs-mtcp;
 #        linux-tcp-sink for bench-vs-linux mode A). Both backgrounded
 #        and logged; the bench-pair teardown reaps them implicitly.
+#        </dev/null redirect guards against the OpenSSH-client-hang
+#        gotcha where a backgrounded remote child keeps ssh's stdin
+#        open.
 # ---------------------------------------------------------------------------
-log "[5/11] starting peer services on $PEER_SSH"
+log "[6/12] starting peer services on $PEER_SSH"
 ssh "${SSH_OPTS[@]}" "ubuntu@$PEER_SSH" \
-    "nohup /tmp/echo-server 10001 >/tmp/echo-server.log 2>&1 &"
+    "nohup /tmp/echo-server 10001 >/tmp/echo-server.log 2>&1 </dev/null &"
 ssh "${SSH_OPTS[@]}" "ubuntu@$PEER_SSH" \
-    "nohup /tmp/linux-tcp-sink 10002 >/tmp/linux-tcp-sink.log 2>&1 &"
+    "nohup /tmp/linux-tcp-sink 10002 >/tmp/linux-tcp-sink.log 2>&1 </dev/null &"
 
 # Give the peer services a moment to bind listen sockets.
 sleep 1
@@ -246,9 +261,9 @@ DPDK_COMMON=(
 )
 
 # ---------------------------------------------------------------------------
-# [6/11] bench-e2e — request/response RTT + A-HW Task 18 assertions.
+# [7/12] bench-e2e — request/response RTT + A-HW Task 18 assertions.
 # ---------------------------------------------------------------------------
-log "[6/11] bench-e2e (with --assert-hw-task-18)"
+log "[7/12] bench-e2e (with --assert-hw-task-18)"
 run_dut_bench bench-e2e bench-e2e \
     "${DPDK_COMMON[@]}" \
     --peer-port 10001 \
@@ -257,10 +272,10 @@ run_dut_bench bench-e2e bench-e2e \
     --feature-set trading-latency
 
 # ---------------------------------------------------------------------------
-# [7/11] bench-stress — netem + FaultInjector matrix (peer-host netem
+# [8/12] bench-stress — netem + FaultInjector matrix (peer-host netem
 # needs peer SSH + iface name).
 # ---------------------------------------------------------------------------
-log "[7/11] bench-stress"
+log "[8/12] bench-stress"
 run_dut_bench bench-stress bench-stress \
     "${DPDK_COMMON[@]}" \
     --peer-port 10001 \
@@ -270,13 +285,13 @@ run_dut_bench bench-stress bench-stress \
     --feature-set trading-latency
 
 # ---------------------------------------------------------------------------
-# [8/11] bench-vs-linux — mode A (RTT) + mode B (wire-diff).
+# [9/12] bench-vs-linux — mode A (RTT) + mode B (wire-diff).
 # Mode A: dpdk + linux stacks (afpacket is a T8 stub → dropped in
 #   lenient mode; we keep strict + drop afpacket from --stacks).
 # Mode B: wire-diff consumes pcaps. The live tcpdump orchestration is a
 #   T15-B follow-up; for the MVP we skip mode B if no pcaps are staged.
 # ---------------------------------------------------------------------------
-log "[8/11] bench-vs-linux mode A (RTT comparison)"
+log "[9/12] bench-vs-linux mode A (RTT comparison)"
 run_dut_bench bench-vs-linux bench-vs-linux-rtt \
     "${DPDK_COMMON[@]}" \
     --mode rtt \
@@ -291,7 +306,7 @@ run_dut_bench bench-vs-linux bench-vs-linux-rtt \
 # staged pcaps into $OUT_DIR/pcaps/{local,peer}.pcap beforehand we run
 # mode B; otherwise we emit a skip note.
 if [ -f "$OUT_DIR/pcaps/local.pcap" ] && [ -f "$OUT_DIR/pcaps/peer.pcap" ]; then
-  log "[8b/11] bench-vs-linux mode B (wire-diff)"
+  log "[9b/12] bench-vs-linux mode B (wire-diff)"
   # Mode B runs locally (no EAL needed — pcap MVP).
   ./target/release/bench-vs-linux \
       --mode wire-diff \
@@ -302,18 +317,18 @@ if [ -f "$OUT_DIR/pcaps/local.pcap" ] && [ -f "$OUT_DIR/pcaps/peer.pcap" ]; then
       --feature-set rfc-compliance \
       --precondition-mode lenient
 else
-  log "[8b/11] bench-vs-linux mode B skipped — no pcaps in $OUT_DIR/pcaps/ "
+  log "[9b/12] bench-vs-linux mode B skipped — no pcaps in $OUT_DIR/pcaps/ "
   log "        (live tcpdump orchestration deferred to T15-B)"
 fi
 
 # ---------------------------------------------------------------------------
-# [9/11] bench-offload-ab + bench-obs-overhead — A/B drivers. These
+# [10/12] bench-offload-ab + bench-obs-overhead — A/B drivers. These
 # rebuild the workspace per config, so they cannot run in parallel with
 # each other. They run on the DUT because they invoke bench-ab-runner
 # which opens an EAL. Output goes into the driver's output-dir plus a
 # Markdown report; we pull both into $OUT_DIR.
 # ---------------------------------------------------------------------------
-log "[9/11] bench-offload-ab"
+log "[10/12] bench-offload-ab"
 ssh "${SSH_OPTS[@]}" "ubuntu@$DUT_SSH" \
     "sudo /tmp/bench-offload-ab \
         --peer-ip $PEER_IP \
@@ -330,7 +345,7 @@ ssh "${SSH_OPTS[@]}" "ubuntu@$DUT_SSH" \
 scp -r "${SCP_OPTS[@]}" \
     "ubuntu@$DUT_SSH:/tmp/bench-offload-ab" "$OUT_DIR/"
 
-log "[9b/11] bench-obs-overhead"
+log "[10b/12] bench-obs-overhead"
 ssh "${SSH_OPTS[@]}" "ubuntu@$DUT_SSH" \
     "sudo /tmp/bench-obs-overhead \
         --peer-ip $PEER_IP \
@@ -348,11 +363,11 @@ scp -r "${SCP_OPTS[@]}" \
     "ubuntu@$DUT_SSH:/tmp/bench-obs-overhead" "$OUT_DIR/"
 
 # ---------------------------------------------------------------------------
-# [10/11] bench-vs-mtcp burst + maxtp grids.
+# [11/12] bench-vs-mtcp burst + maxtp grids.
 # mTCP stub is strict-mode-fatal; pass --stacks dpdk to run the DPDK
 # arm only until Plan 2 T21 lands the real bench-peer binary.
 # ---------------------------------------------------------------------------
-log "[10/11] bench-vs-mtcp burst grid"
+log "[11/12] bench-vs-mtcp burst grid"
 run_dut_bench bench-vs-mtcp bench-vs-mtcp-burst \
     "${DPDK_COMMON[@]}" \
     --workload burst \
@@ -362,7 +377,7 @@ run_dut_bench bench-vs-mtcp bench-vs-mtcp-burst \
     --feature-set trading-latency \
     --nic-max-bps "$NIC_MAX_BPS"
 
-log "[10b/11] bench-vs-mtcp maxtp grid"
+log "[11b/12] bench-vs-mtcp maxtp grid"
 run_dut_bench bench-vs-mtcp bench-vs-mtcp-maxtp \
     "${DPDK_COMMON[@]}" \
     --workload maxtp \
@@ -373,15 +388,16 @@ run_dut_bench bench-vs-mtcp bench-vs-mtcp-maxtp \
     --nic-max-bps "$NIC_MAX_BPS"
 
 # ---------------------------------------------------------------------------
-# [11/11] Local bench-micro + summarize + bench-report.
+# [12/12] Local bench-micro + summarize + bench-report.
 # bench-micro runs locally (pure in-process criterion targets, no NIC
-# needed). obs-none disables observability so we get the "clean" curve.
+# needed). bench-micro has no [features] section so there's nothing
+# feature-gated to toggle; spec §5 doesn't mandate --no-default-features.
+# The caller can override BENCH_MICRO_ARGS if a future feature gate is
+# added to bench-micro.
 # ---------------------------------------------------------------------------
-log "[11/11] bench-micro (local) + summarize + bench-report"
+log "[12/12] bench-micro (local) + summarize + bench-report"
 
-# Per spec §5: bench-micro runs with obs-none so counter sites don't
-# skew the criterion sample. The caller can override BENCH_MICRO_ARGS.
-BENCH_MICRO_ARGS="${BENCH_MICRO_ARGS:---no-default-features}"
+BENCH_MICRO_ARGS="${BENCH_MICRO_ARGS:-}"
 # shellcheck disable=SC2086 # BENCH_MICRO_ARGS is intentionally word-split
 cargo bench -p bench-micro $BENCH_MICRO_ARGS
 
