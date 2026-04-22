@@ -1973,6 +1973,16 @@ impl Engine {
         self.rx_drop_nomem_prev
             .set(self.counters.eth.rx_drop_nomem.load(Ordering::Relaxed));
 
+        // A8 T3.5 follow-up: snapshot `eth.tx_pkts` at top of poll so
+        // each exit path can bump `poll.iters_with_tx` iff any TX fired
+        // this iteration. Captures both inline control-frame emits
+        // (`tx_frame` / `tx_tcp_frame` / `tx_data_frame`, which bump
+        // `eth.tx_pkts` one-by-one) and the batched ring drain
+        // (`drain_tx_pending_data`, which adds `sent` to `eth.tx_pkts`).
+        // Matches `iters_with_rx` semantics: once-per-iteration, not
+        // per burst / per segment.
+        let tx_pkts_snapshot = self.counters.eth.tx_pkts.load(Ordering::Relaxed);
+
         // A6.6 T8: release the previous poll's delivered mbuf refs and
         // clear the per-conn scratch iovec arrays — enforces the "valid
         // until next dpdk_net_poll" contract at the C ABI boundary per
@@ -2018,6 +2028,12 @@ impl Engine {
             // Error event. Sited after the drain so it runs on every
             // exit path.
             self.check_and_emit_rx_enomem();
+            // A8 T3.5 follow-up: bump `iters_with_tx` once if any TX
+            // fired on this iteration (timer-driven retransmit can push
+            // into the ring even on the RX-idle path).
+            if self.counters.eth.tx_pkts.load(Ordering::Relaxed) > tx_pkts_snapshot {
+                inc(&self.counters.poll.iters_with_tx);
+            }
             return 0;
         }
 
@@ -2102,6 +2118,14 @@ impl Engine {
         // A6 (spec §3.6 Site 3): edge-triggered RX-mempool-drop Error
         // event. Sited after the drain so it runs on every exit path.
         self.check_and_emit_rx_enomem();
+        // A8 T3.5 follow-up: bump `iters_with_tx` once if any TX fired
+        // on this iteration (inline control frames from `rx_frame` and/or
+        // the batched ring drain). Mirrors `iters_with_rx` semantics —
+        // once per poll iteration, regardless of how many frames or
+        // bursts happened.
+        if self.counters.eth.tx_pkts.load(Ordering::Relaxed) > tx_pkts_snapshot {
+            inc(&self.counters.poll.iters_with_tx);
+        }
         n
     }
 

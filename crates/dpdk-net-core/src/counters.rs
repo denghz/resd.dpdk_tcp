@@ -848,7 +848,9 @@ mod tests {
     }
 
     /// Every named AtomicU64 on PollCounters is zero at construction.
-    /// `iters_with_tx` is declared but not incremented until A6.
+    /// `iters_with_tx` wired in A8 T3.5 follow-up (engine.rs poll_once
+    /// end-of-iteration bump, snapshot-vs-post-drain compare on
+    /// `eth.tx_pkts`). Starts at zero until the first TX fires.
     #[test]
     fn all_poll_counters_zero_at_construction() {
         let c = Counters::new();
