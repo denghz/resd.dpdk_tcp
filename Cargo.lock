@@ -168,6 +168,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "bench-obs-overhead"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bench-common",
+ "bench-offload-ab",
+ "chrono",
+ "clap 4.6.1",
+ "csv",
+ "serde_json",
+ "uuid",
+ "wait-timeout",
+]
+
+[[package]]
 name = "bench-offload-ab"
 version = "0.1.0"
 dependencies = [

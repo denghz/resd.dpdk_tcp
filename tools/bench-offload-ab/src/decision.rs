@@ -115,6 +115,47 @@ pub fn check_sanity_invariant(
     }
 }
 
+/// Enforce the spec §10 observability-overhead floor invariant: every
+/// feature-enabled configuration's p99 must be no better (lower) than
+/// the `obs-none` floor p99.
+///
+/// Rationale: observability can only add cost, never save it. Counters,
+/// event-queue pushes, and histogram updates are work the CPU does AFTER
+/// the TCP state transition has already completed — turning them off can
+/// only reduce wall-clock, never increase it. If any `obs-*` config p99
+/// is BELOW `obs-none` p99, one of three things is true:
+///
+/// - the observable is dead code (its compile-out path is the hot path,
+///   not a cost-free side branch),
+/// - the implementation regressed (a compile-in change accidentally made
+///   the non-observing path slower — e.g. a branch-predictor pessimisation),
+/// - the measurement is inside the noise floor and the sign is random.
+///
+/// The driver flags the violation so the reviewer triages it before A10
+/// signs off. Tie (`obs-none == other`) is OK — floor equality still
+/// means observability is within measurement noise of free.
+///
+/// Parameters are symmetric with [`check_sanity_invariant`]: the "should
+/// be at most" value first, the "reference" value second. Here
+/// `obs_none_p99_ns` is the floor every `other_p99_ns` must not undercut.
+pub fn check_observability_invariant(
+    other_p99_ns: f64,
+    other_name: &str,
+    obs_none_p99_ns: f64,
+) -> Result<(), String> {
+    if other_p99_ns >= obs_none_p99_ns {
+        Ok(())
+    } else {
+        Err(format!(
+            "observability floor violated: config '{other_name}' p99 \
+             {other_p99_ns} < obs-none p99 {obs_none_p99_ns} \
+             (observability can only add cost; either the observable is \
+             dead code, the implementation regressed, or the delta is \
+             within measurement noise)"
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,5 +211,30 @@ mod tests {
         let err = check_sanity_invariant(94.0, 92.0).unwrap_err();
         assert!(err.contains("full p99 94"), "err should mention full p99: {err}");
         assert!(err.contains("92"), "err should mention best individual p99: {err}");
+    }
+
+    #[test]
+    fn observability_invariant_other_above_floor_ok() {
+        // obs-none = 78; poll-saturation-only = 82 → obs adds cost → ok.
+        assert!(check_observability_invariant(82.0, "poll-saturation-only", 78.0).is_ok());
+    }
+
+    #[test]
+    fn observability_invariant_equality_ok() {
+        // Tie: obs-none == other. Observability costs zero within
+        // measurement noise → ok.
+        assert!(check_observability_invariant(78.0, "poll-saturation-only", 78.0).is_ok());
+    }
+
+    #[test]
+    fn observability_invariant_other_below_floor_errors() {
+        // other p99 < obs-none p99 → violation (observability can't save cost).
+        let err = check_observability_invariant(74.0, "byte-counters-only", 78.0).unwrap_err();
+        assert!(
+            err.contains("byte-counters-only"),
+            "err should mention offending config: {err}"
+        );
+        assert!(err.contains("74"), "err should mention other p99: {err}");
+        assert!(err.contains("78"), "err should mention obs-none p99: {err}");
     }
 }

@@ -17,7 +17,7 @@
 //! loudly rather than silently hiding the contract.
 
 use bench_offload_ab::decision::{
-    check_sanity_invariant, classify, DecisionRule, Outcome,
+    check_observability_invariant, check_sanity_invariant, classify, DecisionRule, Outcome,
 };
 
 #[test]
@@ -52,4 +52,29 @@ fn sanity_invariant_full_le_best_individual_ok() {
     // full=90, best_individual=92 → ok (full < best).
     let result = check_sanity_invariant(90.0, 92.0);
     assert!(result.is_ok(), "full=90 <= best individual=92 → ok");
+}
+
+#[test]
+fn observability_invariant_floor_violation() {
+    // obs-none=78, poll-saturation-only=74 → violation (other < floor).
+    // Observability supposedly-free but ran faster than obs-none — flag.
+    let result = check_observability_invariant(74.0, "poll-saturation-only", 78.0);
+    assert!(
+        result.is_err(),
+        "other p99 74 < obs-none p99 78 must trigger violation"
+    );
+    let msg = result.unwrap_err();
+    assert!(
+        msg.contains("poll-saturation-only"),
+        "err should name offending config: {msg}"
+    );
+    assert!(msg.contains("74"), "err should mention other p99: {msg}");
+    assert!(msg.contains("78"), "err should mention obs-none p99: {msg}");
+}
+
+#[test]
+fn observability_invariant_floor_ok() {
+    // obs-none=78, byte-counters-only=82 → ok (other >= floor).
+    let result = check_observability_invariant(82.0, "byte-counters-only", 78.0);
+    assert!(result.is_ok(), "other p99 82 >= obs-none p99 78 → ok");
 }
