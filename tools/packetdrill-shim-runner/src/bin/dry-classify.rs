@@ -1,11 +1,15 @@
-//! A7 T15 helper: classify every .pkt under
-//! `third_party/packetdrill-testcases` and print bucket counts + full
-//! verdict list. Output is consumed by T15 iteration to pick final counts.
+//! A7 T15 helper: classify every .pkt under a corpus root and print
+//! bucket counts + full verdict list. Output is consumed during T15/T16
+//! iteration to pick final counts.
 //!
 //! Usage:
 //!   cargo run -p packetdrill-shim-runner --bin dry-classify
 //!   CORPUS_ROOT=/abs/path cargo run ... --bin dry-classify
+//!   CLASSIFY_TOML=/abs/path cargo run ... --bin dry-classify
 //!   VERBOSE=1 cargo run ... --bin dry-classify     # list every file + verdict
+//!
+//! A8 T16: CLASSIFY_TOML selects per-corpus rules (ligurio / shivansh /
+//! google). Default is the baked-in ligurio.toml (matches A7 T15 behavior).
 
 use packetdrill_shim_runner::classifier::{Classifier, Verdict};
 use std::path::PathBuf;
@@ -20,7 +24,11 @@ fn main() {
             .into_owned()
     });
     let verbose = std::env::var("VERBOSE").map(|v| v == "1").unwrap_or(false);
-    let c = Classifier::load();
+    let c = match std::env::var("CLASSIFY_TOML") {
+        Ok(p) => Classifier::from_toml_path(std::path::Path::new(&p))
+            .expect("load CLASSIFY_TOML"),
+        Err(_) => Classifier::load(),
+    };
     let mut runnable = Vec::new();
     let mut skip_u: Vec<(String, String)> = Vec::new();
     let mut skip_o: Vec<(String, String)> = Vec::new();

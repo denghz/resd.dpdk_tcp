@@ -1,5 +1,12 @@
 //! A7 T13: ligurio-corpus classifier. Regex-based rules from
 //! `tools/packetdrill-shim/classify/ligurio.toml`.
+//!
+//! A8 T16: extended to per-corpus TOMLs (shivansh, google). The original
+//! `Classifier::load()` still hard-codes ligurio.toml via `include_str!`
+//! (baked into the binary). The new `from_toml_path` reads at runtime so
+//! each corpus test can point at its own TOML without touching
+//! `include_str!` — the latter requires a string literal and can't be
+//! parameterized across corpora.
 
 use regex::Regex;
 use serde::Deserialize;
@@ -27,10 +34,23 @@ pub enum Verdict {
 pub struct Classifier { rules: Vec<Rule> }
 
 impl Classifier {
+    /// A7 T13: load the baked-in ligurio classifier TOML.
     pub fn load() -> Self {
         let raw = include_str!(
             "../../packetdrill-shim/classify/ligurio.toml");
-        let cfg: Config = toml::from_str(raw).expect("parse ligurio.toml");
+        Self::from_toml_str(raw)
+    }
+
+    /// A8 T16: load a classifier TOML from disk (per-corpus tests).
+    /// Path is absolute or cwd-relative at test-runtime.
+    pub fn from_toml_path(path: &Path) -> std::io::Result<Self> {
+        let raw = std::fs::read_to_string(path)?;
+        Ok(Self::from_toml_str(&raw))
+    }
+
+    /// A8 T16: parse a classifier TOML source into a Classifier.
+    pub fn from_toml_str(raw: &str) -> Self {
+        let cfg: Config = toml::from_str(raw).expect("parse classifier toml");
         let rules = cfg.rule.into_iter().map(|r| {
             let v = match r.verdict.as_str() {
                 "runnable" => Verdict::Runnable,
