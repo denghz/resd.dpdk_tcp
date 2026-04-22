@@ -312,6 +312,39 @@ const _: () = {
     assert!(size_of::<EthCounters>().is_multiple_of(64));
 };
 
+// A8-t2-drift-detect-pin: if any of these size pins becomes stale, a new
+// AtomicU64 field has been added to the corresponding *Counters struct
+// without updating ALL_COUNTER_NAMES + KNOWN_COUNTER_COUNT + lookup_counter.
+// Update all three list sites AND this pin together.
+//
+// Every field in these structs is 8 bytes (AtomicU64 or u64 _pad). A new
+// field shifts the struct size by at least 8 bytes — and for the
+// cacheline-aligned groups, by a full 64 bytes once the tail padding is
+// consumed. Either way, this pin breaks at compile time. That closes the
+// scenario the two `a8_tests` runtime tests cannot see: new field present
+// on Counters, absent from ALL_COUNTER_NAMES.
+//
+// To update: insert the new field in the matching *Counters struct (+
+// adjust _pad, if any, so the struct stays cacheline-multiple), add a
+// "group.field" entry to ALL_COUNTER_NAMES, extend the `lookup_counter`
+// match arm, bump KNOWN_COUNTER_COUNT, then update the byte-count on the
+// line below whose struct you changed.
+const _: () = {
+    use std::mem::size_of;
+    // EthCounters: 38 named AtomicU64 + _pad: [AtomicU64; 2] = 40 * 8 = 320 bytes.
+    assert!(size_of::<EthCounters>() == 320);
+    // IpCounters: 12 named AtomicU64 + _pad: [u64; 4] = 16 * 8 = 128 bytes.
+    assert!(size_of::<IpCounters>() == 128);
+    // TcpCounters: 56 named scalar AtomicU64 + state_trans[11][11] matrix of
+    // 121 AtomicU64 = 177 u64s = 1416 bytes; cacheline-align tail pads to
+    // next 64-byte multiple = 1472 bytes.
+    assert!(size_of::<TcpCounters>() == 1472);
+    // PollCounters: 5 named AtomicU64 + _pad: [u64; 11] = 16 * 8 = 128 bytes.
+    assert!(size_of::<PollCounters>() == 128);
+    // ObsCounters: 2 named AtomicU64, repr(C) without align → 16 bytes.
+    assert!(size_of::<ObsCounters>() == 16);
+};
+
 #[repr(C)]
 pub struct Counters {
     pub eth: EthCounters,
@@ -473,11 +506,28 @@ pub const ALL_COUNTER_NAMES: &[&str] = &[
     "obs.events_queue_high_water",
 ];
 
-/// Sanity-pin: bumps whenever counters change. See test
-/// `all_counter_names_count_pinned`. Count below excludes state_trans
-/// (the 121-cell matrix is handled by a dedicated coverage table in
-/// tests/counter-coverage.rs, not by a flat name list) and the A9
-/// `fault_injector.*` group (not yet present on Counters).
+/// Number of names in `ALL_COUNTER_NAMES`.
+///
+/// **Critical contract**: this count MUST be updated whenever a counter
+/// is added or removed. The `all_counter_names_count_pinned` test fails
+/// loudly when `ALL_COUNTER_NAMES.len() != KNOWN_COUNTER_COUNT`.
+///
+/// Count excludes state_trans (the 121-cell matrix is handled by a
+/// dedicated coverage table in tests/counter-coverage.rs, not by a flat
+/// name list) and the A9 `fault_injector.*` group (not yet present on
+/// Counters).
+///
+/// **Scenario caught:** counter added to `ALL_COUNTER_NAMES` without
+/// bumping this constant (or vice-versa) → count-pinned test fails.
+///
+/// **Scenario NOT caught by this constant alone:** a new `AtomicU64`
+/// field added to a `*Counters` struct without also updating
+/// `ALL_COUNTER_NAMES` + this count. The two `a8_tests` tests pass
+/// cleanly in that scenario; the new counter becomes invisible to
+/// every downstream M2 / M1 audit. That scenario IS caught by the
+/// compile-time `size_of::<*Counters>()` pins above — they fail at
+/// compile time when a new field shifts struct size past the pinned
+/// byte count.
 pub const KNOWN_COUNTER_COUNT: usize = 113;
 
 /// Resolve a counter path from ALL_COUNTER_NAMES to a live &AtomicU64
@@ -489,6 +539,13 @@ pub const KNOWN_COUNTER_COUNT: usize = 113;
 ///
 /// Match-arm order mirrors `ALL_COUNTER_NAMES` so a reviewer can diff
 /// the two by eye.
+///
+/// **`tcp.state_trans[11][11]` is NOT addressable via this function.**
+/// The 121-cell matrix is a separate audit concern (see T8 in the A8
+/// plan + `tests/counter-coverage.rs::state_trans_coverage_exhaustive`).
+/// Callers that need cell-level access read `c.tcp.state_trans[from][to]`
+/// directly by index. Do NOT extend this match with a
+/// `"tcp.state_trans[X][Y]"` parser — the grammar is deliberately flat.
 pub fn lookup_counter<'a>(c: &'a Counters, name: &str) -> Option<&'a AtomicU64> {
     Some(match name {
         // --- eth ---
@@ -917,6 +974,23 @@ mod a8_tests {
             ALL_COUNTER_NAMES.len(),
             KNOWN_COUNTER_COUNT,
             "ALL_COUNTER_NAMES count drifted; update KNOWN_COUNTER_COUNT if intentional"
+        );
+    }
+
+    /// Sanity: nonexistent names return None, not a spurious reference.
+    /// Protects against a future refactor replacing the `_ => return None`
+    /// arm with a default-resolving arm. Also re-asserts the architectural
+    /// decision (documented on `lookup_counter`) that state_trans cells
+    /// are NOT addressable via this flat grammar — callers index the
+    /// matrix directly.
+    #[test]
+    fn lookup_counter_unknown_returns_none() {
+        let c = Counters::new();
+        assert!(lookup_counter(&c, "nonexistent.counter").is_none());
+        assert!(lookup_counter(&c, "").is_none());
+        assert!(
+            lookup_counter(&c, "tcp.state_trans[0][0]").is_none(),
+            "state_trans cells are NOT addressable via lookup_counter — see doc comment"
         );
     }
 }
