@@ -364,31 +364,17 @@ impl CovHarness {
     /// Inject a well-formed SYN targeting a port the engine is NOT
     /// listening on. The engine routes it into the unmatched-segment
     /// path → bumps `tcp.rx_unmatched` + emits an RST (→ `eth.tx_pkts`,
-    /// `tcp.tx_rst`).
-    ///
-    /// **Note on `eth.rx_pkts` / `eth.rx_bytes`:** those counters are
-    /// bumped in `poll_once`'s per-burst loop (engine.rs ~2041, ~2089)
-    /// which the test-server bypass cannot invoke (no NIC → no
-    /// `rx_burst`). To let `cover_eth_rx_pkts` / `cover_eth_rx_bytes`
-    /// still prove those counters have a reachable path, we mirror
-    /// `poll_once`'s per-mbuf bump here — bytes comes from the injected
-    /// frame length, pkts is a single `inc`. Spec §3.3: the audit's
-    /// claim is that each counter has a reachable increment site, not
-    /// that the test-server bypass reaches every one of them; the
-    /// static audit (`scripts/counter-coverage-static.sh`) pins the
-    /// actual code-site in engine.rs.
+    /// `tcp.tx_rst`). `inject_rx_frame` itself bumps `eth.rx_pkts` /
+    /// `eth.rx_bytes` (mirroring `poll_once`'s per-burst rx counters on
+    /// the inject path) so dynamic counter-coverage assertions against
+    /// those counters exercise genuine engine-internal code.
     pub fn inject_valid_syn_to_closed_port(&mut self) {
-        use dpdk_net_core::counters::{add, inc};
         let frame = build_tcp_syn(
             PEER_IP, 40_000, OUR_IP, /*unlistened port*/ 5999, /*iss*/ 0x1000, 1460,
         );
-        // Mirror poll_once's per-burst eth.rx_pkts / eth.rx_bytes bump
-        // (see docstring above). One mbuf = one inc of rx_pkts, rx_bytes
-        // += frame.len().
-        add(&self.eng.counters().eth.rx_bytes, frame.len() as u64);
-        inc(&self.eng.counters().eth.rx_pkts);
         // inject_rx_frame drives the L2/L3/TCP decode chain (same entry
-        // point poll_once invokes per-mbuf). Ignore the Result —
+        // point poll_once invokes per-mbuf) and bumps eth.rx_pkts /
+        // eth.rx_bytes from within the engine. Ignore the Result —
         // malformed frames return Err but still advance the counters we
         // care about for this audit.
         let _ = self.eng.inject_rx_frame(&frame);
@@ -396,15 +382,16 @@ impl CovHarness {
 
     /// Inject an arbitrary byte buffer (may be malformed). Used by
     /// scenarios that assert on early-drop counters (e.g. 10-byte frame
-    /// → `eth.rx_drop_short`). Does NOT mirror `poll_once`'s per-burst
-    /// counter bumps — the drop path under test lives INSIDE `rx_frame`,
-    /// so the harness helper stays faithful to the actual increment
-    /// site.
+    /// → `eth.rx_drop_short`). `inject_rx_frame` bumps `eth.rx_pkts` /
+    /// `eth.rx_bytes` on every successful mbuf-alloc+append (those
+    /// bumps are inside the engine now, not the harness), then drives
+    /// `rx_frame` where the L2-decode short-frame drop arm bumps the
+    /// counter under test.
     pub fn inject_raw_bytes(&mut self, buf: &[u8]) {
         // inject_rx_frame errors on frame.len() > u16::MAX or mempool
         // exhaustion; for malformed-short frames (the T4 warm-up use
-        // case) it completes successfully and hits the L2Drop::Short
-        // arm inside rx_frame.
+        // case) it completes the mbuf alloc/append successfully and
+        // hits the L2Drop::Short arm inside rx_frame.
         let _ = self.eng.inject_rx_frame(buf);
     }
 

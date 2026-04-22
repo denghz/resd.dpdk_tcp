@@ -5452,6 +5452,13 @@ impl Engine {
         unsafe {
             std::ptr::copy_nonoverlapping(frame.as_ptr(), dst as *mut u8, frame.len());
         }
+        // Mirror poll_once's per-burst counter bumps on the test-server inject
+        // path. Counter semantics: "frames received on this engine, regardless
+        // of RX source (real rx_burst in production or test-only inject here)."
+        // Without this, dynamic counter-coverage (T4+) would need to fake the
+        // bump from test-side, which would be tautological coverage.
+        crate::counters::inc(&self.counters.eth.rx_pkts);
+        crate::counters::add(&self.counters.eth.rx_bytes, frame.len() as u64);
         // Matches poll_once: the RX path reads a byte slice (via
         // `mbuf_data_slice`) and hands the mbuf pointer through for the
         // OOO reorder path. We skip the HW timestamp / ol_flags / RSS
