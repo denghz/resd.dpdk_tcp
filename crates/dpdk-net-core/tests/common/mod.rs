@@ -335,6 +335,11 @@ pub struct CovHarness {
     /// helper (`inject_peer_data`, `inject_peer_fin`) advances this
     /// by `seg_len` so the consumer doesn't have to thread it.
     pub peer_seq: std::cell::Cell<u32>,
+    /// A8 T10: ephemeral local source port from the active-open path
+    /// (captured on `obs_do_active_open` via parse of the emitted SYN).
+    /// Zero outside of a live active-open scenario. Canonical passive-
+    /// open helpers use 5555 and ignore this field.
+    pub active_src_port: std::cell::Cell<u16>,
     _serialize_guard: std::sync::MutexGuard<'static, ()>,
 }
 
@@ -390,6 +395,7 @@ impl CovHarness {
             eng,
             our_iss: std::cell::Cell::new(0),
             peer_seq: std::cell::Cell::new(0),
+            active_src_port: std::cell::Cell::new(0),
             _serialize_guard: guard,
         }
     }
@@ -1577,6 +1583,223 @@ impl CovHarness {
     ) {
         let _ = self.eng.send_bytes(conn, buf);
         self.eng.flush_tx_pending_data();
+    }
+
+    // -----------------------------------------------------------------
+    // A8 Task 10: M1 observability smoke helpers. Drive the single
+    // scripted scenario in `tests/obs_smoke.rs` — active-open → 4 sends
+    // with 1 RTO retransmit → active close → 2×MSL reap. All helpers
+    // compose with the existing tuple-tracking fields (our_iss, peer_seq)
+    // and an additional `active_src_port` field for the active-open path
+    // (ephemeral local port; needed to craft peer→us data/ACK frames).
+    // -----------------------------------------------------------------
+
+    /// A8 T10: complete an active-open 3WHS and return the live
+    /// `ConnHandle`. Uses 7777 as the destination (peer) port and
+    /// captures our ephemeral src_port + ISS so subsequent helpers
+    /// (`obs_peer_data_ack`, `obs_peer_fin`, etc.) can craft correct
+    /// peer→us frames. Sets `our_iss` and `peer_seq` mirror fields so
+    /// the canonical-tuple helpers remain composable (although this
+    /// scenario uses the active-open tuple, not the passive one).
+    ///
+    /// Drives state_trans[0][2] (Closed→SynSent) from the initial
+    /// `connect()` + state_trans[2][4] (SynSent→Established) on the
+    /// SYN-ACK inject + final ACK emit.
+    pub fn obs_do_active_open(&mut self)
+        -> dpdk_net_core::flow_table::ConnHandle
+    {
+        use dpdk_net_core::clock::set_virt_ns;
+        use dpdk_net_core::tcp_options::TcpOpts;
+        use dpdk_net_core::tcp_output::{TCP_ACK, TCP_SYN};
+        use dpdk_net_core::test_tx_intercept::drain_tx_frames;
+
+        set_virt_ns(0);
+        let _ = drain_tx_frames();
+        let conn = self.eng.connect(PEER_IP, 7777, 0).expect("connect");
+        let frames = drain_tx_frames();
+        assert_eq!(frames.len(), 1, "exactly one active-open SYN expected");
+        let emitted = &frames[0];
+        let ihl = (emitted[14] & 0x0f) as usize;
+        let tcp_off = 14 + ihl * 4;
+        let our_src_port = u16::from_be_bytes([emitted[tcp_off], emitted[tcp_off + 1]]);
+        let our_iss = u32::from_be_bytes([
+            emitted[tcp_off + 4],
+            emitted[tcp_off + 5],
+            emitted[tcp_off + 6],
+            emitted[tcp_off + 7],
+        ]);
+        self.our_iss.set(our_iss);
+        self.active_src_port.set(our_src_port);
+
+        // Inject peer SYN-ACK with matching options (MSS only — no TS so
+        // `ts_enabled` stays false on the conn, keeping subsequent data
+        // segments option-free and counter accounting deterministic).
+        set_virt_ns(1_000_000);
+        let peer_iss: u32 = 0x20000000;
+        let mut opts = TcpOpts::default();
+        opts.mss = Some(1460);
+        let syn_ack = build_tcp_frame(
+            PEER_IP,
+            7777,
+            OUR_IP,
+            our_src_port,
+            peer_iss,
+            our_iss.wrapping_add(1),
+            TCP_SYN | TCP_ACK,
+            u16::MAX,
+            opts,
+            &[],
+        );
+        self.eng.inject_rx_frame(&syn_ack).expect("inject SYN-ACK");
+        // Our final ACK for the 3WHS was emitted; drain it.
+        let _ = drain_tx_frames();
+        // Peer's data-seq counter starts at peer_iss + 1 (SYN consumes 1).
+        self.peer_seq.set(peer_iss.wrapping_add(1));
+        conn
+    }
+
+    /// A8 T10: peer ACKs cumulative `ack` on the active-open tuple.
+    /// No payload, no options, window unchanged. Used to cum-ACK
+    /// burst N's data after we sent it.
+    pub fn obs_peer_cum_ack(&mut self, ack: u32) {
+        use dpdk_net_core::clock::{now_ns, set_virt_ns};
+        use dpdk_net_core::tcp_options::TcpOpts;
+        use dpdk_net_core::tcp_output::TCP_ACK;
+
+        // Don't rewind virt-clock — caller controls monotonic advance.
+        let t = now_ns();
+        set_virt_ns(t);
+        let peer_seq = self.peer_seq.get();
+        let our_src_port = self.active_src_port.get();
+        let frame = build_tcp_frame(
+            PEER_IP,
+            7777,
+            OUR_IP,
+            our_src_port,
+            peer_seq,
+            ack,
+            TCP_ACK,
+            u16::MAX,
+            TcpOpts::default(),
+            &[],
+        );
+        self.eng.inject_rx_frame(&frame).expect("inject peer cum-ack");
+    }
+
+    /// A8 T10: send `buf` on an active-open conn + flush the pending-data
+    /// ring so the frame goes on the wire (bumping `eth.tx_pkts`,
+    /// `eth.tx_bytes`, `tcp.tx_data`, `tcp.tx_flush_bursts`,
+    /// `tcp.tx_flush_batched_pkts`). Drains the intercept queue so
+    /// subsequent drain-and-inspect steps only see later frames.
+    pub fn obs_send_and_flush(
+        &mut self,
+        conn: dpdk_net_core::flow_table::ConnHandle,
+        buf: &[u8],
+    ) {
+        use dpdk_net_core::test_tx_intercept::drain_tx_frames;
+        let _ = self.eng.send_bytes(conn, buf).expect("send_bytes");
+        self.eng.flush_tx_pending_data();
+        let _ = drain_tx_frames();
+    }
+
+    /// A8 T10: peer FIN on the active-open tuple (no payload). Peer
+    /// already ACK'd everything prior; `peer_seq` is stable. Uses
+    /// `ack = our_iss + 2` so it covers our FIN (see
+    /// `inject_peer_ack_our_fin` — same logic, just wrapped for the
+    /// active-open tuple).
+    pub fn obs_peer_fin_and_ack_our_fin(&mut self) {
+        use dpdk_net_core::clock::{now_ns, set_virt_ns};
+        let t = now_ns();
+        set_virt_ns(t);
+        let peer_seq = self.peer_seq.get();
+        let our_iss = self.our_iss.get();
+        let our_src_port = self.active_src_port.get();
+        // After 4 sends + 1 retransmit, our FIN sits at
+        // snd_nxt = our_iss + 1 + 64 (4 * 16 bytes) = our_iss + 65;
+        // peer ACK covers through our_iss + 66 (FIN consumes 1).
+        let our_fin_plus_one = our_iss.wrapping_add(66);
+        let fin = build_tcp_fin(
+            PEER_IP,
+            7777,
+            OUR_IP,
+            our_src_port,
+            peer_seq,
+            our_fin_plus_one,
+        );
+        self.eng.inject_rx_frame(&fin).expect("inject peer FIN");
+        self.peer_seq.set(peer_seq.wrapping_add(1));
+    }
+
+    /// A8 T10: run the full M1 observability smoke scenario on `conn`,
+    /// which MUST have been returned by `obs_do_active_open`. Drives:
+    ///
+    ///   Step B: sends 3 × 16-byte bursts (burst 1 + 2 cum-ACK'd).
+    ///   Step C: withholds peer ACK for burst 3.
+    ///   Step D: advances virt-clock past RTO → engine retransmits
+    ///           burst 3 (N=1 RTO retrans).
+    ///   Step E: peer cum-ACKs through burst 3.
+    ///   Step F: sends 1 more burst + peer cum-ACKs.
+    ///   Step G: active close — our `close_conn` → FIN → peer's
+    ///           FIN+ACK arrives → TimeWait.
+    ///   Step H: advance virt past 2×MSL + reap → Closed.
+    ///
+    /// Each sub-step uses a deterministic monotonic virt-clock advance
+    /// so counter values are reproducible across runs.
+    pub fn run_obs_smoke_scenario(
+        &mut self,
+        conn: dpdk_net_core::flow_table::ConnHandle,
+    ) {
+        use dpdk_net_core::clock::set_virt_ns;
+        use dpdk_net_core::test_tx_intercept::drain_tx_frames;
+
+        let our_iss = self.our_iss.get();
+        // After 3WHS, snd_una = our_iss + 1 (SYN consumed 1 seq).
+        // Each 16-byte burst advances snd_nxt by 16.
+
+        // --- Step B, burst 1: send 16 bytes, peer cum-ACKs ---
+        set_virt_ns(10_000_000); // 10 ms
+        self.obs_send_and_flush(conn, b"burst-1-payload!");
+        set_virt_ns(11_000_000);
+        self.obs_peer_cum_ack(our_iss.wrapping_add(1 + 16));
+
+        // --- Step B, burst 2: send 16 bytes, peer cum-ACKs ---
+        set_virt_ns(12_000_000);
+        self.obs_send_and_flush(conn, b"burst-2-payload!");
+        set_virt_ns(13_000_000);
+        self.obs_peer_cum_ack(our_iss.wrapping_add(1 + 32));
+
+        // --- Step B+C, burst 3: send 16 bytes, WITHHOLD peer ACK ---
+        set_virt_ns(14_000_000);
+        self.obs_send_and_flush(conn, b"burst-3-payload!");
+
+        // --- Step D: advance past RTO → engine retransmits burst 3 ---
+        // Default initial_rto_us = 5000 → RTO fires at t+5ms after the
+        // burst-3 TX. We jump to 14 + 10 = 24 ms to be safe. Drain the
+        // retransmitted frame so the TX intercept queue doesn't grow.
+        set_virt_ns(24_000_000);
+        let _ = self.eng.pump_timers(24_000_000);
+        let _ = drain_tx_frames();
+
+        // --- Step E: peer cum-ACKs through burst 3 (the retransmit) ---
+        set_virt_ns(25_000_000);
+        self.obs_peer_cum_ack(our_iss.wrapping_add(1 + 48));
+
+        // --- Step F: burst 4 — send + peer ACKs ---
+        set_virt_ns(26_000_000);
+        self.obs_send_and_flush(conn, b"burst-4-payload!");
+        set_virt_ns(27_000_000);
+        self.obs_peer_cum_ack(our_iss.wrapping_add(1 + 64));
+
+        // --- Step G: active close — we FIN → peer sends FIN+ACK → TW ---
+        set_virt_ns(30_000_000);
+        self.eng.close_conn(conn).expect("close_conn");
+        let _ = drain_tx_frames();
+        set_virt_ns(31_000_000);
+        self.obs_peer_fin_and_ack_our_fin();
+        let _ = drain_tx_frames();
+
+        // --- Step H: advance past 2×MSL + reap → TimeWait → Closed ---
+        self.advance_virt_past_2msl_and_reap();
     }
 }
 
