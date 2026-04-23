@@ -107,9 +107,9 @@ struct Args {
     #[arg(long, default_value = "")]
     gateway_ip: String,
 
-    /// EAL args, comma-separated. Only consumed if dpdk_net is in the
+    /// EAL args, whitespace-separated. Only consumed if dpdk_net is in the
     /// stacks list — same shape as bench-e2e.
-    #[arg(long, default_value = "")]
+    #[arg(long, default_value = "", allow_hyphen_values = true)]
     eal_args: String,
 
     /// Lcore to pin the dpdk_net engine to.
@@ -340,8 +340,7 @@ fn eal_init(args: &Args) -> anyhow::Result<()> {
     let mut eal_argv: Vec<String> = vec!["bench-vs-linux".to_string()];
     eal_argv.extend(
         args.eal_args
-            .split(',')
-            .filter(|s| !s.is_empty())
+            .split_whitespace()
             .map(|s| s.to_string()),
     );
     let argv_refs: Vec<&str> = eal_argv.iter().map(String::as_str).collect();

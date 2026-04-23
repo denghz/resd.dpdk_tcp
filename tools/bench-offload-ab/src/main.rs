@@ -90,8 +90,8 @@ struct Args {
     #[arg(long, default_value_t = 1_000)]
     warmup: u64,
 
-    /// EAL args, comma-separated. Passed verbatim to the runner.
-    #[arg(long)]
+    /// EAL args, whitespace-separated. Passed verbatim to the runner.
+    #[arg(long, allow_hyphen_values = true)]
     eal_args: String,
 
     /// Local IP (dotted-quad IPv4). Passed to each runner.

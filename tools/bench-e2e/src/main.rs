@@ -102,9 +102,9 @@ struct Args {
     #[arg(long)]
     gateway_ip: String,
 
-    /// EAL args, comma-separated. Passed verbatim after an implicit
+    /// EAL args, whitespace-separated. Passed verbatim after an implicit
     /// argv[0]="bench-e2e" prefix — same shape as bench-ab-runner.
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     eal_args: String,
 
     /// Sum-identity tolerance in ns. Default 50 ns per spec §6.
@@ -290,8 +290,7 @@ fn eal_init(args: &Args) -> anyhow::Result<()> {
     let mut eal_argv: Vec<String> = vec!["bench-e2e".to_string()];
     eal_argv.extend(
         args.eal_args
-            .split(',')
-            .filter(|s| !s.is_empty())
+            .split_whitespace()
             .map(|s| s.to_string()),
     );
     let argv_refs: Vec<&str> = eal_argv.iter().map(String::as_str).collect();

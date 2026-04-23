@@ -114,8 +114,8 @@ struct Args {
     #[arg(long)]
     gateway_ip: String,
 
-    /// EAL args, comma-separated. Same shape as bench-e2e.
-    #[arg(long)]
+    /// EAL args, whitespace-separated. Same shape as bench-e2e.
+    #[arg(long, allow_hyphen_values = true)]
     eal_args: String,
 
     /// Lcore to pin the engine to.
@@ -488,8 +488,7 @@ fn eal_init(args: &Args) -> anyhow::Result<()> {
     let mut eal_argv: Vec<String> = vec!["bench-stress".to_string()];
     eal_argv.extend(
         args.eal_args
-            .split(',')
-            .filter(|s| !s.is_empty())
+            .split_whitespace()
             .map(|s| s.to_string()),
     );
     let argv_refs: Vec<&str> = eal_argv.iter().map(String::as_str).collect();

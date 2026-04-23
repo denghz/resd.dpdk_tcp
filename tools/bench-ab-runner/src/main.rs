@@ -82,9 +82,12 @@ pub struct Args {
     #[arg(long)]
     pub gateway_ip: String,
 
-    /// EAL args, comma-separated. Passed verbatim after an implicit
-    /// argv[0] = "bench-ab-runner" prefix.
-    #[arg(long)]
+    /// EAL args, whitespace-separated. Passed verbatim after an implicit
+    /// argv[0] = "bench-ab-runner" prefix. Whitespace split preserves
+    /// PCI devarg inner commas (e.g. `-a 0000:00:06.0,large_llq_hdr=1`
+    /// stays as two argv slots: `-a` and `0000:00:06.0,large_llq_hdr=1`).
+    /// `allow_hyphen_values` lets the value start with `-` (e.g. `-l`).
+    #[arg(long, allow_hyphen_values = true)]
     pub eal_args: String,
 }
 
@@ -376,17 +379,16 @@ pub(crate) fn parse_ip_host_order(s: &str) -> anyhow::Result<u32> {
 /// bindgen symbol directly compiles fine but silently bypasses both.
 fn eal_init(args: &Args) -> anyhow::Result<()> {
     // EAL argv: argv[0] = binary name; rest comes from --eal-args.
-    // Comma-split so the harness can pass things like
-    //   --eal-args="-l,2-3,-n,4,--proc-type=primary"
-    // with no shell-quoting gymnastics. Empty segments (from leading /
-    // trailing commas) are filtered out; the caller deliberately passing
-    // `--eal-args=""` produces a lone argv[0] — EAL will reject with a
-    // usage error, which is the right behavior.
+    // Whitespace-split so the harness can pass things like
+    //   --eal-args="-l 2-3 -n 4 -a 0000:00:06.0,large_llq_hdr=1,miss_txc_to=3"
+    // — each shell-word becomes one argv slot, and PCI devarg inner
+    // commas stay intact inside the last word. `split_whitespace` already
+    // skips empty segments, so `--eal-args=""` produces a lone argv[0]
+    // and EAL rejects with a usage error, which is the right behavior.
     let mut eal_argv: Vec<String> = vec!["bench-ab-runner".to_string()];
     eal_argv.extend(
         args.eal_args
-            .split(',')
-            .filter(|s| !s.is_empty())
+            .split_whitespace()
             .map(|s| s.to_string()),
     );
     let argv_refs: Vec<&str> = eal_argv.iter().map(String::as_str).collect();
