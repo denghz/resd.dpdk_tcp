@@ -358,8 +358,15 @@ impl Default for EngineConfig {
             port_id: 0,
             rx_queue_id: 0,
             tx_queue_id: 0,
-            rx_ring_size: 1024,
-            tx_ring_size: 1024,
+            // ENA (the default NIC on c6a/c6i/c6in EC2 instance families)
+            // caps rte_eth_tx_queue_setup's nb_tx_desc at 512; passing 1024
+            // trips E_INVAL during bring-up. i40e / ice / mlx5 max ≥ 4096,
+            // so 512 is a universal floor that fits every PMD the project
+            // targets. Trading-oriented workloads run sub-MTU packets and
+            // don't fill a 1024-slot ring anyway; 512 keeps latency stable
+            // with no measurable throughput loss.
+            rx_ring_size: 512,
+            tx_ring_size: 512,
             mbuf_data_room: 2048,
             // A6.6-7 Task 10: 0 = compute formula-based default in
             // `Engine::new`. Keeping it here avoids callers of

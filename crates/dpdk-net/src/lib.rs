@@ -148,8 +148,10 @@ pub unsafe extern "C" fn dpdk_net_engine_create(
         port_id: cfg.port_id,
         rx_queue_id: cfg.rx_queue_id,
         tx_queue_id: cfg.tx_queue_id,
-        rx_ring_size: 1024,
-        tx_ring_size: 1024,
+        // See EngineConfig::default() — 512 is the universal floor that
+        // fits every target PMD (ENA caps nb_tx_desc at 512 on c6a.*).
+        rx_ring_size: 512,
+        tx_ring_size: 512,
         mbuf_data_room: 2048,
         // A6.6-7 Task 10: pass through caller knob as-is. `0` (the common
         // case from a zero-initialized `dpdk_net_engine_config_t`) signals
