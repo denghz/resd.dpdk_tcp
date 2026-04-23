@@ -424,7 +424,8 @@ run_dut_bench bench-e2e bench-e2e \
     --peer-port 10001 \
     --assert-hw-task-18 \
     --tool bench-e2e \
-    --feature-set trading-latency
+    --feature-set trading-latency \
+    || log "  [7/12] bench-e2e exited non-zero — continuing"
 
 # ---------------------------------------------------------------------------
 # [8/12] bench-stress — netem + FaultInjector matrix (peer-host netem
@@ -437,7 +438,8 @@ run_dut_bench bench-stress bench-stress \
     --peer-ssh "ubuntu@$PEER_SSH" \
     --peer-iface ens6 \
     --tool bench-stress \
-    --feature-set trading-latency
+    --feature-set trading-latency \
+    || log "  [8/12] bench-stress exited non-zero — continuing"
 
 # ---------------------------------------------------------------------------
 # [9/12] bench-vs-linux — mode A (RTT) + mode B (wire-diff).
@@ -454,7 +456,8 @@ run_dut_bench bench-vs-linux bench-vs-linux-rtt \
     --peer-iface ens6 \
     --stacks dpdk,linux \
     --tool bench-vs-linux \
-    --feature-set trading-latency
+    --feature-set trading-latency \
+    || log "  [9/12] bench-vs-linux mode A exited non-zero — continuing"
 
 # Mode B: wire-diff — consume pcaps captured around a short live
 # workload. A10 Plan B T15-B wires tcpdump orchestration: start tcpdump
@@ -578,10 +581,12 @@ ssh "${SSH_OPTS[@]}" "ubuntu@$DUT_SSH" \
         --output-dir /tmp/bench-offload-ab \
         --report-path /tmp/bench-offload-ab/offload-ab.md \
         --runner-bin /tmp/bench-ab-runner \
-        --skip-rebuild"
+        --skip-rebuild" \
+    || log "  [10/12] bench-offload-ab exited non-zero — continuing"
 refresh_ec2_ic_grants
 scp -r "${SCP_OPTS[@]}" \
-    "ubuntu@$DUT_SSH:/tmp/bench-offload-ab" "$OUT_DIR/"
+    "ubuntu@$DUT_SSH:/tmp/bench-offload-ab" "$OUT_DIR/" \
+    || log "  [10/12] scp of bench-offload-ab failed — continuing"
 
 log "[10b/12] bench-obs-overhead"
 refresh_ec2_ic_grants
@@ -597,10 +602,12 @@ ssh "${SSH_OPTS[@]}" "ubuntu@$DUT_SSH" \
         --output-dir /tmp/bench-obs-overhead \
         --report-path /tmp/bench-obs-overhead/obs-overhead.md \
         --runner-bin /tmp/bench-ab-runner \
-        --skip-rebuild"
+        --skip-rebuild" \
+    || log "  [10b/12] bench-obs-overhead exited non-zero — continuing"
 refresh_ec2_ic_grants
 scp -r "${SCP_OPTS[@]}" \
-    "ubuntu@$DUT_SSH:/tmp/bench-obs-overhead" "$OUT_DIR/"
+    "ubuntu@$DUT_SSH:/tmp/bench-obs-overhead" "$OUT_DIR/" \
+    || log "  [10b/12] scp of bench-obs-overhead failed — continuing"
 
 # ---------------------------------------------------------------------------
 # [11/12] bench-vs-mtcp burst + maxtp grids.
@@ -616,7 +623,8 @@ run_dut_bench bench-vs-mtcp bench-vs-mtcp-burst \
     --stacks dpdk \
     --tool bench-vs-mtcp \
     --feature-set trading-latency \
-    --nic-max-bps "$NIC_MAX_BPS"
+    --nic-max-bps "$NIC_MAX_BPS" \
+    || log "  [11/12] bench-vs-mtcp burst exited non-zero — continuing"
 
 log "[11b/12] bench-vs-mtcp maxtp grid"
 run_dut_bench bench-vs-mtcp bench-vs-mtcp-maxtp \
@@ -627,7 +635,8 @@ run_dut_bench bench-vs-mtcp bench-vs-mtcp-maxtp \
     --stacks dpdk \
     --tool bench-vs-mtcp \
     --feature-set trading-latency \
-    --nic-max-bps "$NIC_MAX_BPS"
+    --nic-max-bps "$NIC_MAX_BPS" \
+    || log "  [11b/12] bench-vs-mtcp maxtp exited non-zero — continuing"
 
 # ---------------------------------------------------------------------------
 # [12/12] Local bench-micro + summarize + bench-report.
