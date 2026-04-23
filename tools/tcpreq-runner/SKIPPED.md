@@ -20,10 +20,10 @@ Format: `<tcpreq module> — <reason> — <covering-test citation>`
   - tcpreq/tests/options.py:UnknownOptionTest → probes::options::unknown_option (MUST-6)
   - tcpreq/tests/options.py:IllegalLengthOptionTest → probes::options::illegal_length (MUST-7)
   - tcpreq/tests/mss.py:MSSSupportTest → probes::mss::mss_support (MUST-14)
+  - tcpreq/tests/rst_ack.py:RstAckTest → probes::rst_ack::rst_ack_processing (Reset-Processing, Spec §1.1 A)
 
 ## Skipped — duplicate Layer A/B coverage
 
-  - tcpreq/tests/rst_ack.py — covered by A3 RST-path unit tests in tcp_input.rs + A7/A8 S1 AD-A7 fixes + `tcp.rx_rst` / `tcp.tx_rst` counter-coverage. (Reset processing)
   - tcpreq/tests/liveness.py:LivenessTest — not applicable to in-memory loopback (no preflight reachability needed).
   - tcpreq/tests/ttl_coding.py — not applicable to in-memory loopback (no middlebox / ICMP TTL-expired path).
 

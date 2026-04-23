@@ -127,6 +127,7 @@ pub fn run_all_probes() -> Vec<ProbeResult> {
         probes::options::unknown_option(),  // A8.5 T2
         probes::options::illegal_length(),  // A8.5 T2
         probes::mss::mss_support(),         // A8.5 T3
+        probes::rst_ack::rst_ack_processing(),  // A8.5 T4
     ]
 }
 
