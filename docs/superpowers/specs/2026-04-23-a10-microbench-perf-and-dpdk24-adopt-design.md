@@ -5,11 +5,13 @@
 **Grandparent spec (Stage 1 design):** `docs/superpowers/specs/2026-04-17-dpdk-tcp-design.md` §11.2 supplies the per-family order-of-magnitude targets this effort must beat.
 **Roadmap row:** `docs/superpowers/plans/stage1-phase-roadmap.md` § A10 (L609–638). A10 stays `Complete`; this effort amends its line with a `→ A10-perf follow-on` note at end-of-effort.
 **Landing policy:** **Exploratory.** Per-change mTCP / RFC / code-quality review is skipped during iteration. End-of-effort two-stage review (spec-compliance + code-quality reviewer subagents, opus 4.7 per `feedback_subagent_model` + `feedback_per_task_review_discipline`) on each branch's aggregate diff decides what cherry-picks onto master.
-**Branches** (created once this spec is committed on master; both branch from `phase-a10` tip `132e42a`, independent of where the spec lands):
+**Branches** (created once this spec is committed on master; both branch from `phase-a10` tip `671062a`, independent of where the spec lands):
 - `a10-perf-23.11` — DPDK 23.11 uProf-driven optimization
 - `a10-dpdk24-adopt` — DPDK 24.11 LTS rebase + target-API adoption
 **Worktrees:** `/home/ubuntu/resd.dpdk_tcp-a10-perf` and `/home/ubuntu/resd.dpdk_tcp-a10-dpdk24`. Both created via `git worktree add` (shared object DB, independent `target/`).
-**Pinned host:** current dev EC2 instance — AMD EPYC 7R13 (Zen 3 / Milan), KVM. Both worktrees share this host; every bench CSV row carries the host-config metadata and is rejected at analysis time on any mismatch.
+**Base-commit amendment 2026-04-23:** initial spec pinned base at `phase-a10` tip `132e42a`; phase-a10 completed and moved forward 9 commits (8 × `bench-nightly:` plumbing + 1 × `engine: default rx/tx ring size 512 to fit ENA`). User confirmed re-rooting worktrees at `671062a`; neither change affects bench-micro measurement integrity (bench-nightly is scripts only; ring-size change applies only when the real Engine runs against real ENA, which bench-micro on the dev host does not).
+**Profiling host:** current dev EC2 instance — AMD EPYC 7R13 (Zen 3 / Milan), KVM. uProf `tbp` works; IBS + PMC + RAPL unavailable (see `docs/superpowers/reports/perf-host-capabilities.md`). Both worktrees share this host; every bench CSV row carries the host-config metadata and is rejected at analysis time on any mismatch.
+**Verification host:** the A10 `resd.aws-infra-setup` `bench-pair` preset (a dedicated EC2 pair provisioned on-demand). Used for numbers that need real ENA + paired peer + optional PMC-virtualization beyond what the dev host offers. Optimization work runs on the profiling host; post-optimization validation runs on the verification host. Connection details land in a worktree-local `.envrc` or the first family report.
 **Not a phase-letter bump.** Sits between A10 (complete) and A10.5 / A11 (not started). Not a Stage-1 ship gate.
 
 ---
@@ -62,7 +64,7 @@ This is a concrete numeric gate, not "every hotspot addressed."
 
 ### D6 — DPDK 24.11 scope: parallel worktree, rebase + adopt target APIs + re-baseline
 
-Second worktree `a10-dpdk24-adopt` runs in parallel from the same `132e42a` base. Three phases:
+Second worktree `a10-dpdk24-adopt` runs in parallel from the same `671062a` base. Three phases:
 1. **Rebase.** Bump `atleast_version("23.11")` → `atleast_version("24.11")`, rerun bindgen, fix breakage, re-run full test sweep, re-baseline bench-micro.
 2. **Adopt target APIs, one at a time, each an A/B measurement:**
    - `rte_lcore_var` (24.11) — per-lcore static storage replacing `__rte_cache_aligned` + `RTE_CACHE_GUARD` patterns
@@ -134,19 +136,19 @@ User note: **new production hot-path counters are allowed** in either worktree i
 |---|---|---|---|
 | `/home/ubuntu/resd.dpdk_tcp` | `master` | Main repo; hosts this spec + end-of-effort cherry-picks | This spec commit; final cherry-picks |
 | `/home/ubuntu/resd.dpdk_tcp-a10` | `phase-a10` (existing) | Reference for phase-a10 baseline numbers | **Untouched.** Pre-existing untracked/modified files (`test_tx_intercept.rs`, `virt_clock_monotonic.rs`, `build-sanitize/`, modified `tools/*/src/main.rs`) stay where they are |
-| `/home/ubuntu/resd.dpdk_tcp-a10-perf` | `a10-perf-23.11` (new, from `132e42a`) | DPDK 23.11 uProf-driven optimization | Full iteration |
-| `/home/ubuntu/resd.dpdk_tcp-a10-dpdk24` | `a10-dpdk24-adopt` (new, from `132e42a`) | DPDK 24.11 rebase + adoption | Full iteration |
+| `/home/ubuntu/resd.dpdk_tcp-a10-perf` | `a10-perf-23.11` (new, from `671062a`) | DPDK 23.11 uProf-driven optimization | Full iteration |
+| `/home/ubuntu/resd.dpdk_tcp-a10-dpdk24` | `a10-dpdk24-adopt` (new, from `671062a`) | DPDK 24.11 rebase + adoption | Full iteration |
 
 ### 3.2 Creation procedure
 
 The implementation plan's first task creates both worktrees:
 
 ```
-git worktree add -b a10-perf-23.11 /home/ubuntu/resd.dpdk_tcp-a10-perf 132e42a
-git worktree add -b a10-dpdk24-adopt /home/ubuntu/resd.dpdk_tcp-a10-dpdk24 132e42a
+git worktree add -b a10-perf-23.11 /home/ubuntu/resd.dpdk_tcp-a10-perf 671062a
+git worktree add -b a10-dpdk24-adopt /home/ubuntu/resd.dpdk_tcp-a10-dpdk24 671062a
 ```
 
-`132e42a` is the tip of `phase-a10` on 2026-04-23. If `phase-a10` moves forward during the effort, the worktrees **do not** rebase — they stay rooted at the spec's base commit so all measurements remain apples-to-apples.
+`671062a` is the tip of `phase-a10` after A10 completed on 2026-04-23. Phase-a10 is now frozen (A10 is done). Once the worktrees are created at `671062a`, they **do not** rebase further — they stay rooted at this commit so all measurements remain apples-to-apples.
 
 ### 3.3 Isolation guardrails
 

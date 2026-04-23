@@ -4,7 +4,7 @@
 
 **Goal:** Drive every `tools/bench-micro/` family below its Stage-1 design §11.2 order-of-magnitude target using uProf-guided optimization on DPDK 23.11, while running a parallel DPDK 24.11 LTS rebase + target-API adoption experiment, and produce an evidence-based recommendation on 24.11 pinning.
 
-**Architecture:** Two git worktrees branched from `phase-a10` tip `132e42a` (`/home/ubuntu/resd.dpdk_tcp-a10-perf` on `a10-perf-23.11`; `/home/ubuntu/resd.dpdk_tcp-a10-dpdk24` on `a10-dpdk24-adopt`). A new `bench-internals` cargo feature gates an `EngineNoEalHarness` plus pub-for-bench surface that lets bench-micro exercise real library code without DPDK EAL init. uProf (`tbp` + `ibs` + `AMDuProfPcm`) profiles each bench; optimization lands per-family via a hypothesize-implement-measure cycle. The DPDK-24 worktree rebases, re-baselines, then adopts target APIs (`rte_lcore_var`, `rte_ptr_compress`, `rte_bit_atomic_*`) one at a time, each an A/B. End-of-effort two-stage review (spec-compliance + code-quality reviewer subagents, opus 4.7) gates cherry-picks onto master.
+**Architecture:** Two git worktrees branched from `phase-a10` tip `671062a` (`/home/ubuntu/resd.dpdk_tcp-a10-perf` on `a10-perf-23.11`; `/home/ubuntu/resd.dpdk_tcp-a10-dpdk24` on `a10-dpdk24-adopt`). Base commit amended 2026-04-23 from `671062a` → `671062a` after A10 phase completed. A new `bench-internals` cargo feature gates an `EngineNoEalHarness` plus pub-for-bench surface that lets bench-micro exercise real library code without DPDK EAL init. uProf (`tbp` + `ibs` + `AMDuProfPcm`) profiles each bench; optimization lands per-family via a hypothesize-implement-measure cycle. The DPDK-24 worktree rebases, re-baselines, then adopts target APIs (`rte_lcore_var`, `rte_ptr_compress`, `rte_bit_atomic_*`) one at a time, each an A/B. End-of-effort two-stage review (spec-compliance + code-quality reviewer subagents, opus 4.7) gates cherry-picks onto master.
 
 **Tech Stack:** Rust 2021 (stable rustup toolchain), criterion 0.5, AMD uProf 5.2, DPDK 23.11 LTS + 24.11 LTS, clang-22 + libstdc++, cargo workspaces, AMD EPYC 7R13 (Zen 3 / Milan) on EC2 KVM.
 
@@ -310,7 +310,7 @@ EOF
 
 ## Phase 1 — Worktree creation + sanity
 
-### Task 1.1: Create both worktrees from `phase-a10` tip `132e42a`
+### Task 1.1: Create both worktrees from `phase-a10` tip `671062a`
 
 **Files:**
 - Creates: `/home/ubuntu/resd.dpdk_tcp-a10-perf` (worktree); `/home/ubuntu/resd.dpdk_tcp-a10-dpdk24` (worktree)
@@ -319,21 +319,21 @@ EOF
 
 ```bash
 cd /home/ubuntu/resd.dpdk_tcp
-git log --oneline 132e42a -1
+git log --oneline 671062a -1
 ```
-Expected: shows `132e42a bench-nightly: wait_for_ssh probe before first SCP` (or the exact subject that was current on 2026-04-23).
+Expected: shows `671062a bench-nightly: lower iteration count to 5000 to dodge ~7051 failure` (the exact subject at the updated base commit).
 
 - [ ] **Step 2: Create Worktree 1**
 
 ```bash
-git worktree add -b a10-perf-23.11 /home/ubuntu/resd.dpdk_tcp-a10-perf 132e42a
+git worktree add -b a10-perf-23.11 /home/ubuntu/resd.dpdk_tcp-a10-perf 671062a
 ```
-Expected: `Preparing worktree (new branch 'a10-perf-23.11')` + `HEAD is now at 132e42a ...`.
+Expected: `Preparing worktree (new branch 'a10-perf-23.11')` + `HEAD is now at 671062a ...`.
 
 - [ ] **Step 3: Create Worktree 2**
 
 ```bash
-git worktree add -b a10-dpdk24-adopt /home/ubuntu/resd.dpdk_tcp-a10-dpdk24 132e42a
+git worktree add -b a10-dpdk24-adopt /home/ubuntu/resd.dpdk_tcp-a10-dpdk24 671062a
 ```
 Expected: analogous output.
 
@@ -1170,7 +1170,7 @@ for sha in <list them oldest-first>; do
   git cherry-pick $sha
 done
 ```
-Expected: all clean picks (both worktrees branched from the same `132e42a`; no conflict).
+Expected: all clean picks (both worktrees branched from the same `671062a`; no conflict).
 
 - [ ] **Step 3: Sanity**
 
@@ -2027,7 +2027,7 @@ Consolidate both worktree summaries + the port-forward outcome + the 24.11 pinni
 # A10-perf postphase summary
 
 Period: 2026-04-23 → <end-date>
-Worktrees: a10-perf-23.11, a10-dpdk24-adopt (both branched from 132e42a)
+Worktrees: a10-perf-23.11, a10-dpdk24-adopt (both branched from 671062a)
 
 ## Per-family §11.2 gate — final
 
