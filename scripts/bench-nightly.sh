@@ -658,16 +658,24 @@ run_dut_bench bench-vs-mtcp bench-vs-mtcp-maxtp \
 # ---------------------------------------------------------------------------
 # [12/12] Local bench-micro + summarize + bench-report.
 # bench-micro runs locally (pure in-process criterion targets, no NIC
-# needed). bench-micro has no [features] section so there's nothing
-# feature-gated to toggle; spec §5 doesn't mandate --no-default-features.
-# The caller can override BENCH_MICRO_ARGS if a future feature gate is
-# added to bench-micro.
+# needed). Every bench-micro target pulls in dpdk-net-core, which the
+# workspace release profile builds with panic=abort for C-ABI safety.
+# Cargo's bench profile is hard-coded to panic=unwind (bench/test
+# profiles don't accept a panic override), so link fails on the
+# strategy mismatch. Force panic=abort via RUSTFLAGS and enumerate
+# bench targets explicitly so the `summarize` bin's #[cfg(test)] module
+# isn't dragged in (test targets need -Zpanic_abort_tests which is
+# nightly-only). The caller can override BENCH_MICRO_ARGS if a future
+# feature gate is added to bench-micro.
 # ---------------------------------------------------------------------------
 log "[12/12] bench-micro (local) + summarize + bench-report"
 
 BENCH_MICRO_ARGS="${BENCH_MICRO_ARGS:-}"
 # shellcheck disable=SC2086 # BENCH_MICRO_ARGS is intentionally word-split
-cargo bench -p bench-micro $BENCH_MICRO_ARGS
+RUSTFLAGS="${RUSTFLAGS:-} -C panic=abort" cargo bench -p bench-micro \
+    --bench poll --bench tsc_read --bench flow_lookup \
+    --bench send --bench tcp_input --bench counters --bench timer \
+    $BENCH_MICRO_ARGS
 
 ./target/release/summarize target/criterion "$OUT_DIR/bench-micro.csv"
 
