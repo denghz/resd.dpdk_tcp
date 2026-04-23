@@ -582,6 +582,8 @@ fi
 # Markdown report; we pull both into $OUT_DIR.
 # ---------------------------------------------------------------------------
 log "[10/12] bench-offload-ab"
+# /tmp/bench-offload-ab is the scp'd binary — use a distinct -out dir so
+# the driver's mkdir doesn't collide with the executable file.
 refresh_ec2_ic_grants
 ssh "${SSH_OPTS[@]}" "ubuntu@$DUT_SSH" \
     "sudo /tmp/bench-offload-ab \
@@ -592,17 +594,18 @@ ssh "${SSH_OPTS[@]}" "ubuntu@$DUT_SSH" \
         --eal-args $(printf '%q' "$EAL_ARGS") \
         --lcore 2 \
         --precondition-mode strict \
-        --output-dir /tmp/bench-offload-ab \
-        --report-path /tmp/bench-offload-ab/offload-ab.md \
+        --output-dir /tmp/bench-offload-ab-out \
+        --report-path /tmp/bench-offload-ab-out/offload-ab.md \
         --runner-bin /tmp/bench-ab-runner \
         --skip-rebuild" \
     || log "  [10/12] bench-offload-ab exited non-zero — continuing"
 refresh_ec2_ic_grants
 scp -r "${SCP_OPTS[@]}" \
-    "ubuntu@$DUT_SSH:/tmp/bench-offload-ab" "$OUT_DIR/" \
+    "ubuntu@$DUT_SSH:/tmp/bench-offload-ab-out" "$OUT_DIR/bench-offload-ab" \
     || log "  [10/12] scp of bench-offload-ab failed — continuing"
 
 log "[10b/12] bench-obs-overhead"
+# See [10/12] — /tmp/bench-obs-overhead is the binary; use -out for dir.
 refresh_ec2_ic_grants
 ssh "${SSH_OPTS[@]}" "ubuntu@$DUT_SSH" \
     "sudo /tmp/bench-obs-overhead \
@@ -613,14 +616,14 @@ ssh "${SSH_OPTS[@]}" "ubuntu@$DUT_SSH" \
         --eal-args $(printf '%q' "$EAL_ARGS") \
         --lcore 2 \
         --precondition-mode strict \
-        --output-dir /tmp/bench-obs-overhead \
-        --report-path /tmp/bench-obs-overhead/obs-overhead.md \
+        --output-dir /tmp/bench-obs-overhead-out \
+        --report-path /tmp/bench-obs-overhead-out/obs-overhead.md \
         --runner-bin /tmp/bench-ab-runner \
         --skip-rebuild" \
     || log "  [10b/12] bench-obs-overhead exited non-zero — continuing"
 refresh_ec2_ic_grants
 scp -r "${SCP_OPTS[@]}" \
-    "ubuntu@$DUT_SSH:/tmp/bench-obs-overhead" "$OUT_DIR/" \
+    "ubuntu@$DUT_SSH:/tmp/bench-obs-overhead-out" "$OUT_DIR/bench-obs-overhead" \
     || log "  [10b/12] scp of bench-obs-overhead failed — continuing"
 
 # ---------------------------------------------------------------------------
