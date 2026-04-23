@@ -303,23 +303,30 @@ matches_regex = ".*/reset/.*\\.pkt"
 verdict = "skipped-untranslatable"
 reason = "RST tests depend on server-side accept path or wire-option parity"
 
-# --- (4) Client-side scripts with option-order / feature drift ---
+# --- (4) MSS / TCP_MAXSEG socket-option + client-mode plumbing ---
 #
-# The remaining client-side scripts in /mss, /connect, /nagle (client)
-# fail because of TCP-option-order drift (engine emits options in a
-# different order than the script expects: 'mss,sackOK,TS,wscale,nop'
-# instead of 'mss,nop,wscale,sackOK,TS') and fcntl O_NONBLOCK flag
-# shape drift. These are small fixes but out of scope for T15.
+# A8.5 Task 5 aligned TX TCP option emission to Linux canonical order
+# (`<MSS, NOP+WScale, SACKP, TS>`). After that landed, the remaining
+# /mss and /connect scripts no longer fail on option-order — each hits
+# a *different* deeper blocker:
+#   - shim client-mode `connect()` not driven: SYN never emitted
+#   - engine SYN-ACK emits TS/SACKP unconditionally (needs mirror of
+#     peer's SYN options), and WScale is buffer-derived, not mirrored
+#   - scripts/defaults.sh / ../common/defaults.sh host-env dependency
+#   - TCP_MAXSEG setsockopt not plumbed through to the engine
+#   - fcntl(O_NONBLOCK) flag-shape drift (pre-connect fcntl plumbing)
+#   - outbound TS-clock sync gap preventing TS ecr matching
+# SKIPPED.md carries the per-script breakdown.
 
 [[rule]]
 matches_regex = ".*/mss/.*\\.pkt"
 verdict = "skipped-untranslatable"
-reason = "SYN option-order drift vs script expectation; engine/shim fix is A8+"
+reason = "MSS/TCP_MAXSEG + client-mode / host-env plumbing gap (post-reorder; see SKIPPED.md)"
 
 [[rule]]
 matches_regex = ".*/connect/.*\\.pkt"
 verdict = "skipped-untranslatable"
-reason = "fcntl(O_NONBLOCK) flag-shape drift; also option-order drift"
+reason = "fcntl(O_NONBLOCK) flag-shape drift (post-reorder; see SKIPPED.md)"
 
 # --- Default fall-through ---
 # No script should hit this in the A7 corpus; anything new gets skipped

@@ -300,17 +300,23 @@ matches_regex = ".*/reset/.*\\.pkt"
 verdict = "skipped-untranslatable"
 reason = "requires scripts/defaults.sh host-env + server-side accept path (A8+)"
 
-# --- (5) Client-side scripts with option-order / feature drift ---
+# --- (5) MSS / TCP_MAXSEG socket-option + client-mode plumbing ---
+#
+# A8.5 Task 5 aligned TX TCP option emission to Linux canonical order.
+# Google's mss scripts still fail post-reorder because they all depend
+# on ../common/defaults.sh (init command exits 127). The /connect
+# scripts fail on fcntl(O_NONBLOCK) flag-shape drift. SKIPPED.md
+# carries the per-script breakdown.
 
 [[rule]]
 matches_regex = ".*/mss/.*\\.pkt"
 verdict = "skipped-untranslatable"
-reason = "SYN option-order drift vs script expectation; engine/shim fix is A8+"
+reason = "../common/defaults.sh host-env dependency (post-reorder; see SKIPPED.md)"
 
 [[rule]]
 matches_regex = ".*/connect/.*\\.pkt"
 verdict = "skipped-untranslatable"
-reason = "fcntl(O_NONBLOCK) flag-shape drift; also option-order drift"
+reason = "fcntl(O_NONBLOCK) flag-shape drift (post-reorder; see SKIPPED.md)"
 
 # --- Default fall-through ---
 # Anything new gets skipped under "awaiting further triage" so the gate

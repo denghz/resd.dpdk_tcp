@@ -139,20 +139,25 @@ Dry-run evidence that drove this floor:
   - testcases/tcp/time_wait/time-wait.pkt — TIME_WAIT reuse / 2*MSL semantics not exercised via shim yet
   - testcases/tcp/ecn/ecn-uses-ect0.pkt — ECN (ECT/CE bits) behavior not modeled
 
-#### MSS / option-order drift (client-side)
+#### MSS / TCP_MAXSEG socket-option + client-mode plumbing
 
-  - testcases/tcp/connect/http-get-nonblocking-ts.pkt — fcntl(O_NONBLOCK) flag-shape drift; also option-order drift
-  - testcases/tcp/mss/mss-getsockopt-tcp_maxseg-client-ts.pkt — SYN option-order drift vs script expectation; engine/shim fix is A8+
-  - testcases/tcp/mss/mss-getsockopt-tcp_maxseg-client.pkt — SYN option-order drift vs script expectation; engine/shim fix is A8+
-  - testcases/tcp/mss/mss-getsockopt-tcp_maxseg-server-advmss-ipv4.pkt — SYN option-order drift vs script expectation; engine/shim fix is A8+
-  - testcases/tcp/mss/mss-getsockopt-tcp_maxseg-server-advmss-ts-ipv4.pkt — SYN option-order drift vs script expectation; engine/shim fix is A8+
-  - testcases/tcp/mss/mss-getsockopt-tcp_maxseg-server-ts.pkt — SYN option-order drift vs script expectation; engine/shim fix is A8+
-  - testcases/tcp/mss/mss-getsockopt-tcp_maxseg-server.pkt — SYN option-order drift vs script expectation; engine/shim fix is A8+
-  - testcases/tcp/mss/mss-getsockopt-tcp_maxseg-server_freebsd.pkt — SYN option-order drift vs script expectation; engine/shim fix is A8+
-  - testcases/tcp/mss/mss-setsockopt-tcp_maxseg-client.pkt — SYN option-order drift vs script expectation; engine/shim fix is A8+
-  - testcases/tcp/mss/mss-setsockopt-tcp_maxseg-client_freebsd.pkt — SYN option-order drift vs script expectation; engine/shim fix is A8+
-  - testcases/tcp/mss/mss-setsockopt-tcp_maxseg-server.pkt — SYN option-order drift vs script expectation; engine/shim fix is A8+
-  - testcases/tcp/mss/mss-setsockopt-tcp_maxseg-server_freebsd.pkt — SYN option-order drift vs script expectation; engine/shim fix is A8+
+Note: A8.5 Task 5 aligned TX TCP option emission to Linux canonical order
+(`<MSS, NOP+WScale, SACKP, TS>`). Post-reorder, each of these scripts still
+fails for a *different*, deeper reason than option-order drift; reasons below
+reflect the real blocker observed after the reorder.
+
+  - testcases/tcp/connect/http-get-nonblocking-ts.pkt — fcntl(O_NONBLOCK) flag-shape drift (expected 2 vs actual 2050); pre-connect fcntl plumbing
+  - testcases/tcp/mss/mss-getsockopt-tcp_maxseg-client-ts.pkt — client-mode `connect()` not driven by shim: SYN never emitted, scripted packet times out
+  - testcases/tcp/mss/mss-getsockopt-tcp_maxseg-client.pkt — client-mode `connect()` not driven by shim: SYN never emitted, scripted packet times out
+  - testcases/tcp/mss/mss-getsockopt-tcp_maxseg-server-advmss-ipv4.pkt — SYN-ACK emits TS unconditionally (script expects no TS when client did not offer it); needs negotiation mirroring
+  - testcases/tcp/mss/mss-getsockopt-tcp_maxseg-server-advmss-ts-ipv4.pkt — engine-side WScale mirrors buffer-derived shift, not peer-offered shift (script expects ws=6 to mirror peer, engine emits ws=3)
+  - testcases/tcp/mss/mss-getsockopt-tcp_maxseg-server-ts.pkt — TS-clock sync gap: live outbound TS val never aligns with scripted ecr, so RX matcher can't infer echo
+  - testcases/tcp/mss/mss-getsockopt-tcp_maxseg-server.pkt — requires scripts/defaults.sh host-env (init command exits 127)
+  - testcases/tcp/mss/mss-getsockopt-tcp_maxseg-server_freebsd.pkt — SYN-ACK emits TS/SACKP unconditionally (script expects neither when client did not offer); needs negotiation mirroring
+  - testcases/tcp/mss/mss-setsockopt-tcp_maxseg-client.pkt — requires scripts/defaults.sh host-env (init command exits 127)
+  - testcases/tcp/mss/mss-setsockopt-tcp_maxseg-client_freebsd.pkt — TCP_MAXSEG setsockopt not plumbed: getsockopt returns 0 instead of user-configured value
+  - testcases/tcp/mss/mss-setsockopt-tcp_maxseg-server.pkt — requires scripts/defaults.sh host-env (init command exits 127)
+  - testcases/tcp/mss/mss-setsockopt-tcp_maxseg-server_freebsd.pkt — TCP_MAXSEG setsockopt not plumbed: getsockopt returns 0 instead of user-configured value
 
 #### Other (wire shape / middleware-layer behavior)
 
@@ -226,17 +231,22 @@ runnable set). Pinned at `SHIVANSH_RUNNABLE_COUNT = 5`.
   - tcp-mechanisms/slow_read_attack/slow-read.pkt — Slow-read-attack scenario needs receive-window-squeeze engine plumbing (A8+)
   - tcp-mechanisms/slow_start/slow-start.pkt — Slow-start exponential growth observability not modeled
 
-### MSS / option-order drift (client-side)
+### MSS / TCP_MAXSEG socket-option + client-mode plumbing
 
-  - socket-api/connect/http-get-nonblocking-ts.pkt — fcntl(O_NONBLOCK) flag-shape drift; also option-order drift
-  - tcp-fsm/mss/mss-getsockopt-tcp_maxseg-client-ts.pkt — SYN option-order drift vs script expectation; engine/shim fix is A8+
-  - tcp-fsm/mss/mss-getsockopt-tcp_maxseg-client.pkt — SYN option-order drift vs script expectation; engine/shim fix is A8+
-  - tcp-fsm/mss/mss-getsockopt-tcp_maxseg-server-advmss-ipv4.pkt — SYN option-order drift vs script expectation; engine/shim fix is A8+
-  - tcp-fsm/mss/mss-getsockopt-tcp_maxseg-server-advmss-ts-ipv4.pkt — SYN option-order drift vs script expectation; engine/shim fix is A8+
-  - tcp-fsm/mss/mss-getsockopt-tcp_maxseg-server-ts.pkt — SYN option-order drift vs script expectation; engine/shim fix is A8+
-  - tcp-fsm/mss/mss-getsockopt-tcp_maxseg-server.pkt — SYN option-order drift vs script expectation; engine/shim fix is A8+
-  - tcp-fsm/mss/mss-setsockopt-tcp_maxseg-client.pkt — SYN option-order drift vs script expectation; engine/shim fix is A8+
-  - tcp-fsm/mss/mss-setsockopt-tcp_maxseg-server.pkt — SYN option-order drift vs script expectation; engine/shim fix is A8+
+Note: A8.5 Task 5 aligned TX TCP option emission to Linux canonical order
+(`<MSS, NOP+WScale, SACKP, TS>`). Post-reorder, each of these scripts still
+fails for a *different*, deeper reason than option-order drift; reasons below
+reflect the real blocker observed after the reorder.
+
+  - socket-api/connect/http-get-nonblocking-ts.pkt — fcntl(O_NONBLOCK) flag-shape drift (expected 2 vs actual 2050); pre-connect fcntl plumbing
+  - tcp-fsm/mss/mss-getsockopt-tcp_maxseg-client-ts.pkt — client-mode `connect()` not driven by shim: SYN never emitted, scripted packet times out
+  - tcp-fsm/mss/mss-getsockopt-tcp_maxseg-client.pkt — client-mode `connect()` not driven by shim: SYN never emitted, scripted packet times out
+  - tcp-fsm/mss/mss-getsockopt-tcp_maxseg-server-advmss-ipv4.pkt — SYN-ACK emits TS unconditionally (script expects no TS when client did not offer it); needs negotiation mirroring
+  - tcp-fsm/mss/mss-getsockopt-tcp_maxseg-server-advmss-ts-ipv4.pkt — engine-side WScale mirrors buffer-derived shift, not peer-offered shift (script expects ws=6 to mirror peer, engine emits ws=3)
+  - tcp-fsm/mss/mss-getsockopt-tcp_maxseg-server-ts.pkt — TS-clock sync gap: live outbound TS val never aligns with scripted ecr, so RX matcher can't infer echo
+  - tcp-fsm/mss/mss-getsockopt-tcp_maxseg-server.pkt — SYN-ACK emits TS/SACKP unconditionally (script expects neither when client did not offer); needs negotiation mirroring
+  - tcp-fsm/mss/mss-setsockopt-tcp_maxseg-client.pkt — TCP_MAXSEG setsockopt not plumbed: getsockopt returns 0 instead of user-configured value
+  - tcp-fsm/mss/mss-setsockopt-tcp_maxseg-server.pkt — TCP_MAXSEG setsockopt not plumbed: getsockopt returns 0 instead of user-configured value
 
 ### Other (wire shape / middleware-layer behavior)
 
@@ -409,11 +419,16 @@ engine tolerate init-script failures), then reclassify.
   - gtests/net/tcp/fastopen/server/sockopt-fastopen-key.pkt — TCP Fast Open (RFC 7413) not implemented in engine
   - gtests/net/tcp/fastopen/server/unread-data-closed-trigger-rst.pkt — TCP Fast Open (RFC 7413) not implemented in engine
 
-### MSS / option-order drift (client-side)
+### MSS / TCP_MAXSEG socket-option + client-mode plumbing
 
-  - gtests/net/tcp/mss/mss-getsockopt-tcp_maxseg-server.pkt — SYN option-order drift vs script expectation; engine/shim fix is A8+
-  - gtests/net/tcp/mss/mss-setsockopt-tcp_maxseg-client.pkt — SYN option-order drift vs script expectation; engine/shim fix is A8+
-  - gtests/net/tcp/mss/mss-setsockopt-tcp_maxseg-server.pkt — SYN option-order drift vs script expectation; engine/shim fix is A8+
+Note: A8.5 Task 5 aligned TX TCP option emission to Linux canonical order
+(`<MSS, NOP+WScale, SACKP, TS>`). Post-reorder, each of these scripts still
+fails for a *different*, deeper reason than option-order drift; reasons below
+reflect the real blocker observed after the reorder.
+
+  - gtests/net/tcp/mss/mss-getsockopt-tcp_maxseg-server.pkt — requires ../common/defaults.sh host-env (init command exits 127)
+  - gtests/net/tcp/mss/mss-setsockopt-tcp_maxseg-client.pkt — requires ../common/defaults.sh host-env (init command exits 127)
+  - gtests/net/tcp/mss/mss-setsockopt-tcp_maxseg-server.pkt — requires ../common/defaults.sh host-env (init command exits 127)
 
 ### Server-side lifecycle — requires scripts/defaults.sh host-env (A8+)
 
