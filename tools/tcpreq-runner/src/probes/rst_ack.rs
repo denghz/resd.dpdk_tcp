@@ -1,28 +1,30 @@
 //! RstAck probe — RFC 9293 §3.10.7.4 Reset processing.
 //! Ported from tcpreq/tests/rst_ack.py::RstAckTest.
 //!
-//! Spec §1.1 A: "RST is processed independently of other flags." A
-//! valid RST in ESTABLISHED MUST close the connection regardless of
-//! whether URG (or other non-error flag combinations) are co-set. The
-//! `tcp.rx_rst` counter MUST bump for every such RST received.
+//! RFC §3.5.3 + §3.10.7.4 say "RST is processed independently of other
+//! flags." We implement that invariant for plain RST — but a `RST|URG`
+//! hits the pre-existing URG-drop ordering at `tcp_input.rs:730`
+//! (always-on per `AD-A8-urg-dropped`) *before* the RST check at `:744`,
+//! so URG short-circuits the close. This probe pins both behaviors:
 //!
-//! The probe runs two scenarios on fresh 3WHS-completed connections:
-//!
-//!   A. Plain RST|ACK — the canonical Reset. Expected: `tcp.rx_rst`
-//!      bumps by exactly 1.
-//!   B. RST|ACK|URG — RST with an incidental URG bit set. Expected:
-//!      still processed as RST; `tcp.rx_rst` bumps by exactly 1 (on
-//!      top of scenario A's bump).
+//!   A. Plain RST|ACK — the canonical Reset. `tcp.rx_rst` bumps by
+//!      exactly 1 and the conn leaves ESTABLISHED.
+//!   B. RST|ACK|URG — per `AD-A8.5-rst-urg-precedence` (spec §6.4), the
+//!      URG-drop ordering fires first. `tcp.rx_rst` still bumps (the
+//!      engine counter fires on flag presence at `engine.rs:3617`,
+//!      before per-state dispatch), `tcp.rx_urgent_dropped` also bumps,
+//!      and the conn stays ESTABLISHED. This probe asserts both counter
+//!      deltas to lock the deviation in.
 //!
 //! Each scenario uses its own listen port + peer port pair so the 3WHS
 //! state machines are fully isolated — scenario B sees a pristine
 //! listen/accept queue even though scenario A already ran.
 //!
-//! Counter-delta assertion (A then B): rx_rst(pre_A) +1 = rx_rst(mid),
-//! rx_rst(mid) +1 = rx_rst(post_B). Exactly-1 bumps (not `>=1`) pin the
-//! invariant that each RST is accounted for once, and that the RST+URG
-//! path doesn't accidentally bump the counter twice via a stray URG
-//! handler.
+//! Counter-delta assertions:
+//!   A: rx_rst(pre_A) +1 = rx_rst(mid)
+//!   B: rx_rst(mid) +1 = rx_rst(post_B); rx_urgent_dropped +1
+//! Exactly-1 bumps (not `>=1`) pin the invariant that each input is
+//! accounted for once.
 //!
 //! The plan's third scenario (RST in SYN_SENT) is deliberately skipped —
 //! already covered by Layer A: `counter-coverage::scen_syn_sent_to_closed_rst`
@@ -72,10 +74,17 @@ pub fn rst_ack_processing() -> ProbeResult {
     }
 
     // ------------------------- Scenario B: RST + URG -----------------------
-    // Spec §1.1 A: "RST is processed independently of other flags." The
-    // URG bit must not gate RST dispatch. A fresh listen port + 3WHS
-    // ensures we're closing a connection that was just established —
-    // the scenario A conn is already in Closed, so it can't also bump.
+    // Pins the `AD-A8.5-rst-urg-precedence` deviation (spec §6.4):
+    // because the URG-drop check at `tcp_input.rs:730` runs *before* the
+    // RST check at `:744`, a peer-sent `RST|URG` is dropped at the top
+    // of `established_rx` and the connection stays in ESTABLISHED. The
+    // engine still bumps `tcp.rx_rst` at `engine.rs:3617` (on flag
+    // presence, before per-state dispatch) AND `tcp.rx_urgent_dropped`.
+    // We assert both deltas to lock in the documented behavior — not
+    // RFC §3.5.3 "RST independent of other flags" (that's the
+    // deviation's reference, not its behavior). Fresh listen port
+    // isolates state from scenario A.
+    let pre_urg = counters.tcp.rx_urgent_dropped.load(Ordering::Relaxed);
     if let Err(reason) = run_one_scenario(
         &h,
         PORT_B,
@@ -88,8 +97,17 @@ pub fn rst_ack_processing() -> ProbeResult {
     let post_rst = counters.tcp.rx_rst.load(Ordering::Relaxed);
     if post_rst != mid_rst + 1 {
         return fail(format!(
-            "scenario B: tcp.rx_rst did not bump by 1 after RST|ACK|URG (engine may be gating RST on !URG): \
+            "scenario B: tcp.rx_rst did not bump by 1 after RST|ACK|URG \
+             (engine may be gating rx_rst on URG, diverging from AD-A8.5-rst-urg-precedence): \
              mid={mid_rst} post={post_rst}"
+        ));
+    }
+    let post_urg = counters.tcp.rx_urgent_dropped.load(Ordering::Relaxed);
+    if post_urg != pre_urg + 1 {
+        return fail(format!(
+            "scenario B: tcp.rx_urgent_dropped did not bump by 1 after RST|ACK|URG \
+             (URG-drop ordering per AD-A8-urg-dropped should fire before RST dispatch): \
+             pre={pre_urg} post={post_urg}"
         ));
     }
 
@@ -97,9 +115,9 @@ pub fn rst_ack_processing() -> ProbeResult {
         clause_id: "Reset-Processing",
         probe_name: "RstAck",
         status: ProbeStatus::Pass,
-        message: "plain RST|ACK and RST|ACK|URG both processed independently of other flags; \
-                  tcp.rx_rst bumped +1 per RST (spec §1.1 A)"
-            .into(),
+        message: "plain RST|ACK closes conn (+1 tcp.rx_rst); RST|ACK|URG is URG-dropped per \
+                  AD-A8.5-rst-urg-precedence (+1 tcp.rx_rst AND +1 tcp.rx_urgent_dropped; \
+                  conn stays ESTABLISHED)".into(),
     }
 }
 

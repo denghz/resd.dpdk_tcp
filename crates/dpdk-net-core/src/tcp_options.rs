@@ -2,18 +2,21 @@
 //! MSS (RFC 6691), Window Scale + Timestamps (RFC 7323),
 //! SACK-permitted + SACK blocks (RFC 2018).
 //!
-//! Encoder (this file's first half) emits options in Linux canonical
-//! order — `<MSS, NOP+WScale, SACKP, TS, NOPs+SACK blocks>` — matching
-//! `net/ipv4/tcp_output.c::tcp_options_write` so packetdrill corpora
-//! that hand-craft `tcp.opt(...)` assertions against Linux wire shape
-//! match byte-for-byte. RFC 9293 §3.2 is order-agnostic, so the
-//! ordering is corpus-compatibility alignment, not a semantic
-//! requirement. NOPs are embedded where needed to land each group on
-//! a 4-byte word boundary. Decoder (Task 4) parses bytes back into the
-//! same `TcpOpts` representation and remains order-agnostic. Malformed
-//! input (runaway len, wrong-length known options) is rejected at
-//! parse time and bumps `tcp.rx_bad_option`; see `parse_options`'s
-//! return type `Result<TcpOpts, OptionParseError>`.
+//! Encoder emits `<MSS, NOP+WScale, SACKP, TS, NOPs+SACK blocks>` to
+//! match the shivansh + ligurio packetdrill corpus SYN-ACK wire shape
+//! byte-for-byte. Per `AD-A8.5-tx-wscale-position` (spec §6.4), this
+//! places WSCALE second (right after MSS) rather than last. Modern
+//! Linux `net/ipv4/tcp_output.c::tcp_options_write`, Google packetdrill
+//! upstream, and mTCP all emit WSCALE LAST in `<MSS, SACKP, TS, NOP+WSCALE>`
+//! order — we deliberately chose the corpus-compatible order because
+//! shivansh + ligurio are our Layer-B unlock path. RFC 9293 §3.2 is
+//! receiver-order-agnostic, so both orderings are RFC-compliant. NOPs
+//! are embedded where needed to land each group on a 4-byte word
+//! boundary. Decoder (Task 4) parses bytes back into the same `TcpOpts`
+//! representation and remains order-agnostic. Malformed input (runaway
+//! len, wrong-length known options) is rejected at parse time and bumps
+//! `tcp.rx_bad_option`; see `parse_options`'s return type
+//! `Result<TcpOpts, OptionParseError>`.
 
 // TCP option kinds per IANA.
 pub const OPT_END: u8 = 0;
