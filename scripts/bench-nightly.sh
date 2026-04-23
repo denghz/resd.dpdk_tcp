@@ -119,13 +119,38 @@ log "[4/12] provisioning bench-pair fleet via resd-aws-infra"
 OPERATOR_CIDR="${MY_CIDR:-$(curl -fsS https://ifconfig.me)/32}"
 log "  operator-ssh-cidr=$OPERATOR_CIDR"
 
-STACK_JSON="$(resd-aws-infra setup bench-pair \
-    --operator-ssh-cidr "$OPERATOR_CIDR" --json)"
+# The resd-aws-infra CLI internally shells out to `cdk deploy`, which
+# needs cdk.json + app.py at the CWD root. Those live in the sister
+# repo. Wrap every CLI call in a `( cd "$RESD_INFRA_DIR" && ... )`
+# subshell so the rest of the orchestrator keeps its $PWD.
+RESD_INFRA_DIR="${RESD_INFRA_DIR:-$HOME/resd.aws-infra-setup}"
+
+# Resolve AMI_ID. The CLI's default-from-cdk.json path reads relative
+# to its CWD, which IS $RESD_INFRA_DIR once we cd there — but we pass
+# --ami-id explicitly anyway so $AMI_ID env override works cleanly and
+# the log line documents the chosen AMI for reproducibility.
+AMI_ID_ARG=()
+if [ -n "${AMI_ID:-}" ]; then
+  AMI_ID_ARG=(--ami-id "$AMI_ID")
+  log "  ami-id=$AMI_ID (from env)"
+elif [ -f "$RESD_INFRA_DIR/cdk.json" ]; then
+  CDK_AMI="$(jq -r '.context."default-ami-id" // empty' "$RESD_INFRA_DIR/cdk.json")"
+  if [ -n "$CDK_AMI" ] && [ "$CDK_AMI" != "null" ]; then
+    AMI_ID_ARG=(--ami-id "$CDK_AMI")
+    log "  ami-id=$CDK_AMI (from $RESD_INFRA_DIR/cdk.json)"
+  fi
+fi
+
+STACK_JSON="$(
+  cd "$RESD_INFRA_DIR" && \
+  resd-aws-infra setup bench-pair \
+      --operator-ssh-cidr "$OPERATOR_CIDR" "${AMI_ID_ARG[@]}" --json
+)"
 
 # Teardown on exit. Honour SKIP_TEARDOWN=1 for debug sessions.
 teardown_fleet() {
   if [ "${SKIP_TEARDOWN:-0}" != 1 ]; then
-    resd-aws-infra teardown bench-pair --wait || true
+    ( cd "$RESD_INFRA_DIR" && resd-aws-infra teardown bench-pair --wait ) || true
   else
     log "SKIP_TEARDOWN=1; leaving stack up"
   fi
