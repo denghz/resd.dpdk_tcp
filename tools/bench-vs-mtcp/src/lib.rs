@@ -27,6 +27,7 @@ pub mod dpdk_burst;
 pub mod dpdk_maxtp;
 pub mod maxtp;
 pub mod mtcp;
+pub mod peer_introspect;
 pub mod preflight;
 
 /// Stack identifier for CSV `dimensions_json` + runner dispatch.

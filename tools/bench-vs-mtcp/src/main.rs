@@ -178,6 +178,16 @@ struct Args {
     /// pass `--nic-max-bps 100000000000`.
     #[arg(long)]
     nic_max_bps: Option<u64>,
+
+    /// Peer SSH target (e.g. `ubuntu@10.0.0.2`) for pre-run peer
+    /// receive-window introspection (`ss -ti | rcv_space`). When
+    /// unset, the pre-run `peer_rwnd` guard degrades to the T12
+    /// placebo (peer_rwnd := bucket burst/write size) — a WARN is
+    /// emitted on stderr so nightly runs record the degraded check
+    /// rather than silently passing. Supplying this argument wires
+    /// the real introspection path (A10 Plan B T15-B / T12-I4).
+    #[arg(long)]
+    peer_ssh: Option<String>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -337,6 +347,45 @@ fn resolve_nic_max_bps(flag: Option<u64>) -> Option<u64> {
     }
 }
 
+/// Resolve the peer's advertised receive window for the pre-run guard.
+///
+/// A10 Plan B T15-B / T12-I4: when `peer_ssh` is supplied, shell out
+/// and parse `ss -ti | rcv_space` on the peer host. If the arg is
+/// unset OR the SSH probe fails (network glitch, ss returns nothing
+/// yet because the connection setup races the probe, malformed
+/// output), fall back to the T12 placebo `placebo_rwnd` (caller passes
+/// the bucket's K/W in bytes) and emit a WARN to stderr. The WARN
+/// line is what nightly log captures so operators can distinguish
+/// "guard really passed" from "guard degraded to placebo".
+///
+/// Returns u64 to match `check_peer_window`'s signature; the u32
+/// result from the parser is widened to avoid any u32→u64 conversion
+/// at the call sites.
+fn resolve_peer_rwnd_bytes(
+    peer_ssh: Option<&str>,
+    peer_port: u16,
+    placebo_rwnd: u64,
+) -> u64 {
+    let Some(ssh) = peer_ssh else {
+        eprintln!(
+            "bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check \
+             degraded to placebo ({placebo_rwnd} B)"
+        );
+        return placebo_rwnd;
+    };
+    match bench_vs_mtcp::peer_introspect::fetch_peer_rwnd_bytes(ssh, peer_port) {
+        Ok(v) => v as u64,
+        Err(e) => {
+            eprintln!(
+                "bench-vs-mtcp: WARN peer_rwnd introspection via `ss -ti` \
+                 on {ssh}:{peer_port} failed: {e}; falling back to placebo \
+                 ({placebo_rwnd} B)"
+            );
+            placebo_rwnd
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // dpdk_net grid driver.
 // ---------------------------------------------------------------------------
@@ -385,15 +434,17 @@ fn run_burst_grid_dpdk<W: std::io::Write>(
 
         // Pre-run check (1): peer receive window.
         //
-        // TODO(T15): peer-introspected rwnd. The peer's advertised
-        // receive window is not exposed by the engine's public API in
-        // T12, so we plug `peer_rwnd = K` which makes the guard a
-        // tautology (`K >= K`). This is a placebo-pass until Task 15
-        // wires peer-host introspection (parsing the last observed
-        // ACK's window field, scaled, or an out-of-band peer stats
-        // hook). The CSV row still carries the intent; the reason
-        // string on any future real failure will be meaningful.
-        let peer_rwnd = bucket.burst_bytes; // Placebo; see T15 TODO.
+        // A10 Plan B T15-B / T12-I4: if `--peer-ssh` is set, shell out
+        // to the peer and parse `ss -ti | rcv_space` for the real
+        // kernel-side advertised receive window. If unset OR the SSH
+        // probe fails, fall back to the T12 placebo (peer_rwnd := K)
+        // and emit a WARN — nightly runs record the degraded check
+        // rather than silently passing.
+        let peer_rwnd = resolve_peer_rwnd_bytes(
+            args.peer_ssh.as_deref(),
+            peer_port,
+            bucket.burst_bytes,
+        );
         let rwnd_verdict = check_peer_window(peer_rwnd, bucket.burst_bytes);
 
         // Pre-run check (3): NIC saturation is only knowable post-
@@ -619,13 +670,14 @@ fn run_maxtp_grid_dpdk<W: std::io::Write>(
         let mss_verdict =
             check_mss_and_burst_agreement(args.mss, args.mss, 32, 32);
 
-        // Pre-run check (1): peer receive window. Same T15 TODO as the
-        // burst path — peer_rwnd introspection lands with the harness
-        // + peer integration in Task 15. The per-conn `W` bound is a
-        // placebo-pass (W <= peer_rwnd is always true when we use W
-        // itself as the peer_rwnd estimate). Real peer rwnd discovery
-        // parses the last observed ACK's scaled window.
-        let peer_rwnd = bucket.write_bytes; // Placebo; see T15 TODO.
+        // Pre-run check (1): peer receive window. A10 Plan B T15-B /
+        // T12-I4 wires real peer-side introspection — see the mirror
+        // call in `run_burst_grid_dpdk` above for the contract.
+        let peer_rwnd = resolve_peer_rwnd_bytes(
+            args.peer_ssh.as_deref(),
+            peer_port,
+            bucket.write_bytes,
+        );
         let rwnd_verdict = check_peer_window(peer_rwnd, bucket.write_bytes);
 
         let verdict = if !mss_verdict.is_ok() {

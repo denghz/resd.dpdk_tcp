@@ -65,6 +65,7 @@
 
 use std::collections::HashMap;
 use std::io::Cursor;
+use std::net::Ipv4Addr;
 
 use pcap_file::pcap::{PcapHeader, PcapPacket, PcapReader, PcapWriter};
 
@@ -106,6 +107,110 @@ pub enum CanonError {
     Pcap(#[from] pcap_file::PcapError),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    /// A SACK option block walker encountered an option whose length
+    /// byte is malformed. SACK option bodies (after the 2-byte kind/len
+    /// header) are a multiple of 8 bytes (one or more `(left, right)`
+    /// 4+4-byte blocks). `len - 2` not divisible by 8 is an on-wire bug.
+    #[error("malformed SACK option: body length {body_len} is not a multiple of 8")]
+    MalformedSackOption { body_len: usize },
+}
+
+/// Parsed Ethernet + IPv4 + TCP offsets and header fields for a single
+/// frame. Produced by [`parse_l2l3l4`] and consumed by both the pin-
+/// discovery pass and the rewrite pass — sharing the parser eliminates
+/// the bounds-check duplication that used to live in each walker.
+#[derive(Debug)]
+pub(crate) struct FrameOffsets {
+    /// Byte offset of the TCP header within the frame.
+    pub tcp_off: usize,
+    /// Byte length of the TCP header (20..60, always a multiple of 4).
+    pub tcp_data_off: usize,
+    /// IPv4 source address.
+    pub src_ip: Ipv4Addr,
+    /// TCP source port.
+    pub src_port: u16,
+    /// IPv4 destination address.
+    pub dst_ip: Ipv4Addr,
+    /// TCP destination port.
+    pub dst_port: u16,
+    /// IPv4 total length in bytes (including IP header).
+    pub ip_total_len: usize,
+    /// TCP flags byte (at `tcp_off + 13`).
+    pub flags: u8,
+    /// TCP sequence number.
+    pub seq: u32,
+    /// TCP acknowledgement number.
+    pub ack: u32,
+}
+
+/// Shared Ethernet + IPv4 + TCP parser. Returns `Some(FrameOffsets)`
+/// when the frame has a well-formed L2/L3/L4 chain, `None` otherwise.
+/// Non-IPv4 ethertypes, non-TCP IPv4 payloads, and any bounds-check
+/// failure produce `None`; callers skip such frames (pass-1 doesn't
+/// pin anything from them, pass-2 leaves them byte-identical).
+pub(crate) fn parse_l2l3l4(data: &[u8]) -> Option<FrameOffsets> {
+    // 14-byte Ethernet header — anything shorter is a truncated capture.
+    if data.len() < 14 {
+        return None;
+    }
+    let ethertype = u16::from_be_bytes([data[12], data[13]]);
+    if ethertype != ETHERTYPE_IPV4 {
+        return None;
+    }
+    // IPv4 header starts at offset 14.
+    if data.len() < 14 + 20 {
+        return None;
+    }
+    let ihl = (data[14] & 0x0F) as usize * 4;
+    if ihl < 20 || data.len() < 14 + ihl {
+        return None;
+    }
+    let proto = data[14 + 9];
+    if proto != IPPROTO_TCP {
+        return None;
+    }
+    let src_ip = Ipv4Addr::new(data[14 + 12], data[14 + 13], data[14 + 14], data[14 + 15]);
+    let dst_ip = Ipv4Addr::new(data[14 + 16], data[14 + 17], data[14 + 18], data[14 + 19]);
+    let ip_total_len = u16::from_be_bytes([data[14 + 2], data[14 + 3]]) as usize;
+    if 14 + ip_total_len > data.len() {
+        return None;
+    }
+    // TCP header at offset 14 + ihl.
+    let tcp_off = 14 + ihl;
+    if tcp_off + 20 > data.len() {
+        return None;
+    }
+    let src_port = u16::from_be_bytes([data[tcp_off], data[tcp_off + 1]]);
+    let dst_port = u16::from_be_bytes([data[tcp_off + 2], data[tcp_off + 3]]);
+    let tcp_data_off = ((data[tcp_off + 12] >> 4) & 0x0F) as usize * 4;
+    if tcp_data_off < 20 || tcp_off + tcp_data_off > 14 + ip_total_len {
+        return None;
+    }
+    let flags = data[tcp_off + 13];
+    let seq = u32::from_be_bytes([
+        data[tcp_off + 4],
+        data[tcp_off + 5],
+        data[tcp_off + 6],
+        data[tcp_off + 7],
+    ]);
+    let ack = u32::from_be_bytes([
+        data[tcp_off + 8],
+        data[tcp_off + 9],
+        data[tcp_off + 10],
+        data[tcp_off + 11],
+    ]);
+    Some(FrameOffsets {
+        tcp_off,
+        tcp_data_off,
+        src_ip,
+        src_port,
+        dst_ip,
+        dst_port,
+        ip_total_len,
+        flags,
+        seq,
+        ack,
+    })
 }
 
 /// Rewrite every IPv4 / TCP packet in `pcap_bytes` per `opts`,
@@ -133,7 +238,7 @@ pub fn canonicalize_pcap(
         let mut reader = PcapReader::new(cursor)?;
         while let Some(pkt) = reader.next_packet() {
             let pkt = pkt?;
-            discover_pins(&pkt.data, &mut state);
+            discover_pins(&pkt.data, &mut state)?;
         }
     }
 
@@ -145,12 +250,18 @@ pub fn canonicalize_pcap(
     let mut out_buf: Vec<u8> = Vec::with_capacity(pcap_bytes.len());
     {
         let mut writer = PcapWriter::with_header(&mut out_buf, in_header)?;
+        // Pass-2 replays the connection-instance counter by tracking how
+        // many SYNs we've seen on each sorted 4-tuple up to (and
+        // including) the current packet — matching the pass-1 walk
+        // order so each (tuple, instance) lookup resolves to the same
+        // FlowInstance row.
+        let mut pass2_instance_counter: HashMap<ConnTuple, u32> = HashMap::new();
         while let Some(pkt) = reader.next_packet() {
             let pkt = pkt?;
             let ts = pkt.timestamp;
             let orig_len = pkt.orig_len;
             let mut data = pkt.data.into_owned();
-            rewrite_frame(&mut data, opts, &state);
+            rewrite_frame(&mut data, opts, &state, &mut pass2_instance_counter)?;
             let out_pkt = PcapPacket::new_owned(ts, orig_len, data);
             writer.write_packet(&out_pkt)?;
         }
@@ -158,108 +269,108 @@ pub fn canonicalize_pcap(
     Ok(out_buf)
 }
 
-/// Pass 1 walker: note the ISS (first seq seen per direction) and TS
-/// base (first TSval seen per direction) without rewriting. Shares
-/// the frame walker with `rewrite_frame`; factored as a separate
-/// function so the rewrite path can take `&FlowState` instead of
-/// `&mut` and stay read-only.
-fn discover_pins(data: &[u8], state: &mut FlowState) {
-    // Same parse guards as rewrite_frame. Any failed guard drops the
-    // packet from the pin-discovery walk (consistent with the rewrite
-    // path skipping it too).
-    if data.len() < 14 {
-        return;
+/// Pass 1 walker: note the ISS (first seq seen per direction +
+/// connection instance) and TS base (first TSval seen per direction)
+/// without rewriting.
+///
+/// Connection-instance discrimination (T9-I2): the sorted 4-tuple
+/// alone is insufficient — if the same 4-tuple is reused in the same
+/// pcap (e.g. TIME-WAIT port reuse, or two back-to-back flows that
+/// happen to reuse the same source port), the first-seen SYN's ISS
+/// would pin every subsequent SYN's seq and produce garbage rewrites.
+/// We bump a per-tuple SYN-observation counter: every SYN increments
+/// the instance counter for that tuple, and the key becomes
+/// `(tuple, instance)`. Packets without a SYN preceding them on the
+/// tuple (e.g. mid-stream captures, or the first flow's data segments
+/// before its SYN has been accounted for) bind to the current instance
+/// for the tuple (0 if none yet).
+fn discover_pins(data: &[u8], state: &mut FlowState) -> Result<(), CanonError> {
+    // Any failed guard drops the packet from the pin-discovery walk
+    // (consistent with the rewrite path skipping it too).
+    let Some(frame) = parse_l2l3l4(data) else {
+        return Ok(());
+    };
+    let (tuple, is_low) = classify_direction(
+        frame.src_ip,
+        frame.src_port,
+        frame.dst_ip,
+        frame.dst_port,
+    );
+
+    // SYN observations bump the per-tuple instance counter *before*
+    // recording the ISS, so each SYN lands in its own slot.
+    if (frame.flags & TCP_FLAG_SYN) != 0 && (frame.flags & TCP_FLAG_ACK) == 0 {
+        // A pure SYN opens a new connection instance. Bump for every
+        // active-opener SYN; passive-side SYN-ACKs do NOT bump (they
+        // belong to the opener's existing instance).
+        let counter = state.syn_count.entry(tuple).or_insert(0);
+        *counter += 1;
     }
-    let ethertype = u16::from_be_bytes([data[12], data[13]]);
-    if ethertype != ETHERTYPE_IPV4 {
-        return;
-    }
-    if data.len() < 14 + 20 {
-        return;
-    }
-    let ihl = (data[14] & 0x0F) as usize * 4;
-    if ihl < 20 || data.len() < 14 + ihl {
-        return;
-    }
-    let proto = data[14 + 9];
-    if proto != IPPROTO_TCP {
-        return;
-    }
-    let src_ip = u32::from_be_bytes([data[14 + 12], data[14 + 13], data[14 + 14], data[14 + 15]]);
-    let dst_ip = u32::from_be_bytes([data[14 + 16], data[14 + 17], data[14 + 18], data[14 + 19]]);
-    let ip_total_len = u16::from_be_bytes([data[14 + 2], data[14 + 3]]) as usize;
-    if 14 + ip_total_len > data.len() {
-        return;
-    }
-    let tcp_off = 14 + ihl;
-    if tcp_off + 20 > data.len() {
-        return;
-    }
-    let src_port = u16::from_be_bytes([data[tcp_off], data[tcp_off + 1]]);
-    let dst_port = u16::from_be_bytes([data[tcp_off + 2], data[tcp_off + 3]]);
-    let tcp_data_off = ((data[tcp_off + 12] >> 4) & 0x0F) as usize * 4;
-    if tcp_data_off < 20 || tcp_off + tcp_data_off > 14 + ip_total_len {
-        return;
-    }
-    let seq = u32::from_be_bytes([
-        data[tcp_off + 4],
-        data[tcp_off + 5],
-        data[tcp_off + 6],
-        data[tcp_off + 7],
-    ]);
-    let (dir_key, is_low) = classify_direction(src_ip, src_port, dst_ip, dst_port);
-    // First seq observed on this direction pins the ISS. We don't
-    // privilege SYN here — a mid-stream capture has no SYN for at
-    // least one side, and anchoring to the first-seen seq gives a
-    // deterministic pin for both inputs.
-    state.iss.entry((dir_key, is_low)).or_insert(seq);
+    let instance = state.syn_count.get(&tuple).copied().unwrap_or(0);
+
+    let inst_key = FlowKey {
+        tuple,
+        instance,
+        is_low,
+    };
+    // First seq observed on this direction + instance pins the ISS.
+    // We don't privilege SYN here — a mid-stream capture has no SYN
+    // for at least one side, and anchoring to the first-seen seq
+    // gives a deterministic pin for both inputs.
+    state.iss.entry(inst_key).or_insert(frame.seq);
 
     // Walk options for TSval — only needed to pin the base.
-    if tcp_data_off > 20 {
-        let opts_slice = &data[tcp_off + 20..tcp_off + tcp_data_off];
-        let mut i = 0;
-        while i < opts_slice.len() {
-            let kind = opts_slice[i];
-            if kind == 0 {
-                break;
+    if frame.tcp_data_off > 20 {
+        let opts_slice = &data[frame.tcp_off + 20..frame.tcp_off + frame.tcp_data_off];
+        walk_options(opts_slice, |kind, body| {
+            if kind == OptionKind::Timestamps && body.len() == 8 {
+                let tsval =
+                    u32::from_be_bytes([body[0], body[1], body[2], body[3]]);
+                state.ts_base.entry(inst_key).or_insert(tsval);
             }
-            if kind == 1 {
-                i += 1;
-                continue;
-            }
-            if i + 1 >= opts_slice.len() {
-                break;
-            }
-            let len = opts_slice[i + 1] as usize;
-            if len < 2 || i + len > opts_slice.len() {
-                break;
-            }
-            if kind == 8 && len == 10 {
-                let tsval = u32::from_be_bytes([
-                    opts_slice[i + 2],
-                    opts_slice[i + 3],
-                    opts_slice[i + 4],
-                    opts_slice[i + 5],
-                ]);
-                state.ts_base.entry((dir_key, is_low)).or_insert(tsval);
-            }
-            i += len;
-        }
+        })?;
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// Per-flow state — observed ISS + TSval base per direction.
+// Per-flow state — observed ISS + TSval base per direction + connection
+// instance.
 // ---------------------------------------------------------------------------
 
 #[derive(Default)]
 struct FlowState {
-    /// Per-direction observed-ISS pins. Direction is the sorted-tuple
-    /// key — see `direction_key`. `(key, is_low)` maps to the ISS for
-    /// the side that sent the first SYN in that direction.
-    iss: HashMap<(DirectionKey, bool), u32>,
-    /// Per-direction observed-TSval base.
-    ts_base: HashMap<(DirectionKey, bool), u32>,
+    /// Per-direction + per-instance observed-ISS pins. The key
+    /// bundles the sorted 4-tuple, the connection-instance counter
+    /// (bumped on each pure SYN for the tuple), and the side flag.
+    /// See [`FlowKey`] for the exact key shape.
+    iss: HashMap<FlowKey, u32>,
+    /// Per-direction + per-instance observed-TSval base.
+    ts_base: HashMap<FlowKey, u32>,
+    /// Per-tuple SYN-observation counter. The value reflects the
+    /// *current* instance number for the tuple; incremented on each
+    /// pure SYN observed during pass 1. Used as the `instance` field
+    /// when building [`FlowKey`]. Pass-2 replays this in
+    /// `canonicalize_pcap` using a separate counter keyed by the same
+    /// tuple shape.
+    syn_count: HashMap<ConnTuple, u32>,
+}
+
+/// Full flow-state key: sorted 4-tuple + instance counter + side flag.
+///
+/// Separated from [`ConnTuple`] so the map value lookup is bit-wise
+/// identical to "the ISS / TS base for *this* connection instance on
+/// *this* side", and so pass-2's instance counter only needs the
+/// tuple key shape.
+#[derive(Hash, PartialEq, Eq, Clone, Copy)]
+struct FlowKey {
+    tuple: ConnTuple,
+    /// 0-based connection-instance counter — how many pure SYNs on
+    /// this tuple have been observed at or before this packet.
+    instance: u32,
+    /// `true` means the packet was sent by the lex-smaller endpoint
+    /// (source matches `low`).
+    is_low: bool,
 }
 
 /// Connection identifier independent of direction. Built by sorting
@@ -267,46 +378,171 @@ struct FlowState {
 /// alongside this key indicates which side of the sorted pair the
 /// packet originates from.
 #[derive(Hash, PartialEq, Eq, Clone, Copy)]
-struct DirectionKey {
-    /// Lex-smaller (src_ip, src_port) pair, in network-byte-order.
-    low_ip: u32,
+struct ConnTuple {
+    /// Lex-smaller (src_ip, src_port) pair, in host order via
+    /// `Ipv4Addr`.
+    low_ip: Ipv4Addr,
     low_port: u16,
-    /// Lex-larger (dst_ip, dst_port) pair, in network-byte-order.
-    high_ip: u32,
+    /// Lex-larger (dst_ip, dst_port) pair.
+    high_ip: Ipv4Addr,
     high_port: u16,
 }
 
-/// Build the direction key + `is_low` flag. `is_low = true` means the
-/// packet was sent by the lex-smaller endpoint (source matches `low`).
+/// Build the tuple + `is_low` flag. `is_low = true` means the packet
+/// was sent by the lex-smaller endpoint (source matches `low`).
 fn classify_direction(
-    src_ip: u32,
+    src_ip: Ipv4Addr,
     src_port: u16,
-    dst_ip: u32,
+    dst_ip: Ipv4Addr,
     dst_port: u16,
-) -> (DirectionKey, bool) {
-    let s = (src_ip, src_port);
-    let d = (dst_ip, dst_port);
+) -> (ConnTuple, bool) {
+    let s = (src_ip.octets(), src_port);
+    let d = (dst_ip.octets(), dst_port);
     if s <= d {
         (
-            DirectionKey {
-                low_ip: s.0,
-                low_port: s.1,
-                high_ip: d.0,
-                high_port: d.1,
+            ConnTuple {
+                low_ip: src_ip,
+                low_port: src_port,
+                high_ip: dst_ip,
+                high_port: dst_port,
             },
             true,
         )
     } else {
         (
-            DirectionKey {
-                low_ip: d.0,
-                low_port: d.1,
-                high_ip: s.0,
-                high_port: s.1,
+            ConnTuple {
+                low_ip: dst_ip,
+                low_port: dst_port,
+                high_ip: src_ip,
+                high_port: src_port,
             },
             false,
         )
     }
+}
+
+// ---------------------------------------------------------------------------
+// TCP options walker — shared by pass-1 (discovery) and pass-2 (rewrite).
+// ---------------------------------------------------------------------------
+
+/// Option-kind tags for the TCP options walker. Only the kinds we
+/// actually look at by name are listed; unknown kinds flow through
+/// untouched via their length byte.
+#[allow(dead_code)] // surface for future kinds; MSS/WS/SACKPerm aren't rewritten today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OptionKind {
+    EndOfOptions,
+    Nop,
+    Mss,
+    WindowScale,
+    SackPermitted,
+    Sack,
+    Timestamps,
+    Other(u8),
+}
+
+const OPT_KIND_EOL: u8 = 0;
+const OPT_KIND_NOP: u8 = 1;
+const OPT_KIND_MSS: u8 = 2;
+const OPT_KIND_WSCALE: u8 = 3;
+const OPT_KIND_SACK_PERM: u8 = 4;
+const OPT_KIND_SACK: u8 = 5;
+const OPT_KIND_TIMESTAMPS: u8 = 8;
+
+impl OptionKind {
+    fn from_raw(kind: u8) -> Self {
+        match kind {
+            OPT_KIND_EOL => OptionKind::EndOfOptions,
+            OPT_KIND_NOP => OptionKind::Nop,
+            OPT_KIND_MSS => OptionKind::Mss,
+            OPT_KIND_WSCALE => OptionKind::WindowScale,
+            OPT_KIND_SACK_PERM => OptionKind::SackPermitted,
+            OPT_KIND_SACK => OptionKind::Sack,
+            OPT_KIND_TIMESTAMPS => OptionKind::Timestamps,
+            other => OptionKind::Other(other),
+        }
+    }
+}
+
+/// Walk an immutable TCP options slice and invoke `visitor` on each
+/// variable-length option's body (the bytes *after* the 2-byte
+/// kind/len header). No-op options (`NOP = kind 1`) and the end-of-
+/// options marker (`EOL = kind 0`) are handled here; they never call
+/// the visitor. Truncated option tails silently stop the walk
+/// (matches the legacy behaviour; option parsers MUST NOT crash on
+/// garbage input).
+///
+/// SACK blocks are the one option we surface a hard error for: if
+/// the body length isn't a multiple of 8, we return
+/// `CanonError::MalformedSackOption` rather than silently truncating,
+/// because mis-parsed SACK blocks produce garbage seq-space rewrites
+/// downstream (T9 minor).
+fn walk_options<F>(opts_slice: &[u8], mut visitor: F) -> Result<(), CanonError>
+where
+    F: FnMut(OptionKind, &[u8]),
+{
+    let mut i = 0;
+    while i < opts_slice.len() {
+        let kind = opts_slice[i];
+        if kind == OPT_KIND_EOL {
+            break;
+        }
+        if kind == OPT_KIND_NOP {
+            i += 1;
+            continue;
+        }
+        if i + 1 >= opts_slice.len() {
+            break;
+        }
+        let len = opts_slice[i + 1] as usize;
+        if len < 2 || i + len > opts_slice.len() {
+            break;
+        }
+        let body = &opts_slice[i + 2..i + len];
+        if kind == OPT_KIND_SACK && !body.len().is_multiple_of(8) {
+            return Err(CanonError::MalformedSackOption {
+                body_len: body.len(),
+            });
+        }
+        visitor(OptionKind::from_raw(kind), body);
+        i += len;
+    }
+    Ok(())
+}
+
+/// Mutable-slice variant of [`walk_options`]. The visitor receives a
+/// `&mut [u8]` view of each option's body and can rewrite in place.
+fn walk_options_mut<F>(opts_slice: &mut [u8], mut visitor: F) -> Result<(), CanonError>
+where
+    F: FnMut(OptionKind, &mut [u8]),
+{
+    let mut i = 0;
+    while i < opts_slice.len() {
+        let kind = opts_slice[i];
+        if kind == OPT_KIND_EOL {
+            break;
+        }
+        if kind == OPT_KIND_NOP {
+            i += 1;
+            continue;
+        }
+        if i + 1 >= opts_slice.len() {
+            break;
+        }
+        let len = opts_slice[i + 1] as usize;
+        if len < 2 || i + len > opts_slice.len() {
+            break;
+        }
+        if kind == OPT_KIND_SACK && !(len - 2).is_multiple_of(8) {
+            return Err(CanonError::MalformedSackOption {
+                body_len: len - 2,
+            });
+        }
+        let body = &mut opts_slice[i + 2..i + len];
+        visitor(OptionKind::from_raw(kind), body);
+        i += len;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -316,70 +552,62 @@ fn classify_direction(
 const ETHERTYPE_IPV4: u16 = 0x0800;
 const IPPROTO_TCP: u8 = 6;
 const TCP_FLAG_ACK: u8 = 0x10;
+const TCP_FLAG_SYN: u8 = 0x02;
 
-fn rewrite_frame(data: &mut [u8], opts: &CanonicalizationOptions, state: &FlowState) {
-    // 14-byte Ethernet header; anything shorter is a truncated capture
-    // and we pass through (canonicalisation is lossless for unparseable
-    // frames).
-    if data.len() < 14 {
-        return;
-    }
-    let ethertype = u16::from_be_bytes([data[12], data[13]]);
-    if ethertype != ETHERTYPE_IPV4 {
-        return;
-    }
+fn rewrite_frame(
+    data: &mut [u8],
+    opts: &CanonicalizationOptions,
+    state: &FlowState,
+    instance_counter: &mut HashMap<ConnTuple, u32>,
+) -> Result<(), CanonError> {
+    let Some(frame) = parse_l2l3l4(data) else {
+        return Ok(());
+    };
+    let FrameOffsets {
+        tcp_off,
+        tcp_data_off,
+        src_ip,
+        src_port,
+        dst_ip,
+        dst_port,
+        ip_total_len,
+        flags,
+        seq,
+        ack,
+    } = frame;
 
-    // IPv4 header starts at offset 14.
-    if data.len() < 14 + 20 {
-        return;
-    }
-    let ihl = (data[14] & 0x0F) as usize * 4;
-    if ihl < 20 || data.len() < 14 + ihl {
-        return;
-    }
-    let proto = data[14 + 9];
-    if proto != IPPROTO_TCP {
-        return;
-    }
-    let src_ip = u32::from_be_bytes([data[14 + 12], data[14 + 13], data[14 + 14], data[14 + 15]]);
-    let dst_ip = u32::from_be_bytes([data[14 + 16], data[14 + 17], data[14 + 18], data[14 + 19]]);
-    let ip_total_len = u16::from_be_bytes([data[14 + 2], data[14 + 3]]) as usize;
-    if 14 + ip_total_len > data.len() {
-        // Truncated L3 payload; leave alone.
-        return;
-    }
+    let (tuple, is_low) = classify_direction(src_ip, src_port, dst_ip, dst_port);
 
-    // TCP header at offset 14 + ihl.
-    let tcp_off = 14 + ihl;
-    if tcp_off + 20 > data.len() {
-        return;
+    // Replay the per-SYN instance bump the same way pass-1 did. A
+    // pure SYN opens a new instance; a SYN+ACK (or any other flag
+    // combination) does not. This keeps pass-2's FlowKey lookups
+    // aligned with pass-1's stored pins.
+    if (flags & TCP_FLAG_SYN) != 0 && (flags & TCP_FLAG_ACK) == 0 {
+        let counter = instance_counter.entry(tuple).or_insert(0);
+        *counter += 1;
     }
-    let src_port = u16::from_be_bytes([data[tcp_off], data[tcp_off + 1]]);
-    let dst_port = u16::from_be_bytes([data[tcp_off + 2], data[tcp_off + 3]]);
-    let tcp_data_off = ((data[tcp_off + 12] >> 4) & 0x0F) as usize * 4;
-    if tcp_data_off < 20 || tcp_off + tcp_data_off > 14 + ip_total_len {
-        return;
-    }
-    let flags = data[tcp_off + 13];
-    let seq =
-        u32::from_be_bytes([data[tcp_off + 4], data[tcp_off + 5], data[tcp_off + 6], data[tcp_off + 7]]);
-    let ack =
-        u32::from_be_bytes([data[tcp_off + 8], data[tcp_off + 9], data[tcp_off + 10], data[tcp_off + 11]]);
+    let instance = instance_counter.get(&tuple).copied().unwrap_or(0);
 
-    // Classify direction via the sorted-tuple key.
-    let (dir_key, is_low) = classify_direction(src_ip, src_port, dst_ip, dst_port);
-    let reverse_is_low = !is_low;
+    let inst_key = FlowKey {
+        tuple,
+        instance,
+        is_low,
+    };
+    let reverse_key = FlowKey {
+        tuple,
+        instance,
+        is_low: !is_low,
+    };
 
     // Pass 1 has already populated the ISS/TS-base pins for every
-    // direction observed in the capture. Any direction without a pin
-    // here means pass 1 saw no packet for it — which is only possible
-    // if this packet itself was skipped during pass 1 (malformed
-    // frame), and we already bailed above. So `iss` is guaranteed
-    // present; the explicit `get` keeps the code defensive.
-    let Some(&iss) = state.iss.get(&(dir_key, is_low)) else {
-        return;
+    // direction + instance observed in the capture. Any direction
+    // without a pin here means pass 1 saw no packet for it — which
+    // is only possible if this packet itself was skipped during
+    // pass 1 (malformed frame), and we already bailed above.
+    let Some(&iss) = state.iss.get(&inst_key) else {
+        return Ok(());
     };
-    let reverse_iss = state.iss.get(&(dir_key, reverse_is_low));
+    let reverse_iss = state.iss.get(&reverse_key);
 
     // Rewrite seq: (seq - iss) + canonical_iss, wrapping.
     let new_seq = opts.canonical_iss.wrapping_add(seq.wrapping_sub(iss));
@@ -401,10 +629,9 @@ fn rewrite_frame(data: &mut [u8], opts: &CanonicalizationOptions, state: &FlowSt
         &mut data[tcp_off + 20..tcp_off + tcp_data_off],
         opts,
         state,
-        dir_key,
-        is_low,
-        reverse_is_low,
-    );
+        inst_key,
+        reverse_key,
+    )?;
 
     // Rewrite MAC addresses direction-aware. Lex-smaller side always
     // uses canonical_src_mac as its L2 source; the other side uses
@@ -419,6 +646,7 @@ fn rewrite_frame(data: &mut [u8], opts: &CanonicalizationOptions, state: &FlowSt
     data[6..12].copy_from_slice(&our_mac); // src
 
     // Recompute IPv4 header checksum.
+    let ihl = tcp_off - 14;
     data[14 + 10] = 0;
     data[14 + 11] = 0;
     let ip_csum = internet_checksum(&data[14..14 + ihl]);
@@ -431,12 +659,13 @@ fn rewrite_frame(data: &mut [u8], opts: &CanonicalizationOptions, state: &FlowSt
     data[tcp_off + 16] = 0;
     data[tcp_off + 17] = 0;
     let tcp_csum = tcp_checksum(
-        src_ip.to_be_bytes(),
-        dst_ip.to_be_bytes(),
+        src_ip.octets(),
+        dst_ip.octets(),
         tcp_len as u16,
         &data[tcp_off..tcp_slice_end],
     );
     data[tcp_off + 16..tcp_off + 18].copy_from_slice(&tcp_csum.to_be_bytes());
+    Ok(())
 }
 
 /// Rewrite TCP options in-place. Handles kind=8 (Timestamps) +
@@ -447,112 +676,71 @@ fn rewrite_tcp_options(
     opts_slice: &mut [u8],
     canon: &CanonicalizationOptions,
     state: &FlowState,
-    dir_key: DirectionKey,
-    is_low: bool,
-    reverse_is_low: bool,
-) {
-    let mut i = 0;
-    while i < opts_slice.len() {
-        let kind = opts_slice[i];
-        match kind {
-            0 => break, // EOL — stop.
-            1 => {
-                // NOP.
-                i += 1;
-            }
-            _ => {
-                // Kind + length pair. Length covers kind + length +
-                // data. Truncated options (length==0 or past-end) are
-                // treated as parse failure — bail rather than loop.
-                if i + 1 >= opts_slice.len() {
-                    break;
+    inst_key: FlowKey,
+    reverse_key: FlowKey,
+) -> Result<(), CanonError> {
+    walk_options_mut(opts_slice, |kind, body| match kind {
+        OptionKind::Timestamps if body.len() == 8 => {
+            // Timestamps option: TSval(4) + TSecr(4).
+            let tsval = u32::from_be_bytes([body[0], body[1], body[2], body[3]]);
+            let tsecr = u32::from_be_bytes([body[4], body[5], body[6], body[7]]);
+            // Pass 1 has already recorded the per-direction TS base.
+            // Missing entry = no TS option ever seen on this
+            // direction pre-this-packet (only possible on malformed
+            // input); fall through to "this packet's tsval *is* the
+            // base" to keep output deterministic.
+            let base = *state.ts_base.get(&inst_key).unwrap_or(&tsval);
+            let new_tsval = canon.canonical_ts_base.wrapping_add(tsval.wrapping_sub(base));
+            body[0..4].copy_from_slice(&new_tsval.to_be_bytes());
+            // TSecr echoes the peer's TSval. If we've pinned the
+            // peer's base, apply the same shift. Otherwise echo the
+            // raw value (zero on SYN per RFC 7323; non-zero only
+            // after peer speaks).
+            if tsecr != 0 {
+                if let Some(&reverse_base) = state.ts_base.get(&reverse_key) {
+                    let new_tsecr = canon
+                        .canonical_ts_base
+                        .wrapping_add(tsecr.wrapping_sub(reverse_base));
+                    body[4..8].copy_from_slice(&new_tsecr.to_be_bytes());
                 }
-                let len = opts_slice[i + 1] as usize;
-                if len < 2 || i + len > opts_slice.len() {
-                    break;
-                }
-                match kind {
-                    8 if len == 10 => {
-                        // Timestamps option: TSval(4) + TSecr(4).
-                        let tsval = u32::from_be_bytes([
-                            opts_slice[i + 2],
-                            opts_slice[i + 3],
-                            opts_slice[i + 4],
-                            opts_slice[i + 5],
-                        ]);
-                        let tsecr = u32::from_be_bytes([
-                            opts_slice[i + 6],
-                            opts_slice[i + 7],
-                            opts_slice[i + 8],
-                            opts_slice[i + 9],
-                        ]);
-                        // Pass 1 has already recorded the per-direction
-                        // TS base. Missing entry = no TS option ever
-                        // seen on this direction pre-this-packet (only
-                        // possible on malformed input); fall through
-                        // to "this packet's tsval *is* the base" to
-                        // keep output deterministic.
-                        let base = *state.ts_base.get(&(dir_key, is_low)).unwrap_or(&tsval);
-                        let new_tsval =
-                            canon.canonical_ts_base.wrapping_add(tsval.wrapping_sub(base));
-                        opts_slice[i + 2..i + 6].copy_from_slice(&new_tsval.to_be_bytes());
-                        // TSecr echoes the peer's TSval. If we've pinned
-                        // the peer's base, apply the same shift.
-                        // Otherwise echo the raw value (zero on SYN per
-                        // RFC 7323; non-zero only after peer speaks).
-                        if tsecr != 0 {
-                            if let Some(&reverse_base) =
-                                state.ts_base.get(&(dir_key, reverse_is_low))
-                            {
-                                let new_tsecr = canon
-                                    .canonical_ts_base
-                                    .wrapping_add(tsecr.wrapping_sub(reverse_base));
-                                opts_slice[i + 6..i + 10].copy_from_slice(&new_tsecr.to_be_bytes());
-                            }
-                        }
-                    }
-                    5 => {
-                        // SACK option: blocks of (left_edge, right_edge)
-                        // from the peer's seq space. Rewrite using the
-                        // reverse direction's ISS pin.
-                        if let Some(&reverse_iss) = state.iss.get(&(dir_key, reverse_is_low)) {
-                            let blocks = (len - 2) / 8;
-                            for b in 0..blocks {
-                                let base_off = i + 2 + b * 8;
-                                let left = u32::from_be_bytes([
-                                    opts_slice[base_off],
-                                    opts_slice[base_off + 1],
-                                    opts_slice[base_off + 2],
-                                    opts_slice[base_off + 3],
-                                ]);
-                                let right = u32::from_be_bytes([
-                                    opts_slice[base_off + 4],
-                                    opts_slice[base_off + 5],
-                                    opts_slice[base_off + 6],
-                                    opts_slice[base_off + 7],
-                                ]);
-                                let new_left =
-                                    canon.canonical_iss.wrapping_add(left.wrapping_sub(reverse_iss));
-                                let new_right = canon
-                                    .canonical_iss
-                                    .wrapping_add(right.wrapping_sub(reverse_iss));
-                                opts_slice[base_off..base_off + 4]
-                                    .copy_from_slice(&new_left.to_be_bytes());
-                                opts_slice[base_off + 4..base_off + 8]
-                                    .copy_from_slice(&new_right.to_be_bytes());
-                            }
-                        }
-                    }
-                    // kind=2 (MSS), kind=3 (Window Scale), kind=4 (SACK
-                    // Permitted), and any unknown kind: pass through
-                    // unchanged. MSS divergence is expected per spec §8
-                    // and we explicitly do not rewrite it here.
-                    _ => {}
-                }
-                i += len;
             }
         }
-    }
+        OptionKind::Sack => {
+            // SACK option: blocks of (left_edge, right_edge) from the
+            // peer's seq space. Rewrite using the reverse direction's
+            // ISS pin. walk_options_mut has already validated
+            // body.len() % 8 == 0.
+            if let Some(&reverse_iss) = state.iss.get(&reverse_key) {
+                let blocks = body.len() / 8;
+                for b in 0..blocks {
+                    let base_off = b * 8;
+                    let left = u32::from_be_bytes([
+                        body[base_off],
+                        body[base_off + 1],
+                        body[base_off + 2],
+                        body[base_off + 3],
+                    ]);
+                    let right = u32::from_be_bytes([
+                        body[base_off + 4],
+                        body[base_off + 5],
+                        body[base_off + 6],
+                        body[base_off + 7],
+                    ]);
+                    let new_left =
+                        canon.canonical_iss.wrapping_add(left.wrapping_sub(reverse_iss));
+                    let new_right =
+                        canon.canonical_iss.wrapping_add(right.wrapping_sub(reverse_iss));
+                    body[base_off..base_off + 4].copy_from_slice(&new_left.to_be_bytes());
+                    body[base_off + 4..base_off + 8].copy_from_slice(&new_right.to_be_bytes());
+                }
+            }
+        }
+        // kind=2 (MSS), kind=3 (Window Scale), kind=4 (SACK
+        // Permitted), and any unknown kind: pass through unchanged.
+        // MSS divergence is expected per spec §8 and we explicitly do
+        // not rewrite it here.
+        _ => {}
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -668,13 +856,76 @@ mod tests {
     #[test]
     fn classify_direction_is_stable() {
         // swap src/dst: same key, opposite `is_low`.
-        let (k1, l1) = classify_direction(0x0A00_0001, 1000, 0x0A00_0002, 2000);
-        let (k2, l2) = classify_direction(0x0A00_0002, 2000, 0x0A00_0001, 1000);
+        let a = Ipv4Addr::new(10, 0, 0, 1);
+        let b = Ipv4Addr::new(10, 0, 0, 2);
+        let (k1, l1) = classify_direction(a, 1000, b, 2000);
+        let (k2, l2) = classify_direction(b, 2000, a, 1000);
         assert_eq!(k1.low_ip, k2.low_ip);
         assert_eq!(k1.high_ip, k2.high_ip);
         assert_eq!(k1.low_port, k2.low_port);
         assert_eq!(k1.high_port, k2.high_port);
         assert!(l1 && !l2);
+    }
+
+    #[test]
+    fn walk_options_rejects_malformed_sack() {
+        // SACK kind=5 with body len 7 (not multiple of 8) — MUST error.
+        let slice = [5u8, 9, 0, 0, 0, 1, 0, 0, 0];
+        let err = walk_options(&slice, |_, _| {}).unwrap_err();
+        assert!(matches!(
+            err,
+            CanonError::MalformedSackOption { body_len: 7 }
+        ));
+    }
+
+    #[test]
+    fn walk_options_skips_nop_and_eol() {
+        // NOP, NOP, EOL, garbage — visitor must never be called.
+        let slice = [1u8, 1, 0, 9, 9, 9];
+        let mut calls = 0;
+        walk_options(&slice, |_, _| calls += 1).unwrap();
+        assert_eq!(calls, 0);
+    }
+
+    #[test]
+    fn walk_options_visits_timestamps_body() {
+        // NOP, NOP, Timestamps(kind=8, len=10, TSval=1, TSecr=2).
+        let mut slice = [1u8, 1, 8, 10, 0, 0, 0, 1, 0, 0, 0, 2];
+        let mut saw_ts = false;
+        walk_options(&slice, |kind, body| {
+            if kind == OptionKind::Timestamps {
+                saw_ts = true;
+                assert_eq!(body.len(), 8);
+                assert_eq!(u32::from_be_bytes([body[0], body[1], body[2], body[3]]), 1);
+                assert_eq!(u32::from_be_bytes([body[4], body[5], body[6], body[7]]), 2);
+            }
+        })
+        .unwrap();
+        assert!(saw_ts, "Timestamps option not seen");
+        // walk_options_mut must visit the same body as a mutable ref.
+        saw_ts = false;
+        walk_options_mut(&mut slice, |kind, _body| {
+            if kind == OptionKind::Timestamps {
+                saw_ts = true;
+            }
+        })
+        .unwrap();
+        assert!(saw_ts);
+    }
+
+    #[test]
+    fn parse_l2l3l4_rejects_truncated_ethernet() {
+        let data = [0u8; 10];
+        assert!(parse_l2l3l4(&data).is_none());
+    }
+
+    #[test]
+    fn parse_l2l3l4_rejects_non_ipv4() {
+        // ARP ethertype 0x0806; valid Ethernet but non-IPv4.
+        let mut data = [0u8; 64];
+        data[12] = 0x08;
+        data[13] = 0x06;
+        assert!(parse_l2l3l4(&data).is_none());
     }
 
     #[test]

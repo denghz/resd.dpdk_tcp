@@ -301,24 +301,105 @@ run_dut_bench bench-vs-linux bench-vs-linux-rtt \
     --tool bench-vs-linux \
     --feature-set trading-latency
 
-# Mode B: wire-diff — requires pcap inputs. T15-B (follow-up) wires in
-# live tcpdump orchestration on both hosts. For now, if the operator has
-# staged pcaps into $OUT_DIR/pcaps/{local,peer}.pcap beforehand we run
-# mode B; otherwise we emit a skip note.
+# Mode B: wire-diff — consume pcaps captured around a short live
+# workload. A10 Plan B T15-B wires tcpdump orchestration: start tcpdump
+# on both DUT (ens6) and peer (ens6), run a short RTT micro-workload
+# (10 request/response pairs, no --assert-hw-task-18), stop tcpdump,
+# pull both pcaps back, invoke bench-vs-linux --mode wire-diff locally.
+#
+# An operator-staged pcap pair takes precedence — useful for replaying
+# a specific capture against the canonicaliser without burning a fleet.
+log "[9b/12] bench-vs-linux mode B (wire-diff)"
+mkdir -p "$OUT_DIR/pcaps"
+
 if [ -f "$OUT_DIR/pcaps/local.pcap" ] && [ -f "$OUT_DIR/pcaps/peer.pcap" ]; then
-  log "[9b/12] bench-vs-linux mode B (wire-diff)"
-  # Mode B runs locally (no EAL needed — pcap MVP).
-  ./target/release/bench-vs-linux \
-      --mode wire-diff \
-      --peer-ip "$PEER_IP" \
-      --local-pcap "$OUT_DIR/pcaps/local.pcap" \
-      --peer-pcap "$OUT_DIR/pcaps/peer.pcap" \
-      --output-csv "$OUT_DIR/bench-vs-linux-wire-diff.csv" \
-      --feature-set rfc-compliance \
-      --precondition-mode lenient
+  log "        using operator-staged pcaps in $OUT_DIR/pcaps/"
 else
-  log "[9b/12] bench-vs-linux mode B skipped — no pcaps in $OUT_DIR/pcaps/ "
-  log "        (live tcpdump orchestration deferred to T15-B)"
+  log "        capturing live pcaps (10 RTT exchanges, peer port 10001)"
+
+  # Start tcpdump on DUT + peer. `-U` flushes per-packet so partial
+  # captures remain readable if tcpdump is killed before normal exit.
+  # `-s 0` disables truncation (we need full TCP payloads for the
+  # canonicaliser's option walker). `-w <file>` writes pcap. The `tcp
+  # and port 10001` filter narrows to the bench-vs-mtcp / bench-e2e
+  # peer port — mode B does not compare RTT-port traffic so excluding
+  # port 10002 keeps the diff deterministic.
+  TCPDUMP_FILTER="tcp and port 10001"
+
+  # Backgrounded tcpdump on DUT and peer. </dev/null + nohup to detach
+  # from ssh's stdin (same OpenSSH gotcha as the peer-services stanza).
+  ssh "${SSH_OPTS[@]}" "ubuntu@$DUT_SSH" \
+      "sudo nohup tcpdump -i ens6 -U -s 0 -w /tmp/mode-b-local.pcap \
+       '$TCPDUMP_FILTER' >/tmp/tcpdump-dut.log 2>&1 </dev/null &"
+  ssh "${SSH_OPTS[@]}" "ubuntu@$PEER_SSH" \
+      "sudo nohup tcpdump -i ens6 -U -s 0 -w /tmp/mode-b-peer.pcap \
+       '$TCPDUMP_FILTER' >/tmp/tcpdump-peer.log 2>&1 </dev/null &"
+
+  # Give tcpdump a beat to bind its pcap ring before we start driving
+  # traffic. Skipping this can drop the first few handshake packets,
+  # which is exactly what the canonicaliser keys on.
+  sleep 2
+
+  # Short synthetic workload: reuse bench-e2e for 10 request/response
+  # exchanges against the echo-server on port 10001. No HW-task-18
+  # assertions — those add TX-TS preconditions that are orthogonal to
+  # the pcap content we care about for wire-diff.
+  log "        running bench-e2e live capture workload"
+  ssh "${SSH_OPTS[@]}" "ubuntu@$DUT_SSH" \
+      "sudo /tmp/bench-e2e \
+          --peer-ip $PEER_IP \
+          --local-ip $DUT_IP \
+          --gateway-ip $GATEWAY_IP \
+          --eal-args $(printf '%q' "$EAL_ARGS") \
+          --lcore 2 \
+          --precondition-mode lenient \
+          --peer-port 10001 \
+          --iterations 10 \
+          --output-csv /tmp/bench-e2e-mode-b-capture.csv \
+          --tool bench-vs-linux-mode-b \
+          --feature-set rfc-compliance" \
+      || log "        WARN bench-e2e capture workload returned non-zero; \
+diff may still be meaningful"
+
+  # Stop tcpdump and flush buffers. SIGINT (the default on killall
+  # without -9) lets tcpdump write its final pcap trailer. We tolerate
+  # the "no process found" case if tcpdump already exited.
+  ssh "${SSH_OPTS[@]}" "ubuntu@$DUT_SSH" \
+      "sudo killall -INT tcpdump 2>/dev/null || true"
+  ssh "${SSH_OPTS[@]}" "ubuntu@$PEER_SSH" \
+      "sudo killall -INT tcpdump 2>/dev/null || true"
+
+  # Give tcpdump's signal handler a moment to finish flushing.
+  sleep 1
+
+  # Pull pcaps back. SCP's -C compresses on the wire; useful over the
+  # operator-to-AWS link when captures are large. `sudo chown ubuntu`
+  # fixes perms so the scp user can read.
+  ssh "${SSH_OPTS[@]}" "ubuntu@$DUT_SSH" \
+      "sudo chown ubuntu:ubuntu /tmp/mode-b-local.pcap"
+  ssh "${SSH_OPTS[@]}" "ubuntu@$PEER_SSH" \
+      "sudo chown ubuntu:ubuntu /tmp/mode-b-peer.pcap"
+  scp "${SCP_OPTS[@]}" "ubuntu@$DUT_SSH:/tmp/mode-b-local.pcap" \
+      "$OUT_DIR/pcaps/local.pcap"
+  scp "${SCP_OPTS[@]}" "ubuntu@$PEER_SSH:/tmp/mode-b-peer.pcap" \
+      "$OUT_DIR/pcaps/peer.pcap"
+fi
+
+# Invoke the wire-diff mode locally. Mode B runs locally (no EAL
+# needed — pcap MVP). Exit code 1 means "canonical-divergence found"
+# and is the expected signal for operator attention; we don't `exit`
+# on it here because the rest of the nightly pipeline (bench-report)
+# still needs to run.
+if ! ./target/release/bench-vs-linux \
+    --mode wire-diff \
+    --peer-ip "$PEER_IP" \
+    --local-pcap "$OUT_DIR/pcaps/local.pcap" \
+    --peer-pcap "$OUT_DIR/pcaps/peer.pcap" \
+    --output-csv "$OUT_DIR/bench-vs-linux-wire-diff.csv" \
+    --feature-set rfc-compliance \
+    --precondition-mode lenient; then
+  log "        WARN wire-diff found divergence or failed; see \
+$OUT_DIR/bench-vs-linux-wire-diff.csv"
 fi
 
 # ---------------------------------------------------------------------------
@@ -372,6 +453,7 @@ run_dut_bench bench-vs-mtcp bench-vs-mtcp-burst \
     "${DPDK_COMMON[@]}" \
     --workload burst \
     --peer-port 10001 \
+    --peer-ssh "ubuntu@$PEER_SSH" \
     --stacks dpdk \
     --tool bench-vs-mtcp \
     --feature-set trading-latency \
@@ -382,6 +464,7 @@ run_dut_bench bench-vs-mtcp bench-vs-mtcp-maxtp \
     "${DPDK_COMMON[@]}" \
     --workload maxtp \
     --peer-port 10001 \
+    --peer-ssh "ubuntu@$PEER_SSH" \
     --stacks dpdk \
     --tool bench-vs-mtcp \
     --feature-set trading-latency \
