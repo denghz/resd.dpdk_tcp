@@ -5939,6 +5939,24 @@ impl Engine {
 
 impl Drop for Engine {
     fn drop(&mut self) {
+        // Drain the FaultInjector first so reorder-ring mbufs are
+        // returned to their mempools while the pools are still alive.
+        // Rust drops fields in declaration order; `fault_injector` is
+        // declared AFTER every mempool field, so the implicit sequence
+        // would free the pools first and `FaultInjector::Drop`'s
+        // `shim_rte_pktmbuf_free` walk would then deref chain heads
+        // whose backing pool is gone (UAF on `m->pool`, double-put on
+        // the recycled free-list). The take MUST precede the
+        // `port_id == u16::MAX` early return — test-server engines
+        // also carry the same mempool fields. `try_borrow_mut` so a
+        // panic-during-unwind path that already holds the RefCell
+        // does not double-panic abort the process.
+        #[cfg(feature = "fault-injector")]
+        {
+            if let Ok(mut g) = self.fault_injector.try_borrow_mut() {
+                drop(g.take());
+            }
+        }
         // A7 Task 5: the test-server rig passes `port_id == u16::MAX`
         // and `Engine::new` bypasses the queue-setup + dev_start block.
         // Calling dev_stop / dev_close on a port that was never started
