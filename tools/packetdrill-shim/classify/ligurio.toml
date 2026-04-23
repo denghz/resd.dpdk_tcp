@@ -296,7 +296,7 @@ reason = "close() tests all require server-side accept path (A8+)"
 [[rule]]
 matches_regex = ".*/shutdown/.*\\.pkt"
 verdict = "skipped-untranslatable"
-reason = "shutdown() tests all require server-side accept path (A8+)"
+reason = "half-close semantics not implemented; spec §6.4 AD-A8.5-shutdown-no-half-close (SHUT_RD/SHUT_WR return EOPNOTSUPP; SHUT_RDWR scripts probe post-shutdown read=0/write=EPIPE which is half-close behavior)"
 
 [[rule]]
 matches_regex = ".*/reset/.*\\.pkt"

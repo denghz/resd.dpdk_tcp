@@ -14,6 +14,16 @@
 // listen/, blocking/, and close/ directories. Remaining 116 stay
 // skipped for A8+ follow-up (engine edge behaviors, ISN pinning,
 // shutdown wiring, scripts/defaults.sh init files).
+//
+// A8.5 T8 update: patch 0008 routes the shutdown(fd, how) syscall to
+// the T7 dpdk_net_shutdown public API. Under AD-A8.5-shutdown-no-half-
+// close, SHUT_RD/SHUT_WR return EOPNOTSUPP. SHUT_RDWR dispatches to
+// full close. The 11 ligurio shutdown/*.pkt scripts all probe Linux
+// half-close semantics (either directly via SHUT_RD/SHUT_WR, or
+// indirectly via post-SHUT_RDWR read=0/write=EPIPE expectations), so
+// none unlock under T8. LIGURIO_RUNNABLE_COUNT stays at 6; skip
+// reasons in classify/ligurio.toml + SKIPPED.md now cite the spec
+// deviation explicitly.
 pub const LIGURIO_RUNNABLE_COUNT: usize = 6;
 pub const LIGURIO_SKIP_UNTRANSLATABLE: usize = 116;
 pub const LIGURIO_SKIP_OUT_OF_SCOPE: usize = 0;

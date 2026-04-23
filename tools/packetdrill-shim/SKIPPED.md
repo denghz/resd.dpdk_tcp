@@ -61,17 +61,17 @@ Dry-run evidence that drove this floor:
   - testcases/tcp/reset/rst-sync-est-time-wait.pkt — RST tests depend on server-side accept path or wire-option parity
   - testcases/tcp/reset/rst-synchronized-established.pkt — RST tests depend on server-side accept path or wire-option parity
   - testcases/tcp/reset/rst_sync_close_wait.pkt — RST tests depend on server-side accept path or wire-option parity
-  - testcases/tcp/shutdown/shutdown-double-shut-wr.pkt — shutdown() tests all require server-side accept path (A8+)
-  - testcases/tcp/shutdown/shutdown-rd-close.pkt — shutdown() tests all require server-side accept path (A8+)
-  - testcases/tcp/shutdown/shutdown-rd-wr-close.pkt — shutdown() tests all require server-side accept path (A8+)
-  - testcases/tcp/shutdown/shutdown-rd.pkt — shutdown() tests all require server-side accept path (A8+)
-  - testcases/tcp/shutdown/shutdown-rdwr-close.pkt — shutdown() tests all require server-side accept path (A8+)
-  - testcases/tcp/shutdown/shutdown-rdwr-send-queue-ack-close.pkt — shutdown() tests all require server-side accept path (A8+)
-  - testcases/tcp/shutdown/shutdown-rdwr-write-queue-close.pkt — shutdown() tests all require server-side accept path (A8+)
-  - testcases/tcp/shutdown/shutdown-rdwr.pkt — shutdown() tests all require server-side accept path (A8+)
-  - testcases/tcp/shutdown/shutdown-recv-after-shut-rd.pkt — shutdown() tests all require server-side accept path (A8+)
-  - testcases/tcp/shutdown/shutdown-wr-close.pkt — shutdown() tests all require server-side accept path (A8+)
-  - testcases/tcp/shutdown/shutdown-wr.pkt — shutdown() tests all require server-side accept path (A8+)
+  - testcases/tcp/shutdown/shutdown-double-shut-wr.pkt — half-close semantics (SHUT_WR) not implemented; spec §6.4 AD-A8.5-shutdown-no-half-close
+  - testcases/tcp/shutdown/shutdown-rd-close.pkt — half-close semantics (SHUT_RD) not implemented; spec §6.4 AD-A8.5-shutdown-no-half-close
+  - testcases/tcp/shutdown/shutdown-rd-wr-close.pkt — half-close semantics (SHUT_RD/SHUT_WR) not implemented; spec §6.4 AD-A8.5-shutdown-no-half-close
+  - testcases/tcp/shutdown/shutdown-rd.pkt — half-close semantics (SHUT_RD) not implemented; spec §6.4 AD-A8.5-shutdown-no-half-close
+  - testcases/tcp/shutdown/shutdown-rdwr-close.pkt — SHUT_RDWR probes post-shutdown read=0/write=EPIPE (half-close); spec §6.4 AD-A8.5-shutdown-no-half-close
+  - testcases/tcp/shutdown/shutdown-rdwr-send-queue-ack-close.pkt — SHUT_RDWR probes post-shutdown read=0/write=EPIPE (half-close); spec §6.4 AD-A8.5-shutdown-no-half-close
+  - testcases/tcp/shutdown/shutdown-rdwr-write-queue-close.pkt — SHUT_RDWR probes post-shutdown read=0/write=EPIPE (half-close); spec §6.4 AD-A8.5-shutdown-no-half-close
+  - testcases/tcp/shutdown/shutdown-rdwr.pkt — SHUT_RDWR probes post-shutdown read=0/write=EPIPE (half-close); spec §6.4 AD-A8.5-shutdown-no-half-close
+  - testcases/tcp/shutdown/shutdown-recv-after-shut-rd.pkt — half-close semantics (SHUT_RD) not implemented; spec §6.4 AD-A8.5-shutdown-no-half-close
+  - testcases/tcp/shutdown/shutdown-wr-close.pkt — half-close semantics (SHUT_WR) not implemented; spec §6.4 AD-A8.5-shutdown-no-half-close
+  - testcases/tcp/shutdown/shutdown-wr.pkt — half-close semantics (SHUT_WR) not implemented; spec §6.4 AD-A8.5-shutdown-no-half-close
 
 #### Syscalls returning EOPNOTSUPP in the A7 shim
 
@@ -202,9 +202,9 @@ runnable set). Pinned at `SHIVANSH_RUNNABLE_COUNT = 5`.
   - socket-api/close/close-unread-data-rst.pkt — close() tests all require server-side accept path (A8+)
   - socket-api/close/close-write-data-rst.pkt — close() tests all require server-side accept path (A8+)
   - socket-api/listen/listen-incoming-no-tcp-flags.pkt — server-side edge behavior (FreeBSD silent-drop on no-flags) needs engine parity (A8+)
-  - socket-api/shutdown/shutdown-rd.pkt — shutdown() tests all require server-side accept path (A8+)
-  - socket-api/shutdown/shutdown-rdwr.pkt — shutdown() tests all require server-side accept path (A8+)
-  - socket-api/shutdown/shutdown-wr.pkt — shutdown() tests all require server-side accept path (A8+)
+  - socket-api/shutdown/shutdown-rd.pkt — half-close semantics (SHUT_RD) not implemented; spec §6.4 AD-A8.5-shutdown-no-half-close
+  - socket-api/shutdown/shutdown-rdwr.pkt — SHUT_RDWR probes post-shutdown read=0/write=EPIPE (half-close); spec §6.4 AD-A8.5-shutdown-no-half-close
+  - socket-api/shutdown/shutdown-wr.pkt — half-close semantics (SHUT_WR) not implemented; spec §6.4 AD-A8.5-shutdown-no-half-close
   - tcp-fsm/reset/rst-non-synchronized.pkt — RST tests depend on server-side accept path or wire-option parity
   - tcp-fsm/reset/rst-syn-sent.pkt — RST tests depend on server-side accept path or wire-option parity
   - tcp-fsm/reset/rst-sync-est-fin-wait-1.pkt — RST tests depend on server-side accept path or wire-option parity
@@ -460,12 +460,12 @@ progress into the TCP path and fail on the deeper blockers noted.
   - gtests/net/tcp/close/close-local-close-then-remote-fin.pkt — close() syscall return-time delta vs scripted tolerance (post-T6; A8+)
   - gtests/net/tcp/close/close-on-syn-sent.pkt — connect() returns 0 where script expects -1 ECONNRESET (RST-during-SYN-SENT path; A8+)
   - gtests/net/tcp/close/close-remote-fin-then-close.pkt — server-side accept path needed for close-after-FIN test (post-T6; A8+)
-  - gtests/net/tcp/shutdown/shutdown-rd-close.pkt — shutdown() tests require server-side accept path (post-T6; A8+)
-  - gtests/net/tcp/shutdown/shutdown-rd-wr-close.pkt — shutdown() tests require server-side accept path (post-T6; A8+)
-  - gtests/net/tcp/shutdown/shutdown-rdwr-close.pkt — shutdown() tests require server-side accept path (post-T6; A8+)
-  - gtests/net/tcp/shutdown/shutdown-rdwr-send-queue-ack-close.pkt — shutdown() tests require server-side accept path (post-T6; A8+)
-  - gtests/net/tcp/shutdown/shutdown-rdwr-write-queue-close.pkt — shutdown() tests require server-side accept path (post-T6; A8+)
-  - gtests/net/tcp/shutdown/shutdown-wr-close.pkt — shutdown() tests require server-side accept path (post-T6; A8+)
+  - gtests/net/tcp/shutdown/shutdown-rd-close.pkt — half-close semantics (SHUT_RD) not implemented; spec §6.4 AD-A8.5-shutdown-no-half-close
+  - gtests/net/tcp/shutdown/shutdown-rd-wr-close.pkt — half-close semantics (SHUT_RD/SHUT_WR) not implemented; spec §6.4 AD-A8.5-shutdown-no-half-close
+  - gtests/net/tcp/shutdown/shutdown-rdwr-close.pkt — SHUT_RDWR probes post-shutdown read=0/write=EPIPE (half-close); spec §6.4 AD-A8.5-shutdown-no-half-close
+  - gtests/net/tcp/shutdown/shutdown-rdwr-send-queue-ack-close.pkt — SHUT_RDWR probes post-shutdown read=0/write=EPIPE (half-close); spec §6.4 AD-A8.5-shutdown-no-half-close
+  - gtests/net/tcp/shutdown/shutdown-rdwr-write-queue-close.pkt — SHUT_RDWR probes post-shutdown read=0/write=EPIPE (half-close); spec §6.4 AD-A8.5-shutdown-no-half-close
+  - gtests/net/tcp/shutdown/shutdown-wr-close.pkt — half-close semantics (SHUT_WR) not implemented; spec §6.4 AD-A8.5-shutdown-no-half-close
 
 ### Other (wire shape / middleware-layer behavior)
 
