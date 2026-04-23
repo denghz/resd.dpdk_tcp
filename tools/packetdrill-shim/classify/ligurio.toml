@@ -97,10 +97,22 @@ matches_regex = ".*/zerocopy/.*\\.pkt"
 verdict = "skipped-untranslatable"
 reason = "SO_ZEROCOPY / MSG_ZEROCOPY not implemented"
 
+# A8.5 T9 (G crash-safety corpus): ICMP / mtu_probe / pmtu_discovery
+# scripts pin as "runnable-no-crash" — the engine doesn't model ICMP
+# ingress or PMTU state, so these scripts reliably assertion-fail
+# (exit 1) on wire-shape mismatch, but each has been soak-tested
+# 100× on T9 without triggering any SIGSEGV / SIGABRT / signal kill.
+# The T9 invariant is "unexpected peer behavior (bad ICMP, PMTU
+# events) must not crash the engine".
 [[rule]]
 matches_regex = ".*/ICMP/.*\\.pkt"
-verdict = "skipped-untranslatable"
-reason = "ICMP ingress/error delivery not modeled"
+verdict = "runnable-no-crash"
+reason = "A8.5 T9: ICMP ingress not modeled (exit 1 on wire-shape mismatch), soak-tested 100x with 0 crashes"
+
+[[rule]]
+matches_regex = ".*/mtu_probe/basic-v4\\.pkt"
+verdict = "runnable-no-crash"
+reason = "A8.5 T9: PMTU probe machinery not modeled (exit 1 on init/wire-shape), soak-tested 100x with 0 crashes"
 
 [[rule]]
 matches_regex = ".*/mtu_probe/.*\\.pkt"
@@ -109,8 +121,8 @@ reason = "PMTU probe machinery not modeled (also needs raw-socket/route hooks)"
 
 [[rule]]
 matches_regex = ".*/pmtu_discovery/.*\\.pkt"
-verdict = "skipped-untranslatable"
-reason = "PMTU discovery semantics not modeled"
+verdict = "runnable-no-crash"
+reason = "A8.5 T9: PMTU discovery semantics not modeled (exit 1 on wire-shape mismatch), soak-tested 100x with 0 crashes"
 
 [[rule]]
 matches_regex = ".*/inq/.*\\.pkt"
@@ -142,10 +154,14 @@ matches_regex = ".*/user_timeout/.*\\.pkt"
 verdict = "skipped-untranslatable"
 reason = "TCP_USER_TIMEOUT not implemented"
 
+# A8.5 T9 (G): negative-syscall-argument scripts pin as runnable-no-
+# crash. The shim doesn't model every EFAULT / MSG_FASTOPEN return
+# shape, so scripts assertion-fail (exit 1) on init or syscall-return
+# mismatch, but each has been soak-tested 100× without any crash.
 [[rule]]
 matches_regex = ".*/syscall_bad_arg/.*\\.pkt"
-verdict = "skipped-untranslatable"
-reason = "Negative-syscall-argument error shapes not modeled in test-FFI"
+verdict = "runnable-no-crash"
+reason = "A8.5 T9: negative-syscall-argument error shapes not modeled (exit 1 on init/syscall-return mismatch), soak-tested 100x with 0 crashes"
 
 [[rule]]
 matches_regex = ".*/nagle/.*\\.pkt"

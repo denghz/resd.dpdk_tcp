@@ -24,8 +24,22 @@
 // none unlock under T8. LIGURIO_RUNNABLE_COUNT stays at 6; skip
 // reasons in classify/ligurio.toml + SKIPPED.md now cite the spec
 // deviation explicitly.
+//
+// A8.5 T9 update: spec §1.1 G + §7 "crash-safety corpus" introduces
+// a new classifier verdict "runnable-no-crash" — scripts whose pass
+// criterion is *engine-crash-safety* under unexpected peer behavior
+// (malformed ICMP, bad syscall arguments, PMTU / frag-needed
+// events). These scripts cannot exit 0 because the engine doesn't
+// reproduce the scripted wire shape (ICMP delivery / PMTU state
+// machine / frag-needed handling isn't modeled), but the goal is
+// that they must never trigger a SIGSEGV / SIGABRT / signal kill.
+// Each script is soak-tested 100× before being pinned under this
+// verdict. LIGURIO_NO_CRASH_COUNT tracks the count; the
+// corpus_ligurio test asserts every no-crash script exits with a
+// non-signal status (exit < 128).
 pub const LIGURIO_RUNNABLE_COUNT: usize = 6;
-pub const LIGURIO_SKIP_UNTRANSLATABLE: usize = 116;
+pub const LIGURIO_NO_CRASH_COUNT: usize = 6;
+pub const LIGURIO_SKIP_UNTRANSLATABLE: usize = 110;
 pub const LIGURIO_SKIP_OUT_OF_SCOPE: usize = 0;
 
 // --- shivansh TCP-IP regression (third_party/shivansh-tcp-ip-regression/) ---

@@ -8,6 +8,25 @@ Format: `<path relative to third_party/packetdrill-testcases> — <reason>`
 
 ## ligurio corpus
 
+### Runnable-no-crash (A8.5 T9 — spec §1.1 G crash-safety corpus)
+
+The "runnable-no-crash" verdict pins scripts whose pass criterion is
+*engine-crash-safety* under unexpected peer behavior (bad ICMP,
+malformed syscall arguments, PMTU events). Each script has been
+soak-tested 100× on the T9 shim without triggering any SIGSEGV /
+SIGABRT / signal kill. Exit code 1 is acceptable because the engine
+does not model the behaviors under test (ICMP ingress / PMTU state /
+EFAULT for NULL buffers) and therefore reliably assertion-fails on
+wire-shape or syscall-return mismatch; the gate catches only signal
+kills (exit > 128), which are the true crash-safety regressions.
+
+  - testcases/tcp/ICMP/icmp-all-types.pkt — A8.5 T9: ICMP ingress not modeled (exit 1 on wire-shape mismatch), soak-tested 100x with 0 crashes
+  - testcases/tcp/mtu_probe/basic-v4.pkt — A8.5 T9: PMTU probe machinery not modeled (exit 1 on init/wire-shape), soak-tested 100x with 0 crashes
+  - testcases/tcp/pmtu_discovery/pmtu-10pkt.pkt — A8.5 T9: PMTU discovery semantics not modeled (exit 1 on wire-shape mismatch), soak-tested 100x with 0 crashes
+  - testcases/tcp/syscall_bad_arg/fastopen-invalid-buf-ptr.pkt — A8.5 T9: negative-syscall-argument error shapes not modeled (exit 1 on init/syscall-return mismatch), soak-tested 100x with 0 crashes
+  - testcases/tcp/syscall_bad_arg/sendmsg-empty-iov.pkt — A8.5 T9: negative-syscall-argument error shapes not modeled (exit 1 on init/syscall-return mismatch), soak-tested 100x with 0 crashes
+  - testcases/tcp/syscall_bad_arg/syscall-invalid-buf-ptr.pkt — A8.5 T9: negative-syscall-argument error shapes not modeled (exit 1 on init/syscall-return mismatch), soak-tested 100x with 0 crashes
+
 ### Runnable-but-broken (T15 pragmatic floor; revisit in A8+)
 
 Per T15 reality-check: the A7 shim binary cannot currently pass any of
@@ -161,11 +180,15 @@ reflect the real blocker observed after the reorder.
 
 #### Other (wire shape / middleware-layer behavior)
 
-  - testcases/tcp/ICMP/icmp-all-types.pkt — ICMP ingress/error delivery not modeled
+Note: the ligurio scripts under `ICMP/`, `mtu_probe/basic-v4.pkt`,
+`pmtu_discovery/`, and `syscall_bad_arg/` were migrated to the
+"runnable-no-crash" verdict in A8.5 T9 (G crash-safety corpus). They
+no longer appear here — the pass criterion is "no SIGSEGV / SIGABRT /
+signal kill", not exit-0 end-to-end. See the "## Runnable-no-crash"
+section below for details.
+
   - testcases/tcp/gro/gro-mss-option.pkt — GRO-specific wire-shape expectations not modeled
-  - testcases/tcp/mtu_probe/basic-v4.pkt — PMTU probe machinery not modeled (also needs raw-socket/route hooks)
   - testcases/tcp/mtu_probe/basic-v6.pkt — PMTU probe machinery not modeled (also needs raw-socket/route hooks)
-  - testcases/tcp/pmtu_discovery/pmtu-10pkt.pkt — PMTU discovery semantics not modeled
   - testcases/tcp/nagle/https_client.pkt — Nagle/TCP_NODELAY fine-grained segmentation not modeled
   - testcases/tcp/nagle/sendmsg_msg_more.pkt — Nagle/TCP_NODELAY fine-grained segmentation not modeled
   - testcases/tcp/nagle/sockopt_cork_nodelay.pkt — Nagle/TCP_NODELAY fine-grained segmentation not modeled
@@ -173,9 +196,6 @@ reflect the real blocker observed after the reorder.
   - testcases/tcp/eor/no-coalesce-retrans.pkt — MSG_EOR / no-coalesce boundary semantics not modeled
   - testcases/tcp/eor/no-coalesce-small.pkt — MSG_EOR / no-coalesce boundary semantics not modeled
   - testcases/tcp/eor/no-coalesce-subsequent.pkt — MSG_EOR / no-coalesce boundary semantics not modeled
-  - testcases/tcp/syscall_bad_arg/fastopen-invalid-buf-ptr.pkt — Negative-syscall-argument error shapes not modeled in test-FFI
-  - testcases/tcp/syscall_bad_arg/sendmsg-empty-iov.pkt — Negative-syscall-argument error shapes not modeled in test-FFI
-  - testcases/tcp/syscall_bad_arg/syscall-invalid-buf-ptr.pkt — Negative-syscall-argument error shapes not modeled in test-FFI
 
 ## shivansh corpus
 
