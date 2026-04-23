@@ -141,16 +141,18 @@ elif [ -f "$RESD_INFRA_DIR/cdk.json" ]; then
   fi
 fi
 
-# Capture the full CLI output — includes CDK deploy progress (stderr
-# would be cleaner but the CLI merges both into stdout today) plus the
-# `Outputs:` block at the end. The `--json` flag is passed through but
-# the current CLI doesn't honour it for setup; extract each output by
-# name from the `bench-pair.KEY = VALUE` lines instead.
+# Capture the full CLI stdout. The CLI's `--json` flag emits a JSON
+# object at the end of stdout; CDK's verbose deploy log + `Outputs:`
+# block go to stderr, which we let pass through to the operator's
+# terminal. A `Stack ARN: <arn>` line often precedes the JSON on
+# stdout, so extract the JSON starting at the first `{` line.
 CLI_STDOUT="$(
   cd "$RESD_INFRA_DIR" && \
   resd-aws-infra setup bench-pair \
       --operator-ssh-cidr "$OPERATOR_CIDR" "${AMI_ID_ARG[@]}" --json
 )"
+
+STACK_JSON="$(echo "$CLI_STDOUT" | sed -n '/^{/,$p')"
 
 # Teardown on exit. Honour SKIP_TEARDOWN=1 for debug sessions.
 teardown_fleet() {
@@ -162,27 +164,13 @@ teardown_fleet() {
 }
 trap teardown_fleet EXIT
 
-# Extract one stack output by key from the CDK `Outputs:` block. Matches
-# lines of the form `bench-pair.KEY = VALUE` (any amount of whitespace
-# around `=`). Empty string if the key is absent.
-extract_output() {
-  awk -v key="bench-pair.$1" '
-    $1 == key {
-      # Everything after the first "=" (trim leading whitespace).
-      sub(/^[^=]*=[[:space:]]*/, "")
-      print
-      exit
-    }
-  ' <<<"$CLI_STDOUT"
-}
-
-DUT_SSH="$(extract_output DutSshEndpoint)"
-PEER_SSH="$(extract_output PeerSshEndpoint)"
-DUT_INSTANCE_ID="$(extract_output DutInstanceId)"
-PEER_INSTANCE_ID="$(extract_output PeerInstanceId)"
-DUT_IP="$(extract_output DutDataEniIp)"
-PEER_IP="$(extract_output PeerDataEniIp)"
-AMI_ID="$(extract_output AmiId)"
+DUT_SSH="$(jq -r '.DutSshEndpoint // empty' <<<"$STACK_JSON")"
+PEER_SSH="$(jq -r '.PeerSshEndpoint // empty' <<<"$STACK_JSON")"
+DUT_INSTANCE_ID="$(jq -r '.DutInstanceId // empty' <<<"$STACK_JSON")"
+PEER_INSTANCE_ID="$(jq -r '.PeerInstanceId // empty' <<<"$STACK_JSON")"
+DUT_IP="$(jq -r '.DutDataEniIp // empty' <<<"$STACK_JSON")"
+PEER_IP="$(jq -r '.PeerDataEniIp // empty' <<<"$STACK_JSON")"
+AMI_ID="$(jq -r '.AmiId // empty' <<<"$STACK_JSON")"
 
 for var in DUT_SSH PEER_SSH DUT_INSTANCE_ID PEER_INSTANCE_ID DUT_IP PEER_IP AMI_ID; do
   val="${!var}"
