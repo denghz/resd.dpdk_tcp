@@ -149,12 +149,14 @@ fn uprof_session_id() -> Option<String> {
 ///
 /// Keep in sync with each stub bench's module-level doc comment. When
 /// a stub is replaced with a real call, remove its entry here.
+///
+/// A10-perf T2.5 + T2.6 unblocked poll_* + timer_add_cancel via the
+/// `EngineNoEalHarness` (spec §4.3). bench_send_* real-path wiring
+/// deferred to Phase 3 T3.3 (see docs/superpowers/reports/t2-7-deferral.md)
+/// because it requires EAL init + mempool + vdev + hugepages + CAP.
 const STUB_TARGETS: &[&str] = &[
-    "bench_poll_empty",
-    "bench_poll_idle_with_timers",
     "bench_send_small",
     "bench_send_large_chain",
-    "bench_timer_add_cancel",
 ];
 
 fn main() -> anyhow::Result<()> {
