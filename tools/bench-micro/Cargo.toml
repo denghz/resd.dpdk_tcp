@@ -6,7 +6,7 @@ publish = false
 
 [dependencies]
 bench-common = { path = "../bench-common" }
-dpdk-net-core = { path = "../../crates/dpdk-net-core" }
+dpdk-net-core = { path = "../../crates/dpdk-net-core", features = ["bench-internals"] }
 dpdk-net-sys = { path = "../../crates/dpdk-net-sys" }
 dpdk-net = { path = "../../crates/dpdk-net" }
 walkdir = "2"
