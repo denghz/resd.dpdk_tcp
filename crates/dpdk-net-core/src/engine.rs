@@ -1074,8 +1074,24 @@ impl Engine {
             flow_table: RefCell::new(FlowTable::new(cfg.max_connections)),
             events: RefCell::new(EventQueue::with_cap(cfg.event_queue_soft_cap as usize)),
             iss_gen: IssGen::new(),
-            // RFC 6056 ephemeral port hint range: start at 49152.
-            last_ephemeral_port: Cell::new(49151),
+            // RFC 6056 ephemeral port hint range: [49152, 65535].
+            // Per-process variable seed: a fixed seed of 49151 made every
+            // new process pick port 49152 first, colliding with peer-side
+            // TIME_WAIT on the same (local-ip, peer-ip, 49152, peer-port)
+            // 5-tuple from a recent prior run — observed in run bl16x36lb
+            // as bench-offload-ab "connection closed during handshake:
+            // err=0" right after bench-e2e wound down. TSC mix gives 14
+            // bits of variability (range size = 16 384), which is enough
+            // to deconflict back-to-back bench processes; collision odds
+            // with stale flows in this bench's own table stay negligible
+            // at the 16-conn default cap.
+            last_ephemeral_port: Cell::new({
+                let t = crate::clock::now_ns();
+                let mixed = (t ^ t.rotate_left(13) ^ t.rotate_right(7)) as u16;
+                // 49151 + offset in [0, 16383]; next_ephemeral_port pre-
+                // increments so the first emitted port lands in [49152, 65535].
+                49151u16.wrapping_add(mixed % 16384)
+            }),
             // Slot capacity hint: under sustained TX, every push that
             // arms the RTO timer (when `snd_retrans` transitions empty
             // → non-empty) and every cancel-then-rearm on the next ACK
