@@ -193,16 +193,14 @@ pub enum OptionParseError {
 /// (with the defensive `optlen >= 2` check that mTCP's `ParseTCPOptions`
 /// lacks, see the mTCP I-6 note in A3's review).
 ///
-/// `#[inline(always)]` is intentional: the function is the dominant
-/// resolved hotspot in `tcp_input_data_throughput` post-H1 (16% TBP).
-/// `#[inline]` alone produced +11% but LLVM still emitted an
-/// out-of-line copy. Forcing full inlining at the dispatch call site
-/// lets the optimizer elide bounds checks against the (statically-
-/// known short) options-buf shape, fold the `TcpOpts::default()`
-/// zero-init with later writes, and skip the `Result` discriminant
-/// store whenever the caller's branch later proves a specific `Err`
-/// variant.
-#[inline(always)]
+/// `#[inline]` is intentional: the function is the dominant resolved
+/// hotspot in `tcp_input_data_throughput` post-H1 (16% TBP). Forcing
+/// inlining at the dispatch call site lets the optimizer elide bounds
+/// checks against the (statically-known short) options-buf shape, fold
+/// the `TcpOpts::default()` zero-init with later writes, and skip the
+/// `Result` discriminant store whenever the caller's branch later
+/// proves a specific `Err` variant.
+#[inline]
 pub fn parse_options(opts: &[u8]) -> Result<TcpOpts, OptionParseError> {
     let mut out = TcpOpts::default();
     let mut i = 0usize;
