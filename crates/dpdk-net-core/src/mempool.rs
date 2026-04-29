@@ -265,9 +265,17 @@ impl Drop for MbufHandle {
         // before our read lands. Computing post-dec from the pre-dec read is
         // sound because the engine serializes mbuf operations on its lcore
         // (no other thread mutates the refcount concurrently).
+        // A10 Stage B fix: use rte_pktmbuf_free_seg, NOT
+        // rte_mbuf_refcnt_update(-1). The refcnt_update primitive only
+        // decrements the atomic; it does NOT return the mbuf to its
+        // mempool when the count reaches 0. The pktmbuf_free_seg
+        // primitive checks the refcount and properly returns to pool
+        // on last-ref drop. The leak surfaced as a 1-mbuf-per-iteration
+        // RX-mempool drain in bench-e2e/bench-stress; the cliff hit at
+        // iteration ~11151 (capacity=12288) when the pool exhausted.
         let pre = unsafe { sys::shim_rte_mbuf_refcnt_read(self.ptr.as_ptr()) };
         unsafe {
-            sys::shim_rte_mbuf_refcnt_update(self.ptr.as_ptr(), -1);
+            sys::shim_rte_pktmbuf_free_seg(self.ptr.as_ptr());
         }
         let post = pre.saturating_sub(1);
         // Diagnostic fires on:

@@ -105,6 +105,30 @@ uint16_t shim_rte_mbuf_refcnt_read(struct rte_mbuf *m) {
     return rte_mbuf_refcnt_read(m);
 }
 
+/* rte_pktmbuf_free_seg is static inline; re-export. Releases one
+ * refcount on a SINGLE segment and returns the mbuf to its mempool
+ * when the count reaches 0. The fix for the iteration-7050/11151
+ * cliff: MbufHandle::Drop previously used rte_mbuf_refcnt_update(-1)
+ * which only decrements; mbufs whose last MbufHandle dropped were
+ * left orphaned at refcount=0 and never returned to the pool.
+ *
+ * Pool-guarded variant: skip the pool-put when m->pool is NULL.
+ * Unit tests construct fake mbufs from raw byte buffers with no
+ * backing mempool; calling rte_mbuf_raw_free against such a mbuf
+ * dereferences a NULL pool pointer (SIGSEGV). The guard preserves
+ * the production fix while letting fake-mbuf tests Drop safely
+ * (they fall back to a refcnt-only dec, matching the prior
+ * behaviour for the test-only path). */
+void shim_rte_pktmbuf_free_seg(struct rte_mbuf *m) {
+    if (m == NULL) return;
+    if (m->pool == NULL) {
+        /* test-only fallback: behave like the legacy refcnt_update(-1) */
+        rte_mbuf_refcnt_update(m, -1);
+        return;
+    }
+    rte_pktmbuf_free_seg(m);
+}
+
 /* rte_pktmbuf_nb_segs — field accessor for test assertions + debug.
  * bindgen can't expose the rte_mbuf field layout directly. */
 uint16_t shim_rte_pktmbuf_nb_segs(const struct rte_mbuf *m) {
