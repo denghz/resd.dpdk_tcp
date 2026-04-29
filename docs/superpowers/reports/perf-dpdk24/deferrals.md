@@ -1,6 +1,6 @@
 # DPDK 24.11 — pre-declared deferrals (not adopted in A10-perf)
 
-These were marked deferred at brainstorm time (D6) and confirmed deferred during execution. Distinct from the T4.7-4.10 reports (`adopt-rte_lcore_var.md`, `adopt-rte_ptr_compress.md`, `adopt-rte_bit_atomic.md`, `adopt-ena-tx-logger.md`) which document outcomes of investigating APIs we considered actively.
+These were marked deferred at brainstorm time (D6) and confirmed deferred during execution. Distinct from the T4.7-4.10 reports (`adopt-rte-lcore-var.md`, `adopt-rte-ptr-compress.md`, `adopt-rte-bit-atomic.md`, `adopt-ena-tx-logger.md`) which document outcomes of investigating APIs we considered actively.
 
 ## Per-CPU PM QoS resume latency (24.11)
 
@@ -42,9 +42,9 @@ The 4 target APIs we DID investigate:
 
 | API | Outcome | Report |
 |---|---|---|
-| `rte_lcore_var` | N/A — 0 candidate sites in our crate (architectural mismatch: single-Engine-per-lcore, not per-lcore-arrays) | `adopt-rte_lcore_var.md` |
-| `rte_ptr_compress` | Deferred-to-e2e — 1 site exists in engine.rs RX burst but bench-micro doesn't reach it (no port in EngineNoEalHarness; send is stubbed) | `adopt-rte_ptr_compress.md` |
-| `rte_bit_atomic_*` | N/A — 0 candidate sites; the codebase only uses `fetch_add` / `load` on counters, no `fetch_or` / `fetch_and` / `fetch_xor` patterns | `adopt-rte_bit_atomic.md` |
+| `rte_lcore_var` | N/A — 0 candidate sites in our crate (architectural mismatch: single-Engine-per-lcore, not per-lcore-arrays) | `adopt-rte-lcore-var.md` |
+| `rte_ptr_compress` | Deferred-to-e2e — 1 site exists in engine.rs RX burst but bench-micro doesn't reach it (no port in EngineNoEalHarness; send is stubbed) | `adopt-rte-ptr-compress.md` |
+| `rte_bit_atomic_*` | N/A — 0 candidate sites; the codebase only uses `fetch_add` / `load` on counters, no `fetch_or` / `fetch_and` / `fetch_xor` patterns | `adopt-rte-bit-atomic.md` |
 | ENA TX logger rework | Deferred-pending-T3.3 + bench-pair host — passive driver-side change requires real send measurement | `adopt-ena-tx-logger.md` |
 
 Combined verdict: DPDK 24.11's API-surface improvements deliver **little measurable value at the bench-micro scope on a KVM dev host**. The improvements that COULD matter for our workload (`rte_ptr_compress` on real RX bursts, ENA TX logger on real send) require infrastructure (real ENA NIC, real send-path benches) that's deferred to T3.3 + bench-pair execution.
