@@ -2750,6 +2750,54 @@ impl Engine {
     /// events; P6 mut flow_table. Each phase's borrow ends at the
     /// block's closing `}`.
     pub(crate) fn force_close_etimedout(&self, handle: ConnHandle) {
+        // A10 deferred-fix Stage B diagnostic: dump the leak-detect
+        // counter trail at the exact moment of cliff failure. The
+        // iteration-7050/11151 cliff is hypothesized to be RX mempool
+        // exhaustion via a per-iteration mbuf refcount leak; surfacing
+        // these values when ETIMEDOUT fires gives the audit a starting
+        // point. Slow path — no cost to non-cliff runs.
+        unsafe {
+            let avail = sys::shim_rte_mempool_avail_count(self._rx_mempool.as_ptr());
+            let drop_unexpected = self
+                .counters
+                .tcp
+                .mbuf_refcnt_drop_unexpected
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let conn_timeout_retrans = self
+                .counters
+                .tcp
+                .conn_timeout_retrans
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let tx_rto = self
+                .counters
+                .tcp
+                .tx_rto
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let recv_buf_drops = self
+                .counters
+                .tcp
+                .recv_buf_drops
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let rx_partial_read_splits = self
+                .counters
+                .tcp
+                .rx_partial_read_splits
+                .load(std::sync::atomic::Ordering::Relaxed);
+            eprintln!(
+                "dpdk_net: force_close_etimedout DIAGNOSTIC handle={} rx_mempool_avail={} \
+                 (capacity={}) mbuf_refcnt_drop_unexpected={} conn_timeout_retrans={} \
+                 tx_rto={} recv_buf_drops={} rx_partial_read_splits={}",
+                handle,
+                avail,
+                self.rx_mempool_size,
+                drop_unexpected,
+                conn_timeout_retrans,
+                tx_rto,
+                recv_buf_drops,
+                rx_partial_read_splits,
+            );
+        }
+
         // Phase 1: snapshot timer ids + drain snd_retrans mbufs. Note: do
         // NOT write conn.state here — transition_conn below owns that
         // transition so StateChange emission + state_trans[from][to]
