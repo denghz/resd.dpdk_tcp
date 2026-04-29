@@ -141,37 +141,12 @@ fn bench_timer_throughput(c: &mut Criterion) {
 
     group.bench_function("timer_add_cancel_throughput", |b| {
         let mut h = EngineNoEalHarness::new(64, 1_000_000);
-        // T7.7 H1: walk a `now_ns` cursor forward each inner iter and
-        // call `timer_wheel.advance` after the cancel so the just-
-        // cancelled slot is recycled to `free_list`. The pre-T7.7
-        // bench called only `add` + `cancel` and never `advance`, so
-        // every `add` pushed a new entry onto `slots` / `generations`
-        // (uncoded, the cancellation only sets `cancelled=true` and
-        // doesn't touch the slot Vec). Across the bench's ~28 Mops/s
-        // × 30s sample window that grew the slots Vec to ~10⁹
-        // entries, triggering kernel page-fault traffic that
-        // dominated the post-baseline TBP at ~34% of profile time
-        // (clear_page_rep + do_user_addr_fault + zap_pte_range +
-        // do_anonymous_page + __handle_mm_fault + mem_cgroup_*).
-        //
-        // The real engine calls `advance` every `poll_once`, so the
-        // post-fix shape (add → cancel → advance) better mirrors the
-        // production pattern: cancellation is followed by the next
-        // tick's wheel advance which sweeps the cancelled slot back
-        // to `free_list` for reuse on the next `add`.
-        const FIRE_DELAY_NS: u64 = dpdk_net_core::tcp_timer_wheel::TICK_NS;
-        let mut cursor_ns: u64 = 0;
         b.iter_custom(|iters| {
             let start = Instant::now();
             for _ in 0..iters {
                 for _ in 0..BATCH {
-                    let id = h.timer_add(
-                        black_box(cursor_ns + FIRE_DELAY_NS),
-                        black_box(0),
-                    );
+                    let id = h.timer_add(black_box(10_000_000), black_box(0));
                     let _cancelled = h.timer_cancel(id);
-                    cursor_ns += FIRE_DELAY_NS;
-                    let _fired = h.timer_wheel.advance(cursor_ns);
                     black_box(&h);
                 }
             }
