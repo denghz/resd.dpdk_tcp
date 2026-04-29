@@ -175,8 +175,46 @@ the only retained perf change in the post-Phase-3 state.
   full-stack TCP throughput under realistic packet I/O is out of
   scope for the no-EAL harness.
 
+## Update — T7.7 uProf-driven results
+
+T7.5 left the bench at the post-H1 / post-T7.1 numbers above and
+flagged that uProf TBP couldn't resolve workload symbols at ns-scale
+on the latency benches. T7.7 retried on the µs-scale throughput
+benches; results are detailed in
+[`throughput-investigation.md`](throughput-investigation.md). Brief:
+
+| Family | Hypotheses tested | Kept | Effect |
+|---|---|---|---|
+| `tcp_input_data` | 3 (H1 bench-restructure, H2 `#[inline]` parse_options, H3 `#[inline(always)]`) | 2 (H1, H2) | **6.89 → 17.51 Mops/s (+154%)** |
+| `timer_add_cancel` | 1 (H1 advance after cancel) | 0 (H1 regressed -8.4%) | unchanged (28.0–28.8 Mops/s, within noise) |
+| `poll_empty`, `poll_idle_with_timers`, `flow_lookup_hot` | 0 (no resolved hotspot) | 0 | unchanged (within noise) |
+
+Kept commits: `1718208` (H1) and `50c0fd0` (H2) on `a10-perf-23.11`,
+both cherry-picked clean to `a10-dpdk24-adopt` (as `8f9a015` and
+`252a79a`); identical post-T7.7 landing on dpdk24. The pre-T7.7
+cross-worktree "+6.1% on dpdk24 vs 23.11" gap on tcp_input_data
+shrinks to within-noise after T7.7 — both worktrees received the
+same H1+H2 fixes and now sit at ~17.5 Mops/s.
+
+H1 is bench-only (it changes what the bench measures, not the
+shipped runtime). H2 is workload-only (`#[inline]` on a public API
+in `tcp_options.rs`). Both ship.
+
+For `timer_add_cancel`, the pre-T7.7 measurement is structurally
+mis-shaped (page-fault dominated due to unbounded `slots` Vec growth
+under the bench's add+cancel-without-advance pattern). H1 attempted
+to fix this by adding `advance` per inner iter; the per-iter
+advance overhead exceeded the saved page-fault cost and regressed
+throughput. A future bench redesign that pre-populates `free_list`
+for steady-state slot reuse without per-iter advance is deferred.
+
+For `poll_*` and `flow_lookup_hot`, TBP attributes ≥99.9% of profile
+time to `iter_custom` (workload fully inlined into the bench harness
+loop), so no resolved hotspot was available to attribute.
+
 ## Related artefacts
 
+- T7.7 detail: [`throughput-investigation.md`](throughput-investigation.md)
 - Per-family latency summaries: same directory (e.g.
   [`poll-summary.md`](poll-summary.md), [`tcp_input-summary.md`](tcp_input-summary.md)).
 - Cross-worktree latency comparison:
