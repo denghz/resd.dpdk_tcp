@@ -218,27 +218,56 @@ fn bench_tcp_input_throughput_data(c: &mut Criterion) {
             payload_offset: 54,
         };
 
+        // T7.7 H1: hoist conn construction out of the timed inner loop.
+        // Pre-T7.7 TBP showed 36% of CPU time in libc malloc/free from
+        // `make_est_conn` rebuilding TcpConn (≈5 heap allocations:
+        // SendQueue VecDeque(256 KiB), RecvQueue, ReorderQueue, Vec
+        // timer_ids(32), SendRetrans deque) per inner iter, with the
+        // matching `drop_in_place::TcpConn` adding 3.2%. That harness
+        // overhead masked the actual dispatch hotspots TBP could resolve.
+        //
+        // The bench's intent was always "sustained dispatch throughput",
+        // not "dispatch + per-call alloc-free". This restructure builds
+        // one conn outside the timed window and resets only the seq /
+        // window-state fields dispatch mutates between BATCH calls. The
+        // reset must keep `seg.seq == rcv_nxt` true so each dispatch
+        // takes the in-order data path; everything else returns to the
+        // post-`make_est_conn` shape.
+        //
+        // Fields dispatch mutates that need per-iter reset (verified by
+        // reading `handle_established` for the in-order, TS-only,
+        // SACK-permitted, no-new-ACK case the bench exercises):
+        //   - `rcv_nxt`        ← advanced by payload.len()
+        //   - `snd_wnd`        ← seg.window (65535)
+        //   - `snd_wl1` / `snd_wl2`
+        //   - `recv.bytes`     ← one InOrderSegment pushed
+        //   - `last_advertised_wnd`
+        //   - `ts_recent`      ← seg's tsval (0x1000)
+        //   - `ts_recent_age`  ← clock::now_ns()
+        //   - `last_sack_trigger` (cleared on in-order)
+        // `snd_una`, `snd_nxt`, `snd_retrans`, `sack_scoreboard`,
+        // `timer_ids`, `rtt_est` are not changed in this code path
+        // (seg.ack == snd_una, no new bytes acked, in-order, etc.).
+        let mut conn = make_est_conn(1000, 5000, 1024, Some(200), true);
+
         b.iter_custom(|iters| {
             let start = Instant::now();
             for _ in 0..iters {
-                // For sustained throughput we cannot reuse a single conn
-                // across BATCH calls — after the first dispatch, the
-                // segment at seq=5001 is no longer in-order (rcv_nxt
-                // advances by payload.len()). So we rebuild the conn
-                // outside the timed inner loop per outer-iter, then
-                // burn through BATCH dispatches each of which sees a
-                // fresh in-order segment via reset between dispatches.
-                //
-                // The reset cost is in the timed window — that's
-                // intentional: throughput measures sustained-rate of
-                // realistic dispatch calls, and a fresh-conn reset is
-                // the only way to keep each call seeing in-order data.
-                // The latency bench (tcp_input.rs) uses iter_batched_ref
-                // for the same reason but excludes setup from the
-                // window; throughput intentionally includes it as part
-                // of the per-op cost.
                 for _ in 0..BATCH {
-                    let mut conn = make_est_conn(1000, 5000, 1024, Some(200), true);
+                    // Reset only the fields dispatch mutates so the next
+                    // call still sees seq=5001 as the in-order point.
+                    conn.rcv_nxt = 5001;
+                    conn.snd_wnd = 1024;
+                    conn.snd_wl1 = 0;
+                    conn.snd_wl2 = 0;
+                    conn.last_advertised_wnd = None;
+                    conn.last_sack_trigger = None;
+                    conn.ts_recent = 200;
+                    conn.ts_recent_age = 0;
+                    // Drop accumulated in-order segments without
+                    // dropping the VecDeque's backing capacity.
+                    conn.recv.bytes.clear();
+
                     let seg = ParsedSegment {
                         src_port: 5000,
                         dst_port: 40000,
