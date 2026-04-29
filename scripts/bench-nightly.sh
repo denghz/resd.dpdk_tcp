@@ -400,21 +400,30 @@ run_dut_bench() {
   local cmd="sudo /tmp/$bench"
   local arg
   for arg in "$@"; do
-    # Quote every arg for the remote shell. Tolerates spaces / commas in
-    # --eal-args without shell-injection.
     cmd+=" $(printf '%q' "$arg")"
   done
   cmd+=" --output-csv /tmp/${csv_name}.csv"
 
-  # Refresh the EC2 Instance Connect grant (60 s auth window) before the
-  # ssh invocation. Once ssh authenticates the session persists for the
-  # full bench duration — we only need a fresh grant at connect time.
   refresh_ec2_ic_grants
 
-  log "  DUT> $bench"
-  ssh "${SSH_OPTS[@]}" "ubuntu@$DUT_SSH" "$cmd"
+  local stderr_log="$OUT_DIR/${csv_name}.stderr.log"
+  local stdout_log="$OUT_DIR/${csv_name}.stdout.log"
+
+  log "  DUT> $bench (stderr -> $stderr_log)"
+  # Capture stdout + stderr separately. The remote `2>&1` pattern would
+  # interleave the two streams; we want stderr preserved in its own
+  # file because the binaries log structured progress to stdout and
+  # diagnostics to stderr.
+  if ! ssh "${SSH_OPTS[@]}" "ubuntu@$DUT_SSH" "$cmd" \
+      >"$stdout_log" 2>"$stderr_log"; then
+    local rc=$?
+    log "  $bench exited rc=$rc; tailing stderr:"
+    tail -n 40 "$stderr_log" | sed 's/^/    /' | tee -a /dev/stderr
+    return $rc
+  fi
   refresh_ec2_ic_grants
-  scp "${SCP_OPTS[@]}" "ubuntu@$DUT_SSH:/tmp/${csv_name}.csv" "$OUT_DIR/"
+  scp "${SCP_OPTS[@]}" "ubuntu@$DUT_SSH:/tmp/${csv_name}.csv" "$OUT_DIR/" \
+    || log "  scp ${csv_name}.csv failed (bench may have exited before write)"
 }
 
 # Common args shared across bench-e2e / bench-stress / bench-vs-linux /
