@@ -234,6 +234,7 @@ dependencies = [
  "hostname",
  "serde",
  "serde_json",
+ "tempfile",
  "uuid",
 ]
 
