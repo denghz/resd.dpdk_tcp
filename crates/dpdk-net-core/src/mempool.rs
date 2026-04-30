@@ -25,9 +25,14 @@ thread_local! {
 
 /// Threshold above which a post-dec refcount in `MbufHandle::Drop`
 /// surfaces as `mbuf_refcnt_drop_unexpected`. No production path
-/// holds more than 32 handles to one mbuf concurrently; bump above
-/// this is a leak signal.
-pub(crate) const MBUF_DROP_UNEXPECTED_THRESHOLD: u16 = 32;
+/// holds more than 8 handles to one mbuf concurrently — the maximum
+/// observed in code review of `delivered_segments` / `recv.bytes` /
+/// `OooSegment` / `snd_retrans` overlap is ~4. The 8-handle threshold
+/// gives 2× headroom over reality so a slow monotonic refcount climb
+/// (rate < 1 per leak event but cumulative) surfaces faster than the
+/// prior 32-handle ceiling. False positives on the legitimate path
+/// remain zero.
+pub(crate) const MBUF_DROP_UNEXPECTED_THRESHOLD: u16 = 8;
 
 /// RAII wrapper around an `rte_mempool*`.
 /// Dropped pool calls `rte_mempool_free` on the inner pointer.
