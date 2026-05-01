@@ -200,8 +200,37 @@ pub enum OptionParseError {
 /// the `TcpOpts::default()` zero-init with later writes, and skip the
 /// `Result` discriminant store whenever the caller's branch later
 /// proves a specific `Err` variant.
+///
+/// T9 H7 (production-code throughput hunt): the steady-state
+/// inbound-data path carries Timestamps + 2 NOP-pad bytes only — a
+/// 12-byte options buffer with `[OPT_TIMESTAMP, 10, tsval4, tsecr4,
+/// NOP, NOP]`. Detecting this canonical shape with a single
+/// length+first-byte check lets us bypass the generic state-machine
+/// loop's branches (outer match on `[END | NOP | kind]` × 12 iters,
+/// inner match on `kind`) and emit a straight-line decode of the TS
+/// option. The general parser stays as the fall-through for any non-
+/// canonical buffer (longer, NOPs first, MSS present, etc.); the
+/// fast-path is purely additive.
 #[inline]
 pub fn parse_options(opts: &[u8]) -> Result<TcpOpts, OptionParseError> {
+    // T9 H7 fast-path: canonical TS-only ACK buffer
+    // `[OPT_TIMESTAMP=8, 10, tsval4, tsecr4, NOP, NOP]` (12 bytes,
+    // word-aligned). Decoded straight-line; no loop.
+    if opts.len() == 12 && opts[0] == OPT_TIMESTAMP && opts[1] == LEN_TIMESTAMP
+        && opts[10] == OPT_NOP && opts[11] == OPT_NOP
+    {
+        let tsval = u32::from_be_bytes([opts[2], opts[3], opts[4], opts[5]]);
+        let tsecr = u32::from_be_bytes([opts[6], opts[7], opts[8], opts[9]]);
+        return Ok(TcpOpts {
+            mss: None,
+            wscale: None,
+            sack_permitted: false,
+            timestamps: Some((tsval, tsecr)),
+            sack_blocks: [SackBlock { left: 0, right: 0 }; MAX_SACK_BLOCKS_DECODE],
+            sack_block_count: 0,
+            ws_clamped: false,
+        });
+    }
     let mut out = TcpOpts::default();
     let mut i = 0usize;
     while i < opts.len() {
