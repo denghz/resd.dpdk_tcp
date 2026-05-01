@@ -303,6 +303,101 @@ shift) with no offsetting performance benefit. **Stay on 23.11.**
    the wheel-add cost in production is dominated by something else
    we can't see here.
 
+## Update — T9 deep production-code throughput optimization hunt (2026-05-01)
+
+T9 picked up where T8.2 left off: with parse_options at 16% TBP and
+shim_rte_mbuf_refcnt_update at 5.9% TBP on `tcp_input_data` post-H1+H2,
+the question was whether more production-code optimizations could be
+found beyond the single `#[inline] parse_options` win. T9 tested 9
+hypotheses under the strict criterion gate (criterion verdict
+"Performance has improved" + p<0.05 + lower CI bound improvement ≥ 5%
+on the targeted bench, no regression on others).
+
+### Hypotheses tested
+
+| ID | Target | Change | Result | Disposition |
+|---|---|---|---|---|
+| H1 | dispatch state-match | `#[cold]` on `handle_syn_sent` + `handle_close_path` AND `#[inline]` on `handle_established` | -9.5% throughput, p=0 | REJECTED — reverted |
+| H1b | dispatch state-match | `#[cold]` only on syn_sent + close_path (no inline) | -9.5% throughput, p=0 | REJECTED — reverted |
+| H3 | `dispatch` shell | `#[inline]` on the per-state dispatcher | +1.6% lower CI (sub-noise) | REJECTED — reverted |
+| H4 | `Outcome::base` | `#[inline]` on the 28-field struct-init | no change (p=0.66) | REJECTED — reverted |
+| H5 | `handle_established` in-order branch | Gate `reorder.drain_contiguous_into` on `reorder.is_empty()` | **+7.0% lower CI**, p=0 | RETAINED — commit `3ff4e6f` |
+| H6 | hot helpers | `#[inline]` on `RecvQueue::free_space` / `ReorderQueue::is_empty` / `SendRetrans::is_empty` | +3.4% lower CI (sub-noise) | REJECTED — reverted |
+| H7 | `parse_options` | Fast-path the canonical 12-byte TS-only options buffer | **+10.3% lower CI**, p=0 | RETAINED — commit `c33ae91` |
+| H8 | `handle_established` window check | Fold double `in_window` into single offset bound | +0.6% lower CI (sub-noise) | REJECTED — reverted |
+| H9 | `Outcome::base` (re-test post-H7) | `#[inline]` re-evaluation now that dispatch is faster | no change (p=0.77) | REJECTED — reverted |
+
+### Retained optimizations
+
+**T9-H5** (commit `3ff4e6f`): `handle_established` unconditionally
+called `recv.reorder.drain_contiguous_into(...)` on every in-order
+data segment, even when the OOO reorder queue was empty (the
+steady-state case). The empty-queue case returns `(0, 0)` immediately,
+but the call still costs a function-call + 3-arg setup + tuple-return
++ 3 output stores. Wrapping the drain in
+`if !conn.recv.reorder.is_empty()` skips that overhead on the
+steady-state path. Behaviour bit-for-bit identical (the post-call
+counter accumulations were no-ops too when drain returned zero).
+
+**T9-H7** (commit `c33ae91`): `parse_options` now detects the
+canonical TS-only options buffer
+`[OPT_TIMESTAMP=8, 10, tsval4, tsecr4, NOP, NOP]` (12 bytes, the
+shape every steady-state inbound-data ACK carries) and decodes it
+straight-line, bypassing the generic state-machine loop. The general
+parser stays as the fall-through for non-canonical buffers (longer,
+NOP-prefixed, MSS-bearing, SACK-bearing, etc.); the fast-path is
+purely additive and the existing 22-test parse_options suite covers
+all non-canonical shapes through the slow path.
+
+### Cumulative throughput improvements (vs pre-T9 baseline)
+
+| Bench | pre-T9 | post-T9 (H5+H7) | Δ throughput | Lower-CI bound |
+|---|---|---|---|---|
+| tcp_input_data | 17.282 Melem/s | 20.812 Melem/s | +20.43% | +18.58% |
+| poll_empty | 22.844 Melem/s | 22.973 Melem/s | +0.56% | (no change) |
+| poll_idle_with_timers | 22.010 Melem/s | 22.210 Melem/s | +0.91% | (no change) |
+| flow_lookup_hot | 100.20 Melem/s | 100.96 Melem/s | +0.76% | (no change) |
+| timer_add_cancel | 27.025 Melem/s | 26.483 Melem/s | -2.01% | (within noise) |
+
+The big retained wins are concentrated on `tcp_input_data` (the
+bench that had usable TBP attribution); the other 4 benches were
+already TBP-criterion-bound (99%+ in `iter_custom`) and the H5+H7
+changes touch code not exercised by them — small drift only.
+
+### Cross-worktree comparison (post-T9, both worktrees with H5+H7)
+
+| Bench | 23.11 | 24.11 | Δ |
+|---|---|---|---|
+| poll_empty | 22.97 Melem/s | 22.96 Melem/s | -0.04% (noise) |
+| poll_idle_with_timers | 22.21 Melem/s | 22.16 Melem/s | -0.23% (noise) |
+| flow_lookup_hot | 100.96 Melem/s | 98.34 Melem/s | -2.59% (noise) |
+| timer_add_cancel | 26.48 Melem/s | 26.87 Melem/s | +1.47% (noise) |
+| tcp_input_data | 20.81 Melem/s | 20.59 Melem/s | -1.06% (noise) |
+
+DPDK 24.11 is within ±5% on every bench — fully within the
+criterion noise threshold. **Recommendation: do NOT promote DPDK
+24.11.** The H5+H7 wins are layered on both worktrees, the relative
+performance is statistically tied, and the upgrade has no measured
+benefit to offset the rebase / retesting / vendor surface shift cost.
+
+### Top remaining hotspots (post-T9 TBP refresh)
+
+1. `iter_custom` — 68.7% (criterion harness, unattributable)
+2. `rayon::bridge_producer_consumer` — 11.4% (criterion harness)
+3. `shim_rte_mbuf_refcnt_update` — 7.2% (DPDK shim, untouchable per
+   directive)
+4. `__ieee754_exp_fma` — 4.5% (libm, criterion stats)
+5. `parse_options` — 3.1% (down from 16.2% pre-T9, slow-path only
+   now reachable on non-canonical buffers)
+6. `shim_rte_pktmbuf_next` — 0.5% (DPDK shim, single-link chains
+   always return NULL on ENA)
+
+Production code now accounts for ~10% of total CPU on the bench;
+the rest is criterion overhead + DPDK shims. Further wins on this
+bench would require either (a) bench-harness restructuring to
+de-couple from criterion (out of scope per directive) or (b) DPDK
+internals modification (out of scope per directive).
+
 ## Related artefacts
 
 - T8 hotspot diff: [`../../../profile/hotspot-diff.md`](../../../profile/hotspot-diff.md)
