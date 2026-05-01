@@ -938,6 +938,7 @@ dependencies = [
  "hostname",
  "serde",
  "serde_json",
+ "thiserror",
  "uuid",
 ]
 

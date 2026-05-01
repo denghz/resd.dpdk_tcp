@@ -291,8 +291,8 @@ pub fn is_smoke_member(name: &str) -> bool {
 /// The returned vector has at most one entry per distinct FI spec; each
 /// entry's scenarios all share the same FI config and can be run in one
 /// process invocation.
-pub fn partition_by_fi_spec<'a>(
-    selected: &'a [&'static LayerHScenario],
+pub fn partition_by_fi_spec(
+    selected: &[&'static LayerHScenario],
 ) -> Vec<(Option<&'static str>, Vec<&'static LayerHScenario>)> {
     let mut groups: Vec<(Option<&'static str>, Vec<&'static LayerHScenario>)> = Vec::new();
     for s in selected {

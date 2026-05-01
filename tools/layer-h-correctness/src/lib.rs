@@ -7,4 +7,5 @@
 //! primitives so the integration tests in `tests/*` can import them
 //! without going through the binary.
 
+pub mod assertions;
 pub mod scenarios;
