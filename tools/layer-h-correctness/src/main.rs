@@ -8,7 +8,7 @@ use anyhow::{Context as _, Result};
 use clap::Parser;
 use uuid::Uuid;
 
-use bench_common::preconditions::{PreconditionMode, Preconditions};
+use bench_common::preconditions::PreconditionMode;
 use bench_stress::netem::NetemGuard;
 
 use dpdk_net_core::engine::{Engine, EngineConfig};
@@ -124,6 +124,16 @@ fn main() {
 
 fn run() -> Result<i32> {
     let args = Args::parse();
+
+    // Stage 1 layer-h-correctness inherits a checked environment from the
+    // orchestrator script (scripts/layer-h-{smoke,nightly}.sh runs
+    // check-bench-preconditions upfront). The flag's role here is to
+    // validate input + record the mode in the report header so a future
+    // downstream consumer can correlate with the bench-stress preset.
+    let precondition_mode: PreconditionMode = args
+        .precondition_mode
+        .parse()
+        .map_err(|e| anyhow::anyhow!("--precondition-mode {}: {e}", args.precondition_mode))?;
 
     // 0. --report-md clobber check (before EAL init so a clobber doesn't
     //    waste a fleet-bring-up cycle).
@@ -244,7 +254,7 @@ fn run() -> Result<i32> {
     }
 
     // 10. Write Markdown report.
-    let header = build_header(&engine, run_id, fi_spec_for_run);
+    let header = build_header(&engine, run_id, fi_spec_for_run, precondition_mode);
     write_markdown_report(&args.report_md, &header, &results, args.force)
         .with_context(|| format!("write report {}", args.report_md.display()))?;
 
@@ -376,17 +386,18 @@ fn build_engine(args: &Args) -> Result<Engine> {
     Engine::new(cfg).map_err(|e| anyhow::anyhow!("Engine::new failed: {e:?}"))
 }
 
-fn build_header(engine: &Engine, run_id: Uuid, fi_spec: Option<&str>) -> ReportHeader {
+fn build_header(
+    engine: &Engine,
+    run_id: Uuid,
+    fi_spec: Option<&str>,
+    precondition_mode: PreconditionMode,
+) -> ReportHeader {
     let cfg = engine.config();
     // The header's hw_offload_rx_cksum / fault_injector flags reflect the
-    // dpdk-net-core dep's compile-time feature set. Those features live on
-    // the dep crate, not this one; cfg!() over them in *this* crate's
-    // build returns false unless we declare local forwarders. The
-    // `#[allow]` keeps the report fields wired to the spec-defined slots
-    // while the future-cleanup task lands the forwarder features.
-    #[allow(unexpected_cfgs)]
+    // dpdk-net-core dep's compile-time feature set. Local forwarder
+    // features in this crate's Cargo.toml propagate to the dep, so
+    // cfg!() evaluates against the real build configuration.
     let hw_offload_rx_cksum = cfg!(feature = "hw-offload-rx-cksum");
-    #[allow(unexpected_cfgs)]
     let fault_injector = cfg!(feature = "fault-injector");
     ReportHeader {
         run_id: run_id.to_string(),
@@ -401,6 +412,7 @@ fn build_header(engine: &Engine, run_id: Uuid, fi_spec: Option<&str>) -> ReportH
         tcp_max_retrans_count: cfg.tcp_max_retrans_count,
         hw_offload_rx_cksum,
         fault_injector,
+        precondition_mode,
         fi_spec: fi_spec.map(String::from),
     }
 }
@@ -433,12 +445,4 @@ fn pkg_config_dpdk_version() -> String {
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default()
-}
-
-// Suppress unused-import lint when the harness binary's unit tests grow
-// later; for now the bin has no #[cfg(test)] mod.
-#[allow(dead_code)]
-fn _swallow_unused_imports() {
-    let _ = PreconditionMode::Strict;
-    let _ = Preconditions::default();
 }

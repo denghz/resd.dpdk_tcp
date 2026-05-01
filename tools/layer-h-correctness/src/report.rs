@@ -9,6 +9,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
+use bench_common::preconditions::PreconditionMode;
 use serde::Serialize;
 
 use crate::counters_snapshot::Snapshot;
@@ -30,6 +31,7 @@ pub struct ReportHeader {
     pub tcp_max_retrans_count: u32,
     pub hw_offload_rx_cksum: bool,
     pub fault_injector: bool,
+    pub precondition_mode: PreconditionMode,
     pub fi_spec: Option<String>,
 }
 
@@ -91,6 +93,7 @@ fn write_header<W: Write>(
         "- fault-injector = {}",
         if h.fault_injector { "on" } else { "off" }
     )?;
+    writeln!(f, "- precondition_mode = {}", h.precondition_mode)?;
     if let Some(fi) = &h.fi_spec {
         writeln!(f, "- DPDK_NET_FAULT_INJECTOR = {fi}")?;
     }
@@ -258,6 +261,7 @@ mod tests {
             tcp_max_retrans_count: 15,
             hw_offload_rx_cksum: true,
             fault_injector: true,
+            precondition_mode: PreconditionMode::Strict,
             fi_spec: None,
         }
     }
