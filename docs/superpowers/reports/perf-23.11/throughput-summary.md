@@ -212,8 +212,102 @@ For `poll_*` and `flow_lookup_hot`, TBP attributes ≥99.9% of profile
 time to `iter_custom` (workload fully inlined into the bench harness
 loop), so no resolved hotspot was available to attribute.
 
+## Update — T8.1+T8.2 uProf TBP on throughput benches (2026-05-01)
+
+T8 followed up by capturing AMDuProfCLI TBP on **all 5 throughput
+benches** (×2 worktrees = 10 captures), then attempting
+benchmark-justified A/B for any TBP-resolved hotspot. Detail:
+[`../../../profile/hotspot-diff.md`](../../../profile/hotspot-diff.md)
+on this worktree.
+
+### TBP attribution quality (T8.1)
+
+| Bench | Workload symbols visible? |
+|---|---|
+| `poll_empty_throughput` | NO — `iter_custom` 99% (workload fully inlined into criterion wrapper) |
+| `poll_idle_with_timers_throughput` | NO — same |
+| `flow_lookup_hot_throughput` | NO — same |
+| `timer_add_cancel_throughput` | PARTIAL — `TimerWheel::add` 38–40%, kernel-mm 26% (page-fault setup overhead, not measured throughput) |
+| `tcp_input_data_throughput` | YES — `parse_options` 16%, `shim_rte_mbuf_refcnt_update` 5–6%, rayon-criterion stats 11% |
+
+This is consistent with KVM TBP limitations (no IBS / no PMU events) and the
+T7.5/T7.7 finding that LLVM's loop-flattening folds the bench's inner BATCH
+loop into `iter_custom`. Honest finding: only `tcp_input_data` (and
+partially `timer_add_cancel`) yields actionable workload hotspots.
+
+### Hypotheses tested (T8.2)
+
+Per the strict gate (criterion verdict "improved" + p<0.05 + lower CI ≥ +5%):
+
+| ID | Target | Change | Result | Disposition |
+|---|---|---|---|---|
+| T8.2-H1 | `parse_options` | Hoist OPT_SACK arm into `#[cold] #[inline(never)]` helper to shrink hot-parser body | -3.74% throughput, p=0.00 | REJECTED — reverted |
+| T8.2-H2 | `parse_options` | Reorder match arms `if/else` chain ordered by frequency (TIMESTAMP first) | -0.95% throughput, p=0.00 (within noise but in wrong direction) | REJECTED — reverted |
+
+**Not pursued (with reasoning):**
+
+- `shim_rte_mbuf_refcnt_update` direct atomic on bindgen-derived offset:
+  layout-fragile across DPDK versions; violates the "ARM on roadmap, no
+  x86_64-only struct-layout assumptions" memory rule.
+- `shim_rte_mbuf_refcnt_update` bulk-decref shim: bench-artifact only
+  (production has 1 enqueue + 1 dequeue, never bulk-clear).
+- `TcpOpts` field-set elision: invasive, and the established-only
+  caller already short-circuits on `parsed_opts.timestamps`.
+- `timer_add_cancel` `TimerWheel::add` setup-cost reduction: would
+  change what the bench measures; the dominant cost is page-fault
+  / kernel-mm from the bench's pathological `add+cancel-without-advance`
+  pattern, not the wheel itself.
+
+### Cross-worktree throughput post-T8
+
+Both worktrees: 0 retained optimisations. Numbers below are the same
+post-T7.7 baseline re-measured on 2026-05-01 with `--measurement-time 15
+--sample-size 30`:
+
+| Bench | 23.11 (Mops/s) | 24.11 (Mops/s) | Δ |
+|---|---:|---:|---:|
+| `poll_empty_throughput` | 23.011 | 23.437 | +1.85% (within noise) |
+| `poll_idle_with_timers_throughput` | 22.286 | 22.309 | +0.10% (noise) |
+| `flow_lookup_hot_throughput` | 100.49 | 98.979 | -1.50% (noise) |
+| `timer_add_cancel_throughput` | 28.142 | 27.492 | -2.31% (noise) |
+| `tcp_input_data_throughput` | 17.456 | 17.543 | +0.50% (sub-noise) |
+
+**The pre-T7.7 "+6.1% on tcp_input_data on 24.11" gap has fully closed
+post-T7.7+T8** — both worktrees now sit within ±2% of each other on
+every family. The earlier delta was a transient state of cherry-pick
+ordering, not a durable advantage.
+
+### Recommendation: do NOT promote DPDK 24.11
+
+Post-T8 there is **no measurable throughput advantage** of 24.11 over
+23.11 on any of the 5 benches. All cross-worktree deltas are within
+noise (≤2.31% absolute, none clearing the 5% lower-CI bar). Combined
+with the unchanged latency story (per `../perf-a10-postphase.md`),
+the 24.11 upgrade carries cost (rebase, retesting, vendor surface
+shift) with no offsetting performance benefit. **Stay on 23.11.**
+
+### Top 3 remaining hotspots (for future T8 cycles)
+
+1. **`parse_options`** — 16% of TBP on `tcp_input_data`. T7.7 + T8
+   exhausted the obvious inline / arm-reorder / helper-hoist
+   experiments; further wins likely need either SIMD parsing or a
+   call-site fast-path for the canonical TS-only 10-byte case (both
+   risky).
+2. **`shim_rte_mbuf_refcnt_update`** — 5–6% of TBP on `tcp_input_data`.
+   Pure FFI cost. Reducing it requires either bypassing the shim
+   (layout-fragile) or restructuring the in-order append's refcount
+   ownership lineage (correctness-fragile).
+3. **`TimerWheel::add`** — 38–40% of TBP on `timer_add_cancel`, but
+   the bench's add+cancel-without-advance pattern is bench-artifact
+   territory. Production paths advance the wheel between adds, so
+   the wheel-add cost in production is dominated by something else
+   we can't see here.
+
 ## Related artefacts
 
+- T8 hotspot diff: [`../../../profile/hotspot-diff.md`](../../../profile/hotspot-diff.md)
+  on this worktree (cross-worktree TBP top-10 + per-bench attribution
+  quality). Each capture also has a `tbp.csv` next to its profile dir.
 - T7.7 detail: [`throughput-investigation.md`](throughput-investigation.md)
 - Per-family latency summaries: same directory (e.g.
   [`poll-summary.md`](poll-summary.md), [`tcp_input-summary.md`](tcp_input-summary.md)).
