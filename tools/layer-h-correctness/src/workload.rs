@@ -1,8 +1,8 @@
 //! Spec §5.4: per-scenario lifecycle + deadline-driven outer loop.
 //!
 //! `run_one_scenario` is the engine-driven entry point. The pure-data
-//! helpers (`select_counter_names`, `merge_failure_lists`) are exposed
-//! and unit-tested without DPDK.
+//! helper (`select_counter_names`) is exposed and unit-tested without
+//! DPDK.
 
 use std::time::Duration;
 
