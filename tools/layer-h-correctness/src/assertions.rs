@@ -173,6 +173,12 @@ pub fn evaluate_disjunctive(
         let mut deltas = Vec::with_capacity(counters.len());
         let mut any_pass = false;
         for c in *counters {
+            // Disjunctive groups treat absent counters as voting 0:
+            // `select_counter_names` (workload.rs) pre-resolves every
+            // group member at startup, so the missing-counter case is
+            // not expected to fire in practice. The `unwrap_or(0)` is
+            // a defensive default that keeps an unrelated logic bug
+            // from crashing the sweep.
             let d = snapshot_delta(pre, post, c).unwrap_or(0);
             deltas.push(d);
             if rel.check(c, d).is_ok() {
@@ -195,7 +201,7 @@ pub fn evaluate_disjunctive(
 /// the run; the end-of-scenario versions are evaluated here.
 pub fn evaluate_global_side_checks(pre: &Snapshot, post: &Snapshot) -> Vec<FailureReason> {
     let mut out = Vec::new();
-    for counter in ["tcp.mbuf_refcnt_drop_unexpected", "obs.events_dropped"] {
+    for counter in crate::counters_snapshot::SIDE_CHECK_COUNTERS.iter().copied() {
         let d = match snapshot_delta(pre, post, counter) {
             Ok(d) => d,
             Err(e) => {
@@ -399,5 +405,27 @@ mod evaluator_tests {
         let post = snap(&[("tcp.mbuf_refcnt_drop_unexpected", 3), ("obs.events_dropped", 0)]);
         let fails = evaluate_global_side_checks(&pre, &post);
         assert_eq!(fails.len(), 1);
+    }
+
+    #[test]
+    fn global_side_checks_fail_when_events_dropped_nonzero() {
+        let pre = snap(&[("tcp.mbuf_refcnt_drop_unexpected", 0), ("obs.events_dropped", 0)]);
+        let post = snap(&[("tcp.mbuf_refcnt_drop_unexpected", 0), ("obs.events_dropped", 12)]);
+        let fails = evaluate_global_side_checks(&pre, &post);
+        assert_eq!(fails.len(), 1);
+        match &fails[0] {
+            FailureReason::CounterRelation { counter, .. } => {
+                assert_eq!(counter, "obs.events_dropped");
+            }
+            other => panic!("expected CounterRelation on obs.events_dropped, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn global_side_checks_collect_both_failures_when_both_nonzero() {
+        let pre = snap(&[("tcp.mbuf_refcnt_drop_unexpected", 0), ("obs.events_dropped", 0)]);
+        let post = snap(&[("tcp.mbuf_refcnt_drop_unexpected", 4), ("obs.events_dropped", 7)]);
+        let fails = evaluate_global_side_checks(&pre, &post);
+        assert_eq!(fails.len(), 2);
     }
 }

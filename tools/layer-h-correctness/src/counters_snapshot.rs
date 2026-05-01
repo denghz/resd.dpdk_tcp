@@ -30,8 +30,9 @@ pub const MIN_RX_MEMPOOL_AVAIL: u32 = 32;
 ///   - `obs.events_dropped` per-batch delta `== 0` (in observation.rs).
 ///
 /// These names are added to the snapshot's name set automatically so
-/// scenarios don't repeat them. Wired into snapshot collection by
-/// `snapshot_with_side_checks`.
+/// scenarios don't repeat them. The driver's `select_counter_names`
+/// helper (in `workload.rs`) unions these names with each scenario's
+/// `counter_expectations` before pre-flight resolution.
 pub const SIDE_CHECK_COUNTERS: &[&str] =
     &["tcp.mbuf_refcnt_drop_unexpected", "obs.events_dropped"];
 
