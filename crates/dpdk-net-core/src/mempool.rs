@@ -284,8 +284,10 @@ impl Drop for MbufHandle {
         }
         let post = pre.saturating_sub(1);
         // Diagnostic fires on:
-        // - High refcount leak: post > 32 (more handles outstanding
-        //   than any legitimate path holds simultaneously).
+        // - High refcount leak: post > MBUF_DROP_UNEXPECTED_THRESHOLD
+        //   (currently 8 — see the constant for the rationale; more
+        //   handles outstanding than any legitimate path holds
+        //   simultaneously).
         // - Double-dec / saturating-underflow: pre == 0 (a Drop
         //   ran on a handle whose mbuf was already freed by another
         //   path — symmetric leak signal, same forensic value).
