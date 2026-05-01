@@ -146,6 +146,88 @@ point. The 23.11-stays recommendation from
   `Engine::poll_once`. Real-traffic poll cost on a populated mempool
   is unmeasured here.
 
+## Update — T9 deep production-code throughput optimization hunt (2026-05-01)
+
+T9 ran on the 23.11 worktree (with cherry-picks to 24.11) testing 9
+production-code optimization hypotheses against the strict criterion
+gate (verdict "improved" + p<0.05 + lower CI bound improvement ≥ 5%
+on the targeted bench, no regression on others).
+
+### T9 retained optimizations (committed on both worktrees)
+
+| Hypothesis | 23.11 commit | 24.11 commit | Description | Lower-CI gain |
+|---|---|---|---|---|
+| T9-H5 | `3ff4e6f` | `381cd93` | Gate `reorder.drain_contiguous_into` on `is_empty()` in `handle_established`'s in-order branch | +7.0% (23.11) / +7.4% (24.11) on `tcp_input_data` |
+| T9-H7 | `c33ae91` | `509f039` | Fast-path canonical 12-byte TS-only `parse_options` buffer | +10.3% on top of H5 (both worktrees) |
+
+Cumulative: tcp_input_data improved from 17.2 Melem/s to ~20.8
+Melem/s (+20% point estimate, +18.6% lower-CI bound) on both
+worktrees.
+
+### T9 rejected hypotheses (7 of 9 tested)
+
+| ID | Target | Why rejected |
+|---|---|---|
+| H1 | `#[cold]` on syn_sent + close_path AND `#[inline]` on `handle_established` | -9.5% throughput (likely cold-path setup leaked into hot prologue) |
+| H1b | `#[cold]` only, no inline on handle_established | -9.5% throughput (same regression mode) |
+| H3 | `#[inline]` on `dispatch` shell | +1.6% lower CI — sub-noise |
+| H4 | `#[inline]` on `Outcome::base()` | No change (p=0.66) |
+| H6 | `#[inline]` on `RecvQueue::free_space` / `ReorderQueue::is_empty` / `SendRetrans::is_empty` | +3.4% lower CI — sub-noise |
+| H8 | Fold double `in_window` into single offset bound | +0.6% lower CI — sub-noise |
+| H9 | Re-test H4 post-H7 | No change (p=0.77) |
+
+### Final cross-worktree throughput (post-T9, both worktrees with H5+H7)
+
+| Bench | 23.11 final | 24.11 final | Δ | Verdict |
+|---|---|---|---|---|
+| poll_empty | 22.97 Melem/s | 22.96 Melem/s | -0.04% | tied (noise) |
+| poll_idle_with_timers | 22.21 Melem/s | 22.16 Melem/s | -0.23% | tied (noise) |
+| flow_lookup_hot | 100.96 Melem/s | 98.34 Melem/s | -2.59% | tied (noise) |
+| timer_add_cancel | 26.48 Melem/s | 26.87 Melem/s | +1.47% | tied (noise) |
+| tcp_input_data | 20.81 Melem/s | 20.59 Melem/s | -1.06% | tied (noise) |
+
+**The pre-T7.7 +6.1% advantage on 24.11 (the original throughput-only
+signal that motivated this whole investigation) is fully absorbed by
+the T7.7-H2 #[inline] win cherry-picked to both worktrees, the T7.5
+`port-forward` H1 win on both worktrees, and the T9 H5+H7 wins
+applied to both worktrees. There is no measurable performance
+advantage to running 24.11 on this codebase.**
+
+### DPDK 24.11 promotion verdict (T9-final)
+
+**DO NOT PROMOTE 24.11.** Per the T9 task brief's decision rule:
+
+- 24.11 is NOT consistently ≥ 5% faster on any bench (all within ±2.6%)
+- 24.11 does NOT regress beyond -5% on any bench (worst case
+  flow_lookup_hot at -2.59%, well within criterion noise)
+- → "DO NOT PROMOTE — no benefit justifies the upgrade cost"
+
+The recommendation from the original
+[`perf-a10-postphase.md`](perf-a10-postphase.md) (stay on 23.11
+until full-stack measurement is available) is **reinforced** by T9.
+The case for revisiting later (T3.3 real-send wiring, bench-pair
+host, PMU access) is unchanged.
+
+### Top remaining production-code hotspots (post-T9)
+
+The TBP refresh on 23.11 post-H5+H7 attributes:
+
+1. `iter_custom` 68.7% (criterion harness, unattributable on KVM)
+2. `rayon::bridge` 11.4% (criterion harness)
+3. `shim_rte_mbuf_refcnt_update` 7.2% (DPDK shim, out of scope per directive)
+4. `__ieee754_exp_fma` 4.5% (libm, criterion stats)
+5. `parse_options` 3.1% (down from 16.2% pre-T9; slow path only)
+6. `shim_rte_pktmbuf_next` 0.5%
+
+Production code is now ~10% of the bench's total CPU. The remaining
+~90% is criterion overhead + DPDK shims. **`tcp_input_data` is
+effectively at the host's measurement-resolution ceiling on this KVM
+configuration.** Future T10 cycles would need either:
+
+- Real-traffic bench harness (T3.3 real-send + bench-pair host)
+- Direct PMU access for IBS / branch-mispredict resolution
+- DPDK-internals tuning (out of scope for this codebase)
+
 ## Related artefacts
 
 - Latency-focused cross-worktree summary:
