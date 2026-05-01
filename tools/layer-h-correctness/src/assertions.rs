@@ -95,6 +95,130 @@ pub enum RelationParseError {
     InvalidBound(String),
 }
 
+use crate::counters_snapshot::{delta as snapshot_delta, Snapshot};
+use crate::observation::FailureReason;
+
+/// Evaluate every `(counter_name, relation_str)` pair in `expectations`
+/// against `(pre, post)` snapshots. Collects all failures rather than
+/// short-circuiting — the caller surfaces them together in the
+/// per-scenario verdict.
+pub fn evaluate_counter_expectations(
+    pre: &Snapshot,
+    post: &Snapshot,
+    expectations: &[(&str, &str)],
+) -> Vec<FailureReason> {
+    let mut out = Vec::new();
+    for (counter, rel_str) in expectations {
+        let rel = match Relation::parse(rel_str) {
+            Ok(r) => r,
+            Err(e) => {
+                // Should not occur — pre-flight at startup parses every
+                // matrix relation. Surface as a synthetic failure so a
+                // logic regression doesn't silently swallow.
+                out.push(FailureReason::CounterRelation {
+                    counter: (*counter).to_string(),
+                    relation: (*rel_str).to_string(),
+                    observed_delta: 0,
+                    message: format!("relation parse error mid-sweep: {e}"),
+                });
+                continue;
+            }
+        };
+        let delta = match snapshot_delta(pre, post, counter) {
+            Ok(d) => d,
+            Err(e) => {
+                out.push(FailureReason::CounterRelation {
+                    counter: (*counter).to_string(),
+                    relation: rel.to_string(),
+                    observed_delta: 0,
+                    message: format!("counter missing from snapshot: {e}"),
+                });
+                continue;
+            }
+        };
+        if let Err(msg) = rel.check(counter, delta) {
+            out.push(FailureReason::CounterRelation {
+                counter: (*counter).to_string(),
+                relation: rel.to_string(),
+                observed_delta: delta,
+                message: msg,
+            });
+        }
+    }
+    out
+}
+
+/// Evaluate disjunctive groups: each `(counters[], relation)` pair
+/// passes iff at least one counter in `counters[]` satisfies `relation`.
+/// Used for offload-aware corruption-counter selection (spec §4 row 14).
+pub fn evaluate_disjunctive(
+    pre: &Snapshot,
+    post: &Snapshot,
+    expectations: &[(&[&str], &str)],
+) -> Vec<FailureReason> {
+    let mut out = Vec::new();
+    for (counters, rel_str) in expectations {
+        let rel = match Relation::parse(rel_str) {
+            Ok(r) => r,
+            Err(e) => {
+                out.push(FailureReason::DisjunctiveCounterRelation {
+                    counters: counters.iter().map(|s| (*s).to_string()).collect(),
+                    relation: (*rel_str).to_string(),
+                    observed_deltas: vec![],
+                    message: format!("relation parse error mid-sweep: {e}"),
+                });
+                continue;
+            }
+        };
+        let mut deltas = Vec::with_capacity(counters.len());
+        let mut any_pass = false;
+        for c in *counters {
+            let d = snapshot_delta(pre, post, c).unwrap_or(0);
+            deltas.push(d);
+            if rel.check(c, d).is_ok() {
+                any_pass = true;
+            }
+        }
+        if !any_pass {
+            out.push(FailureReason::disjunctive(counters, rel, &deltas));
+        }
+    }
+    out
+}
+
+/// Evaluate the global side-checks (spec §4 "Global side-checks"):
+///   - `tcp.mbuf_refcnt_drop_unexpected` delta `== 0`.
+///   - `obs.events_dropped` delta `== 0`.
+///
+/// The per-batch live `tcp.rx_mempool_avail >= MIN` and per-batch
+/// `obs.events_dropped == 0` are evaluated by `observe_batch` during
+/// the run; the end-of-scenario versions are evaluated here.
+pub fn evaluate_global_side_checks(pre: &Snapshot, post: &Snapshot) -> Vec<FailureReason> {
+    let mut out = Vec::new();
+    for counter in ["tcp.mbuf_refcnt_drop_unexpected", "obs.events_dropped"] {
+        let d = match snapshot_delta(pre, post, counter) {
+            Ok(d) => d,
+            Err(e) => {
+                out.push(FailureReason::CounterRelation {
+                    counter: counter.to_string(),
+                    relation: "==0".into(),
+                    observed_delta: 0,
+                    message: format!("counter missing from snapshot: {e}"),
+                });
+                continue;
+            }
+        };
+        if d != 0 {
+            out.push(FailureReason::counter_relation(
+                counter,
+                Relation::EqualsZero,
+                d,
+            ));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,5 +322,82 @@ mod tests {
             let r = Relation::parse(s).unwrap();
             assert_eq!(format!("{r}"), s);
         }
+    }
+}
+
+#[cfg(test)]
+mod evaluator_tests {
+    use super::*;
+    use crate::counters_snapshot::Snapshot;
+
+    fn snap(pairs: &[(&str, u64)]) -> Snapshot {
+        pairs.iter().map(|(k, v)| ((*k).to_string(), *v)).collect()
+    }
+
+    #[test]
+    fn evaluate_passes_when_all_expectations_hold() {
+        let pre = snap(&[("tcp.tx_retrans", 0), ("obs.events_dropped", 0)]);
+        let post = snap(&[("tcp.tx_retrans", 5), ("obs.events_dropped", 0)]);
+        let exp = &[
+            ("tcp.tx_retrans", ">0"),
+            ("tcp.tx_retrans", "<=10000"),
+            ("obs.events_dropped", "==0"),
+        ];
+        let fails = evaluate_counter_expectations(&pre, &post, exp);
+        assert!(fails.is_empty(), "expected pass, got {fails:?}");
+    }
+
+    #[test]
+    fn evaluate_collects_all_failures_not_first() {
+        let pre = snap(&[("tcp.tx_retrans", 0), ("obs.events_dropped", 0)]);
+        let post = snap(&[("tcp.tx_retrans", 0), ("obs.events_dropped", 5)]);
+        let exp = &[
+            ("tcp.tx_retrans", ">0"),       // fail: delta=0
+            ("obs.events_dropped", "==0"),  // fail: delta=5
+        ];
+        let fails = evaluate_counter_expectations(&pre, &post, exp);
+        assert_eq!(fails.len(), 2);
+    }
+
+    #[test]
+    fn disjunctive_passes_when_any_counter_fires() {
+        let pre = snap(&[("eth.rx_drop_cksum_bad", 0), ("ip.rx_csum_bad", 0)]);
+        let post = snap(&[("eth.rx_drop_cksum_bad", 0), ("ip.rx_csum_bad", 7)]);
+        let exp: &[(&[&str], &str)] =
+            &[(&["eth.rx_drop_cksum_bad", "ip.rx_csum_bad"], ">0")];
+        let fails = evaluate_disjunctive(&pre, &post, exp);
+        assert!(fails.is_empty(), "expected pass, got {fails:?}");
+    }
+
+    #[test]
+    fn disjunctive_fails_when_no_counter_fires() {
+        let pre = snap(&[("eth.rx_drop_cksum_bad", 0), ("ip.rx_csum_bad", 0)]);
+        let post = snap(&[("eth.rx_drop_cksum_bad", 0), ("ip.rx_csum_bad", 0)]);
+        let exp: &[(&[&str], &str)] =
+            &[(&["eth.rx_drop_cksum_bad", "ip.rx_csum_bad"], ">0")];
+        let fails = evaluate_disjunctive(&pre, &post, exp);
+        assert_eq!(fails.len(), 1);
+        match &fails[0] {
+            FailureReason::DisjunctiveCounterRelation { counters, .. } => {
+                assert_eq!(counters.len(), 2);
+            }
+            other => panic!("expected DisjunctiveCounterRelation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn global_side_checks_pass_when_both_zero() {
+        let pre = snap(&[("tcp.mbuf_refcnt_drop_unexpected", 0), ("obs.events_dropped", 0)]);
+        let post = pre.clone();
+        let fails = evaluate_global_side_checks(&pre, &post);
+        assert!(fails.is_empty());
+    }
+
+    #[test]
+    fn global_side_checks_fail_when_mbuf_refcnt_drop_nonzero() {
+        let pre = snap(&[("tcp.mbuf_refcnt_drop_unexpected", 0), ("obs.events_dropped", 0)]);
+        let post = snap(&[("tcp.mbuf_refcnt_drop_unexpected", 3), ("obs.events_dropped", 0)]);
+        let fails = evaluate_global_side_checks(&pre, &post);
+        assert_eq!(fails.len(), 1);
     }
 }

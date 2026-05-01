@@ -50,7 +50,7 @@ pub struct EventRecord {
     pub to: Option<TcpStateName>,
     /// Populated on `Error` / `Closed` only.
     pub err: Option<i32>,
-    /// Populated on `TcpRetrans` / `TcpLossDetected` only.
+    /// Populated on `TcpRetrans` only.
     pub seq: Option<u32>,
 }
 
@@ -239,16 +239,11 @@ fn record_from_event(ev: &InternalEvent, ord: usize) -> EventRecord {
 }
 
 fn conn_to_idx(conn: dpdk_net_core::flow_table::ConnHandle) -> u32 {
-    // ConnHandle is opaque; we only need a stable u32 to disambiguate
-    // events from the same scenario. The flow_table assigns indices
-    // monotonically per-engine so the cast suffices for reporting.
-    // Cast goes through u64 because ConnHandle is a u32-sized newtype;
-    // see crates/dpdk-net-core/src/flow_table.rs for the underlying
-    // representation. If the type ever grows wider than 32 bits this
-    // compile-time-asserts via the cast.
-    #[allow(clippy::useless_conversion)] // ConnHandle is currently `pub type
-    // ConnHandle = u32`, so `.into()` is a no-op today; keep the conversion
-    // so that a Stage-2 widening to a newtype is a one-line change here.
+    // ConnHandle is currently `pub type ConnHandle = u32` (alias). The
+    // `into()` is a no-op today; we keep it so a Stage-2 newtype migration
+    // is a one-line change. See the `#[allow(clippy::useless_conversion)]`
+    // below.
+    #[allow(clippy::useless_conversion)]
     let raw: u32 = conn.into();
     raw
 }
@@ -444,4 +439,243 @@ mod tests {
         assert!(r.is_empty());
         assert!(r.truncated()); // flag preserved across drain
     }
+
+    #[test]
+    fn fsm_replay_passes_with_no_illegal_transitions() {
+        let mut r = EventRing::new();
+        let events = vec![
+            synth_state_change(TcpState::Established, TcpState::Established),
+        ];
+        match fsm_replay_batch(Some(TcpState::Established), &events, &mut r) {
+            ObserveOutcome::Ok => {}
+            ObserveOutcome::Fail(f) => panic!("expected Ok, got {f:?}"),
+        }
+    }
+
+    #[test]
+    fn fsm_replay_fails_on_state_departure() {
+        let mut r = EventRing::new();
+        match fsm_replay_batch(Some(TcpState::CloseWait), &[], &mut r) {
+            ObserveOutcome::Fail(FailureReason::FsmDeparted { observed }) => {
+                assert_eq!(observed, Some(TcpStateName::CloseWait));
+            }
+            other => panic!("expected FsmDeparted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fsm_replay_fails_on_illegal_state_change() {
+        let mut r = EventRing::new();
+        let events = vec![synth_state_change(TcpState::Established, TcpState::CloseWait)];
+        match fsm_replay_batch(Some(TcpState::Established), &events, &mut r) {
+            ObserveOutcome::Fail(FailureReason::IllegalTransition { from, to, at_event_idx }) => {
+                assert_eq!(from, TcpStateName::Established);
+                assert_eq!(to, TcpStateName::CloseWait);
+                assert_eq!(at_event_idx, 0);
+            }
+            other => panic!("expected IllegalTransition, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fsm_replay_records_first_illegal_index_with_multiple_events() {
+        let mut r = EventRing::new();
+        let events = vec![
+            synth_state_change(TcpState::Established, TcpState::Established),
+            synth_state_change(TcpState::Established, TcpState::CloseWait),
+            synth_state_change(TcpState::Established, TcpState::Established),
+        ];
+        match fsm_replay_batch(Some(TcpState::Established), &events, &mut r) {
+            ObserveOutcome::Fail(FailureReason::IllegalTransition { at_event_idx, .. }) => {
+                assert_eq!(at_event_idx, 1);
+            }
+            other => panic!("expected IllegalTransition at idx 1, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rx_mempool_floor_passes_above_min() {
+        match check_rx_mempool_floor(33) {
+            ObserveOutcome::Ok => {}
+            other => panic!("expected Ok, got {other:?}"),
+        }
+        match check_rx_mempool_floor(32) {
+            ObserveOutcome::Ok => {}
+            other => panic!("expected Ok at boundary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rx_mempool_floor_fails_below_min() {
+        match check_rx_mempool_floor(31) {
+            ObserveOutcome::Fail(FailureReason::LiveCounterBelowMin {
+                counter, observed, min,
+            }) => {
+                assert_eq!(counter, "tcp.rx_mempool_avail");
+                assert_eq!(observed, 31);
+                assert_eq!(min, 32);
+            }
+            other => panic!("expected LiveCounterBelowMin, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn events_dropped_delta_passes_when_unchanged() {
+        match check_events_dropped_delta(5, 5) {
+            ObserveOutcome::Ok => {}
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn events_dropped_delta_fails_when_advanced() {
+        match check_events_dropped_delta(5, 12) {
+            ObserveOutcome::Fail(FailureReason::EventsDropped { count }) => {
+                assert_eq!(count, 7);
+            }
+            other => panic!("expected EventsDropped, got {other:?}"),
+        }
+    }
+}
+
+/// Outcome of a single observation batch. Either liveness + event
+/// replay all passed, or a single fail-fast failure was raised.
+#[derive(Debug)]
+pub enum ObserveOutcome {
+    Ok,
+    Fail(FailureReason),
+}
+
+/// Pure-function FSM oracle: walk a slice of `InternalEvent`s and the
+/// current state, return the first illegal transition (if any) plus
+/// the running ordinal advance. `state_now` is `state_of(handle)`'s
+/// most recent return; `event_window` is appended to.
+///
+/// Separated from the engine-driven `observe_batch` so the FSM oracle
+/// is unit-testable without DPDK.
+pub fn fsm_replay_batch(
+    state_now: Option<TcpState>,
+    events: &[InternalEvent],
+    event_window: &mut EventRing,
+) -> ObserveOutcome {
+    if state_now != Some(TcpState::Established) {
+        return ObserveOutcome::Fail(FailureReason::FsmDeparted {
+            observed: state_now.map(Into::into),
+        });
+    }
+    let mut idx = event_window.next_seq();
+    let mut illegal: Option<(TcpState, TcpState, usize)> = None;
+    // Counter-tracked for-loop kept for symmetry with the closure form
+    // inside `observe_batch` below; both update `idx` alongside other
+    // per-event state.
+    #[allow(clippy::explicit_counter_loop)]
+    for ev in events {
+        if illegal.is_none() {
+            if let InternalEvent::StateChange { from, to, .. } = ev {
+                if *from == TcpState::Established && *to != TcpState::Established {
+                    illegal = Some((*from, *to, idx));
+                }
+            }
+        }
+        event_window.push(ev, idx);
+        idx += 1;
+    }
+    if let Some((from, to, at_event_idx)) = illegal {
+        return ObserveOutcome::Fail(FailureReason::IllegalTransition {
+            from: from.into(),
+            to: to.into(),
+            at_event_idx,
+        });
+    }
+    ObserveOutcome::Ok
+}
+
+/// RX-mempool floor side-check (spec §5.4: MIN_RX_MEMPOOL_AVAIL = 32).
+/// Pure-function form for unit tests.
+pub fn check_rx_mempool_floor(avail: u32) -> ObserveOutcome {
+    if avail < crate::counters_snapshot::MIN_RX_MEMPOOL_AVAIL {
+        ObserveOutcome::Fail(FailureReason::LiveCounterBelowMin {
+            counter: "tcp.rx_mempool_avail",
+            observed: avail as u64,
+            min: crate::counters_snapshot::MIN_RX_MEMPOOL_AVAIL as u64,
+        })
+    } else {
+        ObserveOutcome::Ok
+    }
+}
+
+/// Per-batch obs.events_dropped delta side-check.
+pub fn check_events_dropped_delta(pre: u64, now: u64) -> ObserveOutcome {
+    if now > pre {
+        ObserveOutcome::Fail(FailureReason::EventsDropped { count: now - pre })
+    } else {
+        ObserveOutcome::Ok
+    }
+}
+
+/// Engine-driven observation batch (spec §5.2). Calls `state_of`,
+/// drains up to MAX_DRAIN_PER_BATCH events via the callback API, and
+/// runs the three side-checks. Returns `Ok` to continue or a single
+/// fail-fast `FailureReason`.
+///
+/// Caller passes `obs_events_dropped_pre` from before the batch (read
+/// off `engine.counters().obs.events_dropped` after the previous batch
+/// completed).
+#[cfg(not(test))]
+pub fn observe_batch(
+    engine: &dpdk_net_core::engine::Engine,
+    conn: dpdk_net_core::flow_table::ConnHandle,
+    event_window: &mut EventRing,
+    obs_events_dropped_pre: u64,
+) -> ObserveOutcome {
+    use std::sync::atomic::Ordering;
+
+    // 1. Liveness: state_of must read Established.
+    let state_now = engine.state_of(conn);
+    if state_now != Some(TcpState::Established) {
+        return ObserveOutcome::Fail(FailureReason::FsmDeparted {
+            observed: state_now.map(Into::into),
+        });
+    }
+
+    // 2. Event-stream replay. The closure walks the FSM oracle and
+    //    pushes into the failure-bundle ring. `from == to` self-
+    //    transitions are filtered at engine-side push time
+    //    (engine.rs:4348), so the oracle never sees Established→
+    //    Established events.
+    let mut illegal: Option<(TcpState, TcpState, usize)> = None;
+    let mut idx = event_window.next_seq();
+    engine.drain_events(MAX_DRAIN_PER_BATCH, |evt, _engine| {
+        if illegal.is_none() {
+            if let InternalEvent::StateChange { from, to, .. } = evt {
+                if *from == TcpState::Established && *to != TcpState::Established {
+                    illegal = Some((*from, *to, idx));
+                }
+            }
+        }
+        event_window.push(evt, idx);
+        idx += 1;
+    });
+    if let Some((from, to, at_event_idx)) = illegal {
+        return ObserveOutcome::Fail(FailureReason::IllegalTransition {
+            from: from.into(),
+            to: to.into(),
+            at_event_idx,
+        });
+    }
+
+    // 3. RX-mempool floor side-check. tcp.rx_mempool_avail is
+    //    AtomicU32 and intentionally absent from lookup_counter.
+    let avail = engine.counters().tcp.rx_mempool_avail.load(Ordering::Relaxed);
+    if let ObserveOutcome::Fail(f) = check_rx_mempool_floor(avail) {
+        return ObserveOutcome::Fail(f);
+    }
+
+    // 4. Per-batch obs.events_dropped delta side-check.
+    let obs_dropped_now = engine
+        .counters()
+        .obs
+        .events_dropped
+        .load(Ordering::Relaxed);
+    check_events_dropped_delta(obs_events_dropped_pre, obs_dropped_now)
 }

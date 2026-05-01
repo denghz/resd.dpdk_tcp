@@ -21,7 +21,7 @@ path = "src/main.rs"
 bench-common = { path = "../bench-common" }
 bench-e2e = { path = "../bench-e2e" }
 bench-stress = { path = "../bench-stress" }
-dpdk-net-core = { path = "../../crates/dpdk-net-core", features = ["fault-injector"] }
+dpdk-net-core = { path = "../../crates/dpdk-net-core", features = ["fault-injector", "test-server"] }
 dpdk-net-sys = { path = "../../crates/dpdk-net-sys" }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
