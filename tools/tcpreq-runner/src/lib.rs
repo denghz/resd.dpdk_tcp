@@ -10,6 +10,14 @@
 //! drains TX frames, asserts compliance. Report lines reference the
 //! RFC 793bis MUST clause id so the M5 compliance matrix can cite
 //! the probe by one stable handle.
+//!
+//! All lib content gated behind `cfg(feature = "test-server")`. Without
+//! that feature the crate compiles to an empty library so a workspace
+//! build (`cargo build --workspace --release`) doesn't unify the
+//! `test-server` feature into `dpdk-net-core` for every other binary
+//! (rerouting `tx_frame` → test_tx_intercept and breaking ARP).
+
+#![cfg(feature = "test-server")]
 
 pub mod probes;
 

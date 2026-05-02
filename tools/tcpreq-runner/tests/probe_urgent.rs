@@ -13,6 +13,8 @@
 //! funnels parallel cargo-test workers so this probe cannot race on
 //! DPDK mempool-name collisions during `Engine::new`.
 
+#![cfg(feature = "test-server")]
+
 use tcpreq_runner::probes::urgent::urgent_dropped;
 use tcpreq_runner::ProbeStatus;
 

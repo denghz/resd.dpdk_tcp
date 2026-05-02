@@ -7,6 +7,8 @@
 //! funnels parallel cargo-test workers so the two probes cannot race on
 //! DPDK mempool-name collisions during `Engine::new`.
 
+#![cfg(feature = "test-server")]
+
 use tcpreq_runner::probes::mss::{late_option, missing_mss, mss_support};
 use tcpreq_runner::ProbeStatus;
 

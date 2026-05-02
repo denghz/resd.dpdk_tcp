@@ -10,6 +10,8 @@
 //! UnknownOptionTest, IllegalLengthOptionTest). Share the crate-wide
 //! `ENGINE_SERIALIZE` serialization Mutex so cargo-test's parallel
 //! workers can't race on DPDK mempool-name collisions.
+#![cfg(feature = "test-server")]
+
 #[test]
 fn option_support_all_three() {
     let r = tcpreq_runner::probes::options::option_support();

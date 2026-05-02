@@ -17,6 +17,8 @@
 //! cargo-test workers so this probe cannot race on DPDK mempool-name
 //! collisions during `Engine::new`.
 
+#![cfg(feature = "test-server")]
+
 #[test]
 fn rst_ack_processing_independent() {
     let r = tcpreq_runner::probes::rst_ack::rst_ack_processing();

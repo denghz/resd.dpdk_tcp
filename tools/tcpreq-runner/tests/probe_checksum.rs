@@ -15,6 +15,8 @@
 //! cargo-test workers so this probe cannot race on DPDK mempool-name
 //! collisions during `Engine::new`.
 
+#![cfg(feature = "test-server")]
+
 use tcpreq_runner::probes::checksum::zero_checksum;
 use tcpreq_runner::ProbeStatus;
 
