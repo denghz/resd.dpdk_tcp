@@ -146,10 +146,19 @@ fi
 # block go to stderr, which we let pass through to the operator's
 # terminal. A `Stack ARN: <arn>` line often precedes the JSON on
 # stdout, so extract the JSON starting at the first `{` line.
+#
+# INSTANCE_TYPE env var overrides the CDK preset default (c6a.2xlarge).
+INSTANCE_TYPE_ARG=()
+if [ -n "${INSTANCE_TYPE:-}" ]; then
+  INSTANCE_TYPE_ARG=(--instance-type "$INSTANCE_TYPE")
+  log "  instance-type=$INSTANCE_TYPE (operator override via env)"
+fi
 CLI_STDOUT="$(
   cd "$RESD_INFRA_DIR" && \
   resd-aws-infra setup bench-pair \
-      --operator-ssh-cidr "$OPERATOR_CIDR" "${AMI_ID_ARG[@]}" --json
+      --operator-ssh-cidr "$OPERATOR_CIDR" \
+      "${INSTANCE_TYPE_ARG[@]}" \
+      "${AMI_ID_ARG[@]}" --json
 )"
 
 STACK_JSON="$(echo "$CLI_STDOUT" | sed -n '/^{/,$p')"
@@ -314,22 +323,48 @@ for bin in "${DUT_BINS[@]}" "${PEER_BINS[@]}" "${SHARED_SCRIPTS[@]}"; do
   fi
 done
 
+# retry_remote — wraps a remote-exec command (scp or ssh) with bounded
+# retries against transient `kex_exchange_identification: Connection
+# closed by remote host` errors. The 3-consecutive-probe wait_for_ssh
+# guard didn't fully eliminate this — cloud-init can do a delayed sshd
+# restart after the probes pass.
+retry_remote() {
+  local label="$1"; shift
+  local instance_id="$1"; shift
+  local max=5
+  local attempt=0
+  until "$@"; do
+    attempt=$((attempt + 1))
+    if (( attempt >= max )); then
+      log "  $label failed after $max attempts"
+      return 1
+    fi
+    log "  $label transient failure (attempt $attempt/$max) — sleeping 10s + refreshing EC2IC grant"
+    sleep 10
+    push_operator_pubkey "$instance_id"
+  done
+}
+
 refresh_ec2_ic_grants
 log "  -> DUT ($DUT_SSH)"
-scp "${SCP_OPTS[@]}" \
+retry_remote "scp DUT-bins" "$DUT_INSTANCE_ID" \
+  scp "${SCP_OPTS[@]}" \
     "${DUT_BINS[@]}" "${SHARED_SCRIPTS[@]}" \
     "ubuntu@${DUT_SSH}:/tmp/"
 # scp drops the +x bit on shell scripts; restore it for the gdb wrapper
 # so bench-offload-ab / bench-obs-overhead can exec it as --runner-bin.
-ssh "${SSH_OPTS[@]}" "ubuntu@$DUT_SSH" \
+retry_remote "chmod-DUT" "$DUT_INSTANCE_ID" \
+  ssh "${SSH_OPTS[@]}" "ubuntu@$DUT_SSH" \
     "chmod +x /tmp/bench-ab-runner-gdb.sh /tmp/check-bench-preconditions.sh"
 
 refresh_ec2_ic_grants
 log "  -> peer ($PEER_SSH)"
-scp "${SCP_OPTS[@]}" \
+retry_remote "scp peer-bins" "$PEER_INSTANCE_ID" \
+  scp "${SCP_OPTS[@]}" \
     "${PEER_BINS[@]}" "${SHARED_SCRIPTS[@]}" \
     "ubuntu@${PEER_SSH}:/tmp/"
-ssh "${SSH_OPTS[@]}" "ubuntu@$PEER_SSH" \
+retry_remote "chmod-peer" "$PEER_INSTANCE_ID" \
+  ssh "${SSH_OPTS[@]}" "ubuntu@$PEER_SSH" \
     "chmod +x /tmp/check-bench-preconditions.sh"
 
 # ---------------------------------------------------------------------------
