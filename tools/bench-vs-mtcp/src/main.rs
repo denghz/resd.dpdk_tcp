@@ -956,6 +956,20 @@ fn build_engine(args: &Args) -> anyhow::Result<Engine> {
         // Spec §11.1: cc_mode=off on both stacks (trading-latency).
         // Default is already 0 but we set it explicitly to pin intent.
         cc_mode: 0,
+        // Maxtp grid (`maxtp::C_CONNS`) tops out at C=64 connections
+        // per cell. The default `max_connections=16` is too small —
+        // the 2026-05-03 bench-pair run hit `engine.connect failed:
+        // TooManyConns` at conn 11 on a higher-C cell because earlier
+        // buckets' connections still occupy slots while a new bucket
+        // is bringing up its own. 512 gives us 8× headroom over the
+        // grid's max C, plenty of cushion for stale connections from
+        // earlier buckets that haven't fully torn down by the time
+        // the next bucket opens its connections. Burst grid only needs
+        // 1 connection so the bump is harmless there. The cost is a
+        // larger flow_table allocation + timer wheel, both
+        // proportional to `max_connections` — small relative to the
+        // mempool / mbuf footprint.
+        max_connections: 512,
         ..dpdk_net_core::engine::EngineConfig::default()
     };
     Engine::new(cfg).map_err(|e| anyhow::anyhow!("Engine::new failed: {e:?}"))
