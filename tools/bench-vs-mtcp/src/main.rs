@@ -73,11 +73,13 @@ struct Args {
     #[arg(long, default_value = "burst")]
     workload: String,
 
-    /// CSV of stacks to run. Tokens: `dpdk`, `mtcp`. Default is all
-    /// stacks; the mTCP path errors at startup in T12 (see src/mtcp.rs
-    /// module docs) so real T12 runs pass `--stacks dpdk` unless
-    /// lenient mode is set.
-    #[arg(long, default_value = "dpdk,mtcp")]
+    /// CSV of stacks to run. Tokens: `dpdk`, `mtcp`, `linux`. Default
+    /// runs `dpdk` + `linux` (mTCP stays opt-in while the AMI rebuild
+    /// is blocked on libmtcp / gcc 13). The mTCP path errors at
+    /// startup in strict mode (see src/mtcp.rs module docs); the Linux
+    /// path is wired for the `maxtp` workload only — `burst` skips
+    /// it with a warning.
+    #[arg(long, default_value = "dpdk,linux")]
     stacks: String,
 
     /// Bursts per bucket post-warmup. Spec §11.1 requires ≥10 k per
@@ -293,6 +295,18 @@ fn main() -> anyhow::Result<()> {
                     Stack::Mtcp => {
                         run_burst_grid_mtcp_stub(&args, &grid, &metadata, mode, &mut writer)?;
                     }
+                    Stack::Linux => {
+                        // Linux burst arm is out of scope for the
+                        // 2026-05-03 follow-up — user only asked for
+                        // maxtp comparison. Skip with a warning so
+                        // `--stacks dpdk,linux --workload burst` doesn't
+                        // wedge the operator's pipeline; the dpdk burst
+                        // arm still runs.
+                        eprintln!(
+                            "bench-vs-mtcp: WARN linux stack is wired for `maxtp` only; \
+                             skipping burst grid for Linux"
+                        );
+                    }
                 }
             }
         }
@@ -323,6 +337,17 @@ fn main() -> anyhow::Result<()> {
                     }
                     Stack::Mtcp => {
                         run_maxtp_grid_mtcp_stub(&args, &grid, &metadata, mode, &mut writer)?;
+                    }
+                    Stack::Linux => {
+                        run_maxtp_grid_linux(
+                            peer_ip,
+                            args.peer_port,
+                            &grid,
+                            &args,
+                            &metadata,
+                            nic_max_bps,
+                            &mut writer,
+                        )?;
                     }
                 }
             }
@@ -809,6 +834,244 @@ fn run_maxtp_grid_dpdk<W: std::io::Write>(
 }
 
 // ---------------------------------------------------------------------------
+// Linux kernel-TCP maxtp grid driver — comparator arm landed
+// 2026-05-03 while the mTCP arm stays stubbed (AMI rebuild blocked).
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+fn run_maxtp_grid_linux<W: std::io::Write>(
+    peer_ip: u32,
+    peer_port: u16,
+    grid: &[maxtp::Bucket],
+    args: &Args,
+    metadata: &RunMetadata,
+    nic_max_bps: Option<u64>,
+    writer: &mut csv::Writer<W>,
+) -> anyhow::Result<()> {
+    use bench_vs_mtcp::linux_maxtp::{self, LinuxMaxtpCfg};
+
+    for bucket in grid {
+        eprintln!(
+            "bench-vs-mtcp: running linux maxtp bucket {}",
+            bucket.label()
+        );
+
+        // Pre-run check (1): peer receive window mirrors the dpdk
+        // path so a row's verdict reflects the same pre-run gate
+        // across stacks. The Linux runner doesn't consume the value
+        // for back-pressure handling (kernel non-blocking writes
+        // already report `WouldBlock`), but we still surface the
+        // verdict so CSV consumers see consistent invalidation.
+        let dut_ip: std::net::Ipv4Addr = args.local_ip.parse().with_context(|| {
+            format!("parsing --local-ip `{}` for peer rwnd probe", args.local_ip)
+        })?;
+        let peer_rwnd = resolve_peer_rwnd_bytes(
+            args.peer_ssh.as_deref(),
+            dut_ip,
+            peer_port,
+            bucket.write_bytes,
+        );
+        let rwnd_verdict = check_peer_window(peer_rwnd, bucket.write_bytes);
+
+        // Linux maxtp doesn't have a meaningful TX-TS mode (the runner
+        // doesn't read NIC HW timestamps) — emit `n/a` so bench-report
+        // can filter Linux rows out of pps / TX-TS pivots.
+        let tx_ts_mode_str = "n/a";
+
+        if !rwnd_verdict.is_ok() {
+            eprintln!(
+                "bench-vs-mtcp: linux maxtp bucket {} invalidated pre-run: {}",
+                bucket.label(),
+                rwnd_verdict.reason().unwrap_or("<unknown>")
+            );
+            // Build the marker row directly; we don't have a TxTsMode
+            // to attach (the field is dpdk-specific) so we hand-roll
+            // the dimensions JSON so it carries `tx_ts_mode = "n/a"`.
+            let agg = maxtp::BucketAggregate::from_sample(
+                *bucket,
+                Stack::Linux,
+                None,
+                rwnd_verdict,
+                None,
+            );
+            emit_linux_bucket_rows(
+                writer,
+                metadata,
+                &args.tool,
+                &args.feature_set,
+                &agg,
+                tx_ts_mode_str,
+            )
+            .context("emit invalidated linux maxtp bucket row")?;
+            continue;
+        }
+
+        // Open C kernel-TCP connections.
+        let mut conns = linux_maxtp::open_persistent_connections(
+            peer_ip,
+            peer_port,
+            bucket.conn_count,
+        )
+        .with_context(|| {
+            format!(
+                "linux_maxtp open_persistent_connections (C={})",
+                bucket.conn_count
+            )
+        })?;
+
+        let cfg = LinuxMaxtpCfg {
+            bucket: *bucket,
+            warmup: std::time::Duration::from_secs(args.maxtp_warmup_secs),
+            duration: std::time::Duration::from_secs(args.maxtp_duration_secs),
+            peer_ip_host_order: peer_ip,
+            peer_port,
+            payload: vec![0u8; bucket.write_bytes as usize],
+        };
+        let run = linux_maxtp::run_bucket(&cfg, &mut conns).with_context(|| {
+            format!("linux_maxtp::run_bucket for {}", bucket.label())
+        })?;
+
+        // Post-run NIC-saturation check (mirror dpdk path) — same 70%
+        // ceiling using the same mean throughput in bps.
+        let mut agg = maxtp::BucketAggregate::from_sample(
+            *bucket,
+            Stack::Linux,
+            Some(run.sample),
+            BucketVerdict::Ok,
+            None,
+        );
+        if let Some(max_bps) = nic_max_bps {
+            let sat_verdict =
+                check_nic_saturation_bps(run.sample.goodput_bps as u64, max_bps);
+            if !sat_verdict.is_ok() {
+                eprintln!(
+                    "bench-vs-mtcp: linux maxtp bucket {} NIC-bound post-run: {}",
+                    bucket.label(),
+                    sat_verdict.reason().unwrap_or("<unknown>")
+                );
+                agg.override_verdict(sat_verdict);
+            }
+        }
+        emit_linux_bucket_rows(
+            writer,
+            metadata,
+            &args.tool,
+            &args.feature_set,
+            &agg,
+            tx_ts_mode_str,
+        )
+        .context("emit linux maxtp bucket rows")?;
+
+        // Drop conns explicitly so the next bucket's open isn't racing
+        // an OS-level close on the kernel side.
+        drop(conns);
+    }
+    Ok(())
+}
+
+/// Emit Linux maxtp bucket rows with `tx_ts_mode = "n/a"` overlaid on
+/// the standard maxtp dimensions JSON. The pure dpdk path uses
+/// `maxtp::emit_bucket_rows` which only writes `tx_ts_mode` when the
+/// aggregate carries one (None on Linux); we want the field present
+/// with the explicit "n/a" string so CSV consumers can filter Linux
+/// rows symmetrically with dpdk_net rows.
+fn emit_linux_bucket_rows<W: std::io::Write>(
+    writer: &mut csv::Writer<W>,
+    metadata: &RunMetadata,
+    tool: &str,
+    feature_set: &str,
+    aggregate: &maxtp::BucketAggregate,
+    tx_ts_mode: &str,
+) -> anyhow::Result<()> {
+    use bench_common::csv_row::{CsvRow, MetricAggregation};
+
+    // Build dimensions JSON manually so we can splice in the explicit
+    // `"tx_ts_mode": "n/a"` field. This mirrors what
+    // `maxtp::build_dimensions_json` produces but with a different
+    // tx_ts_mode source.
+    let mut dims_value = serde_json::json!({
+        "workload": "maxtp",
+        "W_bytes": aggregate.bucket.write_bytes as i64,
+        "C": aggregate.bucket.conn_count as i64,
+        "stack": aggregate.stack.as_dimension(),
+        "tx_ts_mode": tx_ts_mode,
+    });
+    if let Some(reason) = aggregate.verdict.reason() {
+        if let Some(m) = dims_value.as_object_mut() {
+            m.insert(
+                "bucket_invalid".to_string(),
+                serde_json::Value::String(reason.to_string()),
+            );
+        }
+    }
+    let dims = dims_value.to_string();
+
+    match &aggregate.sample {
+        Some(sample) => {
+            // Primary: sustained goodput in bits_per_sec.
+            let row = CsvRow {
+                run_metadata: metadata.clone(),
+                tool: tool.to_string(),
+                test_case: "maxtp".to_string(),
+                feature_set: feature_set.to_string(),
+                dimensions_json: dims.clone(),
+                metric_name: "sustained_goodput_bps".to_string(),
+                metric_unit: "bits_per_sec".to_string(),
+                metric_value: sample.goodput_bps,
+                metric_aggregation: MetricAggregation::Mean,
+                cpu_family: None,
+                cpu_model_name: None,
+                dpdk_version_pkgconfig: None,
+                worktree_branch: None,
+                uprof_session_id: None,
+            };
+            writer.serialize(&row)?;
+
+            // Secondary: pps. The Linux runner leaves pps at 0 — see
+            // `linux_maxtp.rs` module doc for why. Emit the row anyway
+            // so the schema stays uniform.
+            let row = CsvRow {
+                run_metadata: metadata.clone(),
+                tool: tool.to_string(),
+                test_case: "maxtp".to_string(),
+                feature_set: feature_set.to_string(),
+                dimensions_json: dims,
+                metric_name: "tx_pps".to_string(),
+                metric_unit: "pps".to_string(),
+                metric_value: sample.pps,
+                metric_aggregation: MetricAggregation::Mean,
+                cpu_family: None,
+                cpu_model_name: None,
+                dpdk_version_pkgconfig: None,
+                worktree_branch: None,
+                uprof_session_id: None,
+            };
+            writer.serialize(&row)?;
+        }
+        None => {
+            let row = CsvRow {
+                run_metadata: metadata.clone(),
+                tool: tool.to_string(),
+                test_case: "maxtp".to_string(),
+                feature_set: feature_set.to_string(),
+                dimensions_json: dims,
+                metric_name: "sustained_goodput_bps".to_string(),
+                metric_unit: "bits_per_sec".to_string(),
+                metric_value: 0.0,
+                metric_aggregation: MetricAggregation::Mean,
+                cpu_family: None,
+                cpu_model_name: None,
+                dpdk_version_pkgconfig: None,
+                worktree_branch: None,
+                uprof_session_id: None,
+            };
+            writer.serialize(&row)?;
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // mTCP maxtp stub driver.
 // ---------------------------------------------------------------------------
 
@@ -1205,6 +1468,23 @@ mod tests {
     fn parse_stacks_default_is_both() {
         let out = parse_stacks("dpdk,mtcp").unwrap();
         assert_eq!(out, vec![Stack::DpdkNet, Stack::Mtcp]);
+    }
+
+    #[test]
+    fn parse_stacks_accepts_linux() {
+        // The 2026-05-03 follow-up added a Linux maxtp arm. Confirm the
+        // CLI parser routes both `linux` and `linux_kernel` aliases to
+        // the same Stack::Linux variant.
+        let out = parse_stacks("dpdk,linux").unwrap();
+        assert_eq!(out, vec![Stack::DpdkNet, Stack::Linux]);
+        let out = parse_stacks("linux_kernel").unwrap();
+        assert_eq!(out, vec![Stack::Linux]);
+    }
+
+    #[test]
+    fn parse_stacks_accepts_three_stacks() {
+        let out = parse_stacks("dpdk,mtcp,linux").unwrap();
+        assert_eq!(out, vec![Stack::DpdkNet, Stack::Mtcp, Stack::Linux]);
     }
 
     #[test]

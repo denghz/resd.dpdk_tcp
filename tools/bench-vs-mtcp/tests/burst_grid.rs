@@ -24,17 +24,21 @@ use bench_vs_mtcp::{Stack, Workload};
 // ---------------------------------------------------------------------------
 
 #[test]
-fn stack_parse_covers_both_stacks() {
+fn stack_parse_covers_all_stacks() {
     assert_eq!(Stack::parse("dpdk").unwrap(), Stack::DpdkNet);
     assert_eq!(Stack::parse("dpdk_net").unwrap(), Stack::DpdkNet);
     assert_eq!(Stack::parse("mtcp").unwrap(), Stack::Mtcp);
-    assert!(Stack::parse("linux").is_err());
+    // 2026-05-03 follow-up — linux maxtp comparator landed.
+    assert_eq!(Stack::parse("linux").unwrap(), Stack::Linux);
+    assert_eq!(Stack::parse("linux_kernel").unwrap(), Stack::Linux);
+    assert!(Stack::parse("afpacket").is_err());
 }
 
 #[test]
 fn stack_as_dimension_is_the_documented_string() {
     assert_eq!(Stack::DpdkNet.as_dimension(), "dpdk_net");
     assert_eq!(Stack::Mtcp.as_dimension(), "mtcp");
+    assert_eq!(Stack::Linux.as_dimension(), "linux");
 }
 
 #[test]
