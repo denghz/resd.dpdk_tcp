@@ -167,11 +167,13 @@ mod tests {
 
     #[test]
     fn sanity_violation_when_any_row_below_floor() {
-        // poll-saturation-only is BELOW obs-none — impossible if obs is
-        // actually adding cost. Flag.
+        // poll-saturation-only is BELOW obs-none × 0.90 (10% threshold,
+        // bumped from 5% on 2026-05-04). 78.3 × 0.90 = 70.47, so
+        // poll-saturation-only at 68.0 (13.2% drop) is comfortably
+        // outside noise — must flag.
         let agg = agg_of(&[
             ("obs-none", 78.3),
-            ("poll-saturation-only", 74.0),
+            ("poll-saturation-only", 68.0),
             ("byte-counters-only", 103.2),
             ("obs-all-no-none", 112.5),
             ("default", 86.2),
@@ -185,7 +187,7 @@ mod tests {
         assert_eq!(s.obs_none_p99_ns, Some(78.3));
         assert_eq!(s.violators.len(), 1);
         assert_eq!(s.violators[0].0, "poll-saturation-only");
-        assert_eq!(s.violators[0].1, 74.0);
+        assert_eq!(s.violators[0].1, 68.0);
     }
 
     #[test]

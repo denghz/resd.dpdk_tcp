@@ -401,6 +401,47 @@ pub struct EngineConfig {
     /// `Engine::new` / `dpdk_net_engine_create`.
     pub rx_mempool_size: u32,
 
+    /// 2026-04-29 fix: TX **data** mempool capacity in mbufs. `0` =
+    /// compute formula default at `Engine::new`:
+    ///   `max(8 * tx_ring_size,
+    ///        2 * max_connections * ceil(send_buffer_bytes / mbuf_data_room) + 8192)`
+    ///
+    /// Sizing rationale — three concurrent claims on this pool per
+    /// connection:
+    /// 1. **In-flight (`snd_retrans`)** — every accepted segment grabs an
+    ///    mbuf and retains it until the corresponding ACK prunes the
+    ///    `RetransEntry`. Bound: `send_buffer_bytes / mss` segments per
+    ///    conn.
+    /// 2. **Driver-held** — segments that have been pushed to the NIC TX
+    ///    ring but the driver has not yet released (DPDK ENA cleans up
+    ///    completions inside the next `rte_eth_tx_burst`). Bound:
+    ///    `tx_ring_size`.
+    /// 3. **In-batch** — `tx_pending_data` queue between `send_bytes`
+    ///    push and end-of-poll drain. Bound: `tx_ring_size`.
+    ///
+    /// The per-conn term covers (1); the `8 * tx_ring_size` floor
+    /// covers (2)+(3) plus a 4× cushion for transient bursts. The
+    /// 8192 additive cushion absorbs late-RTO retransmits (which use
+    /// `tx_hdr_mempool` for headers but keep the original data mbuf
+    /// in `snd_retrans` until ACKed) and operator-edge cases.
+    ///
+    /// History: pre-2026-04-29 this field did not exist; `tx_data_mempool`
+    /// was hardcoded at 4096 mbufs. That cap exhausted under
+    /// `bench-vs-mtcp` burst grid `K=1MiB G=0ms` around iteration 8050
+    /// and at the maxtp grid's W ≥ 4096 cells, surfacing as
+    /// `Err(SendBufferFull)` from `send_bytes` (engine.rs:5104-5112,
+    /// 5242-5256). The new formula gives ≈16384 mbufs at default
+    /// `EngineConfig` (max_connections=16, send_buffer_bytes=256KiB,
+    /// mss-equivalent=2048-byte mbuf data room), 4× more than the
+    /// hardcoded value, with the per-conn term scaling for callers
+    /// that bump `max_connections` (the maxtp grid bumps it to 512).
+    /// Saturating arithmetic mirrors `rx_mempool_size`.
+    ///
+    /// Non-zero caller value is used verbatim (no floor clamp);
+    /// callers sizing below `tx_ring_size` are accepting the wedge
+    /// risk knowingly. Retrievable via `Engine::tx_data_mempool_size()`.
+    pub tx_data_mempool_size: u32,
+
     // Phase A2 additions (host byte order for IPs; raw bytes for MAC)
     pub local_ip: u32,
     /// bug_010 → feature: additional local IPs the engine is willing to
@@ -514,6 +555,11 @@ impl Default for EngineConfig {
             // `EngineConfig::default()` accidentally spawning a size-0
             // mempool if they never set this field.
             rx_mempool_size: 0,
+            // 2026-04-29 fix: 0 = formula in `Engine::new`. Sizes the
+            // TX data mempool for `max_connections * send_buffer_bytes /
+            // mbuf_data_room` in-flight segments + driver-held + in-batch
+            // headroom. See doc-comment for the full breakdown.
+            tx_data_mempool_size: 0,
             local_ip: 0,
             secondary_local_ips: Vec::new(),
             gateway_ip: 0,
@@ -559,8 +605,18 @@ pub struct Engine {
     /// `dpdk_net_rx_mempool_size()` FFI getter so the application can
     /// report / log the actual pool size without re-deriving the formula.
     pub(crate) rx_mempool_size: u32,
+    /// A10 Stage A: TSC of the most-recent `rx_mempool_avail` sample.
+    /// `poll_once` re-samples when the current TSC has advanced ≥
+    /// `tsc_hz` cycles past this value (≈1 second of wall clock).
+    /// `Cell<u64>` because writes happen from the single engine lcore.
+    pub(crate) rx_mempool_avail_last_sample_tsc: Cell<u64>,
     tx_hdr_mempool: Mempool,
     tx_data_mempool: Mempool,
+    /// 2026-04-29 fix: resolved TX data mempool capacity (post zero-
+    /// sentinel substitution + formula application). Mirrors the
+    /// `rx_mempool_size` field shape; exposed via
+    /// `Engine::tx_data_mempool_size()` for diagnostic logging.
+    pub(crate) tx_data_mempool_size: u32,
     our_mac: [u8; 6],
     /// Current best-known MAC of the configured `cfg.gateway_ip`. Seeded
     /// from `cfg.gateway_mac` at `Engine::new` (caller may leave it zero
@@ -1060,9 +1116,45 @@ impl Engine {
             256,
             socket_id,
         )?;
+        // 2026-04-29 fix: compute TX data mempool size from the same
+        // shape as `rx_mempool_size`. `0` sentinel = formula. The
+        // formula sizes for max_connections × per-conn-in-flight segments
+        // (snd_retrans depth) plus a TX-ring-floor cushion to cover
+        // driver-held + in-batch claims. See `EngineConfig.tx_data_mempool_size`
+        // doc-comment for the full breakdown.
+        let tx_data_mempool_size = if cfg.tx_data_mempool_size > 0 {
+            cfg.tx_data_mempool_size
+        } else {
+            let mbuf_data_room = cfg.mbuf_data_room as u32;
+            // ceil(send_buffer_bytes / mbuf_data_room). Matches the
+            // rx_mempool_size formula shape — `mbuf_data_room` is a
+            // safe lower bound on segment-occupancy because every
+            // accepted segment grabs one mbuf regardless of whether
+            // the payload is MSS-sized or smaller.
+            let per_conn = cfg
+                .send_buffer_bytes
+                .saturating_add(mbuf_data_room.saturating_sub(1))
+                / mbuf_data_room.max(1);
+            // 2× over the per-conn snd_retrans bound: covers the
+            // typical case (every conn has its full send buffer in
+            // flight) plus a 1× headroom for transient retrans
+            // overlap. Callers running pathologically high
+            // max_connections × send_buffer_bytes products (e.g. 512
+            // conns × 256 KiB → 270K mbufs at 4×) and unwilling to
+            // pay the memory cost can override
+            // `EngineConfig.tx_data_mempool_size` directly to clamp
+            // the pool to the actual concurrent working set.
+            let computed = 2u32
+                .saturating_mul(cfg.max_connections)
+                .saturating_mul(per_conn)
+                .saturating_add(8192);
+            // 8× the TX ring covers (driver-held + in-batch) × 4 cushion.
+            let floor = 8u32.saturating_mul(cfg.tx_ring_size as u32);
+            computed.max(floor)
+        };
         let tx_data_mempool = Mempool::new_pktmbuf(
             &format!("tx_data_mp_{}", cfg.lcore_id),
-            4096,
+            tx_data_mempool_size,
             128,
             0,
             cfg.mbuf_data_room + sys::RTE_PKTMBUF_HEADROOM as u16,
@@ -1200,8 +1292,10 @@ impl Engine {
             counters,
             _rx_mempool: rx_mempool,
             rx_mempool_size,
+            rx_mempool_avail_last_sample_tsc: Cell::new(0),
             tx_hdr_mempool,
             tx_data_mempool,
+            tx_data_mempool_size,
             our_mac,
             gateway_mac: Cell::new(cfg.gateway_mac),
             pmtu: RefCell::new(PmtuTable::new()),
@@ -1707,6 +1801,15 @@ impl Engine {
         self.rx_mempool_size
     }
 
+    /// 2026-04-29 fix: resolved TX **data** mempool capacity (in mbufs).
+    /// Sentinel `0` on `EngineConfig.tx_data_mempool_size` → formula
+    /// in `Engine::new`; non-zero → caller value verbatim. Exposed for
+    /// diagnostic logging — bench harnesses log this so the operator
+    /// can see when a workload is wedging close to capacity.
+    pub fn tx_data_mempool_size(&self) -> u32 {
+        self.tx_data_mempool_size
+    }
+
     /// A6.6-7 Task 13: raw pointer to the RX mempool for integration-test
     /// pool-occupancy assertions (see `rx_close_drains_mbufs`). Not a
     /// production API — tests call `shim_rte_mempool_avail_count` on
@@ -2060,6 +2163,42 @@ impl Engine {
         use crate::counters::{add, inc};
         use std::sync::atomic::Ordering;
         inc(&self.counters.poll.iters);
+
+        // A10 Stage A: at most once per second, sample the RX mempool's
+        // free-mbuf count. Cliff hypothesis: a steady drain across many
+        // iterations would surface as a monotonically-decreasing series
+        // here while the workload is otherwise healthy.
+        //
+        // 2026-04-29 fix (Issue #4 diagnostic): sample the TX **data**
+        // mempool's free-mbuf count alongside the RX one. Same per-
+        // second cadence (shares the `rx_mempool_avail_last_sample_tsc`
+        // gate — both samples are slow-path and locking them to the
+        // same heartbeat keeps the sampler footprint minimal). A
+        // sustained drain in `tcp.tx_data_mempool_avail` paired with a
+        // bumping `eth.tx_drop_nomem` is the operator's signal that
+        // `EngineConfig.tx_data_mempool_size` needs more headroom.
+        {
+            let now_tsc = crate::clock::rdtsc();
+            let last = self.rx_mempool_avail_last_sample_tsc.get();
+            let tsc_hz = unsafe { sys::rte_get_tsc_hz() };
+            if tsc_hz > 0 && now_tsc.wrapping_sub(last) >= tsc_hz {
+                let rx_avail = unsafe {
+                    sys::shim_rte_mempool_avail_count(self._rx_mempool.as_ptr())
+                };
+                self.counters
+                    .tcp
+                    .rx_mempool_avail
+                    .store(rx_avail, std::sync::atomic::Ordering::Relaxed);
+                let tx_data_avail = unsafe {
+                    sys::shim_rte_mempool_avail_count(self.tx_data_mempool.as_ptr())
+                };
+                self.counters
+                    .tcp
+                    .tx_data_mempool_avail
+                    .store(tx_data_avail, std::sync::atomic::Ordering::Relaxed);
+                self.rx_mempool_avail_last_sample_tsc.set(now_tsc);
+            }
+        }
 
         // A6 (spec §3.6 Site 3): snapshot RX-mempool-drop counter at top
         // of poll so `check_and_emit_rx_enomem` at each exit path can
@@ -2815,6 +2954,70 @@ impl Engine {
     /// events; P6 mut flow_table. Each phase's borrow ends at the
     /// block's closing `}`.
     pub(crate) fn force_close_etimedout(&self, handle: ConnHandle) {
+        // A10 deferred-fix Stage B diagnostic: dump the leak-detect
+        // counter trail at the exact moment of cliff failure. The
+        // iteration-7050/11151 cliff is hypothesized to be RX mempool
+        // exhaustion via a per-iteration mbuf refcount leak; surfacing
+        // these values when ETIMEDOUT fires gives the audit a starting
+        // point. Slow path — no cost to non-cliff runs.
+        unsafe {
+            let avail = sys::shim_rte_mempool_avail_count(self._rx_mempool.as_ptr());
+            let tx_data_avail =
+                sys::shim_rte_mempool_avail_count(self.tx_data_mempool.as_ptr());
+            let drop_unexpected = self
+                .counters
+                .tcp
+                .mbuf_refcnt_drop_unexpected
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let conn_timeout_retrans = self
+                .counters
+                .tcp
+                .conn_timeout_retrans
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let tx_rto = self
+                .counters
+                .tcp
+                .tx_rto
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let tx_drop_nomem = self
+                .counters
+                .eth
+                .tx_drop_nomem
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let recv_buf_drops = self
+                .counters
+                .tcp
+                .recv_buf_drops
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let rx_partial_read_splits = self
+                .counters
+                .tcp
+                .rx_partial_read_splits
+                .load(std::sync::atomic::Ordering::Relaxed);
+            // 2026-04-29 fix (Issue #4 diagnostic): include the TX
+            // data-mempool snapshot + `tx_drop_nomem` so a stalled
+            // burst that times out via the conn-timeout-retrans budget
+            // surfaces the TX-side picture alongside the RX-side
+            // leak-detect trail.
+            eprintln!(
+                "dpdk_net: force_close_etimedout DIAGNOSTIC handle={} rx_mempool_avail={} \
+                 (capacity={}) tx_data_mempool_avail={} (capacity={}) \
+                 mbuf_refcnt_drop_unexpected={} conn_timeout_retrans={} \
+                 tx_rto={} tx_drop_nomem={} recv_buf_drops={} rx_partial_read_splits={}",
+                handle,
+                avail,
+                self.rx_mempool_size,
+                tx_data_avail,
+                self.tx_data_mempool_size,
+                drop_unexpected,
+                conn_timeout_retrans,
+                tx_rto,
+                tx_drop_nomem,
+                recv_buf_drops,
+                rx_partial_read_splits,
+            );
+        }
+
         // Phase 1: snapshot timer ids + drain snd_retrans mbufs. Note: do
         // NOT write conn.state here — transition_conn below owns that
         // transition so StateChange emission + state_trans[from][to]

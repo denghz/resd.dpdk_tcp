@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// Per-lcore counter struct. Cacheline-grouped.
 /// Hot-path increments use Relaxed stores on the owning lcore;
@@ -269,6 +269,40 @@ pub struct TcpCounters {
     /// consumer is draining non-segment-aligned byte counts, which is
     /// the common case for byte-stream protocols.
     pub rx_partial_read_splits: AtomicU64,
+    // --- A10 deferred-fix Stage A: RX-side leak diagnostics (slow-path) ---
+    // Forensic-only: intentionally NOT mirrored in `dpdk_net_tcp_counters_t`
+    // (crates/dpdk-net/src/api.rs). Consumed by the Rust-side bench-stress
+    // counters_snapshot table + MbufHandle::Drop hook only. The size_of
+    // const assertion at api.rs:503 holds because the 12 new bytes fit
+    // inside the existing tail-padding of the #[repr(C, align(64))] struct;
+    // mirroring these on the C side would break that invariant silently.
+    /// Most-recently-sampled value of `rte_mempool_avail_count(rx_mp)`.
+    /// Sampled at most once per second inside `poll_once`. A monotonically
+    /// decreasing trend across a long run is the leading indicator of an
+    /// RX mempool leak (root-cause hypothesis for the iteration-7050
+    /// retransmit cliff documented in
+    /// `docs/superpowers/reports/a10-ab-driver-debug.md` §3).
+    pub rx_mempool_avail: AtomicU32,
+    /// Cumulative count of `MbufHandle::Drop` invocations that observed
+    /// a post-decrement refcount above the legitimate-handle threshold.
+    /// Threshold rationale: no production path holds more than 32 handles
+    /// to one mbuf concurrently (max in-flight conns × max simultaneous
+    /// READABLE pins); a higher post-dec count is unequivocally a leak.
+    pub mbuf_refcnt_drop_unexpected: AtomicU64,
+    /// 2026-04-29 fix (Issue #4 diagnostic): most-recently-sampled value
+    /// of `rte_mempool_avail_count(tx_data_mp)`. Sampled at most once
+    /// per second inside `poll_once` (same cadence as `rx_mempool_avail`).
+    /// A monotonically decreasing trend during a sustained bench burst
+    /// is the leading indicator of TX-side mbuf retention exceeding
+    /// pool capacity — paired with `eth.tx_drop_nomem` counter delta
+    /// (which records `send_bytes` mempool-alloc failures), gives the
+    /// operator a visible signal at the moment of the wedge.
+    ///
+    /// Slow-path: per-second sample only, no hot-path cost. Forensic-
+    /// only — not mirrored on the C ABI side (matches `rx_mempool_avail`
+    /// scope rule); Rust-direct callers read via
+    /// `engine.counters().tcp.tx_data_mempool_avail.load(...)`.
+    pub tx_data_mempool_avail: AtomicU32,
 }
 
 #[repr(C, align(64))]
@@ -661,5 +695,35 @@ mod a5_5_tests {
         assert_eq!(c.tcp.ts_recent_expired.load(Ordering::Relaxed), 0);
         assert_eq!(c.tcp.tx_flush_bursts.load(Ordering::Relaxed), 0);
         assert_eq!(c.tcp.tx_flush_batched_pkts.load(Ordering::Relaxed), 0);
+    }
+}
+#[cfg(test)]
+mod a10_diagnostic_counter_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn rx_mempool_avail_default_is_zero() {
+        let c = Counters::new();
+        assert_eq!(c.tcp.rx_mempool_avail.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn mbuf_refcnt_drop_unexpected_default_is_zero() {
+        let c = Counters::new();
+        assert_eq!(c.tcp.mbuf_refcnt_drop_unexpected.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn tx_data_mempool_avail_default_is_zero() {
+        // 2026-04-29 fix (Issue #4 diagnostic): construction-time zero
+        // mirrors the rx_mempool_avail invariant. The poll_once
+        // sampler bumps to non-zero on the first per-second tick once
+        // the engine is alive — that path is exercised by integration
+        // tests under TAP (`long_soak_stability`,
+        // `tx_mempool_no_leak_under_retrans`) where the value drifts
+        // are checked.
+        let c = Counters::new();
+        assert_eq!(c.tcp.tx_data_mempool_avail.load(Ordering::Relaxed), 0);
     }
 }

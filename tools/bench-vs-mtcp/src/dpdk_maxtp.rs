@@ -60,7 +60,7 @@ use anyhow::Context;
 
 use bench_e2e::workload::{drain_and_accumulate_readable, open_connection};
 
-use dpdk_net_core::engine::Engine;
+use dpdk_net_core::engine::{Engine, CLOSE_FLAG_FORCE_TW_SKIP};
 use dpdk_net_core::flow_table::ConnHandle;
 
 use crate::maxtp::{Bucket, MaxtpSample};
@@ -154,6 +154,98 @@ pub fn open_persistent_connections(
         out.push(h);
     }
     Ok(out)
+}
+
+/// Close every persistent connection from a finished bucket so the
+/// flow-table slots recycle before the next bucket calls
+/// `open_persistent_connections`. Without this, handles bump
+/// monotonically across buckets (264, 348, …) and large-W cells later
+/// in the grid trip `InvalidConnHandle(<n>)` mid-bucket once a stale
+/// pre-bucket conn — still occupying a low slot — gets reused for a
+/// fresh handshake while the previous holder is still mid-FIN.
+///
+/// 2026-04-29 fix shape (option (b) per the issue triage):
+///   1. Send FIN on each conn with `CLOSE_FLAG_FORCE_TW_SKIP`
+///      (timestamps are negotiated by default in the kernel-TCP peer,
+///      so the engine honors the skip flag and short-circuits the
+///      2×MSL TIME_WAIT wait at reap time).
+///   2. Drive `poll_once` until `flow_table_used()` reports zero or
+///      the deadline expires. The reaper inside `poll_once` walks the
+///      flow table and removes any TIME_WAIT conn past its 2×MSL
+///      deadline — with `force_tw_skip` the deadline is "now" so the
+///      reap fires on the first poll where peer ACK + FIN have
+///      arrived.
+///
+/// On a deadline expiry we log + continue (soft-fail). The next
+/// bucket's `open_persistent_connections` will still succeed as long
+/// as `max_connections` has headroom; this helper is a hygiene step,
+/// not a correctness gate.
+pub fn close_persistent_connections(
+    engine: &Engine,
+    conns: &[ConnHandle],
+) -> anyhow::Result<()> {
+    if conns.is_empty() {
+        return Ok(());
+    }
+    // Phase 1: emit FINs. `close_conn_with_flags` is idempotent for
+    // already-closing/closed conns (returns Ok(()) without sending),
+    // so soft-failing on a per-handle error is safe.
+    for &h in conns {
+        if let Err(e) = engine.close_conn_with_flags(h, CLOSE_FLAG_FORCE_TW_SKIP) {
+            // Slow-path log only — this is per-bucket teardown,
+            // not the hot path. Don't propagate: the bucket's
+            // result is already in CSV; we just want the slot
+            // released for the next bucket.
+            eprintln!(
+                "dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle={h}) \
+                 returned {e:?}; continuing",
+            );
+        }
+    }
+    // Phase 2: drive poll_once until either every slot has been
+    // reaped or the deadline expires. 2× warmup is generous — most
+    // FIN-ACK round trips finish in <1ms on the kernel peer; the
+    // deadline is here for the wedged-peer surface so the next
+    // bucket isn't blocked indefinitely.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        engine.poll_once();
+        // Drain any post-FIN Readable / Closed events so the queue
+        // doesn't accumulate. Observability events from this drain
+        // are not used by the caller — they're already past the
+        // window-close snapshot.
+        for &h in conns {
+            let mut _last: Option<u64> = None;
+            let _ = drain_and_accumulate_readable(engine, h, &mut _last);
+        }
+        // Break once every conn slot reports None on `get` (the
+        // engine reaped + removed it).
+        let any_alive = {
+            let ft = engine.flow_table();
+            conns.iter().any(|h| ft.get(*h).is_some())
+        };
+        if !any_alive {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            // Soft-fail: log the residual count and return Ok so
+            // the grid keeps marching. The next bucket's
+            // open_persistent_connections will fail with
+            // TooManyConns if `max_connections` is exhausted —
+            // that's the harder failure mode the maxtp grid
+            // already handles via per-bucket soft-fail.
+            let residual = {
+                let ft = engine.flow_table();
+                conns.iter().filter(|h| ft.get(**h).is_some()).count()
+            };
+            eprintln!(
+                "dpdk_maxtp: close_persistent_connections: timed out with \
+                 {residual}/{} conns still alive after 5s; continuing",
+                conns.len()
+            );
+            return Ok(());
+        }
+    }
 }
 
 /// Drive one bucket on the dpdk_net side.
