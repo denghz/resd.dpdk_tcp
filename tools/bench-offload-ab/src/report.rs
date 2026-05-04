@@ -643,12 +643,15 @@ mod tests {
         let mut agg = BTreeMap::new();
         agg.insert("baseline".into(), Aggregated { p50_ns: 0.0, p99_ns: 100.0, p999_ns: 0.0 });
         agg.insert("rx".into(), Aggregated { p50_ns: 0.0, p99_ns: 80.0, p999_ns: 0.0 });
-        agg.insert("full".into(), Aggregated { p50_ns: 0.0, p99_ns: 85.0, p999_ns: 0.0 });
+        // full 95 vs best=80 → 18.75% overshoot, clearly outside the 10%
+        // noise band (bumped from 5% on 2026-05-04). Picks the violation
+        // case unambiguously.
+        agg.insert("full".into(), Aggregated { p50_ns: 0.0, p99_ns: 95.0, p999_ns: 0.0 });
 
         let sanity = check_full_sanity(matrix, &agg);
         let err = sanity.verdict.unwrap_err();
         assert!(err.contains("violated"), "err: {err}");
-        assert_eq!(sanity.full_p99_ns, Some(85.0));
+        assert_eq!(sanity.full_p99_ns, Some(95.0));
         assert_eq!(sanity.best_individual, Some(("rx".into(), 80.0)));
     }
 

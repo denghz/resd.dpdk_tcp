@@ -56,19 +56,20 @@ fn sanity_invariant_full_le_best_individual_ok() {
 
 #[test]
 fn observability_invariant_floor_violation() {
-    // obs-none=78, poll-saturation-only=74 → violation (other < floor).
-    // Observability supposedly-free but ran faster than obs-none — flag.
-    let result = check_observability_invariant(74.0, "poll-saturation-only", 78.0);
+    // obs-none=78, poll-saturation-only=68 → 12.8% gap, clearly outside
+    // the 10% noise band (bumped from 5% on 2026-05-04). Observability
+    // supposedly-free but ran meaningfully faster than obs-none — flag.
+    let result = check_observability_invariant(68.0, "poll-saturation-only", 78.0);
     assert!(
         result.is_err(),
-        "other p99 74 < obs-none p99 78 must trigger violation"
+        "other p99 68 < obs-none p99 78 (12.8% gap) must trigger violation"
     );
     let msg = result.unwrap_err();
     assert!(
         msg.contains("poll-saturation-only"),
         "err should name offending config: {msg}"
     );
-    assert!(msg.contains("74"), "err should mention other p99: {msg}");
+    assert!(msg.contains("68"), "err should mention other p99: {msg}");
     assert!(msg.contains("78"), "err should mention obs-none p99: {msg}");
 }
 
