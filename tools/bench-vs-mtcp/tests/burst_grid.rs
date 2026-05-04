@@ -236,11 +236,15 @@ fn good_mtcp_cfg() -> MtcpConfig<'static> {
         peer_ip: "10.0.0.42",
         peer_port: 10_001,
         peer_binary: "/opt/mtcp-peer/bench-peer",
+        driver_binary: "/opt/mtcp-peer/mtcp-driver",
+        mtcp_conf: "/opt/mtcp/etc/mtcp.conf",
         burst_bytes: 64 * 1024,
         gap_ms: 0,
         bursts: 10_000,
         warmup: 100,
         mss: 1460,
+        num_cores: 1,
+        timeout: std::time::Duration::from_secs(60),
     }
 }
 
@@ -250,11 +254,16 @@ fn mtcp_stub_validate_config_accepts_good_shape() {
 }
 
 #[test]
-fn mtcp_stub_run_burst_workload_returns_unimplemented() {
-    let cfg = good_mtcp_cfg();
+fn mtcp_run_burst_workload_surfaces_missing_driver_when_path_does_not_exist() {
+    // Subprocess wrapper returns DriverMissing when driver_binary
+    // doesn't exist on the host. This integration-level test mirrors
+    // the unit-test in src/mtcp.rs but exercises the public API entry
+    // point a real caller would use.
+    let mut cfg = good_mtcp_cfg();
+    cfg.driver_binary = "/this/path/does/not/exist/mtcp-driver";
     match mtcp::run_burst_workload(&cfg) {
-        Err(mtcp::Error::Unimplemented) => {}
-        other => panic!("expected Error::Unimplemented, got {other:?}"),
+        Err(mtcp::Error::DriverMissing { .. }) => {}
+        other => panic!("expected Error::DriverMissing, got {other:?}"),
     }
 }
 

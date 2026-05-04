@@ -64,6 +64,12 @@ struct Args {
     #[arg(long, default_value = "")]
     peer_iface: String,
 
+    /// Peer TCP port for the F-Stack stack. Default 10003 matches the
+    /// bench-nightly.sh wiring (echo-server 10001, linux-tcp-sink
+    /// 10002, fstack-peer 10003).
+    #[arg(long, default_value_t = 10_003)]
+    fstack_peer_port: u16,
+
     /// CSV of stacks to run. Tokens: `dpdk`, `linux`, `afpacket`.
     /// Default is all three; the AF_PACKET path errors at startup in
     /// T8 (see src/afpacket.rs module docs) so real T8 runs pass
@@ -170,6 +176,21 @@ fn main() -> anyhow::Result<()> {
                  (Plan B T8 stub — see src/afpacket.rs)"
             );
         }
+        // Drop F-Stack in lenient mode too if the binary was built
+        // without the `fstack` feature — the run-time arm bails
+        // immediately otherwise.
+        #[cfg(not(feature = "fstack"))]
+        {
+            let before = stacks.len();
+            stacks.retain(|s| !matches!(s, Stack::FStack));
+            if stacks.len() != before {
+                eprintln!(
+                    "bench-vs-linux: WARN dropping fstack stack in lenient mode \
+                     (binary built without `fstack` feature — see src/fstack.rs \
+                     module docs and image-builder component 04b-install-f-stack.yaml)"
+                );
+            }
+        }
     }
 
     if stacks.is_empty() {
@@ -235,6 +256,7 @@ fn main() -> anyhow::Result<()> {
         feature_set: &args.feature_set,
         stacks: &stacks,
         tsc_hz,
+        fstack_peer_port: args.fstack_peer_port,
     };
     run_mode_rtt(&cfg, engine.as_ref(), &metadata, &mut writer)?;
     writer.flush()?;
@@ -602,6 +624,15 @@ mod tests {
             out,
             vec![Stack::DpdkNet, Stack::LinuxKernel, Stack::AfPacket]
         );
+    }
+
+    #[test]
+    fn parse_stacks_accepts_fstack() {
+        let out = parse_stacks("dpdk,linux,fstack").unwrap();
+        assert_eq!(out, vec![Stack::DpdkNet, Stack::LinuxKernel, Stack::FStack]);
+        // Aliases route to the same variant.
+        let out = parse_stacks("f-stack").unwrap();
+        assert_eq!(out, vec![Stack::FStack]);
     }
 
     #[test]

@@ -146,10 +146,19 @@ fi
 # block go to stderr, which we let pass through to the operator's
 # terminal. A `Stack ARN: <arn>` line often precedes the JSON on
 # stdout, so extract the JSON starting at the first `{` line.
+#
+# INSTANCE_TYPE env var overrides the CDK preset default (c6a.2xlarge).
+INSTANCE_TYPE_ARG=()
+if [ -n "${INSTANCE_TYPE:-}" ]; then
+  INSTANCE_TYPE_ARG=(--instance-type "$INSTANCE_TYPE")
+  log "  instance-type=$INSTANCE_TYPE (operator override via env)"
+fi
 CLI_STDOUT="$(
   cd "$RESD_INFRA_DIR" && \
   resd-aws-infra setup bench-pair \
-      --operator-ssh-cidr "$OPERATOR_CIDR" "${AMI_ID_ARG[@]}" --json
+      --operator-ssh-cidr "$OPERATOR_CIDR" \
+      "${INSTANCE_TYPE_ARG[@]}" \
+      "${AMI_ID_ARG[@]}" --json
 )"
 
 STACK_JSON="$(echo "$CLI_STDOUT" | sed -n '/^{/,$p')"
@@ -276,7 +285,16 @@ wait_for_ssh "$PEER_SSH" "$PEER_INSTANCE_ID"
 # miss_txc_to=3) on PCI slot 0000:00:06.0 (c6in.metal default). The
 # script takes EAL_ARGS from env if the operator wants to override for
 # a different instance type or PCI slot.
-EAL_ARGS="${EAL_ARGS:--l 2-3 -n 4 -a 0000:00:06.0,large_llq_hdr=1,miss_txc_to=3}"
+#
+# `--in-memory` keeps DPDK metadata out of /var/run/dpdk/rte/, and
+# `--huge-unlink` removes /dev/hugepages/rtemap_* backing files at mmap
+# time so they don't survive a half-completed rte_eal_cleanup. Without
+# these flags, residual hugepage state from a prior bench-ab-runner
+# leaks into the next process and rte_eal_cleanup walks a corrupted
+# memzone (observed: bench-obs-overhead obs-none SIGSEGV in run
+# bl16x36lb). Same flags as tests/ffi-test/tests/ffi_smoke.rs:48 uses
+# for the same reason.
+EAL_ARGS="${EAL_ARGS:--l 2-3 -n 4 --in-memory --huge-unlink -a 0000:00:06.0,large_llq_hdr=1,miss_txc_to=3}"
 
 # ---------------------------------------------------------------------------
 # [5/12] SCP binaries + scripts to DUT and peer hosts.
@@ -296,7 +314,11 @@ PEER_BINS=(
   tools/bench-e2e/peer/echo-server
   tools/bench-vs-linux/peer/linux-tcp-sink
 )
-SHARED_SCRIPTS=(scripts/check-bench-preconditions.sh)
+# F-Stack peer is built on the AMI itself (against the AMI's libfstack.a +
+# DPDK 23.11 — see image-builder component 04b-install-f-stack.yaml). We
+# don't ship it via scp; the binary lives at /opt/f-stack-peer/bench-peer
+# on the peer host pre-installed by the AMI bake.
+SHARED_SCRIPTS=(scripts/check-bench-preconditions.sh scripts/bench-ab-runner-gdb.sh)
 
 for bin in "${DUT_BINS[@]}" "${PEER_BINS[@]}" "${SHARED_SCRIPTS[@]}"; do
   if [ ! -f "$bin" ]; then
@@ -305,17 +327,49 @@ for bin in "${DUT_BINS[@]}" "${PEER_BINS[@]}" "${SHARED_SCRIPTS[@]}"; do
   fi
 done
 
+# retry_remote — wraps a remote-exec command (scp or ssh) with bounded
+# retries against transient `kex_exchange_identification: Connection
+# closed by remote host` errors. The 3-consecutive-probe wait_for_ssh
+# guard didn't fully eliminate this — cloud-init can do a delayed sshd
+# restart after the probes pass.
+retry_remote() {
+  local label="$1"; shift
+  local instance_id="$1"; shift
+  local max=5
+  local attempt=0
+  until "$@"; do
+    attempt=$((attempt + 1))
+    if (( attempt >= max )); then
+      log "  $label failed after $max attempts"
+      return 1
+    fi
+    log "  $label transient failure (attempt $attempt/$max) — sleeping 10s + refreshing EC2IC grant"
+    sleep 10
+    push_operator_pubkey "$instance_id"
+  done
+}
+
 refresh_ec2_ic_grants
 log "  -> DUT ($DUT_SSH)"
-scp "${SCP_OPTS[@]}" \
+retry_remote "scp DUT-bins" "$DUT_INSTANCE_ID" \
+  scp "${SCP_OPTS[@]}" \
     "${DUT_BINS[@]}" "${SHARED_SCRIPTS[@]}" \
     "ubuntu@${DUT_SSH}:/tmp/"
+# scp drops the +x bit on shell scripts; restore it for the gdb wrapper
+# so bench-offload-ab / bench-obs-overhead can exec it as --runner-bin.
+retry_remote "chmod-DUT" "$DUT_INSTANCE_ID" \
+  ssh "${SSH_OPTS[@]}" "ubuntu@$DUT_SSH" \
+    "chmod +x /tmp/bench-ab-runner-gdb.sh /tmp/check-bench-preconditions.sh"
 
 refresh_ec2_ic_grants
 log "  -> peer ($PEER_SSH)"
-scp "${SCP_OPTS[@]}" \
+retry_remote "scp peer-bins" "$PEER_INSTANCE_ID" \
+  scp "${SCP_OPTS[@]}" \
     "${PEER_BINS[@]}" "${SHARED_SCRIPTS[@]}" \
     "ubuntu@${PEER_SSH}:/tmp/"
+retry_remote "chmod-peer" "$PEER_INSTANCE_ID" \
+  ssh "${SSH_OPTS[@]}" "ubuntu@$PEER_SSH" \
+    "chmod +x /tmp/check-bench-preconditions.sh"
 
 # ---------------------------------------------------------------------------
 # [6/12] Start peer services (echo-server for bench-e2e/stress/vs-mtcp;
@@ -370,6 +424,24 @@ refresh_ec2_ic_grants
 ssh "${SSH_OPTS[@]}" "ubuntu@$PEER_SSH" \
     "nohup /tmp/linux-tcp-sink 10002 >/tmp/linux-tcp-sink.log 2>&1 </dev/null &"
 
+# F-Stack peer (port 10003) — pre-installed on the AMI at
+# /opt/f-stack-peer/bench-peer (image-builder component
+# 04b-install-f-stack.yaml). Requires F-Stack's config file at
+# /etc/f-stack.conf. Soft-fail if the binary doesn't exist on the
+# peer (e.g. running against a pre-04b AMI bake) so the rest of the
+# pipeline (echo-server + linux-tcp-sink stacks) still proceeds.
+refresh_ec2_ic_grants
+ssh "${SSH_OPTS[@]}" "ubuntu@$PEER_SSH" \
+    "if [ -x /opt/f-stack-peer/bench-peer ]; then \
+       nohup sudo /opt/f-stack-peer/bench-peer 10003 \
+         --conf=/etc/f-stack.conf --proc-id=0 \
+         >/tmp/fstack-peer.log 2>&1 </dev/null & \
+       echo 'fstack-peer started on port 10003'; \
+     else \
+       echo 'fstack-peer binary not present (pre-04b AMI?); fstack stack will emit empty CSV rows'; \
+     fi" \
+    || log "  WARN starting fstack peer failed; fstack stack may produce no data"
+
 # Give the peer services a moment to bind listen sockets.
 sleep 1
 
@@ -385,21 +457,34 @@ run_dut_bench() {
   local cmd="sudo /tmp/$bench"
   local arg
   for arg in "$@"; do
-    # Quote every arg for the remote shell. Tolerates spaces / commas in
-    # --eal-args without shell-injection.
     cmd+=" $(printf '%q' "$arg")"
   done
   cmd+=" --output-csv /tmp/${csv_name}.csv"
 
-  # Refresh the EC2 Instance Connect grant (60 s auth window) before the
-  # ssh invocation. Once ssh authenticates the session persists for the
-  # full bench duration — we only need a fresh grant at connect time.
   refresh_ec2_ic_grants
 
-  log "  DUT> $bench"
-  ssh "${SSH_OPTS[@]}" "ubuntu@$DUT_SSH" "$cmd"
+  local stderr_log="$OUT_DIR/${csv_name}.stderr.log"
+  local stdout_log="$OUT_DIR/${csv_name}.stdout.log"
+
+  log "  DUT> $bench (stderr -> $stderr_log)"
+  # Capture stdout + stderr separately. The remote `2>&1` pattern would
+  # interleave the two streams; we want stderr preserved in its own
+  # file because the binaries log structured progress to stdout and
+  # diagnostics to stderr.
+  local rc=0
+  ssh "${SSH_OPTS[@]}" "ubuntu@$DUT_SSH" "$cmd" \
+      >"$stdout_log" 2>"$stderr_log" || rc=$?
+  if [ $rc -ne 0 ]; then
+    log "  $bench exited rc=$rc; tailing stderr:"
+    tail -n 40 "$stderr_log" | sed 's/^/    /' | tee -a /dev/stderr
+  fi
+  # Always attempt to scp the CSV, even on bench failure: a partial CSV
+  # written before the cliff / abort is forensically valuable for
+  # iteration-cliff diagnosis. scp failure here is non-fatal.
   refresh_ec2_ic_grants
-  scp "${SCP_OPTS[@]}" "ubuntu@$DUT_SSH:/tmp/${csv_name}.csv" "$OUT_DIR/"
+  scp "${SCP_OPTS[@]}" "ubuntu@$DUT_SSH:/tmp/${csv_name}.csv" "$OUT_DIR/" \
+    || log "  scp ${csv_name}.csv failed (bench may have exited before write)"
+  return $rc
 }
 
 # Common args shared across bench-e2e / bench-stress / bench-vs-linux /
@@ -442,25 +527,82 @@ run_dut_bench bench-e2e bench-e2e \
     || log "  [7/12] bench-e2e exited non-zero — continuing"
 
 # ---------------------------------------------------------------------------
-# [8/12] bench-stress — netem + FaultInjector matrix (peer-host netem
-# needs peer SSH + iface name).
+# [8/12] bench-stress — operator-side netem orchestration.
+# DUT cannot SSH from the data ENI to the peer's mgmt IP (different SG /
+# no route), so the previous in-process NetemGuard apply hangs on
+# OpenSSH's connect timeout. Operator workstation has working SSH to
+# the peer's mgmt IP; orchestrate netem here, run bench-stress with
+# --external-netem on the DUT.
 # ---------------------------------------------------------------------------
-log "[8/12] bench-stress"
-# Default matrix bundles multiple FaultInjector specs which can't coexist
-# (FI is singleton per Engine). Pick the 4 netem-only scenarios for a
-# single bench-stress pass that produces a usable sweep CSV. FI scenarios
-# can be run individually as a follow-up once the base nightly is green.
-run_dut_bench bench-stress bench-stress \
-    "${DPDK_COMMON[@]}" \
-    --peer-port 10001 \
-    --peer-ssh "ubuntu@$PEER_SSH" \
-    --peer-iface ens6 \
-    --scenarios random_loss_01pct_10ms,correlated_burst_loss_1pct,reorder_depth_3,duplication_2x \
-    --iterations "$BENCH_ITERATIONS" \
-    --warmup "$BENCH_WARMUP" \
-    --tool bench-stress \
-    --feature-set trading-latency \
-    || log "  [8/12] bench-stress exited non-zero — continuing"
+log "[8/12] bench-stress (operator-side netem orchestration)"
+
+# Spec→string map mirrors the literals in
+# `tools/bench-stress/src/scenarios.rs::MATRIX`. Adding a new netem
+# scenario requires a new entry here AND a row in scenarios.rs.
+declare -A NETEM_SPECS=(
+  [random_loss_01pct_10ms]="loss 0.1% delay 10ms"
+  [correlated_burst_loss_1pct]="loss 1% 25%"
+  [reorder_depth_3]="delay 5ms reorder 50% gap 3"
+  [duplication_2x]="duplicate 100%"
+)
+
+NETEM_SCENARIOS=(random_loss_01pct_10ms correlated_burst_loss_1pct reorder_depth_3 duplication_2x)
+
+# Defensive cleanup: if a previous run crashed mid-scenario, the peer
+# may still have a netem qdisc installed. The next `tc qdisc add` would
+# return EEXIST and skip ALL subsequent scenarios via the apply-fail
+# branch — fail loud and silent. One pre-loop `del` puts the peer in a
+# known clean state; `|| true` covers the no-orphan case.
+log "  [8/12] pre-loop netem cleanup (defensive)"
+ssh "${SSH_OPTS[@]}" "ubuntu@$PEER_SSH" \
+  "sudo tc qdisc del dev ens6 root || true" \
+  || log "    pre-loop cleanup ssh failed (peer unreachable?); continuing"
+
+bench_stress_csvs=()
+
+for scenario in "${NETEM_SCENARIOS[@]}"; do
+  spec="${NETEM_SPECS[$scenario]}"
+  log "  [8/12] $scenario — applying netem ($spec)"
+  ssh "${SSH_OPTS[@]}" "ubuntu@$PEER_SSH" \
+    "sudo tc qdisc add dev ens6 root netem $spec" \
+    || { log "    apply failed; skipping scenario"; continue; }
+
+  csv_name="bench-stress-$scenario"
+  if ! run_dut_bench bench-stress "$csv_name" \
+      "${DPDK_COMMON[@]}" \
+      --peer-port 10001 \
+      --peer-ssh "ubuntu@$PEER_SSH" \
+      --peer-iface ens6 \
+      --scenarios "$scenario" \
+      --external-netem \
+      --iterations "$BENCH_ITERATIONS" \
+      --warmup "$BENCH_WARMUP" \
+      --tool bench-stress \
+      --feature-set trading-latency; then
+    log "    $scenario bench-stress exited non-zero — continuing"
+  fi
+
+  log "  [8/12] $scenario — removing netem"
+  ssh "${SSH_OPTS[@]}" "ubuntu@$PEER_SSH" \
+    "sudo tc qdisc del dev ens6 root || true"
+
+  bench_stress_csvs+=("$OUT_DIR/${csv_name}.csv")
+done
+
+# Concatenate per-scenario CSVs into a single bench-stress.csv.
+# First file's header is preserved; subsequent files' headers are
+# stripped via `tail -n +2`. If no scenarios produced a CSV (every one
+# failed), emit an empty file so the downstream report sees the
+# expected name without erroring.
+log "[8/12] merging per-scenario CSVs into bench-stress.csv"
+{
+  if [ ${#bench_stress_csvs[@]} -gt 0 ] && [ -f "${bench_stress_csvs[0]}" ]; then
+    head -n 1 "${bench_stress_csvs[0]}"
+    for f in "${bench_stress_csvs[@]}"; do
+      [ -f "$f" ] && tail -n +2 "$f"
+    done
+  fi
+} > "$OUT_DIR/bench-stress.csv"
 
 # ---------------------------------------------------------------------------
 # [9/12] bench-vs-linux — mode A (RTT) + mode B (wire-diff).
@@ -469,13 +611,20 @@ run_dut_bench bench-stress bench-stress \
 # Mode B: wire-diff consumes pcaps. The live tcpdump orchestration is a
 #   T15-B follow-up; for the MVP we skip mode B if no pcaps are staged.
 # ---------------------------------------------------------------------------
-log "[9/12] bench-vs-linux mode A (RTT comparison)"
+log "[9/12] bench-vs-linux mode A (RTT comparison) — dpdk,linux,fstack"
+# F-Stack arm requires the binary built with `--features fstack`; the
+# default release build (step [3/12]) skips F-Stack so the F-Stack
+# stack is selected here in lenient mode (drops it if feature-off).
+# When the AMI build sets cargo build with --features fstack the arm
+# becomes live. The 2026-04-29 follow-up landed the F-Stack rust arm
+# in mode A.
 run_dut_bench bench-vs-linux bench-vs-linux-rtt \
     "${DPDK_COMMON[@]}" \
     --mode rtt \
     --peer-port 10002 \
     --peer-iface ens6 \
-    --stacks dpdk,linux \
+    --stacks dpdk,linux,fstack \
+    --fstack-peer-port 10003 \
     --iterations "$BENCH_ITERATIONS" \
     --warmup "$BENCH_WARMUP" \
     --tool bench-vs-linux \
@@ -509,12 +658,18 @@ else
 
   # Backgrounded tcpdump on DUT and peer. </dev/null + nohup to detach
   # from ssh's stdin (same OpenSSH gotcha as the peer-services stanza).
-  ssh "${SSH_OPTS[@]}" "ubuntu@$DUT_SSH" \
+  # Soft-fail with retry: a transient kex_exchange_identification race
+  # here shouldn't abort the entire nightly. mode B is diagnostic.
+  retry_remote "ssh tcpdump-DUT" "$DUT_INSTANCE_ID" \
+    ssh "${SSH_OPTS[@]}" "ubuntu@$DUT_SSH" \
       "sudo nohup tcpdump -i ens6 -U -s 0 -w /tmp/mode-b-local.pcap \
-       '$TCPDUMP_FILTER' >/tmp/tcpdump-dut.log 2>&1 </dev/null &"
-  ssh "${SSH_OPTS[@]}" "ubuntu@$PEER_SSH" \
+       '$TCPDUMP_FILTER' >/tmp/tcpdump-dut.log 2>&1 </dev/null &" \
+    || log "        WARN tcpdump DUT start failed; pcap may be empty"
+  retry_remote "ssh tcpdump-peer" "$PEER_INSTANCE_ID" \
+    ssh "${SSH_OPTS[@]}" "ubuntu@$PEER_SSH" \
       "sudo nohup tcpdump -i ens6 -U -s 0 -w /tmp/mode-b-peer.pcap \
-       '$TCPDUMP_FILTER' >/tmp/tcpdump-peer.log 2>&1 </dev/null &"
+       '$TCPDUMP_FILTER' >/tmp/tcpdump-peer.log 2>&1 </dev/null &" \
+    || log "        WARN tcpdump peer start failed; pcap may be empty"
 
   # Give tcpdump a beat to bind its pcap ring before we start driving
   # traffic. Skipping this can drop the first few handshake packets,
@@ -648,30 +803,53 @@ scp -r "${SCP_OPTS[@]}" \
     "ubuntu@$DUT_SSH:/tmp/bench-obs-overhead-out" "$OUT_DIR/bench-obs-overhead" \
     || log "  [10b/12] scp of bench-obs-overhead failed — continuing"
 
+# Pull the gdb wrapper's diagnostic log back for offline analysis. The
+# wrapper writes stack traces from any SIGSEGV that hit bench-ab-runner
+# during [10/12]+[10b/12], plus the gdb-version banner and any apt-install
+# output if gdb was bootstrapped at first invocation.
+refresh_ec2_ic_grants
+scp "${SCP_OPTS[@]}" \
+    "ubuntu@$DUT_SSH:/tmp/bench-ab-runner-gdb.log" "$OUT_DIR/" \
+    || log "  gdb log scp failed — continuing"
+
 # ---------------------------------------------------------------------------
 # [11/12] bench-vs-mtcp burst + maxtp grids.
 # mTCP stub is strict-mode-fatal; pass --stacks dpdk to run the DPDK
 # arm only until Plan 2 T21 lands the real bench-peer binary.
 # ---------------------------------------------------------------------------
-log "[11/12] bench-vs-mtcp burst grid"
+log "[11/12] bench-vs-mtcp burst grid (dpdk + fstack comparator)"
+# 2026-04-29: F-Stack arm landed alongside dpdk_net on the burst grid.
+# F-Stack peer = /opt/f-stack-peer/bench-peer on port 10003 (started
+# in step [6/12]). The dpdk arm continues to use echo-server on
+# 10001. fstack arm requires the binary built with `--features
+# fstack`; default release builds emit invalid-marker rows when
+# `--stacks fstack` is selected without the feature compiled in.
 run_dut_bench bench-vs-mtcp bench-vs-mtcp-burst \
     "${DPDK_COMMON[@]}" \
     --workload burst \
     --peer-port 10001 \
-    --peer-ssh "ubuntu@$PEER_SSH" \
-    --stacks dpdk \
+    --fstack-peer-port 10003 \
+    --stacks dpdk,fstack \
     --tool bench-vs-mtcp \
     --feature-set trading-latency \
     --nic-max-bps "$NIC_MAX_BPS" \
     || log "  [11/12] bench-vs-mtcp burst exited non-zero — continuing"
 
-log "[11b/12] bench-vs-mtcp maxtp grid"
+log "[11b/12] bench-vs-mtcp maxtp grid (dpdk + linux + fstack comparators)"
+# 2026-05-03: Linux kernel-TCP arm landed in bench-vs-mtcp (mTCP arm
+# stays stubbed while AMI rebuild is blocked on libmtcp / gcc 13).
+# 2026-04-29: F-Stack arm landed alongside Linux + dpdk_net. The
+# three peers run on distinct ports (echo-server 10001, linux-tcp-
+# sink 10002, fstack-peer 10003). Linux uses linux-tcp-sink to
+# avoid recv-buffer backpressure; fstack + dpdk both use echo-style
+# peers since their writes are bounded by the user-side app and
+# F-Stack's send buffer drains predictably.
 run_dut_bench bench-vs-mtcp bench-vs-mtcp-maxtp \
     "${DPDK_COMMON[@]}" \
     --workload maxtp \
     --peer-port 10001 \
-    --peer-ssh "ubuntu@$PEER_SSH" \
-    --stacks dpdk \
+    --fstack-peer-port 10003 \
+    --stacks dpdk,linux,fstack \
     --tool bench-vs-mtcp \
     --feature-set trading-latency \
     --nic-max-bps "$NIC_MAX_BPS" \
