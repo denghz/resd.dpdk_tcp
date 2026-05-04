@@ -314,6 +314,10 @@ PEER_BINS=(
   tools/bench-e2e/peer/echo-server
   tools/bench-vs-linux/peer/linux-tcp-sink
 )
+# F-Stack peer is built on the AMI itself (against the AMI's libfstack.a +
+# DPDK 23.11 — see image-builder component 04b-install-f-stack.yaml). We
+# don't ship it via scp; the binary lives at /opt/f-stack-peer/bench-peer
+# on the peer host pre-installed by the AMI bake.
 SHARED_SCRIPTS=(scripts/check-bench-preconditions.sh scripts/bench-ab-runner-gdb.sh)
 
 for bin in "${DUT_BINS[@]}" "${PEER_BINS[@]}" "${SHARED_SCRIPTS[@]}"; do
@@ -419,6 +423,24 @@ ssh "${SSH_OPTS[@]}" "ubuntu@$PEER_SSH" \
 refresh_ec2_ic_grants
 ssh "${SSH_OPTS[@]}" "ubuntu@$PEER_SSH" \
     "nohup /tmp/linux-tcp-sink 10002 >/tmp/linux-tcp-sink.log 2>&1 </dev/null &"
+
+# F-Stack peer (port 10003) — pre-installed on the AMI at
+# /opt/f-stack-peer/bench-peer (image-builder component
+# 04b-install-f-stack.yaml). Requires F-Stack's config file at
+# /etc/f-stack.conf. Soft-fail if the binary doesn't exist on the
+# peer (e.g. running against a pre-04b AMI bake) so the rest of the
+# pipeline (echo-server + linux-tcp-sink stacks) still proceeds.
+refresh_ec2_ic_grants
+ssh "${SSH_OPTS[@]}" "ubuntu@$PEER_SSH" \
+    "if [ -x /opt/f-stack-peer/bench-peer ]; then \
+       nohup sudo /opt/f-stack-peer/bench-peer 10003 \
+         --conf=/etc/f-stack.conf --proc-id=0 \
+         >/tmp/fstack-peer.log 2>&1 </dev/null & \
+       echo 'fstack-peer started on port 10003'; \
+     else \
+       echo 'fstack-peer binary not present (pre-04b AMI?); fstack stack will emit empty CSV rows'; \
+     fi" \
+    || log "  WARN starting fstack peer failed; fstack stack may produce no data"
 
 # Give the peer services a moment to bind listen sockets.
 sleep 1
@@ -589,13 +611,20 @@ log "[8/12] merging per-scenario CSVs into bench-stress.csv"
 # Mode B: wire-diff consumes pcaps. The live tcpdump orchestration is a
 #   T15-B follow-up; for the MVP we skip mode B if no pcaps are staged.
 # ---------------------------------------------------------------------------
-log "[9/12] bench-vs-linux mode A (RTT comparison)"
+log "[9/12] bench-vs-linux mode A (RTT comparison) — dpdk,linux,fstack"
+# F-Stack arm requires the binary built with `--features fstack`; the
+# default release build (step [3/12]) skips F-Stack so the F-Stack
+# stack is selected here in lenient mode (drops it if feature-off).
+# When the AMI build sets cargo build with --features fstack the arm
+# becomes live. The 2026-04-29 follow-up landed the F-Stack rust arm
+# in mode A.
 run_dut_bench bench-vs-linux bench-vs-linux-rtt \
     "${DPDK_COMMON[@]}" \
     --mode rtt \
     --peer-port 10002 \
     --peer-iface ens6 \
-    --stacks dpdk,linux \
+    --stacks dpdk,linux,fstack \
+    --fstack-peer-port 10003 \
     --iterations "$BENCH_ITERATIONS" \
     --warmup "$BENCH_WARMUP" \
     --tool bench-vs-linux \
@@ -788,28 +817,39 @@ scp "${SCP_OPTS[@]}" \
 # mTCP stub is strict-mode-fatal; pass --stacks dpdk to run the DPDK
 # arm only until Plan 2 T21 lands the real bench-peer binary.
 # ---------------------------------------------------------------------------
-log "[11/12] bench-vs-mtcp burst grid"
+log "[11/12] bench-vs-mtcp burst grid (dpdk + fstack comparator)"
+# 2026-04-29: F-Stack arm landed alongside dpdk_net on the burst grid.
+# F-Stack peer = /opt/f-stack-peer/bench-peer on port 10003 (started
+# in step [6/12]). The dpdk arm continues to use echo-server on
+# 10001. fstack arm requires the binary built with `--features
+# fstack`; default release builds emit invalid-marker rows when
+# `--stacks fstack` is selected without the feature compiled in.
 run_dut_bench bench-vs-mtcp bench-vs-mtcp-burst \
     "${DPDK_COMMON[@]}" \
     --workload burst \
     --peer-port 10001 \
-    --stacks dpdk \
+    --fstack-peer-port 10003 \
+    --stacks dpdk,fstack \
     --tool bench-vs-mtcp \
     --feature-set trading-latency \
     --nic-max-bps "$NIC_MAX_BPS" \
     || log "  [11/12] bench-vs-mtcp burst exited non-zero — continuing"
 
-log "[11b/12] bench-vs-mtcp maxtp grid (dpdk + linux comparator)"
+log "[11b/12] bench-vs-mtcp maxtp grid (dpdk + linux + fstack comparators)"
 # 2026-05-03: Linux kernel-TCP arm landed in bench-vs-mtcp (mTCP arm
 # stays stubbed while AMI rebuild is blocked on libmtcp / gcc 13).
-# Both stacks talk to the existing echo-server on port 10001; linux
-# maxtp doesn't care that the peer echoes — it only sends and counts
-# accepted bytes.
+# 2026-04-29: F-Stack arm landed alongside Linux + dpdk_net. The
+# three peers run on distinct ports (echo-server 10001, linux-tcp-
+# sink 10002, fstack-peer 10003). Linux uses linux-tcp-sink to
+# avoid recv-buffer backpressure; fstack + dpdk both use echo-style
+# peers since their writes are bounded by the user-side app and
+# F-Stack's send buffer drains predictably.
 run_dut_bench bench-vs-mtcp bench-vs-mtcp-maxtp \
     "${DPDK_COMMON[@]}" \
     --workload maxtp \
     --peer-port 10001 \
-    --stacks dpdk,linux \
+    --fstack-peer-port 10003 \
+    --stacks dpdk,linux,fstack \
     --tool bench-vs-mtcp \
     --feature-set trading-latency \
     --nic-max-bps "$NIC_MAX_BPS" \

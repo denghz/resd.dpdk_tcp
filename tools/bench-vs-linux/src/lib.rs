@@ -6,6 +6,8 @@
 //! The binary consumes the same modules via `use bench_vs_linux::*`.
 
 pub mod afpacket;
+#[cfg(feature = "fstack")]
+pub mod fstack;
 pub mod linux_kernel;
 pub mod mode_rtt;
 pub mod mode_wire_diff;
@@ -14,15 +16,21 @@ pub mod normalize;
 
 /// Stack identifier for CSV `dimensions_json` + mode-A iteration.
 ///
-/// Three values for mode A (spec §8): `dpdk_net` (our stack),
-/// `linux_kernel` (standard socket path), `afpacket` (AF_PACKET mmap
-/// user-space delivery). The enum serialises to the lowercase string
-/// form emitted into `dimensions_json.stack`.
+/// Four values for mode A: `dpdk_net` (our stack), `linux_kernel`
+/// (standard socket path), `afpacket` (AF_PACKET mmap user-space
+/// delivery), `fstack` (F-Stack — FreeBSD TCP/IP stack ported to
+/// userspace on DPDK; actively maintained, builds against DPDK 23.11).
+/// The F-Stack arm is feature-gated (`--features fstack`) so default
+/// builds compile on dev hosts without libfstack.a; the AMI build
+/// provides libfstack.a at `/opt/f-stack/lib/libfstack.a` (image-builder
+/// component `04b-install-f-stack.yaml`). The enum serialises to the
+/// lowercase string form emitted into `dimensions_json.stack`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stack {
     DpdkNet,
     LinuxKernel,
     AfPacket,
+    FStack,
 }
 
 impl Stack {
@@ -33,6 +41,7 @@ impl Stack {
             Stack::DpdkNet => "dpdk_net",
             Stack::LinuxKernel => "linux_kernel",
             Stack::AfPacket => "afpacket",
+            Stack::FStack => "fstack",
         }
     }
 
@@ -43,8 +52,9 @@ impl Stack {
             "dpdk" | "dpdk_net" => Ok(Stack::DpdkNet),
             "linux" | "linux_kernel" | "kernel" => Ok(Stack::LinuxKernel),
             "afpacket" | "af_packet" => Ok(Stack::AfPacket),
+            "fstack" | "f-stack" | "f_stack" => Ok(Stack::FStack),
             other => Err(format!(
-                "unknown stack `{other}` (valid: dpdk, linux, afpacket)"
+                "unknown stack `{other}` (valid: dpdk, linux, afpacket, fstack)"
             )),
         }
     }
@@ -84,6 +94,9 @@ mod tests {
         assert_eq!(Stack::parse("kernel").unwrap(), Stack::LinuxKernel);
         assert_eq!(Stack::parse("afpacket").unwrap(), Stack::AfPacket);
         assert_eq!(Stack::parse("af_packet").unwrap(), Stack::AfPacket);
+        assert_eq!(Stack::parse("fstack").unwrap(), Stack::FStack);
+        assert_eq!(Stack::parse("f-stack").unwrap(), Stack::FStack);
+        assert_eq!(Stack::parse("f_stack").unwrap(), Stack::FStack);
     }
 
     #[test]
@@ -97,6 +110,7 @@ mod tests {
         assert_eq!(Stack::DpdkNet.as_dimension(), "dpdk_net");
         assert_eq!(Stack::LinuxKernel.as_dimension(), "linux_kernel");
         assert_eq!(Stack::AfPacket.as_dimension(), "afpacket");
+        assert_eq!(Stack::FStack.as_dimension(), "fstack");
     }
 
     #[test]

@@ -344,11 +344,15 @@ fn good_mtcp_maxtp_cfg() -> MaxtpConfig<'static> {
         peer_ip: "10.0.0.42",
         peer_port: 10_001,
         peer_binary: "/opt/mtcp-peer/bench-peer",
+        driver_binary: "/opt/mtcp-peer/mtcp-driver",
+        mtcp_conf: "/opt/mtcp/etc/mtcp.conf",
         write_bytes: 4096,
         conn_count: 4,
         warmup_secs: 10,
         duration_secs: 60,
         mss: 1460,
+        num_cores: 1,
+        timeout: std::time::Duration::from_secs(120),
     }
 }
 
@@ -358,10 +362,14 @@ fn mtcp_maxtp_stub_accepts_good_shape() {
 }
 
 #[test]
-fn mtcp_maxtp_stub_run_returns_unimplemented() {
-    match mtcp::run_maxtp_workload(&good_mtcp_maxtp_cfg()) {
-        Err(mtcp::Error::Unimplemented) => {}
-        other => panic!("expected Unimplemented, got {other:?}"),
+fn mtcp_maxtp_run_surfaces_missing_driver_when_path_does_not_exist() {
+    // Mirrors burst-side integration test: subprocess wrapper returns
+    // DriverMissing when the configured driver binary doesn't exist.
+    let mut cfg = good_mtcp_maxtp_cfg();
+    cfg.driver_binary = "/this/path/does/not/exist/mtcp-driver";
+    match mtcp::run_maxtp_workload(&cfg) {
+        Err(mtcp::Error::DriverMissing { .. }) => {}
+        other => panic!("expected Error::DriverMissing, got {other:?}"),
     }
 }
 

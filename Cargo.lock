@@ -245,6 +245,7 @@ dependencies = [
  "anyhow",
  "bench-common",
  "bench-e2e",
+ "bench-vs-mtcp",
  "chrono",
  "clap 4.6.1",
  "csv",
