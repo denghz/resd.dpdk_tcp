@@ -16,18 +16,41 @@ path = "src/lib.rs"
 [[bin]]
 name = "layer-h-correctness"
 path = "src/main.rs"
+# 2026-05-04: only build when test-server is on. Workspace builds
+# without --features test-server skip this bin entirely; layer-h-
+# correctness's source uses Engine::state_of (test-server only).
+required-features = ["test-server"]
 
 [features]
-default = ["fault-injector"]
-hw-offload-rx-cksum = ["dpdk-net-core/hw-offload-rx-cksum"]
-fault-injector = ["dpdk-net-core/fault-injector"]
+# 2026-05-04: gated layer-h-correctness behind its own `test-server`
+# non-default feature so a workspace build (`cargo build --workspace
+# --release`) doesn't unify `test-server` into `dpdk-net-core` for ALL
+# binaries. Without this gate, bench-e2e / bench-stress / bench-vs-mtcp
+# ship with `tx_frame` rerouted to test_tx_intercept (engine.rs:2050)
+# and gateway ARP requests never reach the wire — same bug that bit
+# tcpreq-runner; fixed there at f6280ab. Same pattern here: optional
+# deps + non-default feature gate.
+#
+# Stand-alone build:
+#   cargo build -p layer-h-correctness --features test-server
+default = []
+hw-offload-rx-cksum = ["dep:dpdk-net-core", "dpdk-net-core/hw-offload-rx-cksum"]
+fault-injector = ["dep:dpdk-net-core", "dpdk-net-core/fault-injector"]
+test-server = [
+    "dep:dpdk-net-core",
+    "dep:dpdk-net-sys",
+    "dep:bench-e2e",
+    "dep:bench-stress",
+    "dpdk-net-core/test-server",
+    "dpdk-net-core/fault-injector",
+]
 
 [dependencies]
 bench-common = { path = "../bench-common" }
-bench-e2e = { path = "../bench-e2e" }
-bench-stress = { path = "../bench-stress" }
-dpdk-net-core = { path = "../../crates/dpdk-net-core", features = ["test-server"], default-features = true }
-dpdk-net-sys = { path = "../../crates/dpdk-net-sys" }
+bench-e2e = { path = "../bench-e2e", optional = true }
+bench-stress = { path = "../bench-stress", optional = true }
+dpdk-net-core = { path = "../../crates/dpdk-net-core", optional = true }
+dpdk-net-sys = { path = "../../crates/dpdk-net-sys", optional = true }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
