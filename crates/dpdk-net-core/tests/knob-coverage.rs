@@ -986,6 +986,95 @@ fn knob_rx_mempool_size_user_override() {
     );
 }
 
+/// Knob: `EngineConfig::tx_data_mempool_size` (2026-04-29 fix).
+/// Non-default value: any `u32 > 0` (caller-supplied capacity in mbufs).
+/// Default value: `0` (sentinel that triggers the formula at `Engine::new`):
+///   `max(8 * tx_ring_size,
+///        2 * max_connections * ceil(send_buffer_bytes / mbuf_data_room) + 8192)`
+///
+/// Observable consequence: mirrors `rx_mempool_size` — the resolution
+/// branch in `Engine::new` returns the caller value verbatim when
+/// non-zero, computes the formula when zero. The two paths produce
+/// distinct values for any reasonable EngineConfig. The retrievable
+/// backing field surfaces via `Engine::tx_data_mempool_size()`.
+///
+/// Same DPDK-init constraint as the RX-side test: this layer asserts
+/// (a) propagation and (b) the resolution rule via mirrored helper.
+#[test]
+fn knob_tx_data_mempool_size_user_override() {
+    use dpdk_net_core::engine::EngineConfig;
+
+    // (a) Propagation.
+    let cfg_override = EngineConfig {
+        tx_data_mempool_size: 32_768,
+        ..EngineConfig::default()
+    };
+    assert_eq!(
+        cfg_override.tx_data_mempool_size, 32_768,
+        "non-default tx_data_mempool_size=32768 must propagate through EngineConfig"
+    );
+    assert_eq!(
+        EngineConfig::default().tx_data_mempool_size,
+        0,
+        "default tx_data_mempool_size is 0 (the formula-trigger sentinel)"
+    );
+
+    // (b) Resolution-branch rule — mirror engine.rs `Engine::new`:
+    //   let tx_data_mempool_size = if cfg.tx_data_mempool_size > 0 {
+    //       cfg.tx_data_mempool_size
+    //   } else {
+    //       let mbuf_data_room = cfg.mbuf_data_room as u32;
+    //       let per_conn = cfg.send_buffer_bytes
+    //           .saturating_add(mbuf_data_room.saturating_sub(1))
+    //           / mbuf_data_room.max(1);
+    //       let computed = 2u32
+    //           .saturating_mul(cfg.max_connections)
+    //           .saturating_mul(per_conn)
+    //           .saturating_add(8192);
+    //       let floor = 8u32.saturating_mul(cfg.tx_ring_size as u32);
+    //       computed.max(floor)
+    //   };
+    fn resolve_tx_data_mempool_size(cfg: &EngineConfig) -> u32 {
+        if cfg.tx_data_mempool_size > 0 {
+            cfg.tx_data_mempool_size
+        } else {
+            let mbuf_data_room = cfg.mbuf_data_room as u32;
+            let per_conn = cfg
+                .send_buffer_bytes
+                .saturating_add(mbuf_data_room.saturating_sub(1))
+                / mbuf_data_room.max(1);
+            let computed = 2u32
+                .saturating_mul(cfg.max_connections)
+                .saturating_mul(per_conn)
+                .saturating_add(8192);
+            let floor = 8u32.saturating_mul(cfg.tx_ring_size as u32);
+            computed.max(floor)
+        }
+    }
+
+    // Non-default branch: caller value verbatim.
+    let resolved_override = resolve_tx_data_mempool_size(&cfg_override);
+    assert_eq!(
+        resolved_override, 32_768,
+        "non-default tx_data_mempool_size=32768 must resolve verbatim (no formula override)"
+    );
+
+    // Default branch: formula fires. Must produce a value distinct
+    // from both the non-default (32768) AND the legacy hardcoded 4096
+    // — that distinction is the whole point of making this knob
+    // configurable, so the assertion is structural.
+    let cfg_default = EngineConfig::default();
+    let resolved_default = resolve_tx_data_mempool_size(&cfg_default);
+    assert_ne!(
+        resolved_default, 32_768,
+        "default formula must produce a value distinguishable from the non-default override"
+    );
+    assert!(
+        resolved_default > 4096,
+        "default formula must exceed the pre-fix hardcoded 4096; got {resolved_default}"
+    );
+}
+
 /// Knob: `miri-safe` cargo feature (A6.6-7 Task 16).
 /// Non-default: feature ON (enabled by `scripts/hardening-miri.sh`).
 /// Observable consequence: the `miri-safe` cfg gates miri-incompatible
@@ -1126,6 +1215,7 @@ fn load_known_knob_names() -> std::collections::HashSet<String> {
         "ena_large_llq_hdr",                    // knob_ena_large_llq_hdr_suppresses_overflow_risk_guard
         "ena_miss_txc_to_sec",                  // knob_ena_miss_txc_to_sec_projects_to_devargs_key
         "rx_mempool_size",                      // knob_rx_mempool_size_user_override
+        "tx_data_mempool_size",                 // knob_tx_data_mempool_size_user_override
         // `preset` covers these via knob_preset_{rfc_compliance,latency}_*
         // (apply_preset overrides five fields at once — the preset scenarios
         // pin the expected post-override value on EngineConfig directly,

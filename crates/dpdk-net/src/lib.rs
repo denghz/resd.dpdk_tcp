@@ -211,6 +211,12 @@ pub unsafe extern "C" fn dpdk_net_engine_create(
         // at this layer, the substitution lives next to the formula in
         // `Engine::new` so the two stay co-located.
         rx_mempool_size: cfg.rx_mempool_size,
+        // 2026-04-29 fix: TX data mempool sizing knob. Not exposed on
+        // the C ABI today (no `dpdk_net_engine_config_t` field) — pin
+        // to the formula sentinel `0` so `Engine::new` applies the
+        // default. Rust-direct callers (bench harnesses) can override
+        // via `EngineConfig.tx_data_mempool_size` directly.
+        tx_data_mempool_size: 0,
         local_ip: cfg.local_ip,
         // bug_010 → feature: start empty. C callers register secondary
         // local IPs post-create via `dpdk_net_engine_add_local_ip`; the
