@@ -360,6 +360,41 @@ pub fn run_bucket(cfg: &DpdkMaxtpCfg<'_>) -> anyhow::Result<BucketRun> {
 
     let sample = MaxtpSample::from_window(acked_bytes_in_window, tx_pkts_delta, elapsed_ns);
 
+    // T21 diag: if the window finished with 0 bytes ACKed AND 0 TX
+    // payload bytes ever transmitted, the conn was wedged the entire
+    // window. Dump per-conn TCP send-side state to stderr so the
+    // operator can attribute root cause without re-running the bench.
+    // We log on stderr (not bail!) because run_maxtp_grid_dpdk's per-
+    // bucket soft-fail pattern wants to continue past a single bad
+    // cell; the diag is informational, not error-flagging.
+    if acked_bytes_in_window == 0 && tx_payload_bytes_delta == 0 {
+        for &conn in cfg.conns {
+            if let Some(s) = cfg.engine.diag_conn_stats(conn) {
+                eprintln!(
+                    "dpdk_maxtp DIAG bucket(C={}, W={}) conn={} wedged: \
+                     snd_una={} snd_nxt={} snd_wnd={} \
+                     send_buf_pending={} send_buf_free={} \
+                     srtt_us={} rto_us={}",
+                    cfg.bucket.conn_count,
+                    cfg.bucket.write_bytes,
+                    conn,
+                    s.snd_una,
+                    s.snd_nxt,
+                    s.snd_wnd,
+                    s.send_buf_bytes_pending,
+                    s.send_buf_bytes_free,
+                    s.srtt_us,
+                    s.rto_us,
+                );
+            } else {
+                eprintln!(
+                    "dpdk_maxtp DIAG bucket(C={}, W={}) conn={} wedged: <handle unknown>",
+                    cfg.bucket.conn_count, cfg.bucket.write_bytes, conn,
+                );
+            }
+        }
+    }
+
     Ok(BucketRun {
         sample,
         acked_bytes_in_window,

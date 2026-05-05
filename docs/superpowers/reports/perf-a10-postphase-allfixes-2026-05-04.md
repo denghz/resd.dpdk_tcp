@@ -102,14 +102,19 @@ c6a.2xlarge × 2 for ~76 min ≈ ~$0.92 (Spot would be lower). Total perf-a10 sp
 
 ## Ship recommendation
 
-**Recommendation:** ✅ **Ship T17 + T18.1 + T19 + layer-h-fix to master.**
+**Recommendation:** ⛔ **DO NOT SHIP YET — performance not proven.**
 
-The four commits accomplish what was scoped:
-- T17 unblocks the maxtp grid + adds engine TX diagnostic surface.
-- T18.1 lands the mTCP comparator infrastructure (driver pump can be incremental).
-- T19 lands F-Stack as 3rd comparator slot (AMI rebake separate).
-- layer-h-fix prevents a known recurring regression class (workspace feature unification on `test-server`).
+We introduced DPDK for performance. Current data:
+- RTT: TIE with Linux at p50/p99, 7.8% better at p999. A single-percentile win at the tail is not strong enough proof to justify the complexity of a userspace stack + DPDK + custom engine.
+- Throughput: 2.7× *behind* Linux at peak (4.65 Gbps vs 12.4 Gbps). Even setting aside TSO/LRO, single-conn large-W cells are ZERO Mbps (T21 stall) — meaning we cannot even *measure* dpdk_net's actual TX ceiling for the trading workload (a single long-lived connection writing batched orders).
+- mTCP: comparator broken (driver pump STUB). We have NO data showing dpdk_net ≥ mTCP, the canonical userspace TCP reference.
+- F-Stack: comparator absent (AMI lacks libfstack.a). We have NO data showing dpdk_net competitive with the FreeBSD-on-DPDK reference.
 
-The remaining issues (T21 warmup stall, T22 mTCP driver, T23 F-Stack AMI, T24 stacks-arg cosmetic, bench-stress workload-mismatch, bench-offload-ab compose threshold) are all **follow-up work, not ship-gate**. None breaks any existing-feature performance promise — bench-e2e RTT and bench-vs-linux RTT both PASS at trading-targeted percentiles, which is the workload that matters for this stack's stated purpose (small request-response over ≤100 long-lived connections).
+**Gates before ship:**
+- **T21 (engine TX-path cwnd-stuck pattern):** Block. Without this fixed we can't characterize the actual single-conn TX ceiling. The stack's *stated workload* is small writes on ≤100 long-lived connections — exactly where C=1 W=large fails today.
+- **T22 (mTCP driver pump):** Block. Without a working mTCP comparator we have no proof that the complexity beats the canonical userspace TCP reference.
+- **T23 (F-Stack AMI):** Block. Same logic — need to show competitive vs the FreeBSD-on-DPDK reference.
 
-The Linux maxtp gap at large W is the **TSO/LRO architectural tradeoff already accepted** by the user, not a regression.
+The Linux maxtp gap at *bulk* W is the TSO/LRO accepted tradeoff. But the gap at *small* W (which is the trading workload!) is unexplained — Linux at C=1 W=256 is 1,247 Mbps, dpdk_net is 789 Mbps. That gap is the actual one to close, and it's likely the same root cause as T21.
+
+The four commits (T17 + T18.1 + T19 + layer-h-fix) are landed and good. They are *infrastructure* for proving DPDK's value, not the proof itself.
