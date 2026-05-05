@@ -5,3 +5,5 @@ Cargo.lock.bak
 .cache/
 /.worktrees/
 /.claude/
+/profile/
+/tools/bench-vs-mtcp/peer/mtcp-driver
