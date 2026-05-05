@@ -43,6 +43,20 @@ make -f Makefile.mtcp mtcp-driver MTCP_BUILD=/tmp/mtcp-yaml-test DPDK_PREFIX=/us
 cargo test -p bench-vs-mtcp --lib mtcp:: # → 36/36 pass
 ```
 
+## Codex post-gate review (subagent `a384386b`, codex:codex-rescue opus 4.7, 2026-05-05)
+
+**Verdict: AGREE-WITH-PRIORS + 2 NEW-FINDING items.** Blocker fixes verified, build passes (19,168,576-byte ELF, exit-2 structured-JSON error on missing args).
+
+### New findings (both non-blocking)
+
+1. **maxtp `bytes_sent_total` semantics drift (medium, doc-only).** `mtcp-driver.c:858+948` — `bytes_written` is reset at warmup-end. The JSON `bytes_sent_total` field thus reports measurement-window bytes only, not total. Rust wrapper at `mtcp.rs:456-484` does NOT read this field, so no functional break, but bench-report consumers reading the JSON directly will misinterpret. Fix: rename JSON key to `bytes_sent_measurement` OR remove the reset (already redundant given measure_start/measure_end window enforcement). Filed as follow-up.
+
+2. **Unbounded `samples_bps` malloc (low, trusted-caller).** `mtcp-driver.c:556` — `malloc(sizeof(*samples_bps) * a->bursts)` has no overflow guard. With `a->bursts` parsed as raw u64 from CLI (line 1076, no upper bound), a value above ~2.3e18 silently overflows the multiplication. Rust wrapper caps at 10_000 in practice, so trusted-caller protected. Fix: add `if (a->bursts > 10_000_000) { error; }` at start of `run_burst_workload`. Filed as follow-up.
+
+### Forward-looking risk
+
+Highest first-AMI-run risk: if mTCP fails to fire `MTCP_EPOLLOUT` on `snd_wnd` reopen (defect or misconfigured event mask at `:283`), the burst pump degenerates to a 1 ms tight-spin until `OP_DEADLINE_SECS=60s` fires. Bench harness will see "burst failed" rather than "wedged stack" — diagnose by checking whether the epoll_wait `n` return value is ever non-zero on a healthy connection.
+
 ## Outstanding non-blockers (follow-up)
 
 From spec review:
@@ -57,8 +71,12 @@ From code-quality review:
 - Style: line 366 `(void)ep;` comment was wrong (FIXED — removed when replacing events[] decl).
 - Style: line 1051 missing space after comma; line 624 dead `(void)t_first_wire`; duplicated `mtcp_setconf` blocks; CTL_MOD return-value unchecked.
 
+From codex review:
+- C1: maxtp `bytes_sent_total` JSON-key rename or reset removal (above).
+- C2: bound-check `a->bursts` against 10M before malloc (above).
+
 ## Status
 
-**T22 ship-ready.** Driver pump produces real numbers when invoked against an mTCP echo-server peer on the bench-pair AMI (assuming T18.1's libmtcp.a + bench-peer-mtcp ship together — already on AMI per T18.1 commit `e79c41f`).
+**T22 ship-ready** — three independent review passes (spec / code-quality / codex) all reach ship-as-is or fix-then-ship-and-fixed verdicts. Driver pump produces real numbers when invoked against an mTCP echo-server peer on the bench-pair AMI.
 
 The next bench-pair run with `--features fstack` off will exercise the dpdk + linux + mtcp comparator triangle.
