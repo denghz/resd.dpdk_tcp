@@ -106,9 +106,24 @@ make -C tools/bench-vs-linux/peer linux-tcp-sink
 # ---------------------------------------------------------------------------
 # [3/12] cargo build --release --workspace.
 # Built BEFORE provisioning so a local build failure costs $0 AWS spend.
+# If libfstack.a is available at the F-Stack install path (FF_PATH or
+# /opt/f-stack), rebuild bench-vs-mtcp with --features fstack so the
+# F-Stack bench arm produces real data instead of invalid-marker rows.
+# Requires linker=gcc (GCC ld) because rust-lld (Rust 1.95+) does not
+# auto-generate __start/__stop ELF section-set symbols that F-Stack's
+# FreeBSD-derived module system relies on.
 # ---------------------------------------------------------------------------
 log "[3/12] cargo build --release --workspace"
 cargo build --release --workspace
+FF_LIB="${FF_PATH:-/opt/f-stack}/lib/libfstack.a"
+if [ -f "$FF_LIB" ]; then
+  log "  libfstack.a found at $FF_LIB — rebuilding bench-vs-mtcp with --features fstack"
+  RUSTFLAGS="${RUSTFLAGS:-} -C linker=gcc" \
+    cargo build --release -p bench-vs-mtcp --features fstack \
+    || log "  WARN bench-vs-mtcp fstack build failed; fstack arm will emit invalid-marker rows"
+else
+  log "  $FF_LIB not present — bench-vs-mtcp fstack arm will emit invalid-marker rows"
+fi
 
 # ---------------------------------------------------------------------------
 # [4/12] Provision bench-pair fleet via resd-aws-infra.
