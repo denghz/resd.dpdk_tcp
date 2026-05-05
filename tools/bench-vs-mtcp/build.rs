@@ -54,4 +54,10 @@ fn main() {
     for lib in ["rt", "m", "dl", "crypto", "pthread", "numa"] {
         println!("cargo:rustc-link-lib={lib}");
     }
+    // DPDK's --whole-archive block (from pkg-config above) pulls in
+    // librte_telemetry.a which references atexit(). Rust places libc
+    // before build.rs cargo:rustc-link-arg output in the link order, so
+    // the telemetry reference isn't satisfied. Re-emit libc here to ensure
+    // it appears AFTER the DPDK whole-archive block.
+    println!("cargo:rustc-link-arg=-lc");
 }
