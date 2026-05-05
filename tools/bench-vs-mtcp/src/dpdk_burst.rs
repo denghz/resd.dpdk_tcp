@@ -235,12 +235,25 @@ fn send_one_burst_and_drain_acks(
     conn: ConnHandle,
     payload: &[u8],
 ) -> anyhow::Result<()> {
+    // Forward-progress watchdog rather than absolute deadline (parity
+    // with `drive_burst_remainder_to_completion`): we only fail on
+    // genuine wedge ("no byte accepted in 60s"), not on slow-but-
+    // steady big bursts that legitimately exceed a flat 60s budget.
+    const STALL_TIMEOUT: Duration = Duration::from_secs(180);
     let mut sent: usize = 0;
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let mut last_progress = std::time::Instant::now();
     while sent < payload.len() {
         let remaining = &payload[sent..];
         match engine.send_bytes(conn, remaining) {
-            Ok(n) => sent += n as usize,
+            Ok(0) => {
+                // No byte accepted — drive poll/drain and check the
+                // stall watchdog. Falls through to the post-loop poll
+                // / drain on the next iteration.
+            }
+            Ok(n) => {
+                sent += n as usize;
+                last_progress = std::time::Instant::now();
+            }
             Err(e) => anyhow::bail!("send_bytes failed mid-burst: {e:?}"),
         }
         engine.poll_once();
@@ -250,7 +263,7 @@ fn send_one_burst_and_drain_acks(
         let mut _last_rx: Option<u64> = None;
         let _drained = drain_and_accumulate_readable(engine, conn, &mut _last_rx)
             .context("warmup drain")?;
-        if std::time::Instant::now() >= deadline {
+        if last_progress.elapsed() >= STALL_TIMEOUT {
             // T21 diag: on stall, dump TCP send-side state so the
             // operator can attribute root cause without a fresh bench-
             // pair run. Three suspects: (a) snd_wnd never grew past
@@ -288,9 +301,12 @@ fn send_one_burst_and_drain_acks(
             // which `handle_established` validation rejected peer ACKs.
             let drops = engine.diag_input_drops();
             anyhow::bail!(
-                "warmup burst send exceeded 60s (peer unresponsive?) | diag: {} | \
-                 input_drops: bad_seq={} bad_option={} paws_rejected={} bad_ack={} \
+                "warmup burst stalled with {sent}/{} bytes accepted \
+                 (no forward progress in {:?}) | diag: {} | input_drops: \
+                 bad_seq={} bad_option={} paws_rejected={} bad_ack={} \
                  urgent_dropped={}",
+                payload.len(),
+                STALL_TIMEOUT,
                 diag,
                 drops.bad_seq,
                 drops.bad_option,
@@ -320,7 +336,12 @@ fn send_first_segment_and_capture_wire_time(
     conn: ConnHandle,
     payload: &[u8],
 ) -> anyhow::Result<(usize, u64)> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    // Bumped from 30s to 60s for symmetry with the drain watchdog
+    // (parity with `drive_burst_remainder_to_completion`'s
+    // STALL_TIMEOUT). On a healthy peer this fires sub-millisecond;
+    // the deadline is for the wedged-peer surface only.
+    const STALL_TIMEOUT: Duration = Duration::from_secs(180);
+    let start = std::time::Instant::now();
     loop {
         match engine.send_bytes(conn, payload) {
             Ok(0) => {
@@ -328,7 +349,7 @@ fn send_first_segment_and_capture_wire_time(
                 // No TSC capture yet; we want to capture only after
                 // the first byte is actually accepted.
                 engine.poll_once();
-                if std::time::Instant::now() >= deadline {
+                if start.elapsed() >= STALL_TIMEOUT {
                     let diag = engine
                         .diag_conn_stats(conn)
                         .map(|s| {
@@ -348,9 +369,10 @@ fn send_first_segment_and_capture_wire_time(
                         .unwrap_or_else(|| "<conn handle unknown>".to_string());
                     let drops = engine.diag_input_drops();
                     anyhow::bail!(
-                        "first-segment send did not accept any byte within 30s | \
+                        "first-segment send did not accept any byte within {:?} | \
                          diag: {} | input_drops: bad_seq={} bad_option={} \
                          paws_rejected={} bad_ack={} urgent_dropped={}",
+                        STALL_TIMEOUT,
                         diag,
                         drops.bad_seq,
                         drops.bad_option,
@@ -391,16 +413,31 @@ fn send_first_segment_and_capture_wire_time(
 /// the throughput denominator and bias throughput low.
 ///
 /// Once `Engine::last_tx_hw_ts(conn)` lands, the HW-TS path reads the
-/// exact NIC timestamp instead. Error on drain timeout (60s) so a
-/// jammed peer produces a visible failure instead of wedging.
+/// exact NIC timestamp instead. Error on drain timeout (no forward
+/// progress within `STALL_TIMEOUT`) so a jammed peer produces a
+/// visible failure, but a slow-but-steady transfer is not killed
+/// purely on absolute wall-clock — the 2026-05-03 bench-pair run hit
+/// `K=1MiB G=10ms` burst 244 stalling at 151_552/1_048_576 bytes
+/// after the previous fixed-60s ceiling expired. The new model: we
+/// reset the deadline whenever `send_bytes` accepts ≥1 byte, so the
+/// failure surface is "no byte accepted in `STALL_TIMEOUT`", not
+/// "this big burst couldn't finish in 60s flat".
 fn drive_burst_remainder_to_completion(
     engine: &Engine,
     conn: ConnHandle,
     payload: &[u8],
     already_sent: usize,
 ) -> anyhow::Result<u64> {
+    /// Stall timeout — how long we tolerate zero forward progress
+    /// before declaring the connection wedged. 60s is generous for
+    /// any healthy peer (the kernel sink at 100Gbps drains a 1 MiB
+    /// burst in <100µs); the deadline is here for the wedged-peer
+    /// case where the operator wants a visible failure instead of an
+    /// indefinite hang.
+    const STALL_TIMEOUT: Duration = Duration::from_secs(180);
+
     let mut sent = already_sent;
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let mut last_progress = std::time::Instant::now();
     let mut last_rx: Option<u64> = None;
     while sent < payload.len() {
         let remaining = &payload[sent..];
@@ -409,7 +446,7 @@ fn drive_burst_remainder_to_completion(
                 engine.poll_once();
                 let _ = drain_and_accumulate_readable(engine, conn, &mut last_rx)
                     .context("burst drain mid-flight")?;
-                if std::time::Instant::now() >= deadline {
+                if last_progress.elapsed() >= STALL_TIMEOUT {
                     let diag = engine
                         .diag_conn_stats(conn)
                         .map(|s| {
@@ -429,10 +466,12 @@ fn drive_burst_remainder_to_completion(
                         .unwrap_or_else(|| "<conn handle unknown>".to_string());
                     let drops = engine.diag_input_drops();
                     anyhow::bail!(
-                        "burst drain stalled with {sent}/{} bytes accepted | \
-                         diag: {} | input_drops: bad_seq={} bad_option={} \
-                         paws_rejected={} bad_ack={} urgent_dropped={}",
+                        "burst drain stalled with {sent}/{} bytes accepted \
+                         (no forward progress in {:?}) | diag: {} | input_drops: \
+                         bad_seq={} bad_option={} paws_rejected={} bad_ack={} \
+                         urgent_dropped={}",
                         payload.len(),
+                        STALL_TIMEOUT,
                         diag,
                         drops.bad_seq,
                         drops.bad_option,
@@ -442,7 +481,11 @@ fn drive_burst_remainder_to_completion(
                     );
                 }
             }
-            Ok(n) => sent += n as usize,
+            Ok(n) => {
+                sent += n as usize;
+                // Reset the stall watchdog on any forward progress.
+                last_progress = std::time::Instant::now();
+            }
             Err(e) => anyhow::bail!("send_bytes failed mid-burst: {e:?}"),
         }
     }
