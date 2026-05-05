@@ -55,7 +55,26 @@ All 5 counters already existed at `crates/dpdk-net-core/src/counters.rs:163-189`
 
 ### Codex review (subagent `ad6a7f55`, codex:codex-rescue opus 4.7)
 
-In-flight as of commit time. Summary will be appended to this file or filed as a follow-up if codex surfaces additional findings.
+**Verdict: NEW-FINDING (non-critical).**
+
+One uncovered drop path: `tcp_input.rs:759` — `if (seg.flags & TCP_ACK) == 0 { return Outcome { rx_zero_window, ..Outcome::base() }; }`. Returns `Outcome::base()` with NO flags set. Not critical for the C=1 healthy-peer ACK stall hypothesis because peer window-update / ACK segments must carry TCP_ACK by definition. If this site fires it indicates malformed peer traffic — separate concern from T21's investigation scope. Spec-compliance reviewer also accepted this site as out-of-scope.
+
+Codex confirmed:
+- All 6 ACK-carrying drop sites covered (URG @ 733-740, bad_seq @ 779-787, bad_option @ 790-804 + 808-820, paws_rejected @ 837-843, bad_ack @ 1005-1014). Engine maps flags to atomics at `engine.rs:873-916`.
+- Diag emission format `input_drops: bad_seq={} ...` parseable across all 4 sites; Rust `u64` Display is locale-independent decimal.
+- Snapshot loads are 5 separate relaxed atomics (`engine.rs:2476-2480`) — fine for stall attribution but not a proof of "no new drops between snapshots".
+
+Codex couldn't run cargo locally (sandbox read-only) but spec + code-quality both confirmed build clean and 424 tests pass — sufficient cross-verification.
+
+### Refined hypothesis-vs-counter prediction table (codex)
+
+| Hypothesis | bad_seq | bad_option | paws_rejected | bad_ack | urgent_dropped | Notes |
+|---|---:|---:|---:|---:|---:|---|
+| **H1**: snd_wnd-stuck | likely >0 (window update rejected by seq-window gate) | possible >0 (TS/options invalid) | possible >0 (TS regression) | usually 0 | 0 | Window-update is gated by ACK-advance + window rules at `tcp_input.rs:970-982`; rejection before that surfaces as bad_seq/bad_option/PAWS. |
+| **H2**: snd_una-stuck | possible >0 | possible >0 | possible >0 | likely >0 (ACK ahead of `snd_nxt`) | 0 | New-ACK advance only accepted at `tcp_input.rs:901-907`; future-ACK rejections hit bad_ack at `1005-1014`. |
+| **H4**: state-leakage | possible >0 | usually 0 unless parser corrupted | possible >0 | possible >0 | usually 0 | Corrupt `rcv_nxt`, `snd_nxt`, or `ts_recent` points at bad_seq, bad_ack, or PAWS respectively. **Multiple counters rising together strengthens H4.** |
+
+If ALL counters stay 0 during the stall: **H1 wire-level** — peer ACKs aren't reaching the engine at all (gateway / RSS queue routing / ARP staleness). That's the most-likely-root-cause-isn't-engine signal; check `tcpdump` on the failing run.
 
 ## Build verification
 
