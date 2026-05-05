@@ -274,15 +274,24 @@ fn send_one_burst_and_drain_acks(
             let diag = engine
                 .diag_conn_stats(conn)
                 .map(|s| {
+                    // T21 (per af6a487 investigation): emit `in_flight`
+                    // and `room_in_peer_wnd` directly — those are the
+                    // values `Engine::send_bytes` (engine.rs:5286-5292)
+                    // actually clamps acceptance against. The stale
+                    // `send_buf_bytes_pending` field (always 0 in
+                    // production — `snd.pending` is TLP-probe-only,
+                    // see engine.rs:3121) is no longer surfaced.
+                    let in_flight = s.snd_nxt.wrapping_sub(s.snd_una);
+                    let room_in_peer_wnd = s.snd_wnd.saturating_sub(in_flight);
                     format!(
-                        "snd_una={} snd_nxt={} snd_wnd={} \
-                         send_buf_pending={} send_buf_free={} \
+                        "snd_una={} snd_nxt={} in_flight={} \
+                         snd_wnd={} room_in_peer_wnd={} \
                          srtt_us={} rto_us={}",
                         s.snd_una,
                         s.snd_nxt,
+                        in_flight,
                         s.snd_wnd,
-                        s.send_buf_bytes_pending,
-                        s.send_buf_bytes_free,
+                        room_in_peer_wnd,
                         s.srtt_us,
                         s.rto_us,
                     )
