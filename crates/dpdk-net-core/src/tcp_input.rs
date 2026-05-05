@@ -441,6 +441,14 @@ fn handle_syn_sent(
         }
     }
     conn.sack_enabled = parsed_opts.sack_permitted;
+    // T21 fix (Bug 1): conn.rcv_wnd was initialised to
+    // min(recv_buf_bytes, u16::MAX) = 65535 by new_client (A3-era cap for
+    // pre-WS builds). Now that WS is negotiated, the seq-window check in
+    // handle_established uses conn.rcv_wnd as the in-window gate. Keeping
+    // it at 65535 while emit_ack advertises up to 256 KiB (via ws_shift_out)
+    // causes OOO rejections of valid peer data in [rcv_nxt+65536, rcv_nxt+cap).
+    // Correct to the full buffer capacity after option negotiation is done.
+    conn.rcv_wnd = conn.recv.cap;
     if let Some((tsval, _tsecr)) = parsed_opts.timestamps {
         conn.ts_enabled = true;
         conn.ts_recent = tsval;
@@ -689,6 +697,12 @@ fn handle_established(
     }
 
     // ACK processing — RFC 9293 §3.10.7.4, "ESTABLISHED STATE" ACK handling.
+    // T21 fix (Bug 2): the SND.WL1/SND.WL2/SND.WND update must also fire on
+    // pure window-update segments where seg.ack == snd_una (no new data ACKed).
+    // Capture the current snd_wnd before the ACK branches so the dup-ACK c3
+    // comparison uses the pre-update value; the update itself runs after the
+    // entire if/else chain below.
+    let snd_wnd_before_ack = conn.snd_wnd;
     let mut dup_ack = false;
     let mut snd_una_advanced_to: Option<u32> = None;
     let mut rtt_sample_taken = false;
@@ -762,19 +776,6 @@ fn handle_established(
         if conn.sack_enabled {
             conn.sack_scoreboard.prune_below(conn.snd_una);
         }
-        // Update send window. Only accept advances from newer segments
-        // per RFC 9293 §3.10.7.4 "SND.WL1 / SND.WL2" rules.
-        if seq_lt(conn.snd_wl1, seg.seq)
-            || (conn.snd_wl1 == seg.seq && seq_le(conn.snd_wl2, seg.ack))
-        {
-            // F-2 RFC 7323 §2.3: on non-SYN segments the receiver MUST
-            // left-shift SEG.WND by Snd.Wind.Shift bits before updating
-            // SND.WND. `ws_shift_in` is bounded at 14 (F-1), so wrapping_shl
-            // is safe and deterministic.
-            conn.snd_wnd = (seg.window as u32).wrapping_shl(conn.ws_shift_in as u32);
-            conn.snd_wl1 = seg.seq;
-            conn.snd_wl2 = seg.ack;
-        }
 
         // A6 Task 16 (spec §3.3): WRITABLE hysteresis. If a prior
         // `send_bytes` refused bytes (`send_refused_pending` latched by
@@ -818,15 +819,33 @@ fn handle_established(
         //   c5: SYN and FIN flags both off (RFC 5681 §2 (c))
         //
         // c3 window comparison: on-wire `seg.window` is pre-scale (u16);
-        // `conn.snd_wnd` is post-scale (u32). Right-shift snd_wnd back by
-        // `ws_shift_in` to compare against the u16 on-wire value. When
-        // ws_shift_in == 0 this reduces to plain u16 equality.
+        // `snd_wnd_before_ack` is the post-scale value before any update below.
+        // Right-shift back by `ws_shift_in` to compare against the u16
+        // on-wire value. When ws_shift_in == 0 this reduces to plain u16
+        // equality. Using `snd_wnd_before_ack` (not conn.snd_wnd which the
+        // T21 fix updates after this chain) preserves the pre-update snapshot.
         let c1 = seg.ack == conn.snd_una;
         let c2 = seg.payload.is_empty();
-        let c3 = (seg.window as u32) == (conn.snd_wnd >> conn.ws_shift_in);
+        let c3 = (seg.window as u32) == (snd_wnd_before_ack >> conn.ws_shift_in);
         let c4 = conn.snd_una != conn.snd_nxt;
         let c5 = (seg.flags & (TCP_SYN | TCP_FIN)) == 0;
         dup_ack = c1 && c2 && c3 && c4 && c5;
+    }
+
+    // RFC 9293 §3.10.7.4 SND.WL1/SND.WL2/SND.WND update — fires for ALL
+    // valid in-window segments, not just those that advance snd_una. Moving
+    // this outside the new-ACK branch fixes the T21 Bug 2 deadlock: a pure
+    // window-reopen ACK (seg.ack == snd_una, window field goes 0→positive)
+    // previously fell into the dup-ACK else branch with no snd_wnd update,
+    // permanently stalling the send path.
+    if seq_lt(conn.snd_wl1, seg.seq)
+        || (conn.snd_wl1 == seg.seq && seq_le(conn.snd_wl2, seg.ack))
+    {
+        // RFC 7323 §2.3: on non-SYN segments, left-shift SEG.WND by
+        // Snd.Wind.Shift. `ws_shift_in` is bounded at 14 (RFC 7323 §2.2).
+        conn.snd_wnd = (seg.window as u32).wrapping_shl(conn.ws_shift_in as u32);
+        conn.snd_wl1 = seg.seq;
+        conn.snd_wl2 = seg.ack;
     }
 
     // A5 Task 15: RACK detect-lost pass (RFC 8985 §6.2).
@@ -3144,5 +3163,95 @@ mod tests {
         };
         let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
         assert!(out.rack_lost_indexes.is_empty());
+    }
+
+    // T21 Bug 1: rcv_wnd must be set to recv.cap (not u16::MAX) after
+    // window-scale negotiation in handle_syn_sent. With a 256 KiB recv buffer
+    // and ws_shift_out=3, the pre-fix code left rcv_wnd at 65535 while
+    // emit_ack advertised up to 256 KiB, causing peer data beyond 65535 bytes
+    // past rcv_nxt to be rejected as bad_seq.
+    #[test]
+    fn syn_ack_sets_rcv_wnd_to_recv_cap_after_wscale_negotiation() {
+        use crate::flow_table::FourTuple;
+        use crate::tcp_conn::TcpConn;
+        use crate::tcp_options::TcpOpts;
+
+        const RECV_BUF: u32 = 256 * 1024; // 262144 — triggers pre-fix cap at 65535
+        let t = FourTuple {
+            local_ip: 0x0a_00_00_02,
+            local_port: 40000,
+            peer_ip: 0x0a_00_00_01,
+            peer_port: 5000,
+        };
+        let mut c = TcpConn::new_client(t, 1000, 1460, RECV_BUF, RECV_BUF, 5000, 5000, 1_000_000);
+        c.state = TcpState::SynSent;
+        c.snd_nxt = c.snd_nxt.wrapping_add(1);
+        c.ws_shift_out = 3; // engine advertises WS=3 in our SYN
+
+        assert_eq!(c.rcv_wnd, 65535, "pre: new_client caps rcv_wnd at u16::MAX");
+        assert_eq!(c.recv.cap, RECV_BUF, "pre: recv.cap is the full buffer size");
+
+        let mut peer_opts = TcpOpts::default();
+        peer_opts.wscale = Some(3);
+        let mut opts_buf = [0u8; 40];
+        let opts_len = peer_opts.encode(&mut opts_buf).unwrap();
+
+        let seg = ParsedSegment {
+            src_port: 5000,
+            dst_port: 40000,
+            seq: 5000,
+            ack: 1001,
+            flags: TCP_SYN | TCP_ACK,
+            window: 65535,
+            header_len: 20 + opts_len,
+            payload: &[],
+            options: &opts_buf[..opts_len],
+        };
+        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
+        assert_eq!(out.new_state, Some(TcpState::Established));
+        assert_eq!(
+            c.rcv_wnd, RECV_BUF,
+            "post: rcv_wnd must equal recv.cap after WS negotiation"
+        );
+    }
+
+    // T21 Bug 2: snd_wnd must be updated for a pure window-reopen ACK where
+    // seg.ack == snd_una (no new data ACKed). Pre-fix, the SND.WL update
+    // was inside the `if seq_lt(snd_una, seg.ack)` branch only, so a
+    // window-update segment with an unchanged ack field fell into the dup-ACK
+    // else branch and snd_wnd was never updated — permanent zero-window deadlock.
+    #[test]
+    fn pure_window_reopen_ack_updates_snd_wnd() {
+        // Connection with zero peer window and in-flight data.
+        let mut c = est_conn(1000, 5000, 0); // peer_wnd = 0
+        // Arrange in-flight: snd_nxt ahead of snd_una.
+        c.snd_nxt = c.snd_una.wrapping_add(4096);
+        // Set WL state: last update was for a seq before rcv_nxt, so the
+        // seq_lt(snd_wl1, seg.seq) condition will fire on the incoming segment.
+        c.snd_wl1 = c.irs; // older than rcv_nxt = irs+1
+        c.snd_wl2 = c.snd_una;
+        assert_eq!(c.snd_wnd, 0, "pre: peer window is zero");
+
+        // Pure window-reopen: seg.ack == snd_una (no new data ACKed) but
+        // window field is now positive (peer reopens).
+        let seg = ParsedSegment {
+            src_port: 5000,
+            dst_port: 40000,
+            seq: c.rcv_nxt, // in-window zero-len probe reply
+            ack: c.snd_una, // same as snd_una — pure window update
+            flags: TCP_ACK,
+            window: 4096,
+            header_len: 20,
+            payload: &[],
+            options: &[],
+        };
+        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
+        assert!(!out.bad_ack, "must not be flagged as bad_ack");
+        // c3: seg.window=4096 != snd_wnd_before_ack=0 → dup_ack is false.
+        assert!(!out.dup_ack, "window-reopen must not be classified as dup-ACK");
+        assert_eq!(
+            c.snd_wnd, 4096,
+            "snd_wnd must be updated by pure window-reopen ACK"
+        );
     }
 }
