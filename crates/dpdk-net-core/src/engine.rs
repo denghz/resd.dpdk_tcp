@@ -2427,6 +2427,21 @@ impl Engine {
     pub fn send_buffer_bytes(&self) -> u32 {
         self.cfg.send_buffer_bytes
     }
+    /// T21 diag: read-only snapshot of a conn's TCP send-side state for
+    /// stall forensics. Returns `None` if the handle is unknown. Mirrors
+    /// `state_of` shape — slow-path, intended for use from bench arms'
+    /// stall-bail diagnostic messages so we capture (snd_una, snd_nxt,
+    /// snd_wnd, send_buf_bytes_pending, send_buf_bytes_free, srtt, rto)
+    /// at the moment a wedge is detected. Distinct from the test-server-
+    /// gated `state_of` because forensics don't need test-only access.
+    pub fn diag_conn_stats(
+        &self,
+        h: crate::flow_table::ConnHandle,
+    ) -> Option<crate::tcp_conn::ConnStats> {
+        self.flow_table
+            .borrow()
+            .get_stats(h, self.cfg.send_buffer_bytes)
+    }
     pub fn events(&self) -> std::cell::RefMut<'_, EventQueue> {
         self.events.borrow_mut()
     }

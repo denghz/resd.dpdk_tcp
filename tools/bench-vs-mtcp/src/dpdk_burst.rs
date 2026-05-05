@@ -264,11 +264,36 @@ fn send_one_burst_and_drain_acks(
         let _drained = drain_and_accumulate_readable(engine, conn, &mut _last_rx)
             .context("warmup drain")?;
         if last_progress.elapsed() >= STALL_TIMEOUT {
+            // T21 diag: on stall, dump TCP send-side state so the
+            // operator can attribute root cause without a fresh bench-
+            // pair run. Three suspects: (a) snd_wnd never grew past
+            // initial value (peer's recv buf small / ACKs not arriving
+            // / ws_shift_out wrong), (b) send_buf_bytes_pending pinned
+            // (in-flight not draining → ACKs not advancing snd_una),
+            // (c) RTO/RTX storm (rto_us > sane bound).
+            let diag = engine
+                .diag_conn_stats(conn)
+                .map(|s| {
+                    format!(
+                        "snd_una={} snd_nxt={} snd_wnd={} \
+                         send_buf_pending={} send_buf_free={} \
+                         srtt_us={} rto_us={}",
+                        s.snd_una,
+                        s.snd_nxt,
+                        s.snd_wnd,
+                        s.send_buf_bytes_pending,
+                        s.send_buf_bytes_free,
+                        s.srtt_us,
+                        s.rto_us,
+                    )
+                })
+                .unwrap_or_else(|| "<conn handle unknown>".to_string());
             anyhow::bail!(
                 "warmup burst stalled with {sent}/{} bytes accepted \
-                 (no forward progress in {:?})",
+                 (no forward progress in {:?}) | diag: {}",
                 payload.len(),
                 STALL_TIMEOUT,
+                diag,
             );
         }
     }
@@ -306,9 +331,27 @@ fn send_first_segment_and_capture_wire_time(
                 // the first byte is actually accepted.
                 engine.poll_once();
                 if start.elapsed() >= STALL_TIMEOUT {
+                    let diag = engine
+                        .diag_conn_stats(conn)
+                        .map(|s| {
+                            format!(
+                                "snd_una={} snd_nxt={} snd_wnd={} \
+                                 send_buf_pending={} send_buf_free={} \
+                                 srtt_us={} rto_us={}",
+                                s.snd_una,
+                                s.snd_nxt,
+                                s.snd_wnd,
+                                s.send_buf_bytes_pending,
+                                s.send_buf_bytes_free,
+                                s.srtt_us,
+                                s.rto_us,
+                            )
+                        })
+                        .unwrap_or_else(|| "<conn handle unknown>".to_string());
                     anyhow::bail!(
-                        "first-segment send did not accept any byte within {:?}",
+                        "first-segment send did not accept any byte within {:?} | diag: {}",
                         STALL_TIMEOUT,
+                        diag,
                     );
                 }
             }
@@ -377,11 +420,29 @@ fn drive_burst_remainder_to_completion(
                 let _ = drain_and_accumulate_readable(engine, conn, &mut last_rx)
                     .context("burst drain mid-flight")?;
                 if last_progress.elapsed() >= STALL_TIMEOUT {
+                    let diag = engine
+                        .diag_conn_stats(conn)
+                        .map(|s| {
+                            format!(
+                                "snd_una={} snd_nxt={} snd_wnd={} \
+                                 send_buf_pending={} send_buf_free={} \
+                                 srtt_us={} rto_us={}",
+                                s.snd_una,
+                                s.snd_nxt,
+                                s.snd_wnd,
+                                s.send_buf_bytes_pending,
+                                s.send_buf_bytes_free,
+                                s.srtt_us,
+                                s.rto_us,
+                            )
+                        })
+                        .unwrap_or_else(|| "<conn handle unknown>".to_string());
                     anyhow::bail!(
                         "burst drain stalled with {sent}/{} bytes accepted \
-                         (no forward progress in {:?})",
+                         (no forward progress in {:?}) | diag: {}",
                         payload.len(),
                         STALL_TIMEOUT,
+                        diag,
                     );
                 }
             }
