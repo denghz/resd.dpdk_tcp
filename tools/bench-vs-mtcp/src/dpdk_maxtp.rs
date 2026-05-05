@@ -370,19 +370,25 @@ pub fn run_bucket(cfg: &DpdkMaxtpCfg<'_>) -> anyhow::Result<BucketRun> {
     if acked_bytes_in_window == 0 && tx_payload_bytes_delta == 0 {
         for &conn in cfg.conns {
             if let Some(s) = cfg.engine.diag_conn_stats(conn) {
+                // T21 (per af6a487): emit `in_flight` + `room_in_peer_wnd`
+                // directly — what `Engine::send_bytes` actually clamps on.
+                // `send_buf_pending` is always 0 in production (TLP-probe-
+                // only field) and was misleading.
+                let in_flight = s.snd_nxt.wrapping_sub(s.snd_una);
+                let room_in_peer_wnd = s.snd_wnd.saturating_sub(in_flight);
                 eprintln!(
                     "dpdk_maxtp DIAG bucket(C={}, W={}) conn={} wedged: \
-                     snd_una={} snd_nxt={} snd_wnd={} \
-                     send_buf_pending={} send_buf_free={} \
+                     snd_una={} snd_nxt={} in_flight={} \
+                     snd_wnd={} room_in_peer_wnd={} \
                      srtt_us={} rto_us={}",
                     cfg.bucket.conn_count,
                     cfg.bucket.write_bytes,
                     conn,
                     s.snd_una,
                     s.snd_nxt,
+                    in_flight,
                     s.snd_wnd,
-                    s.send_buf_bytes_pending,
-                    s.send_buf_bytes_free,
+                    room_in_peer_wnd,
                     s.srtt_us,
                     s.rto_us,
                 );
