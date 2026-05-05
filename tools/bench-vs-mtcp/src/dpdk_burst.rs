@@ -284,9 +284,19 @@ fn send_one_burst_and_drain_acks(
                     )
                 })
                 .unwrap_or_else(|| "<conn handle unknown>".to_string());
+            // T21 follow-up: engine-wide drop-site counters. Attribute
+            // which `handle_established` validation rejected peer ACKs.
+            let drops = engine.diag_input_drops();
             anyhow::bail!(
-                "warmup burst send exceeded 60s (peer unresponsive?) | diag: {}",
+                "warmup burst send exceeded 60s (peer unresponsive?) | diag: {} | \
+                 input_drops: bad_seq={} bad_option={} paws_rejected={} bad_ack={} \
+                 urgent_dropped={}",
                 diag,
+                drops.bad_seq,
+                drops.bad_option,
+                drops.paws_rejected,
+                drops.bad_ack,
+                drops.urgent_dropped,
             );
         }
     }
@@ -336,9 +346,17 @@ fn send_first_segment_and_capture_wire_time(
                             )
                         })
                         .unwrap_or_else(|| "<conn handle unknown>".to_string());
+                    let drops = engine.diag_input_drops();
                     anyhow::bail!(
-                        "first-segment send did not accept any byte within 30s | diag: {}",
+                        "first-segment send did not accept any byte within 30s | \
+                         diag: {} | input_drops: bad_seq={} bad_option={} \
+                         paws_rejected={} bad_ack={} urgent_dropped={}",
                         diag,
+                        drops.bad_seq,
+                        drops.bad_option,
+                        drops.paws_rejected,
+                        drops.bad_ack,
+                        drops.urgent_dropped,
                     );
                 }
             }
@@ -409,10 +427,18 @@ fn drive_burst_remainder_to_completion(
                             )
                         })
                         .unwrap_or_else(|| "<conn handle unknown>".to_string());
+                    let drops = engine.diag_input_drops();
                     anyhow::bail!(
-                        "burst drain stalled with {sent}/{} bytes accepted | diag: {}",
+                        "burst drain stalled with {sent}/{} bytes accepted | \
+                         diag: {} | input_drops: bad_seq={} bad_option={} \
+                         paws_rejected={} bad_ack={} urgent_dropped={}",
                         payload.len(),
                         diag,
+                        drops.bad_seq,
+                        drops.bad_option,
+                        drops.paws_rejected,
+                        drops.bad_ack,
+                        drops.urgent_dropped,
                     );
                 }
             }

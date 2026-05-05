@@ -368,6 +368,11 @@ pub fn run_bucket(cfg: &DpdkMaxtpCfg<'_>) -> anyhow::Result<BucketRun> {
     // bucket soft-fail pattern wants to continue past a single bad
     // cell; the diag is informational, not error-flagging.
     if acked_bytes_in_window == 0 && tx_payload_bytes_delta == 0 {
+        // T21 follow-up (per af6a487 investigation): also dump engine-wide
+        // `handle_established` drop-site counters. Engine-scoped (not per
+        // conn), so sample once per wedged-bucket — log alongside each conn
+        // line for grep-affinity.
+        let drops = cfg.engine.diag_input_drops();
         for &conn in cfg.conns {
             if let Some(s) = cfg.engine.diag_conn_stats(conn) {
                 // T21 (per af6a487): emit `in_flight` + `room_in_peer_wnd`
@@ -380,7 +385,9 @@ pub fn run_bucket(cfg: &DpdkMaxtpCfg<'_>) -> anyhow::Result<BucketRun> {
                     "dpdk_maxtp DIAG bucket(C={}, W={}) conn={} wedged: \
                      snd_una={} snd_nxt={} in_flight={} \
                      snd_wnd={} room_in_peer_wnd={} \
-                     srtt_us={} rto_us={}",
+                     srtt_us={} rto_us={} | input_drops: \
+                     bad_seq={} bad_option={} paws_rejected={} \
+                     bad_ack={} urgent_dropped={}",
                     cfg.bucket.conn_count,
                     cfg.bucket.write_bytes,
                     conn,
@@ -391,11 +398,25 @@ pub fn run_bucket(cfg: &DpdkMaxtpCfg<'_>) -> anyhow::Result<BucketRun> {
                     room_in_peer_wnd,
                     s.srtt_us,
                     s.rto_us,
+                    drops.bad_seq,
+                    drops.bad_option,
+                    drops.paws_rejected,
+                    drops.bad_ack,
+                    drops.urgent_dropped,
                 );
             } else {
                 eprintln!(
-                    "dpdk_maxtp DIAG bucket(C={}, W={}) conn={} wedged: <handle unknown>",
-                    cfg.bucket.conn_count, cfg.bucket.write_bytes, conn,
+                    "dpdk_maxtp DIAG bucket(C={}, W={}) conn={} wedged: <handle unknown> \
+                     | input_drops: bad_seq={} bad_option={} paws_rejected={} \
+                     bad_ack={} urgent_dropped={}",
+                    cfg.bucket.conn_count,
+                    cfg.bucket.write_bytes,
+                    conn,
+                    drops.bad_seq,
+                    drops.bad_option,
+                    drops.paws_rejected,
+                    drops.bad_ack,
+                    drops.urgent_dropped,
                 );
             }
         }

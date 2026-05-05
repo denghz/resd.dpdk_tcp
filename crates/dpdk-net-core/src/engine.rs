@@ -949,6 +949,21 @@ pub struct ConnectOpts {
     pub local_addr: u32,
 }
 
+/// T21 follow-up: copyable snapshot of the five `handle_established`
+/// drop-site counters, returned by `Engine::diag_input_drops`. Slow-path
+/// only — bench arms read this once at stall-bail time. Field order
+/// mirrors the report's narrative (sequence-window first, then option /
+/// PAWS, then ACK, then URG); changing it is not a breaking change but
+/// keep the diag-emit format string in lock-step.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct InputDropsSnapshot {
+    pub bad_seq: u64,
+    pub bad_option: u64,
+    pub paws_rejected: u64,
+    pub bad_ack: u64,
+    pub urgent_dropped: u64,
+}
+
 /// bug_010 → feature: pure selection+validation helper for per-connection
 /// source IPs. Factored out of `connect_with_opts` so the logic is
 /// testable without standing up a live DPDK-backed `Engine`.
@@ -2159,6 +2174,29 @@ impl Engine {
         self.flow_table
             .borrow()
             .get_stats(h, self.cfg.send_buffer_bytes)
+    }
+
+    /// T21 follow-up (per af6a487 investigation report): read-only snapshot
+    /// of the engine-wide `handle_established` drop-site counters. Slow-path,
+    /// engine-scoped (the underlying counters are bumped per-segment in
+    /// `apply_tcp_input_counters`, not per-conn). Bench-arm diag emissions
+    /// dump these on stall to attribute which input-validation rule rejected
+    /// the peer's ACKs without re-running the bench. Per the report, `bad_seq`
+    /// (out-of-window), `bad_option` (malformed/missing-on-ts-conn),
+    /// `paws_rejected` (TS regression), `bad_ack` (ACK ahead of snd_nxt),
+    /// and `urgent_dropped` (URG flag) are the five sites in
+    /// `tcp_input::handle_established` that early-return without advancing
+    /// connection state.
+    pub fn diag_input_drops(&self) -> InputDropsSnapshot {
+        use std::sync::atomic::Ordering;
+        let t = &self.counters.tcp;
+        InputDropsSnapshot {
+            bad_seq: t.rx_bad_seq.load(Ordering::Relaxed),
+            bad_option: t.rx_bad_option.load(Ordering::Relaxed),
+            paws_rejected: t.rx_paws_rejected.load(Ordering::Relaxed),
+            bad_ack: t.rx_bad_ack.load(Ordering::Relaxed),
+            urgent_dropped: t.rx_urgent_dropped.load(Ordering::Relaxed),
+        }
     }
     pub fn events(&self) -> std::cell::RefMut<'_, EventQueue> {
         self.events.borrow_mut()
