@@ -1,6 +1,12 @@
-//! bench-vs-mtcp build script — links libfstack.a + DPDK 23.11
-//! when the `fstack` cargo feature is enabled. No-op otherwise so
-//! default workspace builds don't require F-Stack on the dev host.
+//! bench-vs-mtcp build script — links libfstack.a when the `fstack`
+//! cargo feature is enabled. No-op otherwise so default workspace
+//! builds don't require F-Stack on the dev host.
+//!
+//! DPDK is intentionally NOT re-linked here. dpdk-net-sys (a transitive
+//! dep via dpdk-net-core) already links DPDK via pkg-config. Adding a
+//! second DPDK whole-archive block duplicates the tailq constructor
+//! objects and triggers a fatal `RTE_MBUF_DYNFIELD tailq is already
+//! registered` PANIC at binary startup.
 //!
 //! F-Stack install layout (image-builder component
 //! 04b-install-f-stack.yaml installs at):
@@ -21,7 +27,9 @@ fn main() {
         return;
     }
 
-    // F-Stack feature on — link libfstack.a + DPDK 23.11 statics.
+    // F-Stack feature on — link libfstack.a only.
+    // DPDK symbols are provided by dpdk-net-sys (via dpdk-net-core dep);
+    // do NOT add a second DPDK block here.
     let ff_path = std::env::var("FF_PATH").unwrap_or_else(|_| "/opt/f-stack".to_string());
     println!("cargo:rustc-link-search=native={ff_path}/lib");
     // libfstack.a — whole-archive so static-link discards aren't
@@ -30,34 +38,15 @@ fn main() {
     println!("cargo:rustc-link-arg=-lfstack");
     println!("cargo:rustc-link-arg=-Wl,--no-whole-archive");
 
-    // DPDK 23.11 — pkg-config produces the right -L/-l flags.
-    let dpdk_libs_out = std::process::Command::new("pkg-config")
-        .args(["--static", "--libs", "libdpdk"])
-        .output()
-        .expect("pkg-config --static --libs libdpdk failed (DPDK 23.11 not installed?)");
-    if !dpdk_libs_out.status.success() {
-        panic!(
-            "pkg-config --static --libs libdpdk exited {}: {}",
-            dpdk_libs_out.status,
-            String::from_utf8_lossy(&dpdk_libs_out.stderr)
-        );
-    }
-    let dpdk_libs = String::from_utf8_lossy(&dpdk_libs_out.stdout);
-    for tok in dpdk_libs.split_whitespace() {
-        // Pass through everything pkg-config emits — `-L`, `-l`,
-        // `-Wl,...` — the `cargo:rustc-link-arg` channel honours them.
-        println!("cargo:rustc-link-arg={tok}");
-    }
-
     // F-Stack uses these system libs at link time per the upstream
     // example/Makefile recipe.
     for lib in ["rt", "m", "dl", "crypto", "pthread", "numa"] {
         println!("cargo:rustc-link-lib={lib}");
     }
-    // DPDK's --whole-archive block (from pkg-config above) pulls in
-    // librte_telemetry.a which references atexit(). Rust places libc
-    // before build.rs cargo:rustc-link-arg output in the link order, so
-    // the telemetry reference isn't satisfied. Re-emit libc here to ensure
-    // it appears AFTER the DPDK whole-archive block.
+    // dpdk-net-sys's DPDK whole-archive block pulls in librte_telemetry.a
+    // which references atexit(). Rust places libc before build.rs
+    // cargo:rustc-link-arg output in the link order, so the telemetry
+    // reference isn't satisfied. Re-emit libc here to ensure it appears
+    // after the DPDK block.
     println!("cargo:rustc-link-arg=-lc");
 }
