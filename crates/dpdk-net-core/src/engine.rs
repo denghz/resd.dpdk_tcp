@@ -2535,6 +2535,9 @@ impl Engine {
                     }
                     crate::counters::inc(&self.counters.tcp.tx_api_timers_fired);
                 }
+                crate::tcp_timer_wheel::TimerKind::Persist => {
+                    self.on_persist_fire(node.owner_handle, id);
+                }
             }
         }
     }
@@ -2777,6 +2780,138 @@ impl Engine {
             if let Some(c) = ft.get_mut(handle) {
                 c.rto_timer_id = Some(id);
                 c.timer_ids.push(id);
+            }
+        }
+    }
+
+    /// RFC 9293 §3.8.6.1 persist-timer fire. Sends a 1-byte zero-window
+    /// probe at `snd_nxt` to solicit a window update from the peer. If the
+    /// peer's window is still zero, re-arms with exponential backoff (capped
+    /// at 64× RTO). If the window has opened, cancels the persist timer and
+    /// lets the normal send path resume.
+    ///
+    /// Borrow ordering matches `on_rto_fire`: Phase 1 shared-borrow for
+    /// validation, Phase 2 mut-borrow to clear timer_id, Phase 3 TX (no
+    /// borrow), Phase 4 mut-borrow to write snd_nxt + arm next timer.
+    pub(crate) fn on_persist_fire(
+        &self,
+        handle: ConnHandle,
+        fired_id: crate::tcp_timer_wheel::TimerId,
+    ) {
+        use crate::tcp_output::{build_segment, SegmentTx, TCP_ACK, TCP_PSH};
+
+        // Phase 1: validate fired_id + snapshot TX fields.
+        let snap = {
+            let ft = self.flow_table.borrow();
+            let Some(c) = ft.get(handle) else { return };
+            if c.persist_timer_id != Some(fired_id) {
+                // Stale or already cancelled.
+                return;
+            }
+            if c.snd_wnd > 0 {
+                // Window reopened between arming and fire (rare race).
+                // The cancel-on-ACK path will clean up; just bail.
+                return;
+            }
+            (
+                c.four_tuple(),
+                c.snd_nxt,
+                c.rcv_nxt,
+                c.ws_shift_out,
+                c.ts_enabled,
+                c.ts_recent,
+                c.recv.free_space_total(),
+                c.persist_backoff_shift,
+                c.rtt_est.rto_us(),
+            )
+        };
+        let (tuple, snd_nxt, rcv_nxt, ws_shift_out, ts_enabled, ts_recent,
+             free_space, backoff_shift, rto_us) = snap;
+
+        // Phase 2: clear persist_timer_id so a racing cancel is idempotent.
+        {
+            let mut ft = self.flow_table.borrow_mut();
+            if let Some(c) = ft.get_mut(handle) {
+                c.persist_timer_id = None;
+                c.timer_ids.retain(|t| *t != fired_id);
+            }
+        }
+
+        // Phase 3: build and send the 1-byte probe.
+        // The probe byte is 0x00 — its value is irrelevant; the probe
+        // serves only to make the peer respond with an ACK carrying its
+        // current window advertisement. snd_nxt advances by 1 on success
+        // so the next probe (or real data, if the window opens) starts at
+        // the correct seq. The probe is NOT added to snd_retrans — the
+        // persist timer IS the retransmit mechanism for zero-window stalls.
+        let probe_payload = [0u8; 1];
+        let now_us = (crate::clock::now_ns() / 1_000) as u32;
+        let opts = if ts_enabled {
+            build_ack_outcome(
+                ws_shift_out, true, ts_recent, now_us, false, &[], None, free_space,
+            ).opts
+        } else {
+            build_ack_outcome(
+                ws_shift_out, false, 0, 0, false, &[], None, free_space,
+            ).opts
+        };
+        // Encode the advertised window using the same ws_shift_out scaling
+        // the normal ACK path uses: free_space >> ws_shift_out, clamped to
+        // 16-bit. Matches the `build_ack_outcome` wire window field.
+        let adv_wnd = (free_space >> ws_shift_out) as u16;
+        let seg = SegmentTx {
+            src_mac: self.our_mac,
+            dst_mac: self.gateway_mac.get(),
+            src_ip: tuple.local_ip,
+            dst_ip: tuple.peer_ip,
+            src_port: tuple.local_port,
+            dst_port: tuple.peer_port,
+            seq: snd_nxt,
+            ack: rcv_nxt,
+            flags: TCP_ACK | TCP_PSH,
+            window: adv_wnd,
+            options: opts,
+            payload: &probe_payload,
+        };
+        let mut buf = [0u8; 160]; // 14+20+20+40 opts + 1 payload; 160 is safe
+        let Some(n) = build_segment(&seg, &mut buf) else { return };
+        let sent = self.tx_tcp_frame(&buf[..n], &seg);
+        if sent {
+            crate::counters::inc(&self.counters.tcp.tx_persist);
+            // Advance snd_nxt past the probe byte.
+            let mut ft = self.flow_table.borrow_mut();
+            if let Some(c) = ft.get_mut(handle) {
+                c.snd_nxt = c.snd_nxt.wrapping_add(1);
+            }
+        }
+
+        // Phase 4: re-arm with exponential backoff regardless of TX outcome.
+        // Backoff: interval = rto_us << min(backoff_shift, 6) (cap at 64×).
+        let new_shift = backoff_shift.saturating_add(1).min(6);
+        let interval_us = if rto_us > 0 {
+            (rto_us as u64) << (new_shift as u64)
+        } else {
+            200_000 // 200 ms floor if RTO estimator not seeded yet
+        };
+        let now_ns = crate::clock::now_ns();
+        let fire_at_ns = now_ns + interval_us * 1_000;
+        let new_id = self.timer_wheel.borrow_mut().add(
+            now_ns,
+            crate::tcp_timer_wheel::TimerNode {
+                fire_at_ns,
+                owner_handle: handle,
+                kind: crate::tcp_timer_wheel::TimerKind::Persist,
+                user_data: 0,
+                generation: 0,
+                cancelled: false,
+            },
+        );
+        {
+            let mut ft = self.flow_table.borrow_mut();
+            if let Some(c) = ft.get_mut(handle) {
+                c.persist_timer_id = Some(new_id);
+                c.persist_backoff_shift = new_shift;
+                c.timer_ids.push(new_id);
             }
         }
     }
@@ -3096,6 +3231,9 @@ impl Engine {
                 ids.push(id);
             }
             if let Some(id) = conn.syn_retrans_timer_id.take() {
+                ids.push(id);
+            }
+            if let Some(id) = conn.persist_timer_id.take() {
                 ids.push(id);
             }
             conn.timer_ids.clear();
@@ -3797,6 +3935,73 @@ impl Engine {
         // all per-segment counter wiring in one place so the dispatch
         // hot-path stays straight-line.
         apply_tcp_input_counters(&outcome, &self.counters.tcp);
+
+        // RFC 9293 §3.8.6.1 persist-timer arm: when the peer advertises a
+        // zero window AND snd_retrans is empty (no outstanding segments that
+        // the RTO will already retransmit), arm the persist timer so we
+        // periodically probe the peer for a window update. If a persist
+        // timer is already running we leave it untouched — one timer
+        // suffices and re-arming on every zero-window ACK would reset the
+        // backoff. Only arm in Established state; SynSent / CloseWait /
+        // etc. don't need zero-window probing.
+        if outcome.rx_zero_window {
+            let (should_arm, rto_us) = {
+                let ft = self.flow_table.borrow();
+                if let Some(c) = ft.get(handle) {
+                    let ok = c.state == crate::tcp_state::TcpState::Established
+                        && c.persist_timer_id.is_none()
+                        && c.snd_retrans.is_empty();
+                    (ok, c.rtt_est.rto_us())
+                } else {
+                    (false, 0)
+                }
+            };
+            if should_arm {
+                let now_ns = crate::clock::now_ns();
+                let interval_us = if rto_us > 0 { rto_us as u64 } else { 200_000 };
+                let fire_at_ns = now_ns + interval_us * 1_000;
+                let id = self.timer_wheel.borrow_mut().add(
+                    now_ns,
+                    crate::tcp_timer_wheel::TimerNode {
+                        fire_at_ns,
+                        owner_handle: handle,
+                        kind: crate::tcp_timer_wheel::TimerKind::Persist,
+                        user_data: 0,
+                        generation: 0,
+                        cancelled: false,
+                    },
+                );
+                let mut ft = self.flow_table.borrow_mut();
+                if let Some(c) = ft.get_mut(handle) {
+                    c.persist_timer_id = Some(id);
+                    c.persist_backoff_shift = 0;
+                    c.timer_ids.push(id);
+                }
+            }
+        }
+
+        // RFC 9293 §3.8.6.1: cancel the persist timer when the peer
+        // reopens its window (snd_wnd > 0 after ACK processing). The
+        // outcome flag `rx_zero_window` covers the zero→nonzero case
+        // implicitly via absence: if the ACK carries a nonzero window and
+        // a persist timer is running, cancel it.
+        if !outcome.rx_zero_window {
+            let id_to_cancel = {
+                let ft = self.flow_table.borrow();
+                ft.get(handle).and_then(|c| {
+                    if c.snd_wnd > 0 { c.persist_timer_id } else { None }
+                })
+            };
+            if let Some(id) = id_to_cancel {
+                self.timer_wheel.borrow_mut().cancel(id);
+                let mut ft = self.flow_table.borrow_mut();
+                if let Some(c) = ft.get_mut(handle) {
+                    c.persist_timer_id = None;
+                    c.persist_backoff_shift = 0;
+                    c.timer_ids.retain(|t| *t != id);
+                }
+            }
+        }
 
         // A6 Task 16 (spec §3.3): WRITABLE hysteresis emission. The
         // ACK-prune site inside `handle_established` flipped
