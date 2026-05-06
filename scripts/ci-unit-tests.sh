@@ -32,20 +32,27 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# Each entry is "<pkg>[ <extra cargo args>...]". The extra args are passed
+# verbatim to `cargo test`. Crates whose forbidden-feature dep is now
+# optional (A7 / Pattern P1) need `--features <name>` here so their tests
+# (or test-binaries' compilation) actually exercise the feature surface.
 PKGS=(
-    dpdk-net-sys
-    dpdk-net-core
-    dpdk-net
-    ffi-test
-    bench-rx-zero-copy
-    packetdrill-shim-runner
-    scapy-fuzz-runner
-    tcpreq-runner
+    "dpdk-net-sys"
+    "dpdk-net-core"
+    "dpdk-net"
+    "ffi-test"
+    "bench-rx-zero-copy --features bench-alloc-audit"
+    "packetdrill-shim-runner"
+    "scapy-fuzz-runner --features test-inject"
+    "tcpreq-runner"
 )
 
-for pkg in "${PKGS[@]}"; do
-    echo "=== ci-unit-tests: cargo test -p ${pkg} ==="
-    cargo test -p "${pkg}"
+for entry in "${PKGS[@]}"; do
+    # shellcheck disable=SC2086 # word-split intended for per-pkg extra args
+    set -- $entry
+    pkg="$1"; shift
+    echo "=== ci-unit-tests: cargo test -p ${pkg} $* ==="
+    cargo test -p "${pkg}" "$@"
 done
 
 echo "=== ci-unit-tests: cargo test --workspace --exclude dpdk-net-core-fuzz --doc ==="

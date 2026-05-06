@@ -873,6 +873,7 @@ log "[12/12] bench-micro (local) + summarize + bench-report"
 BENCH_MICRO_ARGS="${BENCH_MICRO_ARGS:-}"
 # shellcheck disable=SC2086 # BENCH_MICRO_ARGS is intentionally word-split
 RUSTFLAGS="${RUSTFLAGS:-} -C panic=abort" cargo bench -p bench-micro \
+    --features bench-internals \
     --bench poll --bench tsc_read --bench flow_lookup \
     --bench send --bench tcp_input --bench counters --bench timer \
     $BENCH_MICRO_ARGS

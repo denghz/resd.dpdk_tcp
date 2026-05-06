@@ -1,12 +1,35 @@
+# A7 / Pattern P1 fix: `dpdk-net-core` MUST be an OPTIONAL dependency, with
+# its `bench-internals` feature activated transitively by this crate's own
+# non-default `bench-internals` feature. Otherwise Cargo's resolver v2
+# unifies `dpdk-net-core/bench-internals` ACROSS THE WORKSPACE — production
+# binaries linking `dpdk-net-core` (e.g. `bench-e2e`) silently get the
+# TimerWheel/EngineNoEalHarness probe surfaces compiled in. The
+# workspace-feature unification gate (`scripts/check-workspace-features.sh`)
+# fails CI in that state.
+#
+# Same pattern applied at commits 9f0ccd0 (tcpreq-runner) and 8147404
+# (layer-h-correctness). Stand-alone build:
+#   cargo bench -p bench-micro --features bench-internals
+#
+# CI invocation: `scripts/bench-nightly.sh` step [12/12] passes
+# `--features bench-internals` explicitly. Benches without the feature are
+# skipped entirely (required-features gate on each [[bench]] below).
+# `summarize` is the only target buildable without features (it does not
+# touch `dpdk-net-core`); a workspace `cargo build --release --workspace`
+# (bench-nightly step [3/12]) still produces `target/release/summarize`.
 [package]
 name = "bench-micro"
 version.workspace = true
 edition.workspace = true
 publish = false
 
+[features]
+default = []
+bench-internals = ["dep:dpdk-net-core", "dpdk-net-core/bench-internals"]
+
 [dependencies]
 bench-common = { path = "../bench-common" }
-dpdk-net-core = { path = "../../crates/dpdk-net-core", features = ["bench-internals"] }
+dpdk-net-core = { path = "../../crates/dpdk-net-core", optional = true }
 dpdk-net-sys = { path = "../../crates/dpdk-net-sys" }
 dpdk-net = { path = "../../crates/dpdk-net" }
 walkdir = "2"
@@ -21,38 +44,54 @@ hostname = "0.4"
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 
+# Every bench depends (directly or via test_support) on dpdk-net-core
+# items gated behind `bench-internals` (TimerWheel, EngineNoEalHarness,
+# tcp_input::dispatch + ParsedSegment + MbufInsertCtx, flow_table public
+# probes). Without --features bench-internals these benches don't build,
+# so `required-features` gates each bench target accordingly.
 [[bench]]
 name = "poll"
 harness = false
+required-features = ["bench-internals"]
 
 [[bench]]
 name = "tsc_read"
 harness = false
+required-features = ["bench-internals"]
 
 [[bench]]
 name = "flow_lookup"
 harness = false
+required-features = ["bench-internals"]
 
 [[bench]]
 name = "tcp_input"
 harness = false
+required-features = ["bench-internals"]
 
 [[bench]]
 name = "send"
 harness = false
+required-features = ["bench-internals"]
 
 [[bench]]
 name = "timer"
 harness = false
+required-features = ["bench-internals"]
 
 [[bench]]
 name = "counters"
 harness = false
+required-features = ["bench-internals"]
 
 [[bench]]
 name = "throughput"
 harness = false
+required-features = ["bench-internals"]
 
 [[bin]]
 name = "summarize"
 path = "src/bin/summarize.rs"
+# `summarize` does not use `dpdk-net-core` — it only walks
+# `target/criterion/**` and emits CSV. Buildable without features so
+# workspace builds (bench-nightly step [3/12]) keep producing it.

@@ -1,11 +1,31 @@
+# A7 / Pattern P1 fix: `dpdk-net-core` MUST be an OPTIONAL dependency, with
+# its `test-inject` feature activated transitively by this crate's own
+# non-default `test-inject` feature. Otherwise Cargo's resolver v2 unifies
+# `dpdk-net-core/test-inject` ACROSS THE WORKSPACE — production binaries
+# linking `dpdk-net-core` (e.g. `bench-e2e`) silently get the synthetic
+# RX-injection paths compiled in, which violates the workspace-feature
+# unification gate at `scripts/check-workspace-features.sh` and breaks
+# counter-coverage tests (see ci-unit-tests.sh comment).
+#
+# Same pattern applied at commits 9f0ccd0 (tcpreq-runner) and 8147404
+# (layer-h-correctness). Stand-alone build:
+#   cargo build -p scapy-fuzz-runner --features test-inject
+#
+# CI invocation: `scripts/ci-scapy-replay.sh` passes `--features test-inject`
+# explicitly. A workspace build without `--features test-inject` skips the
+# binary entirely (required-features gate on [[bin]] below).
 [package]
 name = "scapy-fuzz-runner"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+test-inject = ["dep:dpdk-net-core", "dpdk-net-core/test-inject"]
+
 [dependencies]
-dpdk-net-core = { path = "../../crates/dpdk-net-core", features = ["test-inject"] }
+dpdk-net-core = { path = "../../crates/dpdk-net-core", optional = true }
 pcap-file = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -15,3 +35,7 @@ anyhow = "1"
 [[bin]]
 name = "scapy-fuzz-runner"
 path = "src/main.rs"
+# Whole binary is test-inject-dependent (uses Engine::inject_rx_frame /
+# inject_rx_chain via dpdk_net_core::test_fixtures::make_test_engine).
+# Workspace builds without --features test-inject skip this bin entirely.
+required-features = ["test-inject"]
