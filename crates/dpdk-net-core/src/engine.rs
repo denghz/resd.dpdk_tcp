@@ -6437,6 +6437,16 @@ impl Drop for Engine {
     }
 }
 
+impl Engine {
+    /// Snapshot a conn's TCP state; `None` if the handle is unknown.
+    pub fn state_of(
+        &self,
+        h: crate::flow_table::ConnHandle,
+    ) -> Option<crate::tcp_state::TcpState> {
+        self.flow_table.borrow().get(h).map(|c| c.state)
+    }
+}
+
 // A7 Task 5: test-server-only Engine API surface. All methods behind
 // `feature = "test-server"` so the default build has NO server-side
 // passive-open code. Mirror pattern to `test_tx_intercept` (T4).
@@ -6471,22 +6481,10 @@ impl Engine {
         slot.1.accept_queue.take()
     }
 
-    /// Snapshot a conn's TCP state; `None` if the handle is unknown.
-    pub fn state_of(
-        &self,
-        h: crate::flow_table::ConnHandle,
-    ) -> Option<crate::tcp_state::TcpState> {
-        self.flow_table.borrow().get(h).map(|c| c.state)
-    }
-
     /// A8 T19: snapshot a conn's negotiated `peer_mss`. Consumed by
     /// `tcpreq-runner`'s MissingMSS probe (RFC 9293 §3.7.1 MUST-15) to
     /// verify the 536-byte fallback applies when the peer's SYN omits
-    /// the MSS option. `None` if the handle is unknown. Mirrors
-    /// `state_of` — a thin read-only accessor on internal conn state
-    /// exposed only under the test-server feature so the production
-    /// build keeps `FlowTable` fully private.
-    #[cfg(feature = "test-server")]
+    /// the MSS option. `None` if the handle is unknown.
     pub fn conn_peer_mss(&self, h: crate::flow_table::ConnHandle) -> Option<u16> {
         self.flow_table.borrow().get(h).map(|c| c.peer_mss)
     }
