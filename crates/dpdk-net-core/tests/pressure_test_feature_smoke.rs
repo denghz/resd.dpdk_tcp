@@ -20,6 +20,7 @@
 #![cfg(feature = "pressure-test")]
 
 use dpdk_net_core::counters::Counters;
+use dpdk_net_core::engine::EngineConfig;
 use dpdk_net_core::flow_table::FlowTable;
 
 #[test]
@@ -66,4 +67,21 @@ fn flow_table_states_iterator_empty_on_fresh_table() {
 fn flow_table_reassembly_byte_occupancy_zero_on_fresh_table() {
     let ft = FlowTable::new(8);
     assert_eq!(ft.reassembly_byte_occupancy(), 0);
+}
+
+/// T1 review I-1, I-2: `EngineConfig::default()` carries the `0` sentinel
+/// for `tx_hdr_mempool_size`, which `Engine::new` resolves to the
+/// production default of 2048. The full `Engine::tx_hdr_mempool_size()`
+/// post-construction round-trip is exercised under TAP-mode smoke tests
+/// (e.g. `engine_smoke.rs`); this unit-level check confirms the sentinel
+/// encoding so a future config-default change cannot silently shift the
+/// resolved value without flipping this assertion.
+#[test]
+fn engine_config_default_tx_hdr_mempool_size_sentinel() {
+    let cfg = EngineConfig::default();
+    assert_eq!(
+        cfg.tx_hdr_mempool_size, 0,
+        "EngineConfig::default().tx_hdr_mempool_size must remain the `0` \
+         sentinel; Engine::new resolves this to the 2048 production default"
+    );
 }

@@ -719,6 +719,13 @@ pub struct Engine {
     /// `Cell<u64>` because writes happen from the single engine lcore.
     pub(crate) rx_mempool_avail_last_sample_tsc: Cell<u64>,
     tx_hdr_mempool: Mempool,
+    /// A11.0 pressure-test (T1 review I-1, I-2): resolved TX **header**
+    /// mempool capacity (post zero-sentinel substitution; production
+    /// default = 2048). Mirrors the `rx_mempool_size` /
+    /// `tx_data_mempool_size` field shape; exposed via
+    /// `Engine::tx_hdr_mempool_size()` so pressure-test consumers can
+    /// confirm the engine resolved the override.
+    pub(crate) tx_hdr_mempool_size: u32,
     tx_data_mempool: Mempool,
     /// 2026-04-29 fix: resolved TX data mempool capacity (post zero-
     /// sentinel substitution + formula application). Mirrors the
@@ -1505,6 +1512,7 @@ impl Engine {
             rx_mempool_size,
             rx_mempool_avail_last_sample_tsc: Cell::new(0),
             tx_hdr_mempool,
+            tx_hdr_mempool_size,
             tx_data_mempool,
             tx_data_mempool_size,
             our_mac,
@@ -2039,6 +2047,16 @@ impl Engine {
     /// can see when a workload is wedging close to capacity.
     pub fn tx_data_mempool_size(&self) -> u32 {
         self.tx_data_mempool_size
+    }
+
+    /// A11.0 pressure-test (T1 review I-1, I-2): resolved TX **header**
+    /// mempool capacity (in mbufs). Sentinel `0` on
+    /// `EngineConfig.tx_hdr_mempool_size` → production default 2048 in
+    /// `Engine::new`; non-zero → caller value verbatim. Exposed for
+    /// pressure-test consumers (and diagnostic logging) so callers can
+    /// confirm the engine actually resolved the override they passed.
+    pub fn tx_hdr_mempool_size(&self) -> u32 {
+        self.tx_hdr_mempool_size
     }
 
     /// A6.6-7 Task 13: raw pointer to the RX mempool for integration-test

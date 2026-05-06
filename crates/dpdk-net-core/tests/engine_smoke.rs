@@ -26,6 +26,17 @@ fn engine_lifecycle_on_tap() {
     };
     let engine = dpdk_net_core::engine::Engine::new(cfg).expect("engine new");
 
+    // T1 review I-1, I-2: confirm `Engine::tx_hdr_mempool_size()` reports
+    // the production default (2048) when the config carries the `0`
+    // sentinel. Mirrors the `rx_mempool_size` / `tx_data_mempool_size`
+    // diagnostic getters; pressure-test consumers rely on this to verify
+    // the engine resolved their override correctly.
+    assert_eq!(
+        engine.tx_hdr_mempool_size(),
+        2048,
+        "tx_hdr_mempool_size() must resolve `0` sentinel → 2048 default"
+    );
+
     // Poll a few times on an idle link; expect 0 packets.
     for _ in 0..10 {
         engine.poll_once();
