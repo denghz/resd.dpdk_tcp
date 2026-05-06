@@ -194,6 +194,10 @@ unsafe extern "C" {
 /// FreeBSD values (35 / 36). The `FF_*` constants below are the
 /// **Linux** values that F-Stack actually surfaces.
 pub fn ff_errno() -> c_int {
+    // SAFETY: __errno_location() is glibc-provided and always returns a
+    // valid pointer to the calling thread's errno slot for the lifetime
+    // of the thread. Reading a c_int through it is sound regardless of
+    // F-Stack init state — the symbol is part of glibc, not F-Stack.
     unsafe { *__errno_location() }
 }
 
@@ -292,6 +296,14 @@ pub fn wait_connect_complete(fd: c_int, deadline: Instant) -> Result<(), String>
         };
         let mut wfds = FdSet::zero();
         wfds.set(fd);
+        // SAFETY: fd was returned by ff_socket (caller's contract — see
+        // connect_nonblocking) and is non-negative + not yet closed.
+        // wfds and tv are local stack values of the correct repr(C) types
+        // and remain live for the duration of the call. F-Stack is
+        // initialised before any connect_* path runs (init_fstack in
+        // main.rs:337-342 calls ff_init exactly once at process start).
+        // Bench-vs-mtcp pumps F-Stack from a single lcore — no concurrent
+        // F-Stack syscall can race this one.
         let rc = unsafe {
             ff_select(
                 fd + 1,
@@ -321,6 +333,12 @@ pub fn wait_connect_complete(fd: c_int, deadline: Instant) -> Result<(), String>
         // connect from a deferred error (e.g. ECONNREFUSED).
         let mut so_error: c_int = 0;
         let mut optlen: c_uint = std::mem::size_of::<c_int>() as c_uint;
+        // SAFETY: fd is the same valid F-Stack fd checked by the ff_select
+        // above (still open). so_error and optlen are local c_int/c_uint
+        // stack values; optlen is initialised to size_of::<c_int>() so
+        // F-Stack writes at most one c_int into so_error. F-Stack is
+        // initialised (ff_init, main.rs:337-342) and called from a single
+        // lcore so no concurrent F-Stack syscall can race.
         let rc = unsafe {
             ff_getsockopt(
                 fd,
@@ -365,19 +383,36 @@ pub fn connect_nonblocking(
     peer_port: u16,
     connect_timeout: Duration,
 ) -> Result<c_int, String> {
+    // SAFETY: ff_socket takes integer-only arguments; AF_INET / SOCK_STREAM
+    // / 0 are the standard TCP-over-IPv4 triple. F-Stack is initialised
+    // before this function is reachable (init_fstack in main.rs:337-342
+    // calls ff_init exactly once at process start). Bench-vs-mtcp drives
+    // F-Stack from a single lcore so this call cannot race another
+    // F-Stack syscall.
     let fd = unsafe { ff_socket(AF_INET as c_int, SOCK_STREAM, 0) };
     if fd < 0 {
         let e = ff_errno();
         return Err(format!("ff_socket returned {fd} (errno={e})"));
     }
     let on: c_int = 1;
+    // SAFETY: fd was just returned by ff_socket above and is still open.
+    // `on` is a local c_int; FIONBIO's variadic argument is a pointer to
+    // a single int, which is what we pass. F-Stack is initialised and
+    // accessed from a single lcore (see ff_socket SAFETY note above).
     let rc = unsafe { ff_ioctl(fd, FIONBIO, &on as *const c_int) };
     if rc != 0 {
         let e = ff_errno();
+        // SAFETY: fd was returned by ff_socket above and has not yet been
+        // closed; ff_close on a valid F-Stack fd is the documented cleanup
+        // path. F-Stack is initialised and single-lcore (see above).
         unsafe { ff_close(fd) };
         return Err(format!("ff_ioctl(FIONBIO) returned {rc} (errno={e})"));
     }
     let sa = make_linux_sockaddr_in(peer_ip_host_order, peer_port);
+    // SAFETY: fd was returned by ff_socket above and is still open. `sa`
+    // is a local repr(C) LinuxSockaddr (16 B, AF_INET layout) and the
+    // length passed via size_of_val matches its actual size. F-Stack is
+    // initialised and accessed from a single lcore (see above).
     let rc = unsafe { ff_connect(fd, &sa, std::mem::size_of_val(&sa) as u32) };
     if rc == 0 {
         // Connect completed inline (loopback or kernel happy-path).
@@ -385,6 +420,9 @@ pub fn connect_nonblocking(
     }
     let e = ff_errno();
     if e != FF_EINPROGRESS {
+        // SAFETY: fd was returned by ff_socket and remains open through
+        // the failing ff_connect; ff_close releases it. F-Stack is
+        // initialised and single-lcore (see above).
         unsafe { ff_close(fd) };
         return Err(format!(
             "ff_connect returned {rc} (errno={e}); expected 0 or EINPROGRESS={FF_EINPROGRESS}"
@@ -394,6 +432,9 @@ pub fn connect_nonblocking(
     // writable + check SO_ERROR.
     let deadline = Instant::now() + connect_timeout;
     if let Err(err) = wait_connect_complete(fd, deadline) {
+        // SAFETY: fd is the same valid F-Stack fd from ff_socket above;
+        // wait_connect_complete does not close it on error so we must.
+        // F-Stack is initialised and single-lcore (see above).
         unsafe { ff_close(fd) };
         return Err(err);
     }
@@ -414,6 +455,12 @@ pub fn ff_init_from_args(args: &[String]) -> Result<(), String> {
         .collect::<Result<Vec<_>, _>>()?;
     let argv: Vec<*const c_char> = cstrings.iter().map(|s| s.as_ptr()).collect();
     let argc = argv.len() as c_int;
+    // SAFETY: argv points into `cstrings` which outlives the ff_init call;
+    // each entry is a non-null NUL-terminated pointer from CString::as_ptr.
+    // argc matches argv.len(). ff_init is the documented one-shot F-Stack
+    // bring-up entry point; caller (init_fstack in main.rs) ensures we
+    // are on the dedicated F-Stack lcore and that this is the only init
+    // for the process.
     let rc = unsafe { ff_init(argc, argv.as_ptr()) };
     if rc != 0 {
         return Err(format!("ff_init returned {rc}"));
