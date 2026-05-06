@@ -6640,6 +6640,16 @@ impl Engine {
                 .expect("listen slot disappeared between lookups");
             slot.1.in_progress = Some(h);
         }
+        // Mirror the active-open path (engine.rs ~5068): set ws_shift_out so
+        // ACKs encode the advertised window correctly after wscale negotiation.
+        // SYN-ACK carries wscale=compute_ws_shift_for(recv_buffer_bytes); the
+        // conn must use the same shift when writing the window field on wire.
+        {
+            let mut ft = self.flow_table.borrow_mut();
+            if let Some(c) = ft.get_mut(h) {
+                c.ws_shift_out = compute_ws_shift_for(self.cfg.recv_buffer_bytes);
+            }
+        }
         self.emit_syn_ack_for_passive(h);
         // SYN-ACK consumes one seq space; bump snd_nxt now so the final
         // ACK we expect carries `ack = iss + 1`.

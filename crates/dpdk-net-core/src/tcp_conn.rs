@@ -377,7 +377,7 @@ impl TcpConn {
         initial_rto_us: u32,
         max_rto_us: u32,
     ) -> Self {
-        let rcv_wnd = recv_buf_bytes.min(u16::MAX as u32); // A3: no WSCALE, so ≤ 65535.
+        let rcv_wnd = recv_buf_bytes; // actual byte window; wire encoding uses ws_shift_out scaling
         Self {
             four_tuple: tuple,
             state: TcpState::Closed, // engine transitions to SynSent once SYN is TX'd.
@@ -786,9 +786,9 @@ mod tests {
 
     #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
-    fn rcv_wnd_clamped_to_u16_max_without_wscale() {
+    fn rcv_wnd_equals_recv_buf_bytes() {
         let c = TcpConn::new_client(tuple(), 0, 1460, 1_000_000, 1024, 5000, 5000, 1_000_000);
-        assert_eq!(c.rcv_wnd, u16::MAX as u32);
+        assert_eq!(c.rcv_wnd, 1_000_000);
     }
 
     #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
