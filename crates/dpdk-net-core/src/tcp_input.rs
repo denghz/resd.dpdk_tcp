@@ -2884,7 +2884,13 @@ mod tests {
 
     #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
-    fn time_wait_replays_ack_on_any_segment() {
+    fn time_wait_fin_retransmit_acked_no_timer_refresh() {
+        // The realistic TIME_WAIT scenario: we've already received and ACKed
+        // the peer's FIN (advancing rcv_nxt to 5002), and the peer retransmits
+        // that FIN at seq=5001. The retransmit lands left-of-window under the
+        // close-path strict in-window formula (seq 5001 < rcv_nxt 5002), so
+        // B3 marks bad_seq=true — the engine will NOT restart the 2×MSL timer.
+        // We still send the replay-ACK per RFC 9293 §3.10.7.8.
         use crate::flow_table::FourTuple;
         use crate::tcp_conn::TcpConn;
         let t = FourTuple {
@@ -2896,15 +2902,12 @@ mod tests {
         let mut c = TcpConn::new_client(t, 1000, 1460, 1024, 2048, 5000, 5000, 1_000_000);
         c.state = TcpState::TimeWait;
         c.our_fin_seq = Some(1001);
-        // Place the next-expected sequence inside the window for this
-        // segment so the in-window check passes (B3 added a window
-        // gate to the TIME_WAIT replay-ACK path).
-        c.rcv_nxt = 5001;
+        c.rcv_nxt = 5002; // past peer's FIN — the realistic post-transition state
         c.rcv_wnd = 1024;
         let seg = ParsedSegment {
             src_port: 5000,
             dst_port: 40000,
-            seq: 5001,
+            seq: 5001, // peer retransmits their FIN (already ACKed)
             ack: 1002,
             flags: TCP_ACK | TCP_FIN,
             window: 0,
@@ -2913,11 +2916,10 @@ mod tests {
             options: &[],
         };
         let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
-        assert_eq!(out.tx, TxAction::Ack);
+        assert_eq!(out.tx, TxAction::Ack); // always replay-ACK in TIME_WAIT
         assert_eq!(out.new_state, None); // stay in TIME_WAIT until reaper
-        // B3: in-window segment must NOT mark bad_seq, so the engine
-        // refreshes the 2×MSL reaper deadline.
-        assert!(!out.bad_seq);
+        // FIN retransmit is left-of-window → bad_seq=true → engine skips timer refresh.
+        assert!(out.bad_seq);
     }
 
     #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
