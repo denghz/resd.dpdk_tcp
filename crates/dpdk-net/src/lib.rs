@@ -133,6 +133,8 @@ pub unsafe extern "C" fn dpdk_net_eal_init(argc: i32, argv: *const *const libc::
     let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     match engine::eal_init(&refs) {
         Ok(()) => 0,
+        Err(dpdk_net_core::Error::ArgvNul) => -libc::EINVAL,
+        Err(dpdk_net_core::Error::Reentrant) => -libc::EDEADLK,
         Err(_) => -libc::EAGAIN,
     }
 }

@@ -1020,7 +1020,10 @@ fn apply_tcp_input_counters(
 static EAL_INIT: Mutex<bool> = Mutex::new(false);
 
 pub fn eal_init(args: &[&str]) -> Result<(), Error> {
-    let mut guard = EAL_INIT.lock().unwrap();
+    let mut guard = match EAL_INIT.lock() {
+        Ok(g) => g,
+        Err(_) => return Err(Error::Reentrant),
+    };
     if *guard {
         return Ok(());
     }
@@ -1046,7 +1049,10 @@ pub fn eal_init(args: &[&str]) -> Result<(), Error> {
     #[cfg(feature = "hw-verify-llq")]
     let args = &effective_args[..];
 
-    let cstrs: Vec<CString> = args.iter().map(|s| CString::new(*s).unwrap()).collect();
+    let cstrs: Vec<CString> = args
+        .iter()
+        .map(|s| CString::new(*s).map_err(|_| Error::ArgvNul))
+        .collect::<Result<Vec<_>, _>>()?;
     let mut argv: Vec<*mut libc::c_char> = cstrs.iter().map(|c| c.as_ptr() as *mut _).collect();
 
     // A-HW Task 12 fixup: install an fmemopen-backed capture of DPDK's
