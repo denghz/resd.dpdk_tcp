@@ -3853,6 +3853,16 @@ impl Engine {
     /// `dpdk_net_poll`, not merely until the next `drain_events` loop
     /// iteration. The next `poll_once` clears the scratch (and only
     /// then), atomically releasing the previous poll's drained events.
+    ///
+    /// # Re-entrancy contract
+    ///
+    /// The sink receives `&Engine` but MUST NOT call `drain_events` or
+    /// `poll_once` (or any function that borrows `drained_events_scratch`
+    /// mutably) while the sink is executing. Phase 2 holds an immutable
+    /// borrow of the scratch for the duration of the sink calls; a
+    /// nested `borrow_mut()` would panic with `BorrowMutError`. The
+    /// expected pattern is observation-only: read the event, write to
+    /// an output buffer, return.
     pub fn drain_events<F: FnMut(&InternalEvent, &Engine)>(&self, max: u32, mut sink: F) -> u32 {
         let mut n = 0u32;
         // Phase 1: pop up to `max` events out of the queue and into the

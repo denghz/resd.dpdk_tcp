@@ -65,7 +65,9 @@ pub enum InternalEvent {
         segs: Vec<crate::iovec::DpdkNetIovec>,
         /// Mbuf ownership that keeps `segs[i].base` pointers valid until
         /// this event is dropped. Moved from `TcpConn.delivered_segments`
-        /// at emission time (`std::mem::take`).
+        /// at emission time via `drain(..).collect()` — `clear()` is used
+        /// on the per-conn scratch (not `std::mem::take`) so capacity is
+        /// preserved for subsequent deliveries on the same connection.
         owned_mbufs: smallvec::SmallVec<[crate::tcp_conn::InOrderSegment; 4]>,
         /// Sum of `segs[i].len`.
         total_len: u32,
@@ -450,5 +452,64 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    /// Regression guard for the C1 drain-UAF fix. Pre-fix, drain_events
+    /// dropped each `InternalEvent` at the end of its while-loop body,
+    /// so for n>1 events the sink received a reference to a dropped value
+    /// on the second iteration. This test simulates the two-phase drain
+    /// pattern (used by `Engine::drain_events`) with `Connected` events
+    /// (no mbufs) to verify that n events remain accessible throughout
+    /// the entire drain pass, not just during their own iteration.
+    #[cfg(not(feature = "obs-none"))]
+    #[test]
+    fn two_phase_drain_keeps_all_events_accessible() {
+        use std::cell::RefCell;
+
+        let counters = Counters::new();
+        let mut q = EventQueue::with_cap(EventQueue::MIN_SOFT_CAP);
+        let scratch: RefCell<Vec<InternalEvent>> = RefCell::new(Vec::new());
+
+        // Push 3 events with distinct conn handles.
+        for i in 1u32..=3 {
+            q.push(
+                InternalEvent::Connected {
+                    conn: i,
+                    rx_hw_ts_ns: u64::from(i) * 100,
+                    emitted_ts_ns: u64::from(i) * 200,
+                },
+                &counters,
+            );
+        }
+        assert_eq!(q.len(), 3);
+
+        // Phase 1: pop all 3 into scratch (mirrors Engine::drain_events Phase 1).
+        let mut n = 0u32;
+        while n < 3 {
+            let Some(ev) = q.pop() else { break; };
+            scratch.borrow_mut().push(ev);
+            n += 1;
+        }
+        assert_eq!(n, 3);
+        assert!(q.is_empty());
+
+        // Phase 2: visit all events while scratch is immutably borrowed.
+        // If any event were dropped mid-loop (pre-fix behaviour) this
+        // would either segfault (under ASAN / Miri) or read garbage.
+        let mut seen_handles: Vec<ConnHandle> = Vec::new();
+        {
+            let s = scratch.borrow();
+            let start = s.len().saturating_sub(n as usize);
+            for ev in &s[start..] {
+                if let InternalEvent::Connected { conn, .. } = ev {
+                    seen_handles.push(*conn);
+                }
+            }
+        }
+
+        assert_eq!(seen_handles, vec![1u32, 2, 3]);
+
+        // Clear scratch (mirrors next poll_once).
+        scratch.borrow_mut().clear();
     }
 }

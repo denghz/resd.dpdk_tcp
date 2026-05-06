@@ -535,20 +535,20 @@ pub unsafe extern "C" fn dpdk_net_poll(
         // `segs` at the event's own `Vec::as_ptr()` rather than at the
         // owning conn's per-poll scratch.
         //
-        // SAFETY: the `InternalEvent` we are reading from is a borrow
-        // into `EventQueue.q[front]` — `drain_events` calls `pop()`
-        // (returning the event by value) only AFTER `sink` returns. The
-        // Vec backing `segs` lives at a stable address until the event
-        // is dropped, which happens after this closure returns. The
-        // raw pointer we hand back to C is only required to be valid
-        // through the `dpdk_net_poll` return — the caller materializes
-        // it into `events_out[i].u.readable` and is documented to
-        // consume the iovecs before the next `dpdk_net_poll`.
+        // SAFETY: drained events are moved into `Engine::drained_events_scratch`
+        // (a `RefCell<Vec<InternalEvent>>`) before this sink is invoked
+        // (C1 fix). The scratch is cleared only at the top of the NEXT
+        // `dpdk_net_poll` call, so every `&InternalEvent` reference
+        // passed to this closure is backed by a live allocation.
         //
-        // The mbuf-refcount holders that pin the `base` pointers live
-        // alongside the iovec Vec on the same event; they drop together
-        // when the event is dropped at the next poll's
-        // top-of-`drain_events` boundary.
+        // The raw pointer we hand back to C (`segs.as_ptr()`) points
+        // into the event's owned `Vec<DpdkNetIovec>`, which lives inside
+        // the scratch for the entire inter-poll window.  The caller is
+        // documented to consume iovecs before the next `dpdk_net_poll`.
+        //
+        // The mbuf-refcount holders (`owned_mbufs`) that pin the `base`
+        // pointers live on the same event in the scratch; they are
+        // released together when the scratch is cleared on the next poll.
         let readable_view: dpdk_net_event_readable_t = match ev {
             dpdk_net_core::tcp_events::InternalEvent::Readable {
                 segs,
