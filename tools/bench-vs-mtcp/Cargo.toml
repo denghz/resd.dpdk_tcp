@@ -48,12 +48,13 @@ name = "bench-vs-mtcp"
 path = "src/main.rs"
 
 [features]
-default = []
+default = ["fstack"]
 # Enables the F-Stack arms (fstack_burst + fstack_maxtp). Requires
 # libfstack.a + F-Stack headers at /opt/f-stack/{lib,include} on the
 # bench-pair AMI (installed via image-builder component
-# 04b-install-f-stack.yaml). Default builds skip the F-Stack arms so
-# the workspace compiles on dev hosts without F-Stack.
+# 04b-install-f-stack.yaml). Default-on as of T23 (AMI 1.0.15
+# ami-0e483926d07d19647) since the bench-pair image ships F-Stack
+# pre-installed; pass `--no-default-features` on dev hosts without it.
 fstack = []
 
 [dependencies]
