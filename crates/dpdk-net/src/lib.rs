@@ -247,6 +247,15 @@ pub unsafe extern "C" fn dpdk_net_engine_create(
         // value honored when `preset == DPDK_NET_PRESET_LATENCY`; `apply_preset`
         // overwrites to `1` (Reno) when `preset == DPDK_NET_PRESET_RFC_COMPLIANCE`.
         cc_mode: cfg.cc_mode,
+        // A1 cross-phase: ABI-to-core pass-through for the SYN-option
+        // negotiation toggles. Default-zeroed `dpdk_net_engine_config_t`
+        // suppresses both options today — production callers wanting
+        // the prior "always emit" behavior must explicitly set these
+        // to true. (Constructed via `EngineConfig::default()` in
+        // Rust-direct paths, which sets both to true.)
+        tcp_timestamps: cfg.tcp_timestamps,
+        tcp_sack: cfg.tcp_sack,
+        tcp_ecn: cfg.tcp_ecn,
         tcp_min_rto_us: min_rto_us,
         tcp_initial_rto_us: initial_rto_us,
         tcp_max_rto_us: max_rto_us,
@@ -1190,7 +1199,6 @@ mod tests {
             tcp_nagle: false,
             tcp_delayed_ack: false,
             cc_mode: 0,
-            tcp_min_rto_ms: 0,
             tcp_min_rto_us: 0,
             tcp_initial_rto_us: 0,
             tcp_max_rto_us: 0,
@@ -1235,7 +1243,6 @@ mod tests {
             tcp_nagle: false,
             tcp_delayed_ack: false,
             cc_mode: 0,
-            tcp_min_rto_ms: 0,
             tcp_min_rto_us: 0,
             tcp_initial_rto_us: 0,
             tcp_max_rto_us: 0,

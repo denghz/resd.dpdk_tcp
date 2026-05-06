@@ -34,6 +34,7 @@ send_buffer_bytes          # Per-conn send buffer sizing; pure sizing.
 tcp_mss                    # Advertised MSS; wire identity / sizing, no branching on the value.
 tcp_msl_ms                 # 2*MSL TIME_WAIT timing; timing-only parameter.
 tx_hdr_mempool_size        # A11.0 pressure-test sizing knob; 0=production default 2048, non-zero verbatim. Sizing-only, no behavioral branch.
+tcp_ecn                    # A1 cross-phase: wired through EngineConfig for Stage-2 ECN negotiation; no Stage-1 wire effect (read at connect path so the C-ABI dead-field audit counts it as wired). Behavioral coverage lands when ECN SYN negotiation does.
 
 # --- A8 T17 (M3): ConnectOpts informational fields -------------------------
 local_addr                 # Per-connection source IP; validation via engine::select_source_ip unit tests (covered by non-knob-coverage tests).

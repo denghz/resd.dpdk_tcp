@@ -89,7 +89,6 @@ struct dpdk_net_engine_config_t {
   bool tcp_nagle;
   bool tcp_delayed_ack;
   uint8_t cc_mode;
-  uint32_t tcp_min_rto_ms;
   uint32_t tcp_min_rto_us;
   uint32_t tcp_initial_rto_us;
   uint32_t tcp_max_rto_us;

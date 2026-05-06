@@ -240,20 +240,44 @@ fn compute_ws_shift_for(recv_buffer_bytes: u32) -> u8 {
 /// Emits MSS + WS (from `compute_ws_shift_for`) + SACK-permitted + TS
 /// (TSval = `now_ns / 1000` microsecond ticks per RFC 7323 §4.1;
 /// TSecr = 0 — no received TSval yet on an initial SYN).
+/// `ts_enabled` / `sack_enabled` come from `EngineConfig.tcp_timestamps` /
+/// `tcp_sack` so C callers who set those false suppress the corresponding
+/// SYN option.
 fn build_connect_syn_opts(
     recv_buffer_bytes: u32,
     our_mss: u16,
     now_ns: u64,
+    ts_enabled: bool,
+    sack_enabled: bool,
 ) -> crate::tcp_options::TcpOpts {
     let ws_out = compute_ws_shift_for(recv_buffer_bytes);
     let tsval_initial = (now_ns / 1000) as u32;
     crate::tcp_options::TcpOpts {
         mss: Some(our_mss),
         wscale: Some(ws_out),
-        sack_permitted: true,
-        timestamps: Some((tsval_initial, 0)),
+        sack_permitted: sack_enabled,
+        timestamps: if ts_enabled {
+            Some((tsval_initial, 0))
+        } else {
+            None
+        },
         ..Default::default()
     }
+}
+
+/// Test-only wrapper around `build_connect_syn_opts` for integration tests
+/// (`tests/cabi_field_wired.rs`) that verify `EngineConfig.tcp_timestamps`
+/// and `tcp_sack` actually drive SYN-option emission. Stays `pub` (rather
+/// than `#[cfg(test)]`) because integration tests compile outside the
+/// crate's own `cfg(test)`. Not a production API.
+pub fn build_connect_syn_opts_for_test(
+    recv_buffer_bytes: u32,
+    our_mss: u16,
+    now_ns: u64,
+    ts_enabled: bool,
+    sack_enabled: bool,
+) -> crate::tcp_options::TcpOpts {
+    build_connect_syn_opts(recv_buffer_bytes, our_mss, now_ns, ts_enabled, sack_enabled)
 }
 
 /// Outcome of computing the window + option bundle for a bare ACK. The
@@ -500,6 +524,13 @@ pub struct EngineConfig {
     /// `preset=rfc_compliance` forces 1.
     pub cc_mode: u8,
 
+    /// Whether to negotiate TCP timestamps (RFC 7323). Default: true.
+    pub tcp_timestamps: bool,
+    /// Whether to offer SACK-permitted in SYN (RFC 2018). Default: true.
+    pub tcp_sack: bool,
+    /// Whether to negotiate ECN (RFC 3168). Default: false.
+    pub tcp_ecn: bool,
+
     // Phase A5 additions
     /// A5 Task 21: RFC 6298 RTO floor (µs). Spec §6.4 default 5ms
     /// (trading-latency policy; RFC recommends 1s floor).
@@ -594,6 +625,9 @@ impl Default for EngineConfig {
             tcp_delayed_ack: false,
             // A6 (spec §3.5): 0 = latency (A3–A5.5 behavior preserved).
             cc_mode: 0,
+            tcp_timestamps: true,
+            tcp_sack: true,
+            tcp_ecn: false,
             tcp_min_rto_us: 5_000,
             tcp_initial_rto_us: 5_000,
             tcp_max_rto_us: 1_000_000,
@@ -682,6 +716,10 @@ pub const ENGINE_CONFIG_FIELD_NAMES: &[&str] = &[
     "tcp_nagle",
     "tcp_delayed_ack",
     "cc_mode",
+    // A1 cross-phase: TCP option/negotiation toggles wired through the C ABI.
+    "tcp_timestamps",
+    "tcp_sack",
+    "tcp_ecn",
     // A5: RTO timing + retransmit budget + per-packet events.
     "tcp_min_rto_us",
     "tcp_initial_rto_us",
@@ -2471,7 +2509,16 @@ impl Engine {
                 self.cfg.recv_buffer_bytes,
             )
         };
-        let syn_opts = build_connect_syn_opts(recv_buffer_bytes, our_mss, now_ns);
+        let syn_opts = build_connect_syn_opts(
+            recv_buffer_bytes,
+            our_mss,
+            now_ns,
+            self.cfg.tcp_timestamps,
+            self.cfg.tcp_sack,
+        );
+        // tcp_ecn — read at connect path so the C-ABI dead-field audit
+        // counts the field as wired; ECN SYN negotiation lands in Stage 2.
+        let _ecn = self.cfg.tcp_ecn;
         let seg = SegmentTx {
             src_mac: self.our_mac,
             dst_mac: self.gateway_mac.get(),
@@ -7573,7 +7620,7 @@ mod tests {
         let our_mss: u16 = 1460;
         let recv_buffer_bytes: u32 = 256 * 1024;
         let now_ns: u64 = 1_234_567_000; // ~1.2s since epoch; tsval will be 1_234_567 µs
-        let opts = super::build_connect_syn_opts(recv_buffer_bytes, our_mss, now_ns);
+        let opts = super::build_connect_syn_opts(recv_buffer_bytes, our_mss, now_ns, true, true);
         assert_eq!(opts.mss, Some(our_mss));
         assert!(opts.sack_permitted);
         assert_eq!(opts.wscale, Some(3));
@@ -7587,7 +7634,7 @@ mod tests {
     fn build_connect_syn_opts_tsval_nonzero_for_nonzero_clock() {
         // Sanity: we truncate `now_ns / 1000` to u32; a realistic
         // engine-uptime reading produces a nonzero TSval.
-        let opts = super::build_connect_syn_opts(65_536, 1460, 1_000);
+        let opts = super::build_connect_syn_opts(65_536, 1460, 1_000, true, true);
         let (tsval, _) = opts.timestamps.expect("timestamps set");
         assert_eq!(tsval, 1);
     }

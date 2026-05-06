@@ -79,9 +79,9 @@ fn ffi_eal_init_and_engine_lifecycle() {
         tcp_delayed_ack: bool,
         cc_mode: u8,
         _pad2: [u8; 2],
-        tcp_min_rto_ms: u32,
         // A5 Task 21: replace tcp_initial_rto_ms with µs floor/initial/max
-        // tuple + retrans budget.
+        // tuple + retrans budget. The legacy `tcp_min_rto_ms` ms-resolution
+        // knob was removed in the A1 cross-phase fix.
         tcp_min_rto_us: u32,
         tcp_initial_rto_us: u32,
         tcp_max_rto_us: u32,
@@ -120,7 +120,6 @@ fn ffi_eal_init_and_engine_lifecycle() {
         tcp_delayed_ack: false,
         cc_mode: 0,
         _pad2: [0; 2],
-        tcp_min_rto_ms: 20,
         tcp_min_rto_us: 5_000,
         tcp_initial_rto_us: 5_000,
         tcp_max_rto_us: 1_000_000,
