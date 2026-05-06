@@ -4957,13 +4957,21 @@ impl Engine {
 
     fn emit_rst(&self, handle: ConnHandle, incoming: &crate::tcp_input::ParsedSegment) {
         use crate::counters::inc;
-        use crate::tcp_output::{build_segment, SegmentTx, TCP_ACK, TCP_RST};
+        use crate::tcp_output::{build_segment, SegmentTx, TCP_ACK, TCP_FIN, TCP_RST, TCP_SYN};
         let ft = self.flow_table.borrow();
         let Some(conn) = ft.get(handle) else {
             return;
         };
         let t = conn.four_tuple();
-        let ack = incoming.seq.wrapping_add(incoming.payload.len() as u32);
+        // RFC 9293 §3.10.7.2: RST ACK must advance past all consumed sequence
+        // space including SYN/FIN flags (each consumes 1 seq number).
+        let syn_len = ((incoming.flags & TCP_SYN) != 0) as u32;
+        let fin_len = ((incoming.flags & TCP_FIN) != 0) as u32;
+        let ack = incoming
+            .seq
+            .wrapping_add(incoming.payload.len() as u32)
+            .wrapping_add(syn_len)
+            .wrapping_add(fin_len);
         let seg = SegmentTx {
             src_mac: self.our_mac,
             dst_mac: self.gateway_mac.get(),
