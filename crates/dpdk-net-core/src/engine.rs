@@ -4372,7 +4372,17 @@ impl Engine {
         // mbuf handle (shouldn't happen on the real RX path but keeps
         // the signature flexible for non-mbuf callers).
         let mbuf_ctx = if let Some(mb) = rx_mbuf {
-            if !parsed.payload.is_empty() {
+            // C2 review fix: gate the zero-copy MbufInsertCtx on
+            // `nb_segs == 1`. Multi-seg frames were linearized into a
+            // scratch buffer at the L2 boundary; the linearized-buffer
+            // `payload_offset` is not valid as a per-segment offset for
+            // zero-copy `MbufInsertCtx`. `InOrderSegment::data_ptr()`
+            // (and the OOO equivalent) compute `head_data + offset`,
+            // which would read past the head segment's `data_len` for
+            // any chain. Fall through to the copy path on multi-seg by
+            // setting `mbuf_ctx = None`.
+            let nb_segs = unsafe { sys::shim_rte_pktmbuf_nb_segs(mb.as_ptr()) };
+            if !parsed.payload.is_empty() && nb_segs == 1 {
                 let payload_offset =
                     tcp_bytes_offset_in_mbuf.saturating_add(parsed.header_len as u16);
                 // SAFETY: `mb` came from the active rx_burst iteration in

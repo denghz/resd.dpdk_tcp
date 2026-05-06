@@ -120,7 +120,7 @@ pub unsafe fn mbuf_data_slice_for_rx<'a>(
     m: *mut dpdk_net_sys::rte_mbuf,
     counters: &crate::counters::EthCounters,
 ) -> std::borrow::Cow<'a, [u8]> {
-    let nb_segs = unsafe { dpdk_net_sys::shim_rte_pktmbuf_nb_segs(m) };
+    let nb_segs = unsafe { dpdk_net_sys::shim_rte_pktmbuf_nb_segs(m) } as usize;
     if nb_segs <= 1 {
         // Fast path: single-segment mbuf. Borrow the head's data region
         // verbatim — identical to mbuf_data_slice's behaviour.
@@ -137,7 +137,14 @@ pub unsafe fn mbuf_data_slice_for_rx<'a>(
         let mut buf: Vec<u8> = Vec::with_capacity(total);
         let mut cur = m;
         let mut written = 0usize;
-        while !cur.is_null() && written < total {
+        // C2 review fix: cap the chain walk at `nb_segs` iterations.
+        // A corrupted chain with zero-length segments in a cycle would
+        // otherwise spin forever — `take == 0` means `written` never
+        // advances and `cur != null` keeps the predicate true. Bounding
+        // by the head's `nb_segs` count enforces a hard upper bound on
+        // the loop length even under adversarial input.
+        let mut walked = 0usize;
+        while !cur.is_null() && written < total && walked < nb_segs {
             let seg_ptr =
                 unsafe { dpdk_net_sys::shim_rte_pktmbuf_data(cur) } as *const u8;
             let seg_len =
@@ -156,6 +163,7 @@ pub unsafe fn mbuf_data_slice_for_rx<'a>(
                 );
             }
             written += take;
+            walked += 1;
             cur = unsafe { dpdk_net_sys::shim_rte_pktmbuf_next(cur) };
         }
         // SAFETY: `written` bytes initialised by the loop above.
@@ -278,6 +286,29 @@ mod mbuf_data_slice_tests {
             counters.rx_multi_seg_linearized.load(Ordering::Relaxed),
             1,
             "three-segment chain still produces exactly one counter bump"
+        );
+    }
+
+    /// C2 review fix — coverage for chains with a zero-length middle
+    /// segment. Mirrors the `nb_segs`-bounded chain walk in
+    /// [`super::mbuf_data_slice_for_rx`]: a 0-length link must not
+    /// stall the loop or skip subsequent links. The linearized output
+    /// is the concatenation of the non-empty segments in order.
+    #[test]
+    fn linearize_with_zero_length_middle_segment() {
+        let counters = EthCounters::default();
+        let s0: Vec<u8> = vec![0x01; 4];
+        let s1: Vec<u8> = Vec::new(); // 0-len middle
+        let s2: Vec<u8> = vec![0x03; 4];
+        let segs: &[&[u8]] = &[&s0, &s1, &s2];
+        let result = linearize_via_slices(segs, &counters);
+        assert_eq!(result.len(), 8);
+        assert_eq!(&result[..4], &[0x01u8; 4]);
+        assert_eq!(&result[4..], &[0x03u8; 4]);
+        assert_eq!(
+            counters.rx_multi_seg_linearized.load(Ordering::Relaxed),
+            1,
+            "zero-length middle segment still produces exactly one counter bump"
         );
     }
 }
