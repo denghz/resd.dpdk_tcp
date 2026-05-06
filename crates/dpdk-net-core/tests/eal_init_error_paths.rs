@@ -13,7 +13,7 @@ fn eal_init_with_nul_byte_in_arg_returns_err_not_panic() {
 }
 
 #[test]
-fn eal_init_with_nul_byte_in_arg_returns_einval_errno() {
+fn eal_init_with_nul_byte_in_arg_returns_argv_nul_error() {
     let result = dpdk_net_core::engine::eal_init(&["eal_test", "no\0null"]);
-    assert!(result.is_err());
+    assert!(matches!(result, Err(dpdk_net_core::Error::ArgvNul)));
 }
