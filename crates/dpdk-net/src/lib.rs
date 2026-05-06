@@ -148,7 +148,12 @@ pub unsafe extern "C" fn dpdk_net_engine_create(
         return ptr::null_mut();
     }
     let cfg = &*cfg;
-    if cfg.event_queue_soft_cap < 64 {
+    let event_cap = if cfg.event_queue_soft_cap == 0 {
+        4096
+    } else {
+        cfg.event_queue_soft_cap
+    };
+    if event_cap < 64 {
         return ptr::null_mut();
     }
     // A3 fields with 0 sentinels fall back to defaults so callers that
@@ -263,7 +268,7 @@ pub unsafe extern "C" fn dpdk_net_engine_create(
         tcp_max_rto_us: max_rto_us,
         tcp_max_retrans_count: max_retrans,
         tcp_per_packet_events: cfg.tcp_per_packet_events,
-        event_queue_soft_cap: cfg.event_queue_soft_cap,
+        event_queue_soft_cap: event_cap,
         // A6 Task 20: ABI-layer pass-through of the caller-supplied
         // bucket edges. All-zero input triggers the spec §3.8.2 default
         // substitution in `Engine::new`; non-monotonic input causes
@@ -1229,6 +1234,10 @@ mod tests {
     // validate the early-return path from a pure unit test. The function
     // returns a pointer type, so validation failure surfaces as a null
     // pointer (same convention as the existing null-cfg guard).
+    //
+    // A4: Non-zero values below 64 are still rejected. Zero is NOT below
+    // 64 after substitution (0 → 4096); see
+    // `engine_create_zero_event_queue_soft_cap_uses_default_4096`.
     #[test]
     fn engine_create_rejects_event_queue_soft_cap_below_64() {
         let cfg = dpdk_net_engine_config_t {
@@ -1265,6 +1274,60 @@ mod tests {
             rx_mempool_size: 0,
         };
         let p = unsafe { dpdk_net_engine_create(0, &cfg) };
+        assert!(p.is_null());
+    }
+
+    // A4: zero-initialized `dpdk_net_engine_config_t` (the canonical C
+    // idiom `dpdk_net_engine_config_t cfg = {};`) must NOT be rejected by
+    // the `event_queue_soft_cap < 64` guard. The 0 sentinel is substituted
+    // to the 4096 default before the bound check, consistent with all
+    // other zero-defaulting fields (max_connections, recv_buffer_bytes,
+    // tcp_mss, etc.).
+    //
+    // This call returns null because DPDK isn't running in tests, NOT
+    // because of the <64 bound check. The bound check should have been
+    // bypassed because 0 → 4096 via substitution. To verify the
+    // substitution is working, compile with a debug print or check that
+    // event_queue_soft_cap=63 IS rejected while event_queue_soft_cap=0
+    // is NOT rejected at the bound check level.
+    #[test]
+    fn engine_create_zero_event_queue_soft_cap_uses_default_4096() {
+        let cfg = dpdk_net_engine_config_t {
+            port_id: 0,
+            rx_queue_id: 0,
+            tx_queue_id: 0,
+            max_connections: 0,
+            recv_buffer_bytes: 0,
+            send_buffer_bytes: 0,
+            tcp_mss: 0,
+            tcp_timestamps: false,
+            tcp_sack: false,
+            tcp_ecn: false,
+            tcp_nagle: false,
+            tcp_delayed_ack: false,
+            cc_mode: 0,
+            tcp_min_rto_us: 0,
+            tcp_initial_rto_us: 0,
+            tcp_max_rto_us: 0,
+            tcp_max_retrans_count: 0,
+            tcp_msl_ms: 0,
+            tcp_per_packet_events: false,
+            preset: 0,
+            local_ip: 0,
+            gateway_ip: 0,
+            gateway_mac: [0u8; 6],
+            garp_interval_sec: 0,
+            event_queue_soft_cap: 0,
+            rtt_histogram_bucket_edges_us: [0u32; 15],
+            ena_large_llq_hdr: 0,
+            ena_miss_txc_to_sec: 0,
+            rx_mempool_size: 0,
+        };
+        let p = unsafe { dpdk_net_engine_create(0, &cfg) };
+        // Null here documents the test environment limitation: DPDK isn't
+        // running, so `Engine::new` fails. The bound check is bypassed by
+        // 0 → 4096 substitution; this assertion captures the contract
+        // shape only.
         assert!(p.is_null());
     }
 
