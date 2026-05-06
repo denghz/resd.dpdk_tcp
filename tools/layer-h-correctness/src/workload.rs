@@ -170,14 +170,17 @@ pub fn run_one_scenario(
     // the StateChange/Closed events produced by the last `run_rtt_workload`
     // call would never be checked, since the loop exits before the next
     // observe_batch call would have run.
+    //
+    // This runs whether the loop exited normally (deadline reached) OR
+    // via `workload_error` (mid-loop `run_rtt_workload` failure). In the
+    // workload-error case, the post-loop observe_batch may surface an
+    // FsmDeparted or other oracle failure that explains *why* the
+    // workload failed — we want both signals in the failure bundle.
     let final_outcome = crate::observation::observe_batch(
         engine, conn, &mut event_ring, obs_dropped_pre,
     );
     match final_outcome {
-        ObserveOutcome::Ok => {
-            obs_dropped_pre =
-                engine.counters().obs.events_dropped.load(Ordering::Relaxed);
-        }
+        ObserveOutcome::Ok => {}
         ObserveOutcome::Fail(f) => {
             fail_fast_failures.push(f);
         }
