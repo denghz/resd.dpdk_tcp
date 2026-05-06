@@ -124,18 +124,16 @@ pub fn run_one_scenario(
     let mut workload_error: Option<FailureReason> = None;
 
     while Instant::now() < deadline {
-        match run_rtt_workload(
-            engine, conn, request_bytes, response_bytes, tsc_hz, 0,
-            OBSERVATION_BATCH,
-        ) {
-            Ok(_samples) => {}
-            Err(e) => {
-                workload_error = Some(FailureReason::WorkloadError {
-                    error: e.to_string(),
-                });
-                break;
-            }
-        }
+        // Observe events from the previous batch BEFORE the next workload
+        // batch consumes them. `run_rtt_workload` calls into bench-e2e's
+        // `drain_and_accumulate_readable`, which pops every event off the
+        // engine queue and silently discards non-Readable variants
+        // (StateChange, Closed, ...) at its `_ => {}` catch-all. If we
+        // observed *after* the workload batch, those StateChange events
+        // — the only signal for illegal FSM transitions — would already
+        // be gone. Observing first means each iteration's observe_batch
+        // sees the events produced by the *previous* iteration's
+        // workload, before the current iteration's workload drains them.
         let outcome = crate::observation::observe_batch(
             engine, conn, &mut event_ring, obs_dropped_pre,
         );
@@ -152,6 +150,36 @@ pub fn run_one_scenario(
                 fail_fast_failures.push(f);
                 break;
             }
+        }
+
+        match run_rtt_workload(
+            engine, conn, request_bytes, response_bytes, tsc_hz, 0,
+            OBSERVATION_BATCH,
+        ) {
+            Ok(_samples) => {}
+            Err(e) => {
+                workload_error = Some(FailureReason::WorkloadError {
+                    error: e.to_string(),
+                });
+                break;
+            }
+        }
+    }
+
+    // Drain the final batch's events after the loop ends. Without this,
+    // the StateChange/Closed events produced by the last `run_rtt_workload`
+    // call would never be checked, since the loop exits before the next
+    // observe_batch call would have run.
+    let final_outcome = crate::observation::observe_batch(
+        engine, conn, &mut event_ring, obs_dropped_pre,
+    );
+    match final_outcome {
+        ObserveOutcome::Ok => {
+            obs_dropped_pre =
+                engine.counters().obs.events_dropped.load(Ordering::Relaxed);
+        }
+        ObserveOutcome::Fail(f) => {
+            fail_fast_failures.push(f);
         }
     }
 
