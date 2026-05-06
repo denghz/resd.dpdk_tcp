@@ -42,7 +42,7 @@
 use anyhow::Context;
 use clap::Parser;
 
-use bench_common::csv_row::{CsvRow, MetricAggregation};
+use bench_common::csv_row::{CsvRow, MetricAggregation, COLUMNS};
 use bench_common::percentile::{summarize, Summary};
 use bench_common::preconditions::{PreconditionMode, PreconditionValue, Preconditions};
 use bench_common::run_metadata::RunMetadata;
@@ -228,12 +228,34 @@ fn main() -> anyhow::Result<()> {
     };
 
     // 8. Sweep scenarios.
+    //
+    // The CSV writer is built with `has_headers(false)` and the header
+    // row is written manually up front (mirrors `bench-micro/summarize.rs`).
+    // Rationale: with `has_headers(true)` (csv default), the header is
+    // only emitted on the first `serialize()` call. If the FIRST scenario
+    // bails before any row is written (e.g. "produced no samples", apply
+    // failure, etc.), the resulting CSV is empty — no header, no rows —
+    // which trips the downstream `head -n 1 ${csv[0]}` merge step in
+    // `scripts/bench-nightly.sh` and produces a header-less merged file.
+    // Writing the header eagerly guarantees the file is well-formed even
+    // if every scenario fails.
     let metadata = build_run_metadata(mode, preconditions)?;
-    let mut writer = csv::Writer::from_path(&args.output_csv)
+    let mut writer = csv::WriterBuilder::new()
+        .has_headers(false)
+        .from_path(&args.output_csv)
         .with_context(|| format!("creating output CSV {:?}", args.output_csv))?;
+    writer.write_record(COLUMNS)?;
+    writer.flush()?;
 
+    // Per-scenario errors are recorded but do not abort the sweep — a
+    // failing scenario emits a sentinel row (metric_value = NaN,
+    // dimensions_json carries the error) so downstream consumers see
+    // the scenario name in the merged CSV instead of silently missing
+    // it. After the sweep, we surface the first failure as the
+    // process-exit error so CI / operators still notice.
+    let mut scenario_failures: Vec<(String, anyhow::Error)> = Vec::new();
     for scenario in &selected {
-        run_one_scenario(
+        match run_one_scenario(
             &engine,
             &args,
             tsc_hz,
@@ -242,10 +264,88 @@ fn main() -> anyhow::Result<()> {
             idle_baseline,
             &metadata,
             &mut writer,
-        )?;
+        ) {
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!(
+                    "bench-stress: scenario {} FAILED: {e:#}",
+                    scenario.name
+                );
+                // Emit a sentinel row so the merged CSV records that
+                // this scenario was attempted. Best-effort: a write
+                // failure here would mask the original error, so we
+                // log and continue.
+                if let Err(emit_err) =
+                    emit_sentinel_row(&mut writer, &args, &metadata, scenario, &e)
+                {
+                    eprintln!(
+                        "bench-stress: failed to emit sentinel row for {}: {emit_err:#}",
+                        scenario.name
+                    );
+                }
+                scenario_failures.push((scenario.name.to_string(), e));
+            }
+        }
+        // Flush after each scenario so a process crash mid-sweep
+        // leaves a partial-but-well-formed CSV on disk.
+        if let Err(e) = writer.flush() {
+            eprintln!(
+                "bench-stress: writer flush after scenario {} failed: {e:#}",
+                scenario.name
+            );
+        }
     }
     writer.flush()?;
 
+    if let Some((name, err)) = scenario_failures.into_iter().next() {
+        return Err(err.context(format!("scenario {name} failed (sentinel row written)")));
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Sentinel row for failed scenarios.
+// ---------------------------------------------------------------------------
+
+/// Emit a single sentinel CSV row recording that `scenario` was attempted
+/// but failed. Used by the sweep loop so the merged CSV always carries the
+/// scenario name (and the error string in `dimensions_json`) even when no
+/// real measurement was produced. `metric_value = NaN` so downstream
+/// numeric aggregation skips the row naturally; `metric_aggregation = P50`
+/// is arbitrary — only one sentinel row per failed scenario, no breakdown.
+fn emit_sentinel_row<W: std::io::Write>(
+    writer: &mut csv::Writer<W>,
+    args: &Args,
+    metadata: &RunMetadata,
+    scenario: &Scenario,
+    err: &anyhow::Error,
+) -> anyhow::Result<()> {
+    let dims = serde_json::json!({
+        "scenario": scenario.name,
+        "netem_config": scenario.netem.unwrap_or(""),
+        "fault_injector_config": scenario.fault_injector.unwrap_or(""),
+        "error": format!("{err:#}"),
+        "sentinel": true,
+    })
+    .to_string();
+    let row = CsvRow {
+        run_metadata: metadata.clone(),
+        tool: args.tool.clone(),
+        test_case: "stress_rtt".to_string(),
+        feature_set: args.feature_set.clone(),
+        dimensions_json: dims,
+        metric_name: "rtt_ns".to_string(),
+        metric_unit: "ns".to_string(),
+        metric_value: f64::NAN,
+        metric_aggregation: MetricAggregation::P50,
+        cpu_family: None,
+        cpu_model_name: None,
+        dpdk_version_pkgconfig: None,
+        worktree_branch: None,
+        uprof_session_id: None,
+    };
+    writer.serialize(&row)?;
     Ok(())
 }
 
@@ -840,5 +940,127 @@ mod tests {
     fn parse_mode_accepts_strict_and_lenient() {
         assert_eq!(parse_mode("strict").unwrap(), PreconditionMode::Strict);
         assert_eq!(parse_mode("lenient").unwrap(), PreconditionMode::Lenient);
+    }
+
+    /// Sample `RunMetadata` for tests that need a value but don't care
+    /// about the contents.
+    fn sample_metadata() -> RunMetadata {
+        RunMetadata {
+            run_id: uuid::Uuid::nil(),
+            run_started_at: "2026-05-06T00:00:00Z".to_string(),
+            commit_sha: String::new(),
+            branch: String::new(),
+            host: String::new(),
+            instance_type: String::new(),
+            cpu_model: String::new(),
+            dpdk_version: String::new(),
+            kernel: String::new(),
+            nic_model: String::new(),
+            nic_fw: String::new(),
+            ami_id: String::new(),
+            precondition_mode: PreconditionMode::Strict,
+            preconditions: Preconditions::default(),
+        }
+    }
+
+    /// Sample `Args` with required positional/flag values populated. Tests
+    /// only consume the `tool` and `feature_set` fields the sentinel-row
+    /// emit path reads from.
+    fn sample_args() -> Args {
+        Args::parse_from([
+            "bench-stress",
+            "--peer-ssh", "user@host",
+            "--peer-iface", "ens6",
+            "--peer-ip", "10.0.0.2",
+            "--local-ip", "10.0.0.1",
+            "--gateway-ip", "10.0.0.3",
+            "--eal-args", "",
+            "--output-csv", "/tmp/sample.csv",
+        ])
+    }
+
+    /// Header is written eagerly so the CSV is well-formed even if no
+    /// scenarios complete. Guards the bug surfaced in
+    /// `scripts/bench-nightly.sh`'s merge step: when the first scenario
+    /// fails, downstream `head -n 1 csv[0]` produced an empty merge.
+    #[test]
+    fn writer_with_has_headers_false_plus_explicit_record_emits_columns() {
+        let mut buf = Vec::new();
+        {
+            let mut wtr = csv::WriterBuilder::new()
+                .has_headers(false)
+                .from_writer(&mut buf);
+            wtr.write_record(COLUMNS).unwrap();
+            wtr.flush().unwrap();
+        }
+        let text = String::from_utf8(buf).unwrap();
+        let header = text.lines().next().unwrap();
+        assert_eq!(header, COLUMNS.join(","));
+    }
+
+    /// `emit_sentinel_row` writes one CSV row whose `dimensions_json`
+    /// carries the scenario name + error string, with `metric_value = NaN`
+    /// so downstream numeric aggregation skips the row. Covers the
+    /// "first scenario missing" recovery path.
+    #[test]
+    fn emit_sentinel_row_writes_one_row_with_error_in_dimensions() {
+        let scenario = bench_stress::scenarios::find("random_loss_01pct_10ms").unwrap();
+        let metadata = sample_metadata();
+        let args = sample_args();
+        let err = anyhow::anyhow!("simulated apply failure");
+
+        let mut buf = Vec::new();
+        {
+            let mut wtr = csv::WriterBuilder::new()
+                .has_headers(false)
+                .from_writer(&mut buf);
+            wtr.write_record(COLUMNS).unwrap();
+            emit_sentinel_row(&mut wtr, &args, &metadata, scenario, &err).unwrap();
+            wtr.flush().unwrap();
+        }
+
+        let text = String::from_utf8(buf).unwrap();
+        let mut lines = text.lines();
+        let header = lines.next().expect("header present");
+        assert_eq!(header, COLUMNS.join(","));
+        let row = lines.next().expect("sentinel row present");
+        assert!(
+            row.contains("random_loss_01pct_10ms"),
+            "sentinel row missing scenario name: {row}"
+        );
+        assert!(
+            row.contains("simulated apply failure"),
+            "sentinel row missing error string: {row}"
+        );
+        // `serde_json::to_string` emits `"sentinel":true`, but csv quoting
+        // doubles the inner double-quotes when the json sits inside a CSV
+        // cell. Accept either rendering.
+        assert!(
+            row.contains("\"\"sentinel\"\":true") || row.contains("\"sentinel\":true"),
+            "sentinel row missing sentinel flag: {row}"
+        );
+        // No further rows.
+        assert!(lines.next().is_none(), "expected exactly one sentinel row");
+    }
+
+    /// Empty CSV (no scenarios produced data) still has the well-formed
+    /// header so the downstream `bench-nightly.sh` merge step's
+    /// `head -n 1` succeeds.
+    #[test]
+    fn header_only_csv_is_well_formed() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let mut wtr = csv::WriterBuilder::new()
+                .has_headers(false)
+                .from_path(tmp.path())
+                .unwrap();
+            wtr.write_record(COLUMNS).unwrap();
+            wtr.flush().unwrap();
+        }
+        let contents = std::fs::read_to_string(tmp.path()).unwrap();
+        let mut lines = contents.lines();
+        assert_eq!(lines.next().unwrap(), COLUMNS.join(","));
+        // No data rows.
+        assert!(lines.next().is_none());
     }
 }

@@ -589,16 +589,33 @@ for scenario in "${NETEM_SCENARIOS[@]}"; do
 done
 
 # Concatenate per-scenario CSVs into a single bench-stress.csv.
-# First file's header is preserved; subsequent files' headers are
-# stripped via `tail -n +2`. If no scenarios produced a CSV (every one
-# failed), emit an empty file so the downstream report sees the
+#
+# Header source: scan the list for the first CSV that exists AND has a
+# non-empty first line. Naively using `bench_stress_csvs[0]` breaks when
+# the first scenario was attempted but failed before writing anything —
+# the file would be missing or empty, `head -n 1` emits nothing, and
+# the merged CSV ends up header-less. The bench-stress binary now
+# writes the header eagerly (see `tools/bench-stress/src/main.rs`), but
+# the scan defends against legacy artifacts and against earlier failure
+# modes where scp never copied the per-scenario file.
+#
+# Subsequent files' headers are stripped via `tail -n +2`. If no
+# scenarios produced a CSV (every one failed and no per-scenario file
+# survived), emit an empty file so the downstream report sees the
 # expected name without erroring.
 log "[8/12] merging per-scenario CSVs into bench-stress.csv"
 {
-  if [ ${#bench_stress_csvs[@]} -gt 0 ] && [ -f "${bench_stress_csvs[0]}" ]; then
-    head -n 1 "${bench_stress_csvs[0]}"
+  header_src=""
+  for f in "${bench_stress_csvs[@]}"; do
+    if [ -f "$f" ] && [ -s "$f" ] && [ -n "$(head -n 1 "$f")" ]; then
+      header_src="$f"
+      break
+    fi
+  done
+  if [ -n "$header_src" ]; then
+    head -n 1 "$header_src"
     for f in "${bench_stress_csvs[@]}"; do
-      [ -f "$f" ] && tail -n +2 "$f"
+      [ -f "$f" ] && [ -s "$f" ] && tail -n +2 "$f"
     done
   fi
 } > "$OUT_DIR/bench-stress.csv"
