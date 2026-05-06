@@ -949,6 +949,11 @@ pub struct Engine {
     /// can treat `0` as a sentinel; overflow returns `Error::InvalidArgument`.
     #[cfg(feature = "test-server")]
     next_listen_id: std::cell::Cell<crate::test_server::ListenHandle>,
+
+    /// C1: holds events drained by drain_events() alive until the next
+    /// poll_once() clears it. Keeps InternalEvent::Readable's segs Vec
+    /// (and owned_mbufs) alive for the full inter-poll window.
+    drained_events_scratch: RefCell<Vec<InternalEvent>>,
 }
 
 /// A4: map an `Outcome` to per-segment `TcpCounters` bumps. Pure slow-path
@@ -1689,6 +1694,9 @@ impl Engine {
             listen_slots: std::cell::RefCell::new(Vec::new()),
             #[cfg(feature = "test-server")]
             next_listen_id: std::cell::Cell::new(1),
+            // C1: scratch begins empty; drain_events() pushes events into
+            // it and poll_once() clears it at the top of every iteration.
+            drained_events_scratch: RefCell::new(Vec::new()),
         })
     }
 
@@ -2642,6 +2650,18 @@ impl Engine {
         use crate::counters::{add, inc};
         use std::sync::atomic::Ordering;
         inc(&self.counters.poll.iters);
+
+        // C1: release events accumulated by the previous poll's
+        // `drain_events` call. Clearing here drops every
+        // `InternalEvent::Readable`'s `owned_mbufs` (releasing its mbuf
+        // refcounts) and `segs` Vec (freeing the iovec backing store)
+        // before any new RX dispatches can re-allocate from the same
+        // mempools. Satisfies the C ABI "valid until next dpdk_net_poll"
+        // contract for `events_out[i].readable.segs` set during the
+        // PREVIOUS poll: those pointers stayed valid through the entire
+        // inter-poll window, and only become invalid here as the new
+        // iteration begins.
+        self.drained_events_scratch.borrow_mut().clear();
 
         // A10 Stage A: at most once per second, sample the RX mempool's
         // free-mbuf count. Cliff hypothesis: a steady drain across many
@@ -3822,14 +3842,42 @@ impl Engine {
     /// Drain up to `max` events from the internal queue. Returns the
     /// number of events drained. Callers in the C ABI layer translate
     /// the `InternalEvent` enum to the public union-tagged form.
+    ///
+    /// C1: drained events are accumulated into
+    /// `drained_events_scratch` BEFORE the sink is invoked, so the
+    /// per-event payload (`Readable::segs` Vec, `owned_mbufs`
+    /// SmallVec — the latter pinning each `MbufHandle` refcount) stays
+    /// alive for the entire inter-poll window. The C ABI sink writes
+    /// `events_out[i].readable.segs = ev.segs.as_ptr()`; the contract
+    /// says those pointers must stay valid until the next
+    /// `dpdk_net_poll`, not merely until the next `drain_events` loop
+    /// iteration. The next `poll_once` clears the scratch (and only
+    /// then), atomically releasing the previous poll's drained events.
     pub fn drain_events<F: FnMut(&InternalEvent, &Engine)>(&self, max: u32, mut sink: F) -> u32 {
         let mut n = 0u32;
+        // Phase 1: pop up to `max` events out of the queue and into the
+        // scratch. Two RefCell borrows (events / scratch) are taken back-
+        // to-back, never overlapping, so neither nests.
         while n < max {
             let Some(ev) = self.events.borrow_mut().pop() else {
                 break;
             };
-            sink(&ev, self);
+            self.drained_events_scratch.borrow_mut().push(ev);
             n += 1;
+        }
+        // Phase 2: invoke the sink against the freshly-pushed events,
+        // borrowing the scratch immutably so the events stay in place
+        // for the lifetime of each `&InternalEvent` reference passed
+        // to `sink`. `start` covers the case where the scratch already
+        // held events from earlier `drain_events` calls within the
+        // SAME poll cycle (`max` was smaller than the queue depth and
+        // the application drains in multiple chunks).
+        {
+            let scratch = self.drained_events_scratch.borrow();
+            let start = scratch.len().saturating_sub(n as usize);
+            for ev in &scratch[start..] {
+                sink(ev, self);
+            }
         }
         n
     }
@@ -5180,34 +5228,42 @@ impl Engine {
             }
         }
 
-        // A6.6 T8: materialize the iovec array for this READABLE event
-        // into the per-conn scratch. Capacity is retained across polls
-        // (§7.6 scratch-reuse policy); `.clear()` keeps it but discards
-        // stale pointers from the previous event's emission.
-        conn.readable_scratch_iovecs.clear();
+        // A6.6 T8 / C1: build the event's iovec Vec directly, sized to
+        // the delivered-segment count. Earlier C1 code went through
+        // `conn.readable_scratch_iovecs` and then `std::mem::take`'d
+        // the scratch into the event — but `std::mem::take` substitutes
+        // `Vec::default()` (zero capacity), so the next
+        // `deliver_readable` on the same conn would re-allocate from
+        // scratch. The doc-comment claimed "capacity retained" but the
+        // implementation regressed to a per-event allocation. We now
+        // build the event's Vec locally and only `clear()` (not take)
+        // the per-conn scratch, preserving its capacity for §7.6 reuse.
+        let seg_count = conn.delivered_segments.len() as u32;
+        let mut event_segs: Vec<crate::iovec::DpdkNetIovec> =
+            Vec::with_capacity(conn.delivered_segments.len());
         let mut total_len: u32 = 0;
         for seg in &conn.delivered_segments {
-            conn.readable_scratch_iovecs.push(crate::iovec::DpdkNetIovec {
+            event_segs.push(crate::iovec::DpdkNetIovec {
                 base: seg.data_ptr(),
                 len: seg.len as u32,
                 _pad: 0,
             });
             total_len = total_len.saturating_add(seg.len as u32);
         }
-        let seg_count = conn.readable_scratch_iovecs.len() as u32;
+        // §7.6 scratch-reuse policy: retain capacity (heap or inline)
+        // across polls. `clear()` keeps capacity; `std::mem::take`
+        // would not.
+        conn.readable_scratch_iovecs.clear();
 
-        // C1: move both vectors into the event so the event itself owns
-        // the iovec descriptors AND the mbuf refcounts that keep their
-        // `base` pointers valid. `std::mem::take` leaves the per-conn
-        // scratch empty (capacity retained for the next deliver_readable
-        // on this conn — §7.6 scratch-reuse policy). The top-of-poll
-        // cleanup in `poll_once` becomes a no-op for these slots in the
-        // common path; it is still defensive against any conn whose
-        // delivery never produced an event.
-        let event_segs: Vec<crate::iovec::DpdkNetIovec> =
-            std::mem::take(&mut conn.readable_scratch_iovecs);
+        // C1: move ownership of the InOrderSegment refcount holders into
+        // the event. `drain(..).collect()` iterates the SmallVec out
+        // element-by-element, leaving `conn.delivered_segments` empty
+        // but with its existing buffer (inline-4 capacity, plus any
+        // heap-spill grown at this conn's high-water mark) intact. The
+        // pre-fix `std::mem::take` substituted a fresh
+        // `SmallVec::default()` that lost the heap-spill on every emit.
         let event_owned_mbufs: smallvec::SmallVec<[crate::tcp_conn::InOrderSegment; 4]> =
-            std::mem::take(&mut conn.delivered_segments);
+            conn.delivered_segments.drain(..).collect();
 
         // A6.6 T9 / C1: single READABLE event covers the full iovec
         // slice. The event now owns both the iovec Vec and the mbuf
@@ -6726,7 +6782,17 @@ impl Drop for Engine {
         // SmallVec → TcpConn → FlowTable → Engine, dereffing an mbuf
         // address inside a memzone marked `(deleted)` in /proc/maps.
         //
-        // C1: clear EventQueue first. Post-C1 `InternalEvent::Readable`
+        // C1: clear the drained-events scratch FIRST. Each
+        // `InternalEvent::Readable` in the scratch owns
+        // `InOrderSegment` mbuf-refcount holders via its `owned_mbufs`
+        // SmallVec; dropping after the mempools have been freed would
+        // crash inside `shim_rte_mbuf_refcnt_update`. We clear before
+        // the EventQueue drain (and before the FlowTable clear) for
+        // the same reason — strict mbuf-owner-then-mempool teardown
+        // ordering.
+        self.drained_events_scratch.get_mut().clear();
+
+        // C1: clear EventQueue next. Post-C1 `InternalEvent::Readable`
         // owns `InOrderSegment` mbuf-refcount holders directly; any
         // queued-but-not-drained Readable event would, on its drop,
         // call `shim_rte_mbuf_refcnt_update(-1)` against an mbuf whose
@@ -7317,7 +7383,14 @@ impl Engine {
     /// No-op when no conn holds pinned mbuf refs. Cheap — one pass over
     /// the flow table.
     pub fn test_clear_pinned_rx_mbufs(&self) {
-        // C1: drain the EventQueue first. Post-C1 `InternalEvent::Readable`
+        // C1: clear the drained-events scratch first. Same rationale as
+        // in `Engine::drop` — every `InternalEvent::Readable` in the
+        // scratch holds `InOrderSegment` mbuf-refcount handles via
+        // `owned_mbufs`. Releasing them here while the mempools (and
+        // every conn-side mbuf-owner) are still alive keeps the test
+        // shim's mbuf-leak invariant clean.
+        self.drained_events_scratch.borrow_mut().clear();
+        // C1: drain the EventQueue next. Post-C1 `InternalEvent::Readable`
         // owns `InOrderSegment` mbuf refs; queued-but-not-drained events
         // would otherwise fire `MbufHandle::Drop` after the mempool
         // teardown. Pre-C1 the events only carried indices and were
