@@ -73,6 +73,12 @@ pub enum Error {
     /// panicked while holding it). Mapped to `-EDEADLK` at the C ABI.
     #[error("EAL init mutex poisoned (prior thread panicked)")]
     Reentrant,
+    /// A3 (Part 3 BLOCK-A11 B1, Pattern P6): release-build validation —
+    /// `tcp_min_rto_us > tcp_max_rto_us` would reach `u32::clamp(min, max)`
+    /// at the first RTT sample and panic. `Engine::new` rejects up front
+    /// instead. Mapped to `-EINVAL` at the C ABI.
+    #[error("invalid RTO bounds: tcp_min_rto_us={min} > tcp_max_rto_us={max}")]
+    InvalidRtoBounds { min: u32, max: u32 },
 }
 
 #[cfg(test)]

@@ -1240,6 +1240,24 @@ pub enum InjectErr {
 
 impl Engine {
     pub fn new(cfg: EngineConfig) -> Result<Self, Error> {
+        // A3 (Part 3 BLOCK-A11 B1, Pattern P6): validate RTO bounds in
+        // release builds. `RttEstimator::new` only `debug_assert!`s
+        // `min <= initial <= max`, so a release-build caller passing
+        // `tcp_min_rto_us > tcp_max_rto_us` would reach
+        // `u32::clamp(min, max)` on the first RTT sample and panic. We
+        // surface the error here, before any DPDK / clock APIs, so the
+        // failure is observable at engine bring-up — and so this check is
+        // testable without EAL initialization. Only `min > max` is
+        // checked (the case that triggers the clamp panic); `0` sentinels
+        // for default substitution are handled by the lib.rs ABI layer
+        // before they ever reach `Engine::new`.
+        if cfg.tcp_min_rto_us > cfg.tcp_max_rto_us {
+            return Err(Error::InvalidRtoBounds {
+                min: cfg.tcp_min_rto_us,
+                max: cfg.tcp_max_rto_us,
+            });
+        }
+
         // Fail fast on non-invariant-TSC hosts (spec §7.5). Also primes
         // the global TscEpoch so later now_ns() calls don't pay the
         // 50ms calibration cost on the hot path.
