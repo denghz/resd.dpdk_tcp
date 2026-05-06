@@ -6558,6 +6558,16 @@ impl Engine {
         self.test_inject_pool().as_ptr()
     }
 
+    /// Returns the runtime value of the `rx_cksum_offload_active` latch.
+    ///
+    /// TAP vdevs always report no hardware checksum-offload capability so this
+    /// returns `false` there. NIC-offload rows in pressure_counter_parity.rs
+    /// use this to skip gracefully rather than asserting zero-delta counters.
+    #[cfg(feature = "test-inject")]
+    pub fn rx_cksum_offload_active(&self) -> bool {
+        self.rx_cksum_offload_active
+    }
+
     /// Inject a synthetic Ethernet frame as if it came from PMD RX.
     /// The frame is copied into an mbuf from a lazily-created test-inject
     /// mempool; the same internal RX dispatch the poll loop uses runs end
@@ -6625,6 +6635,82 @@ impl Engine {
         // `cargo test --workspace`) silently skip `eth.rx_pkts` and
         // break `cover_eth_rx_pkts` counter-coverage (A8.5 T10
         // follow-up regression).
+        crate::counters::inc(&self.counters.eth.rx_pkts);
+
+        // Dispatch through the same per-mbuf RX path `poll_once` uses;
+        // `dispatch_one_rx_mbuf` frees the mbuf before returning.
+        let _accepted = self.dispatch_one_rx_mbuf(mbuf);
+        Ok(())
+    }
+
+    /// Like [`Engine::inject_rx_frame`] but also OR-s `extra_ol_flags`
+    /// into the mbuf's `ol_flags` before dispatching. Used by
+    /// `pressure_counter_parity` (Suite 3) to simulate NIC-reported bad
+    /// checksums (`RTE_MBUF_F_RX_IP_CKSUM_BAD`,
+    /// `RTE_MBUF_F_RX_L4_CKSUM_BAD`) without a real hardware offload
+    /// path. The body mirrors `inject_rx_frame` verbatim except for the
+    /// extra `shim_rte_mbuf_or_ol_flags` call inserted between the
+    /// frame copy and the dispatch — every error path therefore matches
+    /// `inject_rx_frame` byte-for-byte.
+    #[cfg(feature = "test-inject")]
+    pub fn inject_rx_frame_with_ol_flags(
+        &self,
+        frame: &[u8],
+        extra_ol_flags: u64,
+    ) -> Result<(), InjectErr> {
+        // Reject pathologically large frames before the alloc so the
+        // caller gets a typed error instead of a cryptic append-NULL
+        // from DPDK. `elt_size()` returns the pool's `data_room_size`
+        // (including headroom — slightly over-permissive, but errs on
+        // the side of letting the append decide the final boundary).
+        let pool = self.test_inject_pool();
+        let seg_size = pool.elt_size() as usize;
+        if frame.len() > seg_size {
+            return Err(InjectErr::FrameTooLarge {
+                frame_len: frame.len(),
+                seg_size,
+            });
+        }
+
+        // SAFETY: `pool.as_ptr()` is a live, non-null `rte_mempool*` (RAII
+        // wrapper holds `NonNull`). `shim_rte_pktmbuf_alloc` is the
+        // re-exported static-inline `rte_pktmbuf_alloc`; returns NULL
+        // iff the pool is exhausted.
+        let m_raw = unsafe { sys::shim_rte_pktmbuf_alloc(pool.as_ptr()) };
+        let mbuf = std::ptr::NonNull::new(m_raw).ok_or(InjectErr::MempoolExhausted)?;
+
+        // SAFETY: frame length was bounded against `elt_size()` above,
+        // so `append` cannot fail on a non-corrupt mbuf; the NULL
+        // branch below is pure belt-and-suspenders for the
+        // headroom-ate-the-payload edge case.
+        let dst = unsafe {
+            sys::shim_rte_pktmbuf_append(mbuf.as_ptr(), frame.len() as u16)
+        };
+        if dst.is_null() {
+            // SAFETY: we own the mbuf; free returns it to its pool.
+            unsafe { sys::shim_rte_pktmbuf_free(mbuf.as_ptr()) };
+            return Err(InjectErr::FrameTooLarge {
+                frame_len: frame.len(),
+                seg_size,
+            });
+        }
+        // SAFETY: `dst` points to `frame.len()` writable bytes inside
+        // the mbuf's data room (append just reserved them). `frame` is
+        // a caller-owned slice; the regions cannot overlap.
+        unsafe {
+            std::ptr::copy_nonoverlapping(frame.as_ptr(), dst as *mut u8, frame.len());
+        }
+
+        if extra_ol_flags != 0 {
+            // SAFETY: `mbuf` is a live, owned mbuf pointer. `or_ol_flags`
+            // ORs the caller-supplied flags into `m->ol_flags`; the mbuf
+            // remains valid afterwards and is consumed by
+            // `dispatch_one_rx_mbuf` below.
+            unsafe { sys::shim_rte_mbuf_or_ol_flags(mbuf.as_ptr(), extra_ol_flags); }
+        }
+
+        // Mirror poll_once's per-burst per-mbuf RX counter bump on the
+        // injection path (same justification as `inject_rx_frame`).
         crate::counters::inc(&self.counters.eth.rx_pkts);
 
         // Dispatch through the same per-mbuf RX path `poll_once` uses;
