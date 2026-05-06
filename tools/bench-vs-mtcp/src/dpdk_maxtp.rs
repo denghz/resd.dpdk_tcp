@@ -164,17 +164,23 @@ pub fn open_persistent_connections(
 /// pre-bucket conn — still occupying a low slot — gets reused for a
 /// fresh handshake while the previous holder is still mid-FIN.
 ///
-/// 2026-04-29 fix shape (option (b) per the issue triage):
+/// Fix shape (T28, 2026-05-06):
+///   0. One `poll_once` before Phase 1 to drain any in-flight TX data
+///      still in `tx_pending_data` from the bucket's last pump round.
+///      Without this, the NIC TX ring can be full at the moment Phase 1
+///      runs, causing `tx_tcp_frame` to fail (→ `PeerUnreachable`) and
+///      the FIN to be silently dropped — the conn stays ESTABLISHED
+///      forever and the drain loop times out every time.
 ///   1. Send FIN on each conn with `CLOSE_FLAG_FORCE_TW_SKIP`
 ///      (timestamps are negotiated by default in the kernel-TCP peer,
 ///      so the engine honors the skip flag and short-circuits the
 ///      2×MSL TIME_WAIT wait at reap time).
 ///   2. Drive `poll_once` until `flow_table_used()` reports zero or
-///      the deadline expires. The reaper inside `poll_once` walks the
-///      flow table and removes any TIME_WAIT conn past its 2×MSL
-///      deadline — with `force_tw_skip` the deadline is "now" so the
-///      reap fires on the first poll where peer ACK + FIN have
-///      arrived.
+///      the deadline expires. Inside the loop, retry `close_conn_with_flags`
+///      on every connection every iteration: it is a no-op for conns
+///      past FIN_WAIT1, and retries the FIN send for any conn that is
+///      still ESTABLISHED (Phase 1 FIN failed because the NIC ring was
+///      full). The retry succeeds once `poll_once` has drained the ring.
 ///
 /// On a deadline expiry we log + continue (soft-fail). The next
 /// bucket's `open_persistent_connections` will still succeed as long
@@ -187,34 +193,41 @@ pub fn close_persistent_connections(
     if conns.is_empty() {
         return Ok(());
     }
+    // Phase 0: drain any TX data still queued from the last pump round.
+    // The bucket's pump loop bails immediately on SendBufferFull without
+    // calling poll_once, leaving up to tx_ring_size (512) unsent data
+    // mbufs in the tx_pending_data ring. drain_tx_pending_data (called
+    // inside poll_once) flushes them to the NIC so the TX ring has
+    // space for the FINs below.
+    engine.poll_once();
+
     // Phase 1: emit FINs. `close_conn_with_flags` is idempotent for
     // already-closing/closed conns (returns Ok(()) without sending),
-    // so soft-failing on a per-handle error is safe.
+    // so soft-failing on a per-handle error is safe. A PeerUnreachable
+    // error here means the NIC TX ring was still full after Phase 0
+    // (rare); the drain loop in Phase 2 retries on every iteration.
     for &h in conns {
         if let Err(e) = engine.close_conn_with_flags(h, CLOSE_FLAG_FORCE_TW_SKIP) {
-            // Slow-path log only — this is per-bucket teardown,
-            // not the hot path. Don't propagate: the bucket's
-            // result is already in CSV; we just want the slot
-            // released for the next bucket.
             eprintln!(
                 "dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle={h}) \
-                 returned {e:?}; continuing",
+                 returned {e:?}; will retry in drain loop",
             );
         }
     }
     // Phase 2: drive poll_once until either every slot has been
-    // reaped or the deadline expires. 2× warmup is generous — most
-    // FIN-ACK round trips finish in <1ms on the kernel peer; the
-    // deadline is here for the wedged-peer surface so the next
-    // bucket isn't blocked indefinitely.
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // reaped or the deadline expires. On each poll iteration we also
+    // call close_conn_with_flags per conn: this retries the FIN for any
+    // conn still ESTABLISHED (Phase 1 send failed) and is a no-op for
+    // conns already past FIN_WAIT1. FIN-ACK round trips finish in <1ms
+    // on the kernel peer; 15 s is a generous safety margin.
+    let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         engine.poll_once();
-        // Drain any post-FIN Readable / Closed events so the queue
-        // doesn't accumulate. Observability events from this drain
-        // are not used by the caller — they're already past the
-        // window-close snapshot.
         for &h in conns {
+            // FIN retry: no-op for FIN_WAIT1+; sends FIN for ESTABLISHED.
+            let _ = engine.close_conn_with_flags(h, CLOSE_FLAG_FORCE_TW_SKIP);
+            // Drain post-FIN Readable/Closed events so the queue
+            // doesn't fill up and drop events for other connections.
             let mut _last: Option<u64> = None;
             let _ = drain_and_accumulate_readable(engine, h, &mut _last);
         }
@@ -240,7 +253,7 @@ pub fn close_persistent_connections(
             };
             eprintln!(
                 "dpdk_maxtp: close_persistent_connections: timed out with \
-                 {residual}/{} conns still alive after 5s; continuing",
+                 {residual}/{} conns still alive after 15s; continuing",
                 conns.len()
             );
             return Ok(());
