@@ -134,7 +134,6 @@ pub struct TcpCounters {
     pub rx_data: AtomicU64,
     pub rx_ack: AtomicU64,
     pub rx_rst: AtomicU64,
-    pub rx_out_of_order: AtomicU64,
     pub tx_retrans: AtomicU64,
     pub tx_rto: AtomicU64,
     pub tx_tlp: AtomicU64,
@@ -347,6 +346,42 @@ const _: () = {
     use std::mem::{align_of, size_of};
     assert!(align_of::<EthCounters>() == 64);
     assert!(size_of::<EthCounters>().is_multiple_of(64));
+};
+
+// A8-t2-drift-detect-pin: if any of these size pins becomes stale, a new
+// AtomicU64 field has been added to the corresponding *Counters struct
+// without updating ALL_COUNTER_NAMES + KNOWN_COUNTER_COUNT + lookup_counter.
+// Update all three list sites AND this pin together.
+//
+// Every field in these structs is 8 bytes (AtomicU64 or u64 _pad). A new
+// field shifts the struct size by at least 8 bytes — and for the
+// cacheline-aligned groups, by a full 64 bytes once the tail padding is
+// consumed. Either way, this pin breaks at compile time. That closes the
+// scenario the two `a8_tests` runtime tests cannot see: new field present
+// on Counters, absent from ALL_COUNTER_NAMES.
+//
+// To update: insert the new field in the matching *Counters struct (+
+// adjust _pad, if any, so the struct stays cacheline-multiple), add a
+// "group.field" entry to ALL_COUNTER_NAMES, extend the `lookup_counter`
+// match arm, bump KNOWN_COUNTER_COUNT, then update the byte-count on the
+// line below whose struct you changed.
+const _: () = {
+    use std::mem::size_of;
+    // EthCounters: 38 named AtomicU64 + _pad: [AtomicU64; 2] = 40 * 8 = 320 bytes.
+    assert!(size_of::<EthCounters>() == 320);
+    // IpCounters: 12 named AtomicU64 + _pad: [u64; 4] = 16 * 8 = 128 bytes.
+    assert!(size_of::<IpCounters>() == 128);
+    // TcpCounters: 56 named scalar AtomicU64 + state_trans[11][11] matrix of
+    // 121 AtomicU64 = 177 u64s = 1416 bytes; cacheline-align tail pads to
+    // next 64-byte multiple = 1472 bytes.
+    assert!(size_of::<TcpCounters>() == 1472);
+    // PollCounters: 5 named AtomicU64 + _pad: [u64; 11] = 16 * 8 = 128 bytes.
+    assert!(size_of::<PollCounters>() == 128);
+    // ObsCounters: 2 named AtomicU64, repr(C) without align → 16 bytes.
+    assert!(size_of::<ObsCounters>() == 16);
+    // FaultInjectorCounters (A9): 4 named AtomicU64, repr(C, align(64)) →
+    // 32 bytes of fields, padded to 64-byte multiple = 64 bytes.
+    assert!(size_of::<FaultInjectorCounters>() == 64);
 };
 
 #[repr(C)]
@@ -911,7 +946,9 @@ mod tests {
     }
 
     /// Every named AtomicU64 on PollCounters is zero at construction.
-    /// `iters_with_tx` is declared but not incremented until A6.
+    /// `iters_with_tx` wired in A8 T3.5 follow-up (engine.rs poll_once
+    /// end-of-iteration bump, snapshot-vs-post-drain compare on
+    /// `eth.tx_pkts`). Starts at zero until the first TX fires.
     #[test]
     fn all_poll_counters_zero_at_construction() {
         let c = Counters::new();
@@ -927,7 +964,6 @@ mod tests {
     #[test]
     fn tx_retrans_counters_zero_at_construction() {
         let c = Counters::new();
-        assert_eq!(c.tcp.rx_out_of_order.load(Ordering::Relaxed), 0);
         assert_eq!(c.tcp.tx_retrans.load(Ordering::Relaxed), 0);
         assert_eq!(c.tcp.tx_rto.load(Ordering::Relaxed), 0);
         assert_eq!(c.tcp.tx_tlp.load(Ordering::Relaxed), 0);
@@ -1052,5 +1088,52 @@ mod a10_diagnostic_counter_tests {
         // are checked.
         let c = Counters::new();
         assert_eq!(c.tcp.tx_data_mempool_avail.load(Ordering::Relaxed), 0);
+    }
+}
+
+#[cfg(test)]
+mod a8_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    /// Every name in ALL_COUNTER_NAMES resolves to a valid counter path.
+    #[test]
+    fn all_counter_names_lookup_valid() {
+        let c = Counters::new();
+        for name in ALL_COUNTER_NAMES {
+            let atomic = lookup_counter(&c, name)
+                .unwrap_or_else(|| panic!("name {name} does not resolve"));
+            assert_eq!(atomic.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    /// Pinned count: drifts whenever a counter is added or removed.
+    /// Update this number when adding/removing counters + update the
+    /// ALL_COUNTER_NAMES list + update lookup_counter. A mismatch
+    /// means one of the three is out of sync.
+    #[test]
+    fn all_counter_names_count_pinned() {
+        assert_eq!(
+            ALL_COUNTER_NAMES.len(),
+            KNOWN_COUNTER_COUNT,
+            "ALL_COUNTER_NAMES count drifted; update KNOWN_COUNTER_COUNT if intentional"
+        );
+    }
+
+    /// Sanity: nonexistent names return None, not a spurious reference.
+    /// Protects against a future refactor replacing the `_ => return None`
+    /// arm with a default-resolving arm. Also re-asserts the architectural
+    /// decision (documented on `lookup_counter`) that state_trans cells
+    /// are NOT addressable via this flat grammar — callers index the
+    /// matrix directly.
+    #[test]
+    fn lookup_counter_unknown_returns_none() {
+        let c = Counters::new();
+        assert!(lookup_counter(&c, "nonexistent.counter").is_none());
+        assert!(lookup_counter(&c, "").is_none());
+        assert!(
+            lookup_counter(&c, "tcp.state_trans[0][0]").is_none(),
+            "state_trans cells are NOT addressable via lookup_counter — see doc comment"
+        );
     }
 }

@@ -96,8 +96,11 @@ pub fn read(counters: &Counters, name: &str) -> Option<u64> {
         "tcp.tx_tlp_spurious" => Some(counters.tcp.tx_tlp_spurious.load(Ordering::Relaxed)),
         "tcp.rx_dup_ack" => Some(counters.tcp.rx_dup_ack.load(Ordering::Relaxed)),
         "tcp.rx_dsack" => Some(counters.tcp.rx_dsack.load(Ordering::Relaxed)),
-        "tcp.rx_out_of_order" => Some(counters.tcp.rx_out_of_order.load(Ordering::Relaxed)),
-        "tcp.rx_reassembly_queued" => {
+        // `tcp.rx_out_of_order` was renamed to `tcp.rx_reassembly_queued`
+        // in a8 work — old name kept here as a fallback that resolves
+        // to the same counter, so scenarios that referenced the legacy
+        // name keep working without scenario-matrix churn.
+        "tcp.rx_out_of_order" | "tcp.rx_reassembly_queued" => {
             Some(counters.tcp.rx_reassembly_queued.load(Ordering::Relaxed))
         }
         "tcp.tx_rack_loss" => Some(counters.tcp.tx_rack_loss.load(Ordering::Relaxed)),
@@ -113,6 +116,13 @@ pub fn read(counters: &Counters, name: &str) -> Option<u64> {
         }
         "fault_injector.corrupts" => {
             Some(counters.fault_injector.corrupts.load(Ordering::Relaxed))
+        }
+        "tcp.rx_mempool_avail" => {
+            // u32 → u64 widen; the load returns the most-recent sample.
+            Some(counters.tcp.rx_mempool_avail.load(Ordering::Relaxed) as u64)
+        }
+        "tcp.mbuf_refcnt_drop_unexpected" => {
+            Some(counters.tcp.mbuf_refcnt_drop_unexpected.load(Ordering::Relaxed))
         }
         _ => None,
     }
@@ -218,6 +228,16 @@ mod tests {
         assert!(read(&c, "tcp.nonexistent").is_none());
         assert!(read(&c, "fault_injector.bogus").is_none());
         assert!(read(&c, "garbage").is_none());
+    }
+
+    #[test]
+    fn read_recognises_a10_diagnostic_counters() {
+        let c = Counters::new();
+        // Both default to 0; we only need to confirm the names route
+        // through the lookup table without falling through to the
+        // unknown-name `_` arm.
+        assert_eq!(read(&c, "tcp.rx_mempool_avail"), Some(0));
+        assert_eq!(read(&c, "tcp.mbuf_refcnt_drop_unexpected"), Some(0));
     }
 
     /// Coverage guard: every counter name referenced from the scenario

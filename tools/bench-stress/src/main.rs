@@ -134,6 +134,22 @@ struct Args {
     /// Feature-set label emitted as the `feature_set` CSV column.
     #[arg(long, default_value = "trading-latency")]
     feature_set: String,
+
+    /// When set, bench-stress does NOT shell out to `ssh peer "tc qdisc ..."`
+    /// for netem. Operator orchestrates netem externally (see
+    /// `scripts/bench-nightly.sh`). DUT->peer SSH on the data ENI is
+    /// not reachable; orchestrating from the operator workstation
+    /// (which has SSH to both DUT and peer mgmt IPs) is the canonical
+    /// path. Default false (legacy behavior preserved for local tests).
+    #[arg(long, default_value_t = false)]
+    external_netem: bool,
+
+    /// Print the resolved scenario list and exit. Used by the
+    /// integration test in `tests/external_netem_skips_apply.rs` to
+    /// exercise the arg-parsing + scenario-filter path without
+    /// requiring DPDK / EAL on the host.
+    #[arg(long, default_value_t = false)]
+    list_scenarios: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -144,6 +160,17 @@ fn main() -> anyhow::Result<()> {
     let selected = resolve_scenarios(&args.scenarios)?;
     if selected.is_empty() {
         anyhow::bail!("no scenarios selected after filter + Stage-2 skip");
+    }
+
+    // 1a. `--list-scenarios` short-circuit: print resolved names and
+    //     exit. Used by the integration test to exercise arg-parsing
+    //     and scenario-filter logic without DPDK/EAL on the host.
+    //     MUST run before EAL init or any other validation.
+    if args.list_scenarios {
+        for s in &selected {
+            println!("{}", s.name);
+        }
+        return Ok(());
     }
 
     // 2. Invariant: at most one distinct FI spec across the selection
@@ -242,13 +269,26 @@ fn run_one_scenario<W: std::io::Write>(
 ) -> anyhow::Result<f64> {
     eprintln!("bench-stress: scenario {}", scenario.name);
 
-    // 1. Install netem if the scenario needs it. Dropped on scope exit.
-    let _netem_guard = match scenario.netem {
-        Some(spec) => Some(
+    // 1. Install netem if the scenario needs it. `--external-netem`
+    //    skips the SSH apply: operator-side script (e.g.
+    //    `scripts/bench-nightly.sh`) has already orchestrated the
+    //    qdisc apply via its own SSH path, which can reach the peer's
+    //    mgmt IP from the operator workstation but NOT from the DUT
+    //    data ENI (the original failure mode for this code path).
+    let _netem_guard = match (scenario.netem, args.external_netem) {
+        (Some(_spec), true) => {
+            eprintln!(
+                "bench-stress: scenario {} netem applied externally; \
+                 skipping in-process NetemGuard",
+                scenario.name
+            );
+            None
+        }
+        (Some(spec), false) => Some(
             NetemGuard::apply(&args.peer_ssh, &args.peer_iface, spec)
                 .with_context(|| format!("applying netem for scenario {}", scenario.name))?,
         ),
-        None => None,
+        (None, _) => None,
     };
 
     // 2. Pre-run counter snapshot.

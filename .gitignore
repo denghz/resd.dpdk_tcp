@@ -4,4 +4,6 @@ Cargo.lock.bak
 /examples/cpp-consumer/build/
 .cache/
 /.worktrees/
+/.claude/
 /profile/
+/tools/bench-vs-mtcp/peer/mtcp-driver

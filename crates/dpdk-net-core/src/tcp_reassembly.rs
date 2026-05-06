@@ -117,6 +117,20 @@ impl ReorderQueue {
         &self.segments
     }
 
+    /// A8 T7: release all queued segments' mbuf refcounts and empty the
+    /// queue without going through Drop. Used by the test-server teardown
+    /// helper (`Engine::test_clear_pinned_rx_mbufs`) so a conn holding
+    /// OOO-pinned mbuf refs at teardown doesn't UAF its mempool (Drop
+    /// order: `Engine._rx_mempool` frees before `Engine.flow_table` runs
+    /// conn drops). No-op when empty.
+    pub fn clear(&mut self) {
+        for seg in &self.segments {
+            Self::drop_segment_mbuf_ref(seg);
+        }
+        self.segments.clear();
+        self.total_bytes = 0;
+    }
+
     /// A6.5 Task 4b: insert a range of payload bytes as `OooSegment`
     /// entries, referencing the supplied mbuf with offset/length.
     /// Caller MUST have bumped the mbuf refcount by 1 before calling;
@@ -279,11 +293,23 @@ impl ReorderQueue {
     fn drop_segment_mbuf_ref(seg: &OooSegment) {
         // SAFETY: `seg.mbuf` was validated at `insert` time; the queue
         // has held a refcount on it since then, so the pointer is still
-        // live. The decrement may take the refcount to zero and return
-        // the mbuf to its mempool, which is the intended end-of-life
-        // behavior.
+        // live.
+        //
+        // A10 deferred-fix Stage B (same class as the MbufHandle::Drop
+        // fix at f3139f6): use rte_pktmbuf_free_seg, NOT
+        // rte_mbuf_refcnt_update(-1). The refcnt_update primitive only
+        // decrements the atomic; it does NOT return the mbuf to its
+        // mempool when the count reaches 0. When this helper releases
+        // the LAST reference (queue's stored ref was the only one
+        // outstanding — e.g. the engine's pre-dispatch +1 was already
+        // rolled back, or a rare stale/cap-drop path with no other
+        // holder), the mbuf was being leaked at refcount=0.
+        //
+        // The pool-guarded shim falls back to a refcnt-only dec for
+        // unit tests using fake stack-allocated mbufs (no backing
+        // pool), preserving the existing fake-mbuf test surface.
         unsafe {
-            sys::shim_rte_mbuf_refcnt_update(seg.mbuf.as_ptr(), -1);
+            sys::shim_rte_pktmbuf_free_seg(seg.mbuf.as_ptr());
         }
     }
 

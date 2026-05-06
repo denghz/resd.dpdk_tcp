@@ -192,11 +192,14 @@ mod tests {
 
     #[test]
     fn sanity_collects_multiple_violators() {
-        // Two rows undercut the floor → verdict mentions both.
+        // Two rows undercut the floor by more than the 5% noise band →
+        // verdict mentions both. obs-none × 0.95 = 74.385, so violators
+        // must dip below that to be flagged. (70.0 = 10.6% drop, 71.0 =
+        // 9.3% drop — both comfortably outside noise.)
         let agg = agg_of(&[
             ("obs-none", 78.3),
             ("poll-saturation-only", 70.0),
-            ("byte-counters-only", 75.0),
+            ("byte-counters-only", 71.0),
             ("obs-all-no-none", 90.0),
             ("default", 85.0),
         ]);
@@ -205,6 +208,22 @@ mod tests {
         assert!(err.contains("poll-saturation-only"));
         assert!(err.contains("byte-counters-only"));
         assert_eq!(s.violators.len(), 2);
+    }
+
+    #[test]
+    fn sanity_tolerates_within_noise_band_dip() {
+        // 0.5% dip below obs-none — exactly the 2026-05-03 bench-pair
+        // shape. Inside the 5% band → ok.
+        let agg = agg_of(&[
+            ("obs-none", 78.30),
+            ("default", 77.91), // 0.5% below floor
+            ("poll-saturation-only", 80.0),
+            ("byte-counters-only", 90.0),
+            ("obs-all-no-none", 100.0),
+        ]);
+        let s = check_obs_floor_sanity(OBS_MATRIX, &agg);
+        assert!(s.verdict.is_ok(), "within-noise dip must not flag");
+        assert!(s.violators.is_empty());
     }
 
     #[test]

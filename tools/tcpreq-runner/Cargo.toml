@@ -1,0 +1,34 @@
+[package]
+name = "tcpreq-runner"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+# `test-server` MUST be a non-default feature so that a workspace build
+# (`cargo build --workspace --release`) doesn't unify `test-server` into
+# every binary that links `dpdk-net-core`. Without this gate, `bench-e2e`
+# and friends ship a `dpdk-net-core` whose `tx_frame` is rerouted to the
+# test_tx_intercept buffer (engine.rs:2050) and ARP requests never reach
+# the wire — see investigate-arp-regression branch for the full diagnosis.
+#
+# Stand-alone build with the probe library: `cargo build -p tcpreq-runner
+# --features test-server`. Same pattern packetdrill-shim-runner uses.
+default = []
+test-server = [
+    "dep:dpdk-net-core",
+    "dep:dpdk-net",
+    "dpdk-net-core/test-server",
+    "dpdk-net/test-server",
+]
+
+[dependencies]
+dpdk-net-core = { path = "../../crates/dpdk-net-core", optional = true }
+dpdk-net      = { path = "../../crates/dpdk-net", optional = true }
+# Add other deps as needed when T19-T21 land probe bodies.
+
+[dev-dependencies]
+# Nothing for T18 — T19-T21 may add.
