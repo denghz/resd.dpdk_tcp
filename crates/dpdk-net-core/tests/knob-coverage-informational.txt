@@ -33,6 +33,7 @@ recv_buffer_bytes          # Per-conn receive buffer sizing; feeds window calc +
 send_buffer_bytes          # Per-conn send buffer sizing; pure sizing.
 tcp_mss                    # Advertised MSS; wire identity / sizing, no branching on the value.
 tcp_msl_ms                 # 2*MSL TIME_WAIT timing; timing-only parameter.
+tx_hdr_mempool_size        # A11.0 pressure-test sizing knob; 0=production default 2048, non-zero verbatim. Sizing-only, no behavioral branch.
 
 # --- A8 T17 (M3): ConnectOpts informational fields -------------------------
 local_addr                 # Per-connection source IP; validation via engine::select_source_ip unit tests (covered by non-knob-coverage tests).

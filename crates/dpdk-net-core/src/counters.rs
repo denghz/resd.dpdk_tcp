@@ -413,6 +413,34 @@ impl Counters {
             fault_injector: FaultInjectorCounters::default(),
         }
     }
+
+    /// Test-only typed accessor for `AtomicU32` **level** counters
+    /// (last-sampled value, not a delta). Slow-path only — gated by the
+    /// `pressure-test` cargo feature; do NOT call from production code.
+    ///
+    /// The generic `lookup_counter` (`counters.rs:609`) returns
+    /// `&AtomicU64` and therefore cannot read these `AtomicU32` fields:
+    ///
+    ///   * `tcp.tx_data_mempool_avail` — last `rte_mempool_avail_count`
+    ///     sample of the TX-data mempool, taken inside `poll_once`'s
+    ///     once-per-second sampler. Pressure-test consumers watch this
+    ///     to confirm that mempool drought scenarios actually drain the
+    ///     pool to (near-)zero on the surfacing iteration.
+    ///   * `tcp.rx_mempool_avail` — same shape, RX side. Pressure-test
+    ///     consumers cross-check `rx_drop_nomem` deltas against a
+    ///     visibly-drained pool.
+    ///
+    /// Cost rationale: a single `Relaxed` load + a string match on a
+    /// 2-arm switch — far below counter-policy hot-path threshold and
+    /// only callable when the `pressure-test` feature is on.
+    #[cfg(feature = "pressure-test")]
+    pub fn read_level_counter_u32(&self, name: &str) -> Option<u32> {
+        match name {
+            "tcp.tx_data_mempool_avail" => Some(self.tcp.tx_data_mempool_avail.load(Ordering::Relaxed)),
+            "tcp.rx_mempool_avail" => Some(self.tcp.rx_mempool_avail.load(Ordering::Relaxed)),
+            _ => None,
+        }
+    }
 }
 
 /// Canonical source-of-truth list of every declared counter path.

@@ -106,6 +106,18 @@ obs-none = []
 # Off by default. Production builds see no difference.
 # See docs/superpowers/specs/2026-04-23-a10-microbench-perf-and-dpdk24-adopt-design.md §4.3
 bench-internals = []
+# A11.0 pressure-test: gates the level-counter accessor + diag accessors
+# (`FlowTable::active_conns`, `FlowTable::states`,
+# `FlowTable::reassembly_byte_occupancy`, `Counters::read_level_counter_u32`,
+# `EngineConfig::with_test_mempool_overrides`) consumed by the
+# pressure-test suite (mempool drought, reorder-queue overflow,
+# FSM-trajectory). Default OFF — production builds carry zero of it.
+# Orthogonal to `test-inject` and `test-server`: suites that need both
+# enable them explicitly. The workspace-feature unification gate
+# (`scripts/check-workspace-features.sh`) lists `pressure-test` in
+# `FORBIDDEN_FEATURES` and fails CI if it ever appears in a production
+# binary's resolved feature set.
+pressure-test = []
 
 [dev-dependencies]
 proptest = "1"

@@ -447,6 +447,18 @@ pub struct EngineConfig {
     /// risk knowingly. Retrievable via `Engine::tx_data_mempool_size()`.
     pub tx_data_mempool_size: u32,
 
+    /// A11.0 pressure-test knob: TX **header** mempool capacity in mbufs.
+    /// `0` = production default (2048 mbufs, hardcoded historically).
+    /// Non-zero caller value is used verbatim — pressure-test suites use
+    /// this to drive header-mempool drought scenarios (e.g. ACK-storm
+    /// pressure: bump every conn's `tx_ack` simultaneously and starve
+    /// the header pool to confirm `eth.tx_drop_nomem` rises predictably).
+    /// Production callers leave this at 0; the formula-default path is
+    /// unchanged. The field is unconditionally present (matches
+    /// `rx_mempool_size` / `tx_data_mempool_size` shape) so the C ABI
+    /// layout does not flip on the `pressure-test` feature.
+    pub tx_hdr_mempool_size: u32,
+
     // Phase A2 additions (host byte order for IPs; raw bytes for MAC)
     pub local_ip: u32,
     /// bug_010 → feature: additional local IPs the engine is willing to
@@ -565,6 +577,7 @@ impl Default for EngineConfig {
             // mbuf_data_room` in-flight segments + driver-held + in-batch
             // headroom. See doc-comment for the full breakdown.
             tx_data_mempool_size: 0,
+            tx_hdr_mempool_size: 0,
             local_ip: 0,
             secondary_local_ips: Vec::new(),
             gateway_ip: 0,
@@ -591,6 +604,36 @@ impl Default for EngineConfig {
             ena_large_llq_hdr: 0,
             ena_miss_txc_to_sec: 0,
         }
+    }
+}
+
+#[cfg(feature = "pressure-test")]
+impl EngineConfig {
+    /// Test-only builder that sets all three pressure-test mempool
+    /// sizing overrides in one shot. Slow-path (constructor); gated by
+    /// `pressure-test` cargo feature; do NOT call from production code.
+    ///
+    /// Equivalent to setting `rx_mempool_size`, `tx_data_mempool_size`,
+    /// and `tx_hdr_mempool_size` directly — provided as an ergonomic
+    /// helper so pressure-test scenarios read as a single line:
+    ///
+    /// ```ignore
+    /// let cfg = EngineConfig::default()
+    ///     .with_test_mempool_overrides(64, 64, 64);
+    /// ```
+    ///
+    /// A `0` for any field falls back to the production default for that
+    /// pool (formula for `rx`/`tx_data`, hardcoded 2048 for `tx_hdr`).
+    pub fn with_test_mempool_overrides(
+        mut self,
+        rx_mempool_size: u32,
+        tx_data_mempool_size: u32,
+        tx_hdr_mempool_size: u32,
+    ) -> Self {
+        self.rx_mempool_size = rx_mempool_size;
+        self.tx_data_mempool_size = tx_data_mempool_size;
+        self.tx_hdr_mempool_size = tx_hdr_mempool_size;
+        self
     }
 }
 
@@ -621,6 +664,8 @@ pub const ENGINE_CONFIG_FIELD_NAMES: &[&str] = &[
     "rx_mempool_size",
     // 2026-04-29 fix: TX data mempool sizing knob.
     "tx_data_mempool_size",
+    // A11.0 pressure-test: TX header mempool sizing knob.
+    "tx_hdr_mempool_size",
     // A2: L2/L3 identity + GARP cadence.
     "local_ip",
     "secondary_local_ips",
@@ -1205,9 +1250,19 @@ impl Engine {
             cfg.mbuf_data_room + sys::RTE_PKTMBUF_HEADROOM as u16,
             socket_id,
         )?;
+        // A11.0 pressure-test: honor `tx_hdr_mempool_size` override
+        // (`0` = production default 2048). Non-zero caller value is used
+        // verbatim. Production builds always pass 0 unless the caller
+        // explicitly sets the field; the resolved size is identical to
+        // the historical hardcoded value when the override is absent.
+        let tx_hdr_mempool_size = if cfg.tx_hdr_mempool_size > 0 {
+            cfg.tx_hdr_mempool_size
+        } else {
+            2048
+        };
         let tx_hdr_mempool = Mempool::new_pktmbuf(
             &format!("tx_hdr_mp_{}", cfg.lcore_id),
-            2048,
+            tx_hdr_mempool_size,
             64,
             0,
             256,

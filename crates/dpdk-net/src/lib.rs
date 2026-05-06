@@ -217,6 +217,13 @@ pub unsafe extern "C" fn dpdk_net_engine_create(
         // default. Rust-direct callers (bench harnesses) can override
         // via `EngineConfig.tx_data_mempool_size` directly.
         tx_data_mempool_size: 0,
+        // A11.0 pressure-test sizing knob. Same shape as
+        // `tx_data_mempool_size`: not exposed on the C ABI; production
+        // C callers always get `0` here (Engine::new substitutes the
+        // hardcoded 2048-mbuf default). Rust-direct pressure-test
+        // callers override via `EngineConfig.tx_hdr_mempool_size`
+        // directly (or via `with_test_mempool_overrides`).
+        tx_hdr_mempool_size: 0,
         local_ip: cfg.local_ip,
         // bug_010 → feature: start empty. C callers register secondary
         // local IPs post-create via `dpdk_net_engine_add_local_ip`; the
