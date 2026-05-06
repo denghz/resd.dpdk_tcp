@@ -3948,6 +3948,21 @@ impl Engine {
     ///
     /// Always frees the mbuf before returning — the caller MUST NOT
     /// touch the pointer afterwards.
+    ///
+    /// **C2 cross-phase retro fix.** The byte slice handed to the
+    /// L2/L3/L4 decoders comes from [`crate::mbuf_data_slice_for_rx`]
+    /// which linearizes multi-segment mbuf chains into a scratch buffer
+    /// before decode. Pre-C2 the dispatch path called the legacy
+    /// [`crate::mbuf_data_slice`] which exposed only the head segment's
+    /// `data_len` — a real-NIC RX_OFFLOAD_SCATTER frame whose IPv4
+    /// `total_length` exceeded the head's `data_len` would be silently
+    /// rejected at the L3 decoder as `BadTotalLen`. The linearized
+    /// slice covers `pkt_len` bytes, so the L3 / L4 decoders see the
+    /// full datagram.
+    ///
+    /// `eth.rx_bytes` accounts the full linearized length on multi-seg
+    /// (matching the bytes the NIC delivered), not just the head's
+    /// `data_len` as before C2.
     #[inline]
     fn dispatch_one_real_mbuf(
         &self,
@@ -3955,7 +3970,9 @@ impl Engine {
     ) -> u32 {
         use crate::counters::add;
         let m = mbuf.as_ptr();
-        let bytes = unsafe { crate::mbuf_data_slice(m) };
+        let bytes_cow =
+            unsafe { crate::mbuf_data_slice_for_rx(m, &self.counters.eth) };
+        let bytes: &[u8] = &bytes_cow;
         // Task 8: read ol_flags once per mbuf at the RX boundary;
         // threaded through rx_frame -> handle_ipv4 -> tcp_input so
         // the IP + L4 offload classifications can gate on the bits

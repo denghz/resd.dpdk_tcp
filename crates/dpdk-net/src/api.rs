@@ -358,7 +358,12 @@ pub struct dpdk_net_eth_counters_t {
     pub rx_q0_bad_desc_num: u64,
     pub rx_q0_bad_req_id: u64,
     pub rx_q0_mbuf_alloc_fail: u64,
-    pub _pad: [u64; 2],
+    // C2 cross-phase retro fix — multi-segment RX linearization counter.
+    // Mirror of `dpdk_net_core::counters::EthCounters::rx_multi_seg_linearized`.
+    // Slow-path per spec §9.1.1; bumped exactly once per linearized chain
+    // in `mbuf_data_slice_for_rx`. See core counters.rs for the full doc.
+    pub rx_multi_seg_linearized: u64,
+    pub _pad: [u64; 1],
 }
 #[repr(C, align(64))]
 pub struct dpdk_net_ip_counters_t {

@@ -283,7 +283,8 @@ struct DPDK_NET_ALIGNED(64) dpdk_net_eth_counters_t {
   uint64_t rx_q0_bad_desc_num;
   uint64_t rx_q0_bad_req_id;
   uint64_t rx_q0_mbuf_alloc_fail;
-  uint64_t _pad[2];
+  uint64_t rx_multi_seg_linearized;
+  uint64_t _pad[1];
 };
 
 struct DPDK_NET_ALIGNED(64) dpdk_net_ip_counters_t {

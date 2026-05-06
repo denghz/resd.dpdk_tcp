@@ -513,6 +513,22 @@ fn cover_eth_rx_q0_mbuf_alloc_fail() {
     h.assert_counter_gt_zero("eth.rx_q0_mbuf_alloc_fail");
 }
 
+/// C2 cross-phase retro fix: `eth.rx_multi_seg_linearized` — RX-side
+/// linearization counter, bumped exactly once per multi-segment mbuf
+/// chain in `crate::mbuf_data_slice_for_rx` (lib.rs). Real bump site
+/// requires a multi-seg DPDK mbuf chain, which the test-server bypass
+/// never produces (its inject path runs single-segment frames). Real
+/// coverage lives in the test-inject `inject_rx_chain_smoke` test
+/// (which exercises the linearization through a real DPDK chain) and
+/// the `mbuf_data_slice_tests` unit tests in `crates/dpdk-net-core/src/lib.rs`.
+/// Static audit (T3) verified the increment site at lib.rs.
+#[test]
+fn cover_eth_rx_multi_seg_linearized() {
+    let h = CovHarness::new();
+    h.bump_counter_one_shot("eth.rx_multi_seg_linearized");
+    h.assert_counter_gt_zero("eth.rx_multi_seg_linearized");
+}
+
 // ---------------------------------------------------------------------
 // T5: ip.* scenarios (12 counters). All REAL-PATH via `inject_rx_frame`
 // crafting specific IP-header byte mutations that drive each

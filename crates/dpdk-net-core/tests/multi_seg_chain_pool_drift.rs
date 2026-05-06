@@ -365,16 +365,23 @@ fn multi_seg_chain_pool_drift_zero_across_n_iters() {
          {rx_data_delta}. Chain-walk paths likely NOT exercised — \
          pool-drift assertion would pass vacuously."
     );
-    // `eth.rx_bytes` bumps by head segment data_len per `inject_rx_chain`
-    // call (one bump per head, NOT per chain link). Lower bound check:
-    // (ITERATIONS + 1) * head_frame_bytes (each iter's head frame is
-    // fixed size = ETH(14) + IP(20) + TCP(20) + HEAD_PAYLOAD_LEN, plus
-    // the OOO chain's head).
-    let expected_head_frame_bytes = (14 + 20 + 20 + HEAD_PAYLOAD_LEN) as u64;
+    // C2 cross-phase retro fix: `eth.rx_bytes` now bumps by the
+    // linearized total of every chain (= `pkt_len` = head data_len +
+    // every link's data_len). Pre-C2 it bumped by the head segment's
+    // data_len only — that constant matched the buggy behaviour
+    // observed by the L3 decoder (which saw only the head's bytes and
+    // would silently reject scatter frames whose IP `total_length`
+    // exceeded head `data_len`). Post-C2 the lower bound is
+    // `EXPECTED_NON_EMPTY_DISPATCHES * full_chain_bytes` because each
+    // multi-seg chain is linearized before the per-mbuf `add(rx_bytes,
+    // bytes.len())` call.
+    let expected_full_chain_bytes = (14 + 20 + 20 + HEAD_PAYLOAD_LEN
+        + LINK1_PAYLOAD_LEN
+        + LINK2_PAYLOAD_LEN) as u64;
     assert!(
-        eth_rx_bytes_delta >= EXPECTED_NON_EMPTY_DISPATCHES * expected_head_frame_bytes,
+        eth_rx_bytes_delta >= EXPECTED_NON_EMPTY_DISPATCHES * expected_full_chain_bytes,
         "eth.rx_bytes delta {eth_rx_bytes_delta} < {EXPECTED_NON_EMPTY_DISPATCHES} * \
-         head_frame_bytes({expected_head_frame_bytes}); chains may have been \
+         full_chain_bytes({expected_full_chain_bytes}); chains may have been \
          truncated before dispatch"
     );
 
