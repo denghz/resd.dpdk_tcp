@@ -4963,8 +4963,9 @@ impl Engine {
             return;
         };
         let t = conn.four_tuple();
-        // RFC 9293 §3.10.7.2: RST ACK must advance past all consumed sequence
-        // space including SYN/FIN flags (each consumes 1 seq number).
+        // RFC 9293 §3.10.7.4 ("Other states"): RST ACK must advance past all
+        // consumed sequence space; SEG.LEN (§3.4 glossary) counts SYN/FIN
+        // flags as 1 seq number each in addition to data bytes.
         let syn_len = ((incoming.flags & TCP_SYN) != 0) as u32;
         let fin_len = ((incoming.flags & TCP_FIN) != 0) as u32;
         let ack = incoming
