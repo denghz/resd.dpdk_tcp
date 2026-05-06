@@ -156,6 +156,31 @@ pub fn open_persistent_connections(
     Ok(out)
 }
 
+/// Close all connections opened by `open_persistent_connections`.
+///
+/// Sends TCP FIN for each handle, then pumps the engine briefly to
+/// drain the FIN through the wire and allow the engine to enter
+/// TIME_WAIT / CLOSED. Ignores individual `close_conn` errors (e.g.
+/// handles already closed by ETIMEDOUT) so every handle gets a close
+/// attempt. Call this between buckets to prevent connection
+/// accumulation from exhausting the TX data mempool at high C.
+pub fn close_persistent_connections(
+    engine: &Engine,
+    conns: Vec<ConnHandle>,
+) {
+    use std::time::{Duration, Instant};
+    for h in &conns {
+        let _ = engine.close_conn(*h);
+    }
+    // Pump for ~500 ms so the FINs and the peer's FIN-ACKs have time to
+    // transit. The engine needs to drive its own poll loop to process
+    // inbound FIN-ACKs and advance connections to CLOSED / TIME_WAIT.
+    let drain_deadline = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < drain_deadline {
+        engine.poll_once();
+    }
+}
+
 /// Drive one bucket on the dpdk_net side.
 ///
 /// Sequence per spec §11.2:
