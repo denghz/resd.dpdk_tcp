@@ -4622,7 +4622,10 @@ impl Engine {
         {
             let mut ft = self.flow_table.borrow_mut();
             if let Some(conn) = ft.get_mut(handle) {
-                if conn.state == TcpState::TimeWait && outcome.tx == TxAction::Ack {
+                if conn.state == TcpState::TimeWait
+                    && outcome.tx == TxAction::Ack
+                    && !outcome.bad_seq
+                {
                     let msl_ns = (self.cfg.tcp_msl_ms as u64) * 1_000_000;
                     conn.time_wait_deadline_ns =
                         Some(crate::clock::now_ns().saturating_add(2 * msl_ns));

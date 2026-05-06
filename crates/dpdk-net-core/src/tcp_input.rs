@@ -1496,10 +1496,22 @@ fn handle_close_path(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
     }
 
     // TIME_WAIT: replay-ACK anything the peer sends; reaper will move
-    // us to CLOSED via the engine tick (Task 19).
+    // us to CLOSED via the engine tick (Task 19). Per RFC 9293 §3.10.7.8,
+    // the 2×MSL timer must only restart on in-window segments — gate that
+    // via bad_seq=true for out-of-window arrivals so the engine doesn't
+    // refresh a reaper deadline on stale duplicates.
     if conn.state == TcpState::TimeWait {
+        let seg_len = seg.payload.len() as u32 + ((seg.flags & TCP_FIN) != 0) as u32;
+        let in_win = if seg_len == 0 {
+            seg.seq == conn.rcv_nxt
+        } else {
+            let last = seg.seq.wrapping_add(seg_len).wrapping_sub(1);
+            in_window(conn.rcv_nxt, seg.seq, conn.rcv_wnd)
+                && in_window(conn.rcv_nxt, last, conn.rcv_wnd)
+        };
         return Outcome {
             tx: TxAction::Ack,
+            bad_seq: !in_win,
             ..Outcome::base()
         };
     }
@@ -2884,7 +2896,10 @@ mod tests {
         let mut c = TcpConn::new_client(t, 1000, 1460, 1024, 2048, 5000, 5000, 1_000_000);
         c.state = TcpState::TimeWait;
         c.our_fin_seq = Some(1001);
-        c.rcv_nxt = 5002;
+        // Place the next-expected sequence inside the window for this
+        // segment so the in-window check passes (B3 added a window
+        // gate to the TIME_WAIT replay-ACK path).
+        c.rcv_nxt = 5001;
         c.rcv_wnd = 1024;
         let seg = ParsedSegment {
             src_port: 5000,
@@ -2900,6 +2915,46 @@ mod tests {
         let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
         assert_eq!(out.tx, TxAction::Ack);
         assert_eq!(out.new_state, None); // stay in TIME_WAIT until reaper
+        // B3: in-window segment must NOT mark bad_seq, so the engine
+        // refreshes the 2×MSL reaper deadline.
+        assert!(!out.bad_seq);
+    }
+
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
+    #[test]
+    fn time_wait_out_of_window_sets_bad_seq() {
+        // B3: an out-of-window segment in TIME_WAIT must still get a
+        // replay-ACK, but with bad_seq=true so the engine does NOT
+        // restart the 2×MSL timer (RFC 9293 §3.10.7.8).
+        use crate::flow_table::FourTuple;
+        use crate::tcp_conn::TcpConn;
+        let t = FourTuple {
+            local_ip: 0x0a_00_00_02,
+            local_port: 40000,
+            peer_ip: 0x0a_00_00_01,
+            peer_port: 5000,
+        };
+        let mut c = TcpConn::new_client(t, 1000, 1460, 1024, 2048, 5000, 5000, 1_000_000);
+        c.state = TcpState::TimeWait;
+        c.our_fin_seq = Some(1001);
+        c.rcv_nxt = 5002;
+        c.rcv_wnd = 1024;
+        // seq is way past the receive window — clearly out-of-window.
+        let seg = ParsedSegment {
+            src_port: 5000,
+            dst_port: 40000,
+            seq: 99_999,
+            ack: 1002,
+            flags: TCP_ACK,
+            window: 0,
+            header_len: 20,
+            payload: &[],
+            options: &[],
+        };
+        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
+        assert_eq!(out.tx, TxAction::Ack);
+        assert!(out.bad_seq);
+        assert_eq!(out.new_state, None);
     }
 
     // A4 Task 19: cross-phase backfill flags on `Outcome`.
