@@ -171,34 +171,29 @@ fn rx_partial_read_split_resumes_or_observes_aligned_delivery() {
         for ev in &evs {
             if let InternalEvent::Readable {
                 conn,
-                seg_idx_start,
-                seg_count,
+                segs,
                 total_len,
                 ..
             } = ev
             {
                 if *conn == handle {
-                    let ft = engine.flow_table();
-                    if let Some(conn_entry) = ft.get(handle) {
-                        let start = *seg_idx_start as usize;
-                        let end = start + *seg_count as usize;
-                        let mut event_bytes: u32 = 0;
-                        for iovec in &conn_entry.readable_scratch_iovecs[start..end] {
-                            let slice = unsafe {
-                                std::slice::from_raw_parts(iovec.base, iovec.len as usize)
-                            };
-                            echoed.extend_from_slice(slice);
-                            event_bytes += iovec.len;
-                        }
-                        // Per-event Σ len must match total_len in the
-                        // event header — this is the wire-level contract
-                        // for the scatter-gather ABI.
-                        assert_eq!(
-                            event_bytes, *total_len,
-                            "per-event Σ iovec.len = {}, event.total_len = {}",
-                            event_bytes, total_len
-                        );
+                    // C1: iovec slice owned by the event itself.
+                    let mut event_bytes: u32 = 0;
+                    for iovec in segs {
+                        let slice = unsafe {
+                            std::slice::from_raw_parts(iovec.base, iovec.len as usize)
+                        };
+                        echoed.extend_from_slice(slice);
+                        event_bytes += iovec.len;
                     }
+                    // Per-event Σ len must match total_len in the
+                    // event header — this is the wire-level contract
+                    // for the scatter-gather ABI.
+                    assert_eq!(
+                        event_bytes, *total_len,
+                        "per-event Σ iovec.len = {}, event.total_len = {}",
+                        event_bytes, total_len
+                    );
                 }
             }
         }

@@ -5196,17 +5196,28 @@ impl Engine {
         }
         let seg_count = conn.readable_scratch_iovecs.len() as u32;
 
-        // A6.6 T9: single READABLE event covers the full iovec slice.
-        // `seg_idx_start` is always 0 — scratch is cleared at the top
-        // of this call and we only emit one event per deliver_readable
-        // invocation.
+        // C1: move both vectors into the event so the event itself owns
+        // the iovec descriptors AND the mbuf refcounts that keep their
+        // `base` pointers valid. `std::mem::take` leaves the per-conn
+        // scratch empty (capacity retained for the next deliver_readable
+        // on this conn — §7.6 scratch-reuse policy). The top-of-poll
+        // cleanup in `poll_once` becomes a no-op for these slots in the
+        // common path; it is still defensive against any conn whose
+        // delivery never produced an event.
+        let event_segs: Vec<crate::iovec::DpdkNetIovec> =
+            std::mem::take(&mut conn.readable_scratch_iovecs);
+        let event_owned_mbufs: smallvec::SmallVec<[crate::tcp_conn::InOrderSegment; 4]> =
+            std::mem::take(&mut conn.delivered_segments);
+
+        // A6.6 T9 / C1: single READABLE event covers the full iovec
+        // slice. The event now owns both the iovec Vec and the mbuf
+        // refcounts; lifetime no longer depends on the per-conn scratch.
         // A10 D4 (G1+G2): obs-none compiles the READABLE push + now_ns
         // + per-event observability counter bumps away. The pop loop
-        // above and the `readable_scratch_iovecs` materialization stay
-        // — those are the application-visible delivery primitives,
-        // not observability. The `recv_buf_delivered` bump is kept as
-        // a slow-path counter (cumulative byte throughput, not per-
-        // event observability).
+        // above and the iovec materialization stay — those are the
+        // application-visible delivery primitives, not observability.
+        // The `recv_buf_delivered` bump is kept as a slow-path counter
+        // (cumulative byte throughput, not per-event observability).
         #[cfg(not(feature = "obs-none"))]
         {
             let mut events = self.events.borrow_mut();
@@ -5231,8 +5242,8 @@ impl Engine {
                 events.push(
                     InternalEvent::Readable {
                         conn: handle,
-                        seg_idx_start: 0,
-                        seg_count,
+                        segs: event_segs,
+                        owned_mbufs: event_owned_mbufs,
                         total_len,
                         rx_hw_ts_ns,
                         emitted_ts_ns: crate::clock::now_ns(),
@@ -5244,7 +5255,13 @@ impl Engine {
         }
         #[cfg(feature = "obs-none")]
         {
-            let _ = (seg_count, total_len, rx_hw_ts_ns);
+            // Under obs-none the event is dropped at the queue boundary
+            // (push is a no-op), which drops `event_owned_mbufs` here
+            // and returns each refcount unit. Bind the locals so the
+            // drop runs at the end of this scope (matches the default
+            // path's drop ordering: refcounts drop just after the push,
+            // not before the `recv_buf_delivered` bump).
+            let _ = (seg_count, total_len, rx_hw_ts_ns, event_segs, event_owned_mbufs);
         }
         drop(ft);
         add(&self.counters.tcp.recv_buf_delivered, total_delivered as u64);
@@ -6709,6 +6726,19 @@ impl Drop for Engine {
         // SmallVec → TcpConn → FlowTable → Engine, dereffing an mbuf
         // address inside a memzone marked `(deleted)` in /proc/maps.
         //
+        // C1: clear EventQueue first. Post-C1 `InternalEvent::Readable`
+        // owns `InOrderSegment` mbuf-refcount holders directly; any
+        // queued-but-not-drained Readable event would, on its drop,
+        // call `shim_rte_mbuf_refcnt_update(-1)` against an mbuf whose
+        // mempool is about to be freed. Drain and let each event drop
+        // here while the mempools are still alive. Pre-C1 this step
+        // was unnecessary because `Readable` only carried indices into
+        // per-conn scratch (no refcount ownership).
+        {
+            let q = self.events.get_mut();
+            while q.pop().is_some() {}
+        }
+
         // Step 1: clear FlowTable. Drops every TcpConn, which drops
         // recv-segment + reorder + snd_retrans + delivered_segments
         // mbufs back into still-alive mempools.
@@ -7287,6 +7317,15 @@ impl Engine {
     /// No-op when no conn holds pinned mbuf refs. Cheap — one pass over
     /// the flow table.
     pub fn test_clear_pinned_rx_mbufs(&self) {
+        // C1: drain the EventQueue first. Post-C1 `InternalEvent::Readable`
+        // owns `InOrderSegment` mbuf refs; queued-but-not-drained events
+        // would otherwise fire `MbufHandle::Drop` after the mempool
+        // teardown. Pre-C1 the events only carried indices and were
+        // safe to leave queued at engine drop.
+        {
+            let mut q = self.events.borrow_mut();
+            while q.pop().is_some() {}
+        }
         let mut ft = self.flow_table.borrow_mut();
         let handles: Vec<_> = ft.iter_handles().collect();
         for h in handles {

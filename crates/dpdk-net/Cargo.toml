@@ -35,6 +35,7 @@ libc.workspace = true
 
 [dev-dependencies]
 libc.workspace = true
+smallvec.workspace = true
 
 [build-dependencies]
 cbindgen = "0.26"

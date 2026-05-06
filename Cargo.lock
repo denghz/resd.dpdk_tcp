@@ -631,6 +631,7 @@ dependencies = [
  "dpdk-net-core",
  "dpdk-net-sys",
  "libc",
+ "smallvec",
 ]
 
 [[package]]

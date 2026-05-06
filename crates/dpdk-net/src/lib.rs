@@ -529,57 +529,37 @@ pub unsafe extern "C" fn dpdk_net_poll(
         return 0;
     }
     let mut filled: u32 = 0;
-    e.drain_events(max_events, |ev, engine| {
-        // A6.6 T8/T9: resolve the `Readable` variant's scatter-gather
-        // payload by pointing `segs` at the owning conn's
-        // `readable_scratch_iovecs` (per-conn scratch). The Vec's
-        // `as_ptr()` is stable because nothing appends to it between
-        // deliver_readable-emit and this drain call — top-of-next-
-        // `poll_once` is the only site that mutates the scratch, and
-        // it runs AFTER the app has consumed the event.
+    e.drain_events(max_events, |ev, _engine| {
+        // C1: the `Readable` variant now owns its iovec Vec and the
+        // mbuf-refcount holders (`owned_mbufs`) directly. We point
+        // `segs` at the event's own `Vec::as_ptr()` rather than at the
+        // owning conn's per-poll scratch.
         //
-        // `seg_idx_start` is always 0 in A6.6 (one emit per
-        // deliver_readable; scratch is cleared and rebuilt per event
-        // for that conn), but the offset-add below is future-proof
-        // against a multi-emit-per-poll design.
+        // SAFETY: the `InternalEvent` we are reading from is a borrow
+        // into `EventQueue.q[front]` — `drain_events` calls `pop()`
+        // (returning the event by value) only AFTER `sink` returns. The
+        // Vec backing `segs` lives at a stable address until the event
+        // is dropped, which happens after this closure returns. The
+        // raw pointer we hand back to C is only required to be valid
+        // through the `dpdk_net_poll` return — the caller materializes
+        // it into `events_out[i].u.readable` and is documented to
+        // consume the iovecs before the next `dpdk_net_poll`.
+        //
+        // The mbuf-refcount holders that pin the `base` pointers live
+        // alongside the iovec Vec on the same event; they drop together
+        // when the event is dropped at the next poll's
+        // top-of-`drain_events` boundary.
         let readable_view: dpdk_net_event_readable_t = match ev {
             dpdk_net_core::tcp_events::InternalEvent::Readable {
-                conn,
-                seg_idx_start,
-                seg_count,
+                segs,
                 total_len,
                 ..
             } => {
-                let ft = engine.flow_table();
-                match ft.get(*conn) {
-                    Some(c) => {
-                        // SAFETY: `c.readable_scratch_iovecs` is a
-                        // per-conn Vec whose capacity is preserved
-                        // across the poll; `seg_idx_start` is always
-                        // 0 (single emit per deliver_readable) and
-                        // `seg_count` is bounded by the Vec's len
-                        // when the event was enqueued. The Vec is
-                        // cleared only at the top of the NEXT
-                        // `poll_once`, so the pointers remain valid
-                        // for the entire event-drain window of THIS
-                        // poll.
-                        let segs_ptr = unsafe {
-                            c.readable_scratch_iovecs
-                                .as_ptr()
-                                .add(*seg_idx_start as usize)
-                                as *const dpdk_net_iovec_t
-                        };
-                        dpdk_net_event_readable_t {
-                            segs: segs_ptr,
-                            n_segs: *seg_count,
-                            total_len: *total_len,
-                        }
-                    }
-                    None => dpdk_net_event_readable_t {
-                        segs: std::ptr::null(),
-                        n_segs: 0,
-                        total_len: 0,
-                    },
+                let segs_ptr = segs.as_ptr() as *const dpdk_net_iovec_t;
+                dpdk_net_event_readable_t {
+                    segs: segs_ptr,
+                    n_segs: segs.len() as u32,
+                    total_len: *total_len,
                 }
             }
             _ => dpdk_net_event_readable_t {
@@ -1437,8 +1417,8 @@ mod tests {
             },
             InternalEvent::Readable {
                 conn: ConnHandle::default(),
-                seg_idx_start: 0,
-                seg_count: 0,
+                segs: Vec::new(),
+                owned_mbufs: smallvec::SmallVec::new(),
                 total_len: 0,
                 rx_hw_ts_ns: 0,
                 emitted_ts_ns: EMITTED,
