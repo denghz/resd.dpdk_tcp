@@ -158,7 +158,6 @@ fn pressure_sack_blocks_hermeticity() {
             &vec![0x5au8; OOO_SEG as usize],
         );
         h.eng.inject_rx_frame(&frame).expect("inject OOO");
-        h.eng.poll_once();
         let _ = drain_tx_frames();
         h.eng.drain_events(64, |_, _| {});
     }
@@ -196,13 +195,11 @@ fn pressure_sack_blocks_hermeticity() {
             TCP_ACK, u16::MAX, opts, &[],
         );
         h.eng.inject_rx_frame(&frame).expect("inject SACK ACK");
-        h.eng.poll_once();
         let _ = drain_tx_frames();
         h.eng.drain_events(64, |_, _| {});
     }
 
     // ── Settle ─────────────────────────────────────────────────────────
-    h.eng.poll_once();
     let _ = drain_tx_frames();
     h.eng.drain_events(64, |_, _| {});
 
@@ -224,7 +221,6 @@ fn pressure_sack_blocks_hermeticity() {
 
     // Close connection.
     let _ = h.eng.close_conn(conn);
-    h.eng.poll_once();
     let _ = drain_tx_frames();
     h.eng.drain_events(64, |_, _| {});
 

@@ -1,27 +1,36 @@
 //! Pressure Suite — `pressure-reassembly-saturation-smoke`.
 //! A11.3 Lane A.
 //!
-//! Workload: open one connection via the test-server bypass, inject an
-//! in-order payload segment to partially fill the RX recv buffer, then
-//! drive a series of out-of-order (OOO) frames that saturate the
-//! reassembly queue to its byte-cap.  A final OOO frame intentionally
-//! exceeds the cap, triggering `tcp.recv_buf_drops`.
+//! Workload: open one connection via the test-server bypass, inject one
+//! in-order payload segment (delivered immediately via deliver_readable),
+//! then drive a series of out-of-order (OOO) frames that fill the reorder
+//! queue.  Once `emit_ack` shrinks `rcv_wnd` in response to a growing
+//! reorder queue, additional OOO frames fall out-of-window and are
+//! silently discarded — this exercises the window-contraction / OOO-reject
+//! path without a RST.
+//!
+//! Note on recv_buf_drops: in the test-server bypass path,
+//! deliver_readable drains recv.bytes synchronously after each
+//! inject_rx_frame call, so recv.bytes is always empty between frames.
+//! recv_buf_drops can only fire if a single in-order frame's payload
+//! exceeds the cap, which does not apply here.  OOO frames that arrive
+//! after rcv_wnd has shrunk are rejected by the window check before
+//! reaching the cap-full path.
 //!
 //! Engine config:
-//!   * `recv_buffer_bytes = 4096` — small cap so 3–4 MSS-sized OOO
-//!     frames exhaust it.
+//!   * `recv_buffer_bytes = 4096` — small cap so the reorder queue
+//!     exhausts the advertised window after a few OOO frames.
 //!   * `max_connections = 4` — only one conn needed.
 //!   * `tcp_msl_ms = 100` — fast TIME_WAIT for teardown.
 //!
 //! Counters asserted (deltas across the workload):
-//!   * `tcp.recv_buf_drops` > 0  — cap was hit.
+//!   * `tcp.recv_buf_delivered` > 0  — the in-order segment was delivered.
 //!   * `tcp.rx_reassembly_queued` > 0  — OOO bytes were enqueued.
 //!   * `tcp.rx_reassembly_hole_filled` == 0  — no gap was ever closed
 //!       (no in-order arrival after the OOO storm).
-//!   * `tcp.mbuf_refcnt_drop_unexpected` == 0  — refcount accounting
-//!       clean through cap-drop rollback.
+//!   * `tcp.mbuf_refcnt_drop_unexpected` == 0  — refcount accounting clean.
 //!   * `obs.events_dropped` == 0  — event-queue cap not breached.
-//!   * `tcp.tx_rst` == 0  — cap-drop does not issue RSTs.
+//!   * `tcp.tx_rst` == 0  — OOO discard and window contraction do not RST.
 //!   * `tcp.rx_mempool_avail`, `tcp.tx_data_mempool_avail` both ±32.
 //!
 //! Gated behind `all(feature = "pressure-test", feature = "test-server")`.
@@ -79,14 +88,13 @@ fn pressure_reassembly_saturation_smoke() {
 
     // ── Phase 2: in-order fill (one SEG_BYTES segment) ─────────────────
     //
-    // inject_peer_data sends at seq = peer_seq, advances peer_seq by
-    // SEG_BYTES.  Engine delivers to recv.bytes, advances rcv_nxt by
-    // SEG_BYTES, emits READABLE event.
+    // inject_peer_data injects at seq = peer_seq.  In the test-server
+    // bypass, deliver_readable drains recv.bytes synchronously after each
+    // inject_rx_frame call.
     //
-    // After: recv.bytes = SEG_BYTES, rcv_nxt = 0x10000401,
-    //        free_space_total = RECV_BUF − SEG_BYTES = 3072.
+    // After: recv.bytes = 0 (drained), rcv_nxt = 0x10000401,
+    //        free_space_total = RECV_BUF = 4096.
     h.inject_peer_data(&vec![0x55u8; SEG_BYTES]);
-    h.eng.poll_once();
     let _ = drain_tx_frames();
     h.eng.drain_events(64, |_, _| {});
 
@@ -97,16 +105,15 @@ fn pressure_reassembly_saturation_smoke() {
     //
     // Inject 3 OOO frames, each SEG_BYTES (1024) bytes, starting at
     // rcv_nxt+1 (one byte past the in-order delivery point).  This
-    // creates a 1-byte gap between in-order and OOO data, preventing
-    // the drain path from collapsing the gap automatically.
+    // creates a 1-byte gap, preventing the gap-fill path from triggering.
     //
-    // Reorder-queue accounting after each frame (cap = RECV_BUF = 4096):
-    //   OOO-1: reorder = 1024, free_total = 4096 − 1024 − 1024 = 2048
-    //   OOO-2: reorder = 2048, free_total = 4096 − 1024 − 2048 = 1024
-    //   OOO-3: reorder = 3072, free_total = 4096 − 1024 − 3072 = 0
+    // recv.bytes = 0 throughout (drained synchronously by deliver_readable).
+    // Reorder-queue accounting (cap = RECV_BUF = 4096):
+    //   OOO-0: reorder = 1024, free_total = 4096 − 1024 = 3072 → rcv_wnd = 3072
+    //   OOO-1: reorder = 2048, free_total = 4096 − 2048 = 2048 → rcv_wnd = 2048
+    //   OOO-2: seq offset = 2049 ≥ rcv_wnd=2048 → out-of-window, REJECTED
     //
-    // Window check (rcv_wnd = RECV_BUF = 4096, fixed at conn creation):
-    //   OOO-3 seq offset from rcv_nxt = 2049 < 4096 → in-window. ✓
+    // Only OOO-0 and OOO-1 are accepted; rx_reassembly_queued += 2048.
     set_virt_ns(4_000_000);
     for i in 0u32..3 {
         let ooo_seq = rcv_nxt.wrapping_add(1).wrapping_add(i * SEG_BYTES as u32);
@@ -123,19 +130,17 @@ fn pressure_reassembly_saturation_smoke() {
             &vec![0xabu8; SEG_BYTES],
         );
         h.eng.inject_rx_frame(&frame).expect("inject OOO");
-        h.eng.poll_once();
         let _ = drain_tx_frames();
         h.eng.drain_events(64, |_, _| {});
     }
-    // free_space_total = 0 after the loop.
+    // After loop: reorder = 2048, free_space_total = 2048 (OOO-2 rejected).
 
-    // ── Phase 4: cap-overflow frame (triggers recv_buf_drops) ──────────
+    // ── Phase 4: additional OOO frame (out-of-window after rcv_wnd shrink) ──
     //
-    // Inject one more OOO frame.  free_space_total = 0 → tcp_input hits
-    // the `total_cap == 0` branch → buf_full_drop = payload.len() = 64.
-    //
-    // Window check: seq offset = 3073 < 4096 (rcv_wnd) → in-window. ✓
-    // The mbuf pre-bump is rolled back when no ref is retained (cap = 0).
+    // After OOO-0 and OOO-1 filled the reorder queue to 2×SEG_BYTES,
+    // emit_ack shrinks rcv_wnd to free_space_total = RECV_BUF - 2×SEG_BYTES.
+    // This frame's seq offset (3×SEG_BYTES + 1) exceeds the shrunken window
+    // and is silently dropped by the window check — no RST, no mbuf leak.
     set_virt_ns(5_000_000);
     {
         let overflow_seq = rcv_nxt.wrapping_add(1).wrapping_add(3 * SEG_BYTES as u32);
@@ -152,21 +157,19 @@ fn pressure_reassembly_saturation_smoke() {
             &[0xddu8; 64],
         );
         h.eng.inject_rx_frame(&frame).expect("inject overflow OOO");
-        h.eng.poll_once();
         let _ = drain_tx_frames();
         h.eng.drain_events(64, |_, _| {});
     }
 
     // ── Settle ─────────────────────────────────────────────────────────
-    h.eng.poll_once();
     let _ = drain_tx_frames();
 
     // ── Snapshot + assertions ──────────────────────────────────────────
     let after = CounterSnapshot::capture(h.eng.counters());
     let delta = after.delta_since(&bucket.before);
 
-    // Cap exceeded: at least one cap-drop from the overflow OOO frame.
-    assert_delta(&delta, "tcp.recv_buf_drops", Relation::Gt(0));
+    // In-order segment was delivered to the app layer.
+    assert_delta(&delta, "tcp.recv_buf_delivered", Relation::Gt(0));
 
     // OOO bytes were enqueued in the reassembly queue across the storm.
     assert_delta(&delta, "tcp.rx_reassembly_queued", Relation::Gt(0));
@@ -182,7 +185,7 @@ fn pressure_reassembly_saturation_smoke() {
     // Event-queue cap was not breached.
     assert_delta(&delta, "obs.events_dropped", Relation::Eq(0));
 
-    // Cap-drop must not produce RSTs (it is a silent receive-side drop).
+    // OOO discard and window contraction must not produce RSTs.
     assert_delta(&delta, "tcp.tx_rst", Relation::Eq(0));
 
     // Mempool drift: both pools must round-trip to ±POOL_DRIFT of baseline
@@ -201,7 +204,6 @@ fn pressure_reassembly_saturation_smoke() {
     // Close the connection to allow the engine to reap its TcpConn slot
     // and release the reorder-queue mbufs before harness teardown.
     let _ = h.eng.close_conn(conn);
-    h.eng.poll_once();
     let _ = drain_tx_frames();
     h.eng.drain_events(64, |_, _| {});
 
