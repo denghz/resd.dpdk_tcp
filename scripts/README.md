@@ -32,7 +32,7 @@ Per-merge pipelines expect the Jenkins agent to provide:
   collide. Jenkins must either pin the two TAP stages
   (`hardening-cpp-sanitizers.sh`, `hardening-no-alloc.sh`) to a dedicated
   agent label with `disableConcurrentBuilds`, or wrap them in a
-  `lock(resource: 'dpdk-tap')` block. The 12 non-TAP stages can
+  `lock(resource: 'dpdk-tap')` block. The 13 non-TAP stages can
   parallelize freely across any number of agents — each script `cd`s to
   the repo root and owns its own build artifacts under `target/`.
 
@@ -46,30 +46,31 @@ Safe to re-run; `apt-get install` is a no-op once packages are present,
 `rustup toolchain install` is a no-op if the toolchain is already there,
 and `cargo install cargo-fuzz` is guarded by `command -v`.
 
-## 2. Per-merge stages (14)
+## 2. Per-merge stages (15)
 
 Run in this order — cheapest-fails-first, with TAP-privileged stages
-last so the first 12 stages can fan out across a fleet of
+last so the first 13 stages can fan out across a fleet of
 non-privileged agents.
 
 | # | Stage | Script | Notes |
 |---|---|---|---|
 | 1 | Install deps | `scripts/ci-install-deps.sh` | idempotent; apt + rustup (stable+nightly) + miri + cargo-fuzz + pip scapy |
-| 2 | Header drift (cbindgen) | `scripts/check-header.sh` | fails if `include/dpdk_net.h` ≠ cbindgen output |
-| 3 | Fault-injector compile | `scripts/ci-fault-injector-compile.sh` | `cargo check -p dpdk-net-core --features fault-injector` |
-| 4 | Panic firewall | `scripts/hardening-panic-firewall.sh` | SIGABRT firewall test (`--features test-panic-entry`) |
-| 5 | Workspace unit + doc tests | `scripts/ci-unit-tests.sh` | per-package `cargo test -p <crate>` over all members + workspace-wide `cargo test --workspace --doc` |
-| 6 | Feature matrix (8 builds) | `scripts/ci-feature-matrix.sh` | `dpdk-net-core` × 8 feature configs per spec §13 |
-| 7 | Miri (pure-compute UB) | `scripts/hardening-miri.sh` | `cargo +nightly miri test` over `--lib` |
-| 8 | Counter / obs / knob coverage | `scripts/ci-counter-coverage.sh` | static ×2 + dynamic + obs smoke + knob-coverage |
-| 9 | Tcpreq probes (M4) | `scripts/ci-tcpreq-gate.sh` | `timeout 300 cargo test -p tcpreq-runner -- --test-threads=1` |
-| 10 | Fuzz smoke (per-merge) | `scripts/fuzz-smoke.sh` | TIME=30; 7 libFuzzer targets, ~3.5 min total |
-| 11 | Scapy corpus replay | `scripts/ci-scapy-replay.sh` | regenerates corpus + feeds through `scapy-fuzz-runner` |
-| 12 | Packetdrill corpus (3 sets) | `scripts/ci-packetdrill-corpus.sh` | shim build + server smoke + ligurio + shivansh + google |
-| 13 | **C++ sanitizers (sudo+TAP)** | `scripts/hardening-cpp-sanitizers.sh` | ASan+UBSan+LSan; full runtime exercise on TAP peer |
-| 14 | **No-alloc hot-path (sudo+TAP)** | `scripts/hardening-no-alloc.sh` | CountingAllocator audit; `--features bench-alloc-audit` |
+| 2 | Workspace-feature unification gate | `scripts/check-workspace-features.sh` | Pattern P1 / pressure-test plan T0 — fails if test/bench-only `dpdk-net-core` features unify into the production resolution |
+| 3 | Header drift (cbindgen) | `scripts/check-header.sh` | fails if `include/dpdk_net.h` ≠ cbindgen output |
+| 4 | Fault-injector compile | `scripts/ci-fault-injector-compile.sh` | `cargo check -p dpdk-net-core --features fault-injector` |
+| 5 | Panic firewall | `scripts/hardening-panic-firewall.sh` | SIGABRT firewall test (`--features test-panic-entry`) |
+| 6 | Workspace unit + doc tests | `scripts/ci-unit-tests.sh` | per-package `cargo test -p <crate>` over all members + workspace-wide `cargo test --workspace --doc` |
+| 7 | Feature matrix (8 builds) | `scripts/ci-feature-matrix.sh` | `dpdk-net-core` × 8 feature configs per spec §13 |
+| 8 | Miri (pure-compute UB) | `scripts/hardening-miri.sh` | `cargo +nightly miri test` over `--lib` |
+| 9 | Counter / obs / knob coverage | `scripts/ci-counter-coverage.sh` | static ×2 + dynamic + obs smoke + knob-coverage |
+| 10 | Tcpreq probes (M4) | `scripts/ci-tcpreq-gate.sh` | `timeout 300 cargo test -p tcpreq-runner -- --test-threads=1` |
+| 11 | Fuzz smoke (per-merge) | `scripts/fuzz-smoke.sh` | TIME=30; 7 libFuzzer targets, ~3.5 min total |
+| 12 | Scapy corpus replay | `scripts/ci-scapy-replay.sh` | regenerates corpus + feeds through `scapy-fuzz-runner` |
+| 13 | Packetdrill corpus (3 sets) | `scripts/ci-packetdrill-corpus.sh` | shim build + server smoke + ligurio + shivansh + google |
+| 14 | **C++ sanitizers (sudo+TAP)** | `scripts/hardening-cpp-sanitizers.sh` | ASan+UBSan+LSan; full runtime exercise on TAP peer |
+| 15 | **No-alloc hot-path (sudo+TAP)** | `scripts/hardening-no-alloc.sh` | CountingAllocator audit; `--features bench-alloc-audit` |
 
-The two TAP stages (13 + 14) are the only ones requiring `sudo` at
+The two TAP stages (14 + 15) are the only ones requiring `sudo` at
 runtime and the only ones contending for the host-global TAP namespace.
 
 ### Single-node aggregator
@@ -81,7 +82,7 @@ for developers reproducing CI locally):
 bash scripts/ci-all.sh
 ```
 
-`ci-all.sh` runs all 14 stages in the order above, fast-fails at
+`ci-all.sh` runs all 15 stages in the order above, fast-fails at
 startup if passwordless `sudo` is unavailable, and prints
 `=== ci-all: ALL PASSED ===` on success. Developers iterating locally
 can skip the apt/pip/rustup bootstrap with:
@@ -95,6 +96,7 @@ CI_ALL_SKIP_INSTALL=1 bash scripts/ci-all.sh
 ```groovy
 stage('per-merge (non-TAP, parallelizable)') {
     steps {
+        sh 'bash scripts/check-workspace-features.sh'
         sh 'bash scripts/check-header.sh'
         sh 'bash scripts/ci-fault-injector-compile.sh'
         sh 'bash scripts/hardening-panic-firewall.sh'
@@ -120,7 +122,7 @@ stage('per-merge (TAP, privileged agent)') {
 }
 ```
 
-Any of the 11 non-TAP working stages (2–12) may be split across
+Any of the 12 non-TAP working stages (2–13) may be split across
 parallel Jenkins stages on separate agents — each script is
 self-contained (it `cd`s to the repo root and builds into its own
 `target/` tree).

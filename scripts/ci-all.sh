@@ -32,7 +32,7 @@ if ! sudo -n true 2>/dev/null; then
     exit 1
 fi
 
-TOTAL=14
+TOTAL=15
 step() {
     echo ""
     echo "=== ci-all: stage $1/${TOTAL} — $2 ==="
@@ -45,24 +45,30 @@ else
     bash scripts/ci-install-deps.sh
 fi
 
-step  2 "check-header";              bash scripts/check-header.sh
-step  3 "ci-fault-injector-compile"; bash scripts/ci-fault-injector-compile.sh
-step  4 "hardening-panic-firewall";  bash scripts/hardening-panic-firewall.sh
-step  5 "ci-unit-tests";             bash scripts/ci-unit-tests.sh
-step  6 "ci-feature-matrix";         bash scripts/ci-feature-matrix.sh
-step  7 "hardening-miri";            bash scripts/hardening-miri.sh
-step  8 "ci-counter-coverage";       bash scripts/ci-counter-coverage.sh
-step  9 "ci-tcpreq-gate";            bash scripts/ci-tcpreq-gate.sh
-step 10 "fuzz-smoke";                TIME="${TIME:-30}" bash scripts/fuzz-smoke.sh
-step 11 "ci-scapy-replay";           bash scripts/ci-scapy-replay.sh
-step 12 "ci-packetdrill-corpus";     bash scripts/ci-packetdrill-corpus.sh
+# Stage 2: cheap mechanical workspace-feature unification gate (Pattern P1).
+# Runs `cargo metadata --offline` only — no compile, no link. Placed early so
+# a feature-leak failure surfaces in <2 s instead of after the long stages.
+# See scripts/check-workspace-features.sh banner for the leak class.
+step  2 "check-workspace-features";  bash scripts/check-workspace-features.sh
+
+step  3 "check-header";              bash scripts/check-header.sh
+step  4 "ci-fault-injector-compile"; bash scripts/ci-fault-injector-compile.sh
+step  5 "hardening-panic-firewall";  bash scripts/hardening-panic-firewall.sh
+step  6 "ci-unit-tests";             bash scripts/ci-unit-tests.sh
+step  7 "ci-feature-matrix";         bash scripts/ci-feature-matrix.sh
+step  8 "hardening-miri";            bash scripts/hardening-miri.sh
+step  9 "ci-counter-coverage";       bash scripts/ci-counter-coverage.sh
+step 10 "ci-tcpreq-gate";            bash scripts/ci-tcpreq-gate.sh
+step 11 "fuzz-smoke";                TIME="${TIME:-30}" bash scripts/fuzz-smoke.sh
+step 12 "ci-scapy-replay";           bash scripts/ci-scapy-replay.sh
+step 13 "ci-packetdrill-corpus";     bash scripts/ci-packetdrill-corpus.sh
 
 # TAP stages: require sudo + DPDK_NET_TEST_TAP=1. Placed last so that a
-# fleet of non-privileged agents can still run the 12 non-TAP stages above.
-step 13 "hardening-cpp-sanitizers (sudo+TAP)"
+# fleet of non-privileged agents can still run the 13 non-TAP stages above.
+step 14 "hardening-cpp-sanitizers (sudo+TAP)"
 sudo -E DPDK_NET_TEST_TAP=1 bash scripts/hardening-cpp-sanitizers.sh
 
-step 14 "hardening-no-alloc (sudo+TAP)"
+step 15 "hardening-no-alloc (sudo+TAP)"
 sudo -E DPDK_NET_TEST_TAP=1 bash scripts/hardening-no-alloc.sh
 
 echo ""
