@@ -34,16 +34,15 @@
 //! handles don't leak across buckets — same hygiene the dpdk_maxtp
 //! arm does to avoid `InvalidConnHandle` on later buckets.
 
-use std::io::ErrorKind;
 use std::os::raw::c_int;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
 
 use crate::dpdk_maxtp::TxTsMode;
+use crate::fstack_burst::CONNECT_TIMEOUT;
 use crate::fstack_ffi::{
-    ff_close, ff_connect, ff_ioctl, ff_read, ff_socket, ff_write, make_linux_sockaddr_in, AF_INET,
-    FIONBIO, SOCK_STREAM,
+    connect_nonblocking, ff_close, ff_errno, ff_read, ff_write, FF_EAGAIN, FF_EWOULDBLOCK,
 };
 use crate::maxtp::{Bucket, MaxtpSample};
 
@@ -73,6 +72,15 @@ pub struct BucketRun {
 /// Open `C` persistent F-Stack connections to the peer. Each carries
 /// non-blocking mode (`FIONBIO`) so partial-accept doesn't stall the
 /// round-robin pump.
+///
+/// Each socket is opened via [`connect_nonblocking`], which sets
+/// `FIONBIO` *before* `ff_connect` and threads the resulting
+/// `EINPROGRESS` through `ff_select` + `ff_getsockopt(SO_ERROR)`. The
+/// previous shape (blocking-connect-then-flip-NB) relied on F-Stack
+/// sockets defaulting to blocking — true today, but a fragile
+/// assumption that left no signal for connect failures other than
+/// "ff_connect returned -1" with no errno classification. This shape
+/// surfaces real failures (ECONNREFUSED, ETIMEDOUT) cleanly.
 pub fn open_persistent_connections(
     peer_ip_host_order: u32,
     peer_port: u16,
@@ -83,34 +91,16 @@ pub fn open_persistent_connections(
     }
     let mut out: Vec<c_int> = Vec::with_capacity(conn_count as usize);
     for i in 0..conn_count {
-        let fd = unsafe { ff_socket(AF_INET as c_int, SOCK_STREAM, 0) };
-        if fd < 0 {
-            close_all(&out);
-            anyhow::bail!("fstack_maxtp: ff_socket on conn {i} returned {fd}");
+        match connect_nonblocking(peer_ip_host_order, peer_port, CONNECT_TIMEOUT) {
+            Ok(fd) => out.push(fd),
+            Err(e) => {
+                close_all(&out);
+                anyhow::bail!(
+                    "fstack_maxtp: connect on conn {i} to {ip}:{peer_port} failed: {e}",
+                    ip = format_ip_host_order(peer_ip_host_order)
+                );
+            }
         }
-        // Connect first (blocking — F-Stack starts socket in default
-        // blocking mode), then flip to non-blocking for the pump
-        // loop. This avoids EINPROGRESS handling we'd otherwise need
-        // to thread through ff_kqueue.
-        let sa = make_linux_sockaddr_in(peer_ip_host_order, peer_port);
-        let rc = unsafe { ff_connect(fd, &sa, std::mem::size_of_val(&sa) as u32) };
-        if rc != 0 {
-            unsafe { ff_close(fd) };
-            close_all(&out);
-            anyhow::bail!(
-                "fstack_maxtp: ff_connect on conn {i} returned {rc} (peer {ip}:{peer_port})",
-                ip = format_ip_host_order(peer_ip_host_order)
-            );
-        }
-        // Flip to non-blocking for the pump.
-        let on: c_int = 1;
-        let rc = unsafe { ff_ioctl(fd, FIONBIO, &on as *const c_int) };
-        if rc != 0 {
-            unsafe { ff_close(fd) };
-            close_all(&out);
-            anyhow::bail!("fstack_maxtp: ff_ioctl(FIONBIO) on conn {i} returned {rc}");
-        }
-        out.push(fd);
     }
     Ok(out)
 }
@@ -175,6 +165,13 @@ pub fn run_bucket(cfg: &FStackMaxtpCfg, conns: &[c_int]) -> anyhow::Result<Bucke
 /// Pump writes round-robin across F-Stack sockets until `deadline`.
 /// Returns the total bytes accepted (sum of successful `ff_write`
 /// return values).
+///
+/// `ff_write` < 0 with `errno == EAGAIN` is treated as transient —
+/// skip to the next conn. Any other errno (ECONNRESET, EPIPE, EBADF)
+/// is recorded but not fatal: the bucket keeps pumping the remaining
+/// healthy conns, and the operator sees the anomaly via the bucket's
+/// goodput floor. We log the first non-EAGAIN error per fd so a
+/// wedged conn surfaces in the harness output without spamming.
 fn pump_round_robin(
     conns: &[c_int],
     payload: &[u8],
@@ -185,6 +182,10 @@ fn pump_round_robin(
     }
     let mut total: u64 = 0;
     let check_between_conns = conns.len() == 1;
+    // Track which fds have already logged a non-EAGAIN error so we
+    // don't spam the harness output for a wedged peer. Bounded by
+    // the conns slice length so this stays cheap.
+    let mut logged_error: Vec<bool> = vec![false; conns.len()];
     // Per-conn discard buffer — drain inbound bytes the peer echoes
     // (F-Stack peer is an echo-server, same as bench-e2e's). Without
     // draining, the recv buffer fills + backpressures the writer
@@ -194,7 +195,7 @@ fn pump_round_robin(
         if Instant::now() >= deadline {
             return Ok(total);
         }
-        for &fd in conns {
+        for (idx, &fd) in conns.iter().enumerate() {
             // Drain inbound (non-blocking). EAGAIN -> nothing pending.
             let mut drained = 0usize;
             while drained < discard.len() * 4 {
@@ -217,14 +218,18 @@ fn pump_round_robin(
             if n > 0 {
                 total = total.saturating_add(n as u64);
             } else if n < 0 {
-                // EAGAIN / send-buffer-full — skip to next conn.
-                // Without an errno-location FFI we can't distinguish
-                // EAGAIN from a genuine ECONNRESET; treat all <0
-                // returns as transient and rely on the deadline to
-                // bound the bucket. A wedged conn would result in a
-                // low byte count on this bucket — operator sees the
-                // anomaly in the CSV.
-                let _ = ErrorKind::WouldBlock; // documentation
+                let e = ff_errno();
+                if e != FF_EAGAIN && e != FF_EWOULDBLOCK && !logged_error[idx] {
+                    eprintln!(
+                        "fstack_maxtp: ff_write returned {n} on fd={fd}; errno={e} \
+                         (not EAGAIN; bucket continues with remaining conns)"
+                    );
+                    logged_error[idx] = true;
+                }
+                // Even on a real error we keep pumping the remaining
+                // conns — the bucket's CSV row will reflect the loss
+                // via reduced goodput. A retry on a dead fd is cheap
+                // (returns instantly with the same errno).
             }
 
             if check_between_conns && Instant::now() >= deadline {

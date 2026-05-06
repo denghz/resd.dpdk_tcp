@@ -29,6 +29,29 @@
 //! use a `#[repr(C)]` mirror of `linux_sockaddr` here so the FFI
 //! signature lines up exactly.
 //!
+//! # Errno surface
+//!
+//! F-Stack syscalls return -1 on error and set the **host (Linux)**
+//! `errno` via `ff_os_errno` (see
+//! `/opt/src/f-stack/lib/ff_host_interface.c`). The translation is
+//! BSD → Linux internally, so callers compare against Linux libc
+//! errno values — `EAGAIN = 11`, `EINPROGRESS = 115` — NOT the
+//! FreeBSD numbers (35 / 36) that `ff_errno.h` documents as the
+//! pre-translation values. The [`ff_errno`] helper here reads
+//! `*__errno_location()` which is what F-Stack actually wrote to.
+//!
+//! # Non-blocking connect (`EINPROGRESS`) flow
+//!
+//! With `FIONBIO` set, `ff_connect` returns `-1` with `errno =
+//! EINPROGRESS` while the SYN is in flight. Callers must:
+//! 1. Detect `EINPROGRESS` (not bail).
+//! 2. Wait for the socket to become writable via `ff_select`.
+//! 3. Confirm via `ff_getsockopt(SO_ERROR)` (a deferred error like
+//!    `ECONNREFUSED` would otherwise go unnoticed until the next
+//!    `ff_write`).
+//!
+//! [`connect_nonblocking`] wraps that flow.
+//!
 //! # Lifetime + thread-safety
 //!
 //! `ff_init` MUST be called exactly once per process and from the
@@ -38,6 +61,7 @@
 
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int, c_uint, c_void};
+use std::time::{Duration, Instant};
 
 /// F-Stack's internal sockaddr shape — BSD-style on the wire for AF_INET,
 /// but the API is named `linux_sockaddr` because F-Stack converts between
@@ -50,6 +74,49 @@ use std::os::raw::{c_char, c_int, c_uint, c_void};
 pub struct LinuxSockaddr {
     pub sa_family: i16,
     pub sa_data: [u8; 14],
+}
+
+/// `fd_set` — same layout as Linux/FreeBSD: 1024 bits stored as 16 × u64.
+/// F-Stack's `kern_select` accepts the standard fd_set bit layout (see
+/// `lib/ff_syscall_wrapper.c::ff_select`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FdSet {
+    pub fds_bits: [u64; 16], // FD_SETSIZE / 64 = 1024 / 64
+}
+
+impl FdSet {
+    pub fn zero() -> Self {
+        FdSet { fds_bits: [0u64; 16] }
+    }
+
+    pub fn set(&mut self, fd: c_int) {
+        let i = (fd as usize) / 64;
+        let bit = (fd as usize) % 64;
+        if i < self.fds_bits.len() {
+            self.fds_bits[i] |= 1u64 << bit;
+        }
+    }
+
+    pub fn is_set(&self, fd: c_int) -> bool {
+        let i = (fd as usize) / 64;
+        let bit = (fd as usize) % 64;
+        if i < self.fds_bits.len() {
+            (self.fds_bits[i] & (1u64 << bit)) != 0
+        } else {
+            false
+        }
+    }
+}
+
+/// `struct timeval` — Linux/FreeBSD layout (8 B sec + 8 B usec on
+/// 64-bit). F-Stack's `ff_select` reads this directly, see
+/// `lib/ff_syscall_wrapper.c`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Timeval {
+    pub tv_sec: i64,
+    pub tv_usec: i64,
 }
 
 unsafe extern "C" {
@@ -76,6 +143,30 @@ unsafe extern "C" {
 
     pub fn ff_ioctl(fd: c_int, request: usize, ...) -> c_int;
 
+    /// `ff_select(nfds, readfds, writefds, exceptfds, timeout)` — same
+    /// signature as POSIX `select`. F-Stack accepts the standard
+    /// fd_set bit layout; on -1 errno is set via `ff_os_errno` (Linux
+    /// libc errno values). See `lib/ff_syscall_wrapper.c::ff_select`.
+    pub fn ff_select(
+        nfds: c_int,
+        readfds: *mut FdSet,
+        writefds: *mut FdSet,
+        exceptfds: *mut FdSet,
+        timeout: *mut Timeval,
+    ) -> c_int;
+
+    /// `ff_getsockopt(s, level, optname, optval, optlen)` — POSIX
+    /// `getsockopt` shape. We use this with `(SOL_SOCKET, SO_ERROR)` to
+    /// confirm a non-blocking connect actually succeeded after the
+    /// socket becomes writable. See `lib/ff_syscall_wrapper.c`.
+    pub fn ff_getsockopt(
+        s: c_int,
+        level: c_int,
+        optname: c_int,
+        optval: *mut c_void,
+        optlen: *mut c_uint,
+    ) -> c_int;
+
     /// F-Stack's main loop driver — calls the user-provided callback in
     /// a loop. Bench-vs-mtcp does NOT use this entry point; it pumps
     /// directly via `ff_socket` / `ff_write` from the main thread (the
@@ -84,6 +175,26 @@ unsafe extern "C" {
     /// the burst + maxtp arms call `ff_run`-free code paths.
     #[allow(dead_code)]
     pub fn ff_run(loop_fn: extern "C" fn(*mut c_void) -> c_int, arg: *mut c_void);
+}
+
+unsafe extern "C" {
+    /// glibc's thread-local errno accessor. F-Stack's syscall wrappers
+    /// set the host (Linux) `errno` via `ff_os_errno`, so reading
+    /// `*__errno_location()` is the canonical way to retrieve the
+    /// last F-Stack syscall's errno. See
+    /// `/opt/src/f-stack/lib/ff_host_interface.c::ff_os_errno`.
+    fn __errno_location() -> *mut c_int;
+}
+
+/// Read the host `errno` set by the most recent F-Stack syscall.
+///
+/// F-Stack's `ff_os_errno` translates its FreeBSD-style internal
+/// errnos into Linux libc errno values before returning. So we compare
+/// against Linux constants (`EAGAIN = 11`, `EINPROGRESS = 115`), NOT
+/// FreeBSD values (35 / 36). The `FF_*` constants below are the
+/// **Linux** values that F-Stack actually surfaces.
+pub fn ff_errno() -> c_int {
+    unsafe { *__errno_location() }
 }
 
 /// AF_INET (IPv4) — Linux-style value used by F-Stack's
@@ -97,11 +208,38 @@ pub const SOCK_STREAM: c_int = 1;
 /// F-Stack accepts the Linux constant via its compat layer.
 pub const FIONBIO: usize = 0x5421;
 
-/// errno equivalents — F-Stack's `ff_errno.h` re-exports BSD-flavour
-/// EAGAIN/EWOULDBLOCK/etc. We probe via `errno_location`-style helpers
-/// in the burst/maxtp callers; here we just record the EAGAIN value
-/// F-Stack returns for "would block".
-pub const FF_EAGAIN: i32 = 35; // FreeBSD EAGAIN (Linux is 11)
+/// Linux `SOL_SOCKET` value — F-Stack's getsockopt accepts both Linux
+/// and FreeBSD level numbers (see `lib/ff_syscall_wrapper.c`,
+/// `LINUX_SOL_SOCKET = 1` is mapped to FreeBSD `SOL_SOCKET`).
+pub const SOL_SOCKET: c_int = 1;
+
+/// Linux `SO_ERROR` value — used after non-blocking connect completes
+/// to confirm the connection succeeded.
+pub const SO_ERROR: c_int = 4;
+
+/// Linux libc errno values. F-Stack's `ff_os_errno` translates its
+/// BSD-style internal errnos into Linux values before they reach the
+/// caller, so these are the values we compare against — NOT the
+/// FreeBSD numbers (`ff_EAGAIN = 35`, `ff_EINPROGRESS = 36`) that
+/// `ff_errno.h` documents as the internal mapping.
+///
+/// The `FF_` prefix is kept on `FF_EAGAIN` for API stability — earlier
+/// code referenced the FreeBSD value via the same name; the value has
+/// been corrected to the Linux constant that F-Stack actually surfaces
+/// at runtime through `*__errno_location()`.
+pub const FF_EAGAIN: c_int = 11;
+
+/// Linux `EWOULDBLOCK` — same as `EAGAIN` on Linux. Documented
+/// separately because both names appear in BSD source.
+pub const FF_EWOULDBLOCK: c_int = 11;
+
+/// Linux `EINPROGRESS` — set on a non-blocking `ff_connect` that has
+/// initiated the SYN but not yet completed the handshake. Caller must
+/// `ff_select` for writable, then `ff_getsockopt(SO_ERROR)` to confirm.
+pub const FF_EINPROGRESS: c_int = 115;
+
+/// Linux `EINTR` — used to retry `ff_select` on signal interruption.
+pub const FF_EINTR: c_int = 4;
 
 /// Build a `LinuxSockaddr` for AF_INET targeting `(ip_host_order, port)`.
 ///
@@ -123,6 +261,143 @@ pub fn make_linux_sockaddr_in(ip_host_order: u32, port: u16) -> LinuxSockaddr {
     sa.sa_data[4] = ip_be[2];
     sa.sa_data[5] = ip_be[3];
     sa
+}
+
+/// Block on a non-blocking `ff_connect` until the socket becomes
+/// writable (handshake complete) or `deadline` elapses, then check
+/// `SO_ERROR` to confirm success.
+///
+/// Use this after `ff_connect` returns -1 with `errno == EINPROGRESS`.
+/// Returns `Ok(())` if the connect completed cleanly, or an error
+/// describing the timeout / SO_ERROR result.
+///
+/// The polling cadence is 100 ms — short enough to react quickly on a
+/// loopback peer, long enough to avoid burning CPU on the F-Stack
+/// poll thread. Bench harnesses typically allow ~5 s for connect.
+pub fn wait_connect_complete(fd: c_int, deadline: Instant) -> Result<(), String> {
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(format!(
+                "ff_connect: timed out waiting for non-blocking connect to complete (fd={fd})"
+            ));
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        // Cap each select wait at 100 ms so we re-check the deadline
+        // frequently and surface timeouts without lag.
+        let slice = remaining.min(Duration::from_millis(100));
+        let mut tv = Timeval {
+            tv_sec: slice.as_secs() as i64,
+            tv_usec: slice.subsec_micros() as i64,
+        };
+        let mut wfds = FdSet::zero();
+        wfds.set(fd);
+        let rc = unsafe {
+            ff_select(
+                fd + 1,
+                std::ptr::null_mut(),
+                &mut wfds as *mut FdSet,
+                std::ptr::null_mut(),
+                &mut tv as *mut Timeval,
+            )
+        };
+        if rc < 0 {
+            let e = ff_errno();
+            // EINTR transient: retry. Anything else is fatal.
+            if e == FF_EINTR {
+                continue;
+            }
+            return Err(format!("ff_select returned {rc} (errno={e})"));
+        }
+        if rc == 0 {
+            // Timeout for this slice — loop and re-check the outer deadline.
+            continue;
+        }
+        if !wfds.is_set(fd) {
+            // Spurious — re-arm.
+            continue;
+        }
+        // Socket is writable; check SO_ERROR to distinguish a clean
+        // connect from a deferred error (e.g. ECONNREFUSED).
+        let mut so_error: c_int = 0;
+        let mut optlen: c_uint = std::mem::size_of::<c_int>() as c_uint;
+        let rc = unsafe {
+            ff_getsockopt(
+                fd,
+                SOL_SOCKET,
+                SO_ERROR,
+                &mut so_error as *mut c_int as *mut c_void,
+                &mut optlen as *mut c_uint,
+            )
+        };
+        if rc != 0 {
+            let e = ff_errno();
+            return Err(format!(
+                "ff_getsockopt(SO_ERROR) returned {rc} (errno={e}) on fd={fd}"
+            ));
+        }
+        if so_error != 0 {
+            return Err(format!(
+                "ff_connect failed: SO_ERROR={so_error} (fd={fd})"
+            ));
+        }
+        return Ok(());
+    }
+}
+
+/// Open a non-blocking F-Stack TCP socket connected to
+/// `(peer_ip_host_order, peer_port)`, handling the `EINPROGRESS` flow
+/// for non-blocking connect. Returns the connected fd in non-blocking
+/// mode, ready for `ff_write` / `ff_read`.
+///
+/// The flow:
+/// 1. `ff_socket(AF_INET, SOCK_STREAM)`.
+/// 2. Set `FIONBIO` so `ff_write` behaves per the F-Stack docs.
+/// 3. `ff_connect`. If it returns 0, we're done. If it returns -1
+///    with `errno == EINPROGRESS`, that's the expected non-blocking
+///    behaviour — `wait_connect_complete` polls for writable + checks
+///    `SO_ERROR`. Any other errno is a real failure.
+///
+/// On any failure path the socket is closed before the error is
+/// returned, so callers don't leak fds on partial setup.
+pub fn connect_nonblocking(
+    peer_ip_host_order: u32,
+    peer_port: u16,
+    connect_timeout: Duration,
+) -> Result<c_int, String> {
+    let fd = unsafe { ff_socket(AF_INET as c_int, SOCK_STREAM, 0) };
+    if fd < 0 {
+        let e = ff_errno();
+        return Err(format!("ff_socket returned {fd} (errno={e})"));
+    }
+    let on: c_int = 1;
+    let rc = unsafe { ff_ioctl(fd, FIONBIO, &on as *const c_int) };
+    if rc != 0 {
+        let e = ff_errno();
+        unsafe { ff_close(fd) };
+        return Err(format!("ff_ioctl(FIONBIO) returned {rc} (errno={e})"));
+    }
+    let sa = make_linux_sockaddr_in(peer_ip_host_order, peer_port);
+    let rc = unsafe { ff_connect(fd, &sa, std::mem::size_of_val(&sa) as u32) };
+    if rc == 0 {
+        // Connect completed inline (loopback or kernel happy-path).
+        return Ok(fd);
+    }
+    let e = ff_errno();
+    if e != FF_EINPROGRESS {
+        unsafe { ff_close(fd) };
+        return Err(format!(
+            "ff_connect returned {rc} (errno={e}); expected 0 or EINPROGRESS={FF_EINPROGRESS}"
+        ));
+    }
+    // EINPROGRESS — non-blocking handshake in flight. Wait for
+    // writable + check SO_ERROR.
+    let deadline = Instant::now() + connect_timeout;
+    if let Err(err) = wait_connect_complete(fd, deadline) {
+        unsafe { ff_close(fd) };
+        return Err(err);
+    }
+    Ok(fd)
 }
 
 /// Initialise F-Stack with a vector of CLI args. F-Stack consumes the
@@ -179,5 +454,55 @@ mod tests {
         // sa_family (2) + sa_data (14) = 16 bytes — wire-compatible
         // with sockaddr_in (16 bytes on Linux/FreeBSD).
         assert_eq!(std::mem::size_of::<LinuxSockaddr>(), 16);
+    }
+
+    #[test]
+    fn fd_set_size_is_128_bytes() {
+        // 1024 bits / 8 = 128 bytes; matches Linux/FreeBSD fd_set
+        // layout for FD_SETSIZE = 1024.
+        assert_eq!(std::mem::size_of::<FdSet>(), 128);
+    }
+
+    #[test]
+    fn fd_set_set_and_is_set_round_trip() {
+        let mut s = FdSet::zero();
+        assert!(!s.is_set(0));
+        s.set(0);
+        assert!(s.is_set(0));
+        // Cross-word boundary (fd 64 = bit 0 of word 1).
+        s.set(64);
+        assert!(s.is_set(64));
+        assert!(!s.is_set(63));
+        assert!(!s.is_set(65));
+    }
+
+    #[test]
+    fn fd_set_set_at_high_fd_does_not_overflow() {
+        let mut s = FdSet::zero();
+        // FD_SETSIZE - 1 = 1023, which is the last valid bit.
+        s.set(1023);
+        assert!(s.is_set(1023));
+        // Out-of-range fd is a silent no-op (matches FD_SET behaviour
+        // for fds >= FD_SETSIZE; F-Stack rejects via select's nfds
+        // bound check).
+        s.set(2048);
+        assert!(!s.is_set(2048));
+    }
+
+    #[test]
+    fn timeval_size_is_16_bytes() {
+        // 8 (tv_sec) + 8 (tv_usec) on 64-bit; matches FreeBSD +
+        // Linux struct timeval ABI.
+        assert_eq!(std::mem::size_of::<Timeval>(), 16);
+    }
+
+    /// Errno constants are the Linux libc values (not FreeBSD).
+    /// F-Stack's `ff_os_errno` translates internally before return.
+    #[test]
+    fn errno_constants_are_linux_values() {
+        assert_eq!(FF_EAGAIN, 11);
+        assert_eq!(FF_EWOULDBLOCK, 11);
+        assert_eq!(FF_EINPROGRESS, 115);
+        assert_eq!(FF_EINTR, 4);
     }
 }

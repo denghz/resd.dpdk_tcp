@@ -45,8 +45,7 @@ use anyhow::Context;
 use crate::burst::{BurstSample, Bucket};
 use crate::dpdk_burst::TxTsMode;
 use crate::fstack_ffi::{
-    ff_close, ff_connect, ff_ioctl, ff_socket, ff_write, make_linux_sockaddr_in, AF_INET, FIONBIO,
-    FF_EAGAIN, SOCK_STREAM,
+    connect_nonblocking, ff_close, ff_errno, ff_write, FF_EAGAIN, FF_EWOULDBLOCK,
 };
 
 /// Per-bucket runner configuration.
@@ -76,39 +75,35 @@ pub struct BucketRun {
     pub tx_ts_mode: TxTsMode,
 }
 
+/// How long to wait for a non-blocking F-Stack connect to complete.
+/// Loopback peer typically completes in microseconds; this allows for
+/// peer cold-start + ARP delays on the bench AMI.
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Open a single persistent connection to the F-Stack peer. Returns
 /// the F-Stack socket fd. Caller closes via [`close_persistent_connection`].
+///
+/// The socket is left in non-blocking mode (FIONBIO) so subsequent
+/// `ff_write` calls behave per the F-Stack docs. The non-blocking
+/// connect path is handled via [`connect_nonblocking`] in
+/// `fstack_ffi`: if `ff_connect` returns -1 with `errno == EINPROGRESS`
+/// the helper polls via `ff_select` for writable, then verifies the
+/// connect via `ff_getsockopt(SO_ERROR)`. This is the correct
+/// non-blocking-connect flow per POSIX and matches what the F-Stack
+/// example does via `ff_kqueue`. The previous shape returned `Ok(fd)`
+/// regardless of `ff_connect`'s result, leaving the bench harness to
+/// dereference a half-open socket on the first `ff_write`; this fix
+/// surfaces the connect outcome cleanly so the per-bucket soft-fail
+/// path can record a real error and move on.
 pub fn open_persistent_connection(
     peer_ip_host_order: u32,
     peer_port: u16,
 ) -> anyhow::Result<c_int> {
-    // 1. Open a TCP socket via F-Stack.
-    let fd = unsafe { ff_socket(AF_INET as c_int, SOCK_STREAM, 0) };
-    if fd < 0 {
-        anyhow::bail!("ff_socket returned {fd}");
-    }
-    // 2. F-Stack mandates non-blocking mode for ff_write to behave as
-    // documented (ff_api.h: "Set non-blocking before ff_write").
-    let on: c_int = 1;
-    let rc = unsafe { ff_ioctl(fd, FIONBIO, &on as *const c_int) };
-    if rc != 0 {
-        unsafe { ff_close(fd) };
-        anyhow::bail!("ff_ioctl(FIONBIO) returned {rc}");
-    }
-    // 3. Connect to the peer. F-Stack uses linux_sockaddr layout —
-    // see fstack_ffi::make_linux_sockaddr_in for the byte layout.
-    let sa = make_linux_sockaddr_in(peer_ip_host_order, peer_port);
-    let rc = unsafe { ff_connect(fd, &sa, std::mem::size_of_val(&sa) as u32) };
-    if rc != 0 {
-        // Non-blocking connect — EINPROGRESS expected. F-Stack's BSD
-        // semantics map this to errno=EINPROGRESS (FreeBSD = 36). We
-        // poll with brief retries; production code would use ff_kqueue
-        // but for bench-vs-mtcp the simple busy-wait keeps the
-        // dependency surface small.
-        // The simpler shape is to do a blocking connect (set NB after).
-        // Re-shape: set NB AFTER connect so the handshake blocks.
-    }
-    Ok(fd)
+    connect_nonblocking(peer_ip_host_order, peer_port, CONNECT_TIMEOUT).map_err(|e| {
+        anyhow::anyhow!(
+            "fstack_burst: open_persistent_connection({peer_port}): {e}"
+        )
+    })
 }
 
 /// Close the persistent connection. Soft-fail logged but Ok — the
@@ -192,6 +187,11 @@ pub fn run_bucket(cfg: &FStackBurstCfg<'_>, fd: c_int) -> anyhow::Result<BucketR
 
 /// Send the entire burst payload, looping on EAGAIN until accepted.
 /// Used during warmup (no per-segment timing capture).
+///
+/// EAGAIN/EWOULDBLOCK on `ff_write` means "send buffer full, retry";
+/// any other errno (ECONNRESET, EPIPE, EBADF, etc.) is a real error
+/// and we surface it immediately rather than silently spinning until
+/// the stall timeout fires.
 fn send_one_burst(fd: c_int, payload: &[u8]) -> anyhow::Result<()> {
     const STALL_TIMEOUT: Duration = Duration::from_secs(180);
     let mut sent: usize = 0;
@@ -203,17 +203,16 @@ fn send_one_burst(fd: c_int, payload: &[u8]) -> anyhow::Result<()> {
             sent += n as usize;
             last_progress = std::time::Instant::now();
         } else if n < 0 {
-            // Errno from F-Stack is in the BSD-style location; the
-            // ff_errno.h header documents EAGAIN=35 (FreeBSD value).
-            // Without an `__errno_location`-equivalent for F-Stack
-            // accessible here we cannot read errno directly; treat
-            // any negative return as "would-block, retry" until the
-            // stall timeout fires. Real per-error classification is a
-            // follow-up (the ff_errno.h FFI surface needs more
-            // bindings).
+            let e = ff_errno();
+            if e != FF_EAGAIN && e != FF_EWOULDBLOCK {
+                anyhow::bail!(
+                    "fstack ff_write returned {n} at {sent}/{} bytes; errno={e} (not EAGAIN)",
+                    payload.len()
+                );
+            }
             if last_progress.elapsed() >= STALL_TIMEOUT {
                 anyhow::bail!(
-                    "fstack ff_write stalled at {sent}/{} bytes (no progress in {:?})",
+                    "fstack ff_write stalled at {sent}/{} bytes (EAGAIN, no progress in {:?})",
                     payload.len(),
                     STALL_TIMEOUT
                 );
@@ -226,6 +225,9 @@ fn send_one_burst(fd: c_int, payload: &[u8]) -> anyhow::Result<()> {
 }
 
 /// First segment + capture TSC. Mirrors dpdk_burst's helper.
+///
+/// As with `send_one_burst`, only EAGAIN / EWOULDBLOCK are retryable;
+/// any other errno is surfaced immediately.
 fn send_first_segment_and_capture_wire_time(
     fd: c_int,
     payload: &[u8],
@@ -237,6 +239,14 @@ fn send_first_segment_and_capture_wire_time(
         if n > 0 {
             let t_first_wire_tsc = dpdk_net_core::clock::rdtsc();
             return Ok((n as usize, t_first_wire_tsc));
+        }
+        if n < 0 {
+            let e = ff_errno();
+            if e != FF_EAGAIN && e != FF_EWOULDBLOCK {
+                anyhow::bail!(
+                    "fstack first-segment ff_write returned {n}; errno={e} (not EAGAIN)"
+                );
+            }
         }
         if start.elapsed() >= STALL_TIMEOUT {
             anyhow::bail!(
@@ -251,6 +261,8 @@ fn send_first_segment_and_capture_wire_time(
 /// Drive remainder + capture t1_tsc when the last segment is accepted
 /// by F-Stack's send path. Mirrors dpdk_burst's helper without the
 /// HW-TS path (F-Stack doesn't expose it).
+///
+/// EAGAIN-vs-real-error classification matches `send_one_burst`.
 fn drive_burst_remainder_to_completion(
     fd: c_int,
     payload: &[u8],
@@ -266,9 +278,16 @@ fn drive_burst_remainder_to_completion(
             sent += n as usize;
             last_progress = std::time::Instant::now();
         } else if n < 0 {
+            let e = ff_errno();
+            if e != FF_EAGAIN && e != FF_EWOULDBLOCK {
+                anyhow::bail!(
+                    "fstack burst drain ff_write returned {n} at {sent}/{} bytes; errno={e} (not EAGAIN)",
+                    payload.len()
+                );
+            }
             if last_progress.elapsed() >= STALL_TIMEOUT {
                 anyhow::bail!(
-                    "fstack burst drain stalled at {sent}/{} bytes (no progress in {:?})",
+                    "fstack burst drain stalled at {sent}/{} bytes (EAGAIN, no progress in {:?})",
                     payload.len(),
                     STALL_TIMEOUT
                 );
@@ -277,7 +296,6 @@ fn drive_burst_remainder_to_completion(
         }
     }
     let t1_tsc = dpdk_net_core::clock::rdtsc();
-    let _ = FF_EAGAIN; // referenced for documentation; not used yet
     Ok(t1_tsc)
 }
 
