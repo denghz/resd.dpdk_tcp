@@ -1433,10 +1433,28 @@ fn run_burst_grid_fstack<W: std::io::Write>(
                 Ok(r) => r,
                 Err(e) => {
                     eprintln!(
-                        "bench-vs-mtcp: fstack burst bucket {} failed: {e:#}",
+                        "bench-vs-mtcp: fstack burst bucket {} failed: {e:#}; \
+                         emitting marker + continuing",
                         bucket.label()
                     );
-                    return Ok(());
+                    // Mirror the open-fail path: emit an Invalid
+                    // marker row so the downstream report scripts
+                    // see a row for every bucket.
+                    let agg = bench_vs_mtcp::burst::BucketAggregate::from_samples(
+                        *bucket,
+                        Stack::FStack,
+                        &[],
+                        BucketVerdict::Invalid(format!("fstack run_bucket failed: {e:#}")),
+                        Some(tx_ts_mode),
+                    );
+                    return bench_vs_mtcp::burst::emit_bucket_rows(
+                        writer,
+                        metadata,
+                        &args.tool,
+                        &args.feature_set,
+                        &agg,
+                    )
+                    .context("emit fstack burst run-fail marker row");
                 }
             };
             let mut agg = bench_vs_mtcp::burst::BucketAggregate::from_samples(
@@ -2268,5 +2286,59 @@ mod tests {
             "reason was {:?}",
             agg.verdict.reason()
         );
+    }
+
+    // ------------------------------------------------------------------
+    // D1 review fix: clap parse coverage for the F-Stack init args
+    // (--fstack-config, --fstack-proc-id) added in commit 0372dbd.
+    //
+    // The original D1 landing wired `ff_init_from_args` behind a CLI
+    // surface but shipped no parse-test, so a typo in the `#[arg]`
+    // attribute (long name, default_value, type) would only surface at
+    // runtime. These tests pin:
+    //   - default `--fstack-config` resolves to `/etc/f-stack.conf`
+    //     (matches the AMI drop site from
+    //     image-builder/components/04b-install-f-stack.yaml)
+    //   - default `--fstack-proc-id` resolves to `0` (matches the
+    //     bench-nightly.sh peer launch)
+    //   - explicit `--fstack-config` / `--fstack-proc-id` overrides
+    //     thread through to the parsed struct
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn fstack_args_have_expected_defaults() {
+        use clap::Parser;
+        // Minimum required args: --peer-ip and --output-csv (no
+        // default_value on either). Everything else falls back to the
+        // attribute defaults.
+        let args = Args::try_parse_from([
+            "bench-vs-mtcp",
+            "--peer-ip",
+            "10.0.0.1",
+            "--output-csv",
+            "/tmp/bench-vs-mtcp-test.csv",
+        ])
+        .expect("minimum-required args should parse");
+        assert_eq!(args.fstack_config, "/etc/f-stack.conf");
+        assert_eq!(args.fstack_proc_id, 0u32);
+    }
+
+    #[test]
+    fn fstack_args_accept_overrides() {
+        use clap::Parser;
+        let args = Args::try_parse_from([
+            "bench-vs-mtcp",
+            "--peer-ip",
+            "10.0.0.1",
+            "--output-csv",
+            "/tmp/bench-vs-mtcp-test.csv",
+            "--fstack-config",
+            "/tmp/test-fstack.conf",
+            "--fstack-proc-id",
+            "2",
+        ])
+        .expect("override args should parse");
+        assert_eq!(args.fstack_config, "/tmp/test-fstack.conf");
+        assert_eq!(args.fstack_proc_id, 2u32);
     }
 }
