@@ -86,6 +86,25 @@ struct Args {
     #[arg(long, default_value_t = 10_003)]
     fstack_peer_port: u16,
 
+    /// F-Stack startup config file absolute path. Consumed by
+    /// `ff_init(argc, argv)` once at process start when `--stacks
+    /// fstack` is selected. Same convention as the `bench-peer-fstack`
+    /// launch in `scripts/bench-nightly.sh` (`--conf=/etc/f-stack.conf
+    /// --proc-id=0`). The file holds DPDK EAL flags + F-Stack runtime
+    /// settings (lcore mask, ports, hugepage path, ...). Image-builder
+    /// component `04b-install-f-stack.yaml` drops the AMI default at
+    /// `/etc/f-stack.conf`.
+    #[arg(long, default_value = "/etc/f-stack.conf")]
+    fstack_config: String,
+
+    /// F-Stack process id (passed to `ff_init` as `--proc-id=<n>`).
+    /// Single-process bench runs leave this at 0 — same as the AMI
+    /// peer launch. F-Stack uses this to namespace shared-memory
+    /// regions across cooperating processes; bench-vs-mtcp only ever
+    /// runs one F-Stack-using process at a time so 0 is correct.
+    #[arg(long, default_value_t = 0)]
+    fstack_proc_id: u32,
+
     /// Workload selector: `burst` (T12) or `maxtp` (T13).
     #[arg(long, default_value = "burst")]
     workload: String,
@@ -296,6 +315,29 @@ fn main() -> anyhow::Result<()> {
         tsc_hz = unsafe { dpdk_net_sys::rte_get_tsc_hz() };
         if tsc_hz == 0 {
             anyhow::bail!("rte_get_tsc_hz() returned 0 — EAL not initialised?");
+        }
+    }
+
+    // F-Stack init — once per process, before any ff_socket / ff_connect
+    // call from the fstack arms. F-Stack's `ff_init` parses the EAL
+    // flags + runtime settings out of the file pointed to by `--conf`
+    // and brings up its internal poll loop on the lcore F-Stack
+    // claims. The `--proc-id` flag namespaces shared-memory regions
+    // across cooperating processes; single-process bench runs leave
+    // it at 0. Wired only when `Stack::FStack` is in the selection so
+    // dpdk-only / linux-only / mtcp-only invocations don't pull in
+    // F-Stack's EAL bring-up.
+    //
+    // NOTE: F-Stack performs its own DPDK EAL init internally. Selecting
+    // both `Stack::DpdkNet` and `Stack::FStack` in the same process
+    // would double-init EAL — `bench-nightly.sh` avoids this by
+    // running each stack via separate binary invocations. Strict
+    // enforcement of "one of {dpdk_net, fstack} per process" lives at
+    // the orchestrator layer.
+    #[cfg(feature = "fstack")]
+    {
+        if stacks.contains(&Stack::FStack) {
+            init_fstack(&args)?;
         }
     }
 
@@ -1714,6 +1756,39 @@ fn eal_init(args: &Args) -> anyhow::Result<()> {
     let argv_refs: Vec<&str> = eal_argv.iter().map(String::as_str).collect();
     dpdk_net_core::engine::eal_init(&argv_refs)
         .map_err(|e| anyhow::anyhow!("eal_init failed: {e:?}"))
+}
+
+/// One-shot F-Stack init. Builds an argv mirroring the AMI peer launch
+/// (`/opt/f-stack-peer/bench-peer 10003 --conf=/etc/f-stack.conf
+/// --proc-id=0`) and hands it to `ff_init`. argv[0] is the program
+/// name (informational; F-Stack ignores it). The remaining flags are
+/// the only two F-Stack's parser consumes from the bench harness:
+/// `--conf` (config file path) and `--proc-id` (shared-mem
+/// namespace). A missing config file is surfaced as `Err` to the
+/// caller before `ff_init` has a chance to crash inside DPDK EAL —
+/// otherwise the operator sees an opaque ff_init failure with no
+/// pointer at the missing file.
+#[cfg(feature = "fstack")]
+fn init_fstack(args: &Args) -> anyhow::Result<()> {
+    if !std::path::Path::new(&args.fstack_config).exists() {
+        anyhow::bail!(
+            "F-Stack config file not found at `{}` (set --fstack-config to override). \
+             AMI default is /etc/f-stack.conf — see image-builder component \
+             04b-install-f-stack.yaml.",
+            args.fstack_config
+        );
+    }
+    let argv: Vec<String> = vec![
+        "bench-vs-mtcp".to_string(),
+        format!("--conf={}", args.fstack_config),
+        format!("--proc-id={}", args.fstack_proc_id),
+    ];
+    eprintln!(
+        "bench-vs-mtcp: ff_init with --conf={} --proc-id={}",
+        args.fstack_config, args.fstack_proc_id
+    );
+    bench_vs_mtcp::fstack_ffi::ff_init_from_args(&argv)
+        .map_err(|e| anyhow::anyhow!("ff_init failed: {e}"))
 }
 
 fn build_engine(args: &Args) -> anyhow::Result<Engine> {
