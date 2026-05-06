@@ -492,16 +492,15 @@ run_dut_bench() {
 # A/B drivers that shell out to bench-ab-runner internally, so they take
 # a narrower arg set.
 #
-# BENCH_ITERATIONS / BENCH_WARMUP: lowered from the spec's 100k/1k
-# defaults because run b5scpbl90 observed a deterministic TCP
-# retransmit-budget exhaustion at iteration ~7051 across every bench
-# on c6a.2xlarge. 5k / 500 stays under that threshold and still gives a
-# usable sample count for p50/p99/p999 summaries. Operators can
-# override via env for longer sweeps once the root cause (AWS
-# per-flow throttle vs. our stack's retransmit-history wrap) is
-# identified and fixed.
-BENCH_ITERATIONS="${BENCH_ITERATIONS:-5000}"
-BENCH_WARMUP="${BENCH_WARMUP:-500}"
+# BENCH_ITERATIONS / BENCH_WARMUP: spec §6 defaults (100k post-warmup,
+# 1k warmup) — the iteration ~7051 retransmit-budget cliff that prior
+# runs hit was root-caused to `MbufHandle::Drop` not returning mbufs to
+# the pool and fixed in commit `f3139f6` (see
+# `docs/superpowers/reports/README.md` row "BENCH_ITERATIONS=5000
+# workaround"). 100k AWS runs now complete cleanly; operators can
+# still override via env for shorter sweeps.
+BENCH_ITERATIONS="${BENCH_ITERATIONS:-100000}"
+BENCH_WARMUP="${BENCH_WARMUP:-1000}"
 
 DPDK_COMMON=(
   --peer-ip "$PEER_IP"
