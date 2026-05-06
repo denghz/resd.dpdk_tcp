@@ -815,13 +815,9 @@ fn run_maxtp_grid_dpdk<W: std::io::Write>(
                     "bench-vs-mtcp: dpdk_maxtp bucket {} failed: {e:#}",
                     bucket.label()
                 );
-                dpdk_maxtp::close_persistent_connections(engine, conns);
                 continue;
             }
         };
-        // Close connections after each bucket to prevent accumulation that
-        // exhausts the TX data mempool at high C (T25 root cause analysis).
-        dpdk_maxtp::close_persistent_connections(engine, conns);
 
         // Sanity invariant (spec §11.2): ACKed bytes during window ==
         // `tx_payload_bytes` delta, minus in-flight bound. The
