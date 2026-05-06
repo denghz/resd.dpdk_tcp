@@ -154,8 +154,9 @@ fn pressure_unmatched_rst_flood() {
     //
     // RSTs from FLOOD_PEER_IP (10.99.2.3) — no connection has this source
     // IP, so every frame goes to rx_unmatched path.  The engine does not
-    // reply to incoming RSTs, so the TX intercept queue stays empty;
-    // periodic poll_once + drain_tx_frames is a safety measure only.
+    // reply to incoming RSTs, so the TX intercept queue stays empty.
+    // poll_once is UB on port_id=u16::MAX (test-server bypass); each
+    // inject_rx_frame already dispatches synchronously via dispatch_one_rx_mbuf.
     set_virt_ns(2_000_000);
     for i in 0..N_FLOOD {
         let rst = build_tcp_frame(
@@ -172,12 +173,10 @@ fn pressure_unmatched_rst_flood() {
         );
         h.eng.inject_rx_frame(&rst).expect("inject flood RST");
         if i % 10_000 == 9_999 {
-            h.eng.poll_once();
             let _ = drain_tx_frames();
             h.eng.drain_events(64, |_, _| {});
         }
     }
-    h.eng.poll_once();
     let _ = drain_tx_frames();
     h.eng.drain_events(64, |_, _| {});
 
@@ -209,7 +208,6 @@ fn pressure_unmatched_rst_flood() {
     for conn in conn_handles {
         let _ = h.eng.close_conn(conn);
     }
-    h.eng.poll_once();
     let _ = drain_tx_frames();
     h.eng.drain_events(64, |_, _| {});
 
@@ -285,7 +283,6 @@ fn pressure_matched_rst_flood() {
         );
         h.eng.inject_rx_frame(&rst).expect("inject matched RST");
     }
-    h.eng.poll_once();
     let _ = drain_tx_frames();
     h.eng.drain_events(256, |_, _| {});
 

@@ -113,7 +113,6 @@ fn pressure_listen_accept_exhaustion() {
         // the TX intercept queue from accumulating N_SYN_FLOOD frames.
         let _ = drain_tx_frames();
     }
-    h.eng.poll_once();
     let _ = drain_tx_frames();
     h.eng.drain_events(64, |_, _| {});
 
@@ -155,7 +154,6 @@ fn pressure_listen_accept_exhaustion() {
             &[],
         );
         h.eng.inject_rx_frame(&rst_abort).expect("inject RST-abort");
-        h.eng.poll_once();
         let _ = drain_tx_frames();
         h.eng.drain_events(64, |_, _| {});
     }
@@ -210,7 +208,6 @@ fn pressure_listen_accept_exhaustion() {
     // One active-open attempt → conn_table_full.
     set_virt_ns(4_000_000);
     let _ = h.eng.connect(PEER_IP, 9_001, 0); // expected to fail
-    h.eng.poll_once();
     let _ = drain_tx_frames();
     h.eng.drain_events(64, |_, _| {});
 
@@ -241,7 +238,6 @@ fn pressure_listen_accept_exhaustion() {
     for conn in conn_handles {
         let _ = h.eng.close_conn(conn);
     }
-    h.eng.poll_once();
     let _ = drain_tx_frames();
     h.eng.drain_events(64, |_, _| {});
 
