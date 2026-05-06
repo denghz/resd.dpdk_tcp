@@ -1,14 +1,9 @@
 //! TDD tests for Task A1: verify tcp_timestamps/tcp_sack config flags are wired
 //! into build_connect_syn_opts so setting them to false actually suppresses the options.
 
-// These tests call the (pub-for-test) helper directly so they run without EAL/DPDK.
-// They are compiled only when the `test` profile is active.
+// These tests call the pub test helper directly so they run without EAL/DPDK.
 
 use dpdk_net_core::engine::EngineConfig;
-
-// We need a way to call build_connect_syn_opts with controlled config.
-// The plan says: add `Engine::build_connect_syn_opts_for_test(&cfg)`.
-// Implement a thin pub(crate) or #[cfg(test)] wrapper in engine.rs.
 
 #[test]
 fn tcp_timestamps_false_omits_ts_option() {
