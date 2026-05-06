@@ -167,11 +167,13 @@ mod tests {
 
     #[test]
     fn sanity_violation_when_any_row_below_floor() {
-        // poll-saturation-only is BELOW obs-none — impossible if obs is
-        // actually adding cost. Flag.
+        // poll-saturation-only is BELOW obs-none × 0.90 (10% threshold,
+        // bumped from 5% on 2026-05-04). 78.3 × 0.90 = 70.47, so
+        // poll-saturation-only at 68.0 (13.2% drop) is comfortably
+        // outside noise — must flag.
         let agg = agg_of(&[
             ("obs-none", 78.3),
-            ("poll-saturation-only", 74.0),
+            ("poll-saturation-only", 68.0),
             ("byte-counters-only", 103.2),
             ("obs-all-no-none", 112.5),
             ("default", 86.2),
@@ -185,19 +187,19 @@ mod tests {
         assert_eq!(s.obs_none_p99_ns, Some(78.3));
         assert_eq!(s.violators.len(), 1);
         assert_eq!(s.violators[0].0, "poll-saturation-only");
-        assert_eq!(s.violators[0].1, 74.0);
+        assert_eq!(s.violators[0].1, 68.0);
     }
 
     #[test]
     fn sanity_collects_multiple_violators() {
-        // Two rows undercut the floor by more than the 5% noise band →
-        // verdict mentions both. obs-none × 0.95 = 74.385, so violators
-        // must dip below that to be flagged. (70.0 = 10.6% drop, 71.0 =
-        // 9.3% drop — both comfortably outside noise.)
+        // Two rows undercut the floor by more than the 10% noise band
+        // (bumped 2026-05-04). obs-none × 0.90 = 70.47, so violators
+        // must dip below that to be flagged. (66.0 = 15.7% drop, 67.0 =
+        // 14.4% drop — both comfortably outside the 10% noise band.)
         let agg = agg_of(&[
             ("obs-none", 78.3),
-            ("poll-saturation-only", 70.0),
-            ("byte-counters-only", 71.0),
+            ("poll-saturation-only", 66.0),
+            ("byte-counters-only", 67.0),
             ("obs-all-no-none", 90.0),
             ("default", 85.0),
         ]);

@@ -41,11 +41,16 @@ fn inject_multi_seg_chain_advances_rx_bytes() {
     let mid: Vec<u8> = vec![0x42u8; 100];
     let tail: Vec<u8> = vec![0x43u8; 50];
 
-    let head_len = head.len() as u64;
+    let total_chain_len = (head.len() + mid.len() + tail.len()) as u64;
     let bytes_before = engine
         .counters()
         .eth
         .rx_bytes
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let lin_before = engine
+        .counters()
+        .eth
+        .rx_multi_seg_linearized
         .load(std::sync::atomic::Ordering::Relaxed);
     engine
         .inject_rx_chain(&[&head, &mid, &tail])
@@ -55,15 +60,31 @@ fn inject_multi_seg_chain_advances_rx_bytes() {
         .eth
         .rx_bytes
         .load(std::sync::atomic::Ordering::Relaxed);
+    let lin_after = engine
+        .counters()
+        .eth
+        .rx_multi_seg_linearized
+        .load(std::sync::atomic::Ordering::Relaxed);
 
-    // dispatch_one_rx_mbuf bumps eth.rx_bytes by the head segment's
-    // data_len (it reads the slice off the head, not the chain). So
-    // the delta should be exactly the head segment's length.
+    // C2 cross-phase retro fix: the dispatch path now linearizes
+    // multi-segment mbuf chains via `mbuf_data_slice_for_rx`, so
+    // `eth.rx_bytes` advances by the sum of every segment's data_len
+    // (= `pkt_len`), not just the head segment. Pre-C2 the assertion
+    // here pinned `bytes_after - bytes_before == head.len()` and
+    // documented the bug ("it reads the slice off the head, not the
+    // chain"). Post-C2 it pins the linearized total + the
+    // per-chain bump on `rx_multi_seg_linearized`.
     assert_eq!(
         bytes_after - bytes_before,
-        head_len,
-        "eth.rx_bytes did not advance by head-segment length after chain inject \
-         (before={bytes_before}, after={bytes_after}, head_len={head_len})"
+        total_chain_len,
+        "eth.rx_bytes did not advance by linearized chain length after chain inject \
+         (before={bytes_before}, after={bytes_after}, total_chain_len={total_chain_len})"
+    );
+    assert_eq!(
+        lin_after - lin_before,
+        1,
+        "eth.rx_multi_seg_linearized must bump exactly once per multi-segment chain \
+         (before={lin_before}, after={lin_after})"
     );
 }
 

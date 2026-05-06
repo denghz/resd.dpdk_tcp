@@ -104,10 +104,19 @@ pub struct EthCounters {
     /// ENA xstat: `rx_q0_mbuf_alloc_fail` — RX mbuf allocation failed at
     /// refill time. Correlates with `rx_drop_nomem`.
     pub rx_q0_mbuf_alloc_fail: AtomicU64,
+    // C2 cross-phase retro fix — slow-path per spec §9.1.1. Bumped exactly
+    // once per multi-segment RX mbuf chain that we copy into a contiguous
+    // scratch buffer before handing it to the L2/L3/L4 decoder. A nonzero
+    // value indicates the NIC is delivering jumbo / scattered frames; the
+    // application can use this signal to size its mempool data_room or to
+    // confirm RX_OFFLOAD_SCATTER expectations. Single-segment RX traffic
+    // never bumps. Increment site lives in `crate::mbuf_data_slice_for_rx`
+    // (lib.rs); zero-cost for the steady-state single-segment fast path.
+    pub rx_multi_seg_linearized: AtomicU64,
     // _pad sized to keep the struct on a 64-byte multiple.
-    // 12 (pre-A-HW) + 11 (A-HW) + 15 (A-HW+) = 38 u64s → 304 B;
-    // next 64-multiple is 320 B → pad with 2 u64s.
-    _pad: [AtomicU64; 2],
+    // 12 (pre-A-HW) + 11 (A-HW) + 15 (A-HW+) + 1 (C2) = 39 u64s → 312 B;
+    // next 64-multiple is 320 B → pad with 1 u64.
+    _pad: [AtomicU64; 1],
 }
 
 #[repr(C, align(64))]
@@ -288,6 +297,20 @@ pub struct TcpCounters {
     /// to one mbuf concurrently (max in-flight conns × max simultaneous
     /// READABLE pins); a higher post-dec count is unequivocally a leak.
     pub mbuf_refcnt_drop_unexpected: AtomicU64,
+    /// 2026-04-29 fix (Issue #4 diagnostic): most-recently-sampled value
+    /// of `rte_mempool_avail_count(tx_data_mp)`. Sampled at most once
+    /// per second inside `poll_once` (same cadence as `rx_mempool_avail`).
+    /// A monotonically decreasing trend during a sustained bench burst
+    /// is the leading indicator of TX-side mbuf retention exceeding
+    /// pool capacity — paired with `eth.tx_drop_nomem` counter delta
+    /// (which records `send_bytes` mempool-alloc failures), gives the
+    /// operator a visible signal at the moment of the wedge.
+    ///
+    /// Slow-path: per-second sample only, no hot-path cost. Forensic-
+    /// only — not mirrored on the C ABI side (matches `rx_mempool_avail`
+    /// scope rule); Rust-direct callers read via
+    /// `engine.counters().tcp.tx_data_mempool_avail.load(...)`.
+    pub tx_data_mempool_avail: AtomicU32,
 }
 
 #[repr(C, align(64))]
@@ -351,7 +374,7 @@ const _: () = {
 // line below whose struct you changed.
 const _: () = {
     use std::mem::size_of;
-    // EthCounters: 38 named AtomicU64 + _pad: [AtomicU64; 2] = 40 * 8 = 320 bytes.
+    // EthCounters: 39 named AtomicU64 + _pad: [AtomicU64; 1] = 40 * 8 = 320 bytes.
     assert!(size_of::<EthCounters>() == 320);
     // IpCounters: 12 named AtomicU64 + _pad: [u64; 4] = 16 * 8 = 128 bytes.
     assert!(size_of::<IpCounters>() == 128);
@@ -397,6 +420,34 @@ impl Counters {
             poll: PollCounters::default(),
             obs: ObsCounters::default(),
             fault_injector: FaultInjectorCounters::default(),
+        }
+    }
+
+    /// Test-only typed accessor for `AtomicU32` **level** counters
+    /// (last-sampled value, not a delta). Slow-path only — gated by the
+    /// `pressure-test` cargo feature; do NOT call from production code.
+    ///
+    /// The generic `lookup_counter` (`counters.rs:609`) returns
+    /// `&AtomicU64` and therefore cannot read these `AtomicU32` fields:
+    ///
+    ///   * `tcp.tx_data_mempool_avail` — last `rte_mempool_avail_count`
+    ///     sample of the TX-data mempool, taken inside `poll_once`'s
+    ///     once-per-second sampler. Pressure-test consumers watch this
+    ///     to confirm that mempool drought scenarios actually drain the
+    ///     pool to (near-)zero on the surfacing iteration.
+    ///   * `tcp.rx_mempool_avail` — same shape, RX side. Pressure-test
+    ///     consumers cross-check `rx_drop_nomem` deltas against a
+    ///     visibly-drained pool.
+    ///
+    /// Cost rationale: a single `Relaxed` load + a string match on a
+    /// 2-arm switch — far below counter-policy hot-path threshold and
+    /// only callable when the `pressure-test` feature is on.
+    #[cfg(feature = "pressure-test")]
+    pub fn read_level_counter_u32(&self, name: &str) -> Option<u32> {
+        match name {
+            "tcp.tx_data_mempool_avail" => Some(self.tcp.tx_data_mempool_avail.load(Ordering::Relaxed)),
+            "tcp.rx_mempool_avail" => Some(self.tcp.rx_mempool_avail.load(Ordering::Relaxed)),
+            _ => None,
         }
     }
 }
@@ -457,6 +508,7 @@ pub const ALL_COUNTER_NAMES: &[&str] = &[
     "eth.rx_q0_bad_desc_num",
     "eth.rx_q0_bad_req_id",
     "eth.rx_q0_mbuf_alloc_fail",
+    "eth.rx_multi_seg_linearized",
     // --- ip (_pad excluded) ---
     "ip.rx_csum_bad",
     "ip.rx_ttl_zero",
@@ -574,7 +626,7 @@ pub const ALL_COUNTER_NAMES: &[&str] = &[
 /// compile-time `size_of::<*Counters>()` pins above — they fail at
 /// compile time when a new field shifts struct size past the pinned
 /// byte count.
-pub const KNOWN_COUNTER_COUNT: usize = 118;
+pub const KNOWN_COUNTER_COUNT: usize = 119;
 
 /// Resolve a counter path from ALL_COUNTER_NAMES to a live &AtomicU64
 /// on the given Counters. Returns None for typos or paths that have
@@ -633,6 +685,7 @@ pub fn lookup_counter<'a>(c: &'a Counters, name: &str) -> Option<&'a AtomicU64> 
         "eth.rx_q0_bad_desc_num" => &c.eth.rx_q0_bad_desc_num,
         "eth.rx_q0_bad_req_id" => &c.eth.rx_q0_bad_req_id,
         "eth.rx_q0_mbuf_alloc_fail" => &c.eth.rx_q0_mbuf_alloc_fail,
+        "eth.rx_multi_seg_linearized" => &c.eth.rx_multi_seg_linearized,
         // --- ip ---
         "ip.rx_csum_bad" => &c.ip.rx_csum_bad,
         "ip.rx_ttl_zero" => &c.ip.rx_ttl_zero,
@@ -1057,6 +1110,19 @@ mod a10_diagnostic_counter_tests {
     fn mbuf_refcnt_drop_unexpected_default_is_zero() {
         let c = Counters::new();
         assert_eq!(c.tcp.mbuf_refcnt_drop_unexpected.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn tx_data_mempool_avail_default_is_zero() {
+        // 2026-04-29 fix (Issue #4 diagnostic): construction-time zero
+        // mirrors the rx_mempool_avail invariant. The poll_once
+        // sampler bumps to non-zero on the first per-second tick once
+        // the engine is alive — that path is exercised by integration
+        // tests under TAP (`long_soak_stability`,
+        // `tx_mempool_no_leak_under_retrans`) where the value drifts
+        // are checked.
+        let c = Counters::new();
+        assert_eq!(c.tcp.tx_data_mempool_avail.load(Ordering::Relaxed), 0);
     }
 }
 

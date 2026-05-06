@@ -60,6 +60,11 @@ pub struct ModeRttCfg<'a> {
     pub feature_set: &'a str,
     pub stacks: &'a [Stack],
     pub tsc_hz: u64,
+    /// F-Stack peer port — distinct from `peer_port` (echo-server)
+    /// because the F-Stack peer (`/opt/f-stack-peer/bench-peer`)
+    /// listens on its own port (default 10003, set in
+    /// bench-nightly.sh step [6/12]).
+    pub fstack_peer_port: u16,
 }
 
 /// Run the selected stacks and emit their CSV rows. Engine is
@@ -138,7 +143,38 @@ fn run_one_stack(
             };
             afpacket::run_rtt_workload(&af_cfg).map_err(|e| anyhow::anyhow!(e))
         }
+        Stack::FStack => run_fstack_rtt(cfg),
     }
+}
+
+/// F-Stack RTT path — feature-gated stub when `fstack` is off. When
+/// the binary is built without `--features fstack` we cannot link
+/// against libfstack.a, so the arm bails with a pointer to the
+/// AMI-rebuild path. Default workspace builds keep compiling.
+#[cfg(feature = "fstack")]
+fn run_fstack_rtt(cfg: &ModeRttCfg<'_>) -> anyhow::Result<Vec<f64>> {
+    use crate::fstack;
+    let fd = fstack::connect(cfg.peer_ip_host_order, cfg.fstack_peer_port)
+        .context("fstack connect")?;
+    let res = fstack::run_rtt_workload(
+        fd,
+        cfg.request_bytes,
+        cfg.response_bytes,
+        cfg.warmup,
+        cfg.iterations,
+    )
+    .context("fstack run_rtt_workload");
+    fstack::close(fd);
+    res
+}
+
+#[cfg(not(feature = "fstack"))]
+fn run_fstack_rtt(_cfg: &ModeRttCfg<'_>) -> anyhow::Result<Vec<f64>> {
+    anyhow::bail!(
+        "fstack stack selected but binary built without `fstack` feature \
+         (libfstack.a not linked). Rebuild with `--features fstack` on the AMI \
+         where libfstack.a is installed at /opt/f-stack/lib/."
+    )
 }
 
 /// Emit the 7-row CSV aggregation tuple for one stack.
@@ -207,7 +243,12 @@ mod tests {
 
     #[test]
     fn build_dimensions_json_shape() {
-        for stack in [Stack::DpdkNet, Stack::LinuxKernel, Stack::AfPacket] {
+        for stack in [
+            Stack::DpdkNet,
+            Stack::LinuxKernel,
+            Stack::AfPacket,
+            Stack::FStack,
+        ] {
             let dims = build_dimensions_json(stack);
             let parsed: serde_json::Value = serde_json::from_str(&dims).unwrap();
             assert_eq!(parsed["preset"], "latency");

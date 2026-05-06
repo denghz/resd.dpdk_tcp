@@ -205,6 +205,52 @@ impl FlowTable {
         })
     }
 
+    /// Test-only diagnostic: number of currently-occupied slots. Slow-path
+    /// (linear scan over the full slot vector). Gated by `pressure-test`
+    /// cargo feature; do NOT call from production code.
+    ///
+    /// Pressure-test suites use this to assert that conn-table drought
+    /// scenarios actually fill the table (or that GC scenarios actually
+    /// drain it) — direct visibility avoids depending on derived deltas
+    /// of `tcp.conn_open` / `tcp.conn_close` which can mask off-by-one
+    /// FSM bugs.
+    #[cfg(feature = "pressure-test")]
+    pub fn active_conns(&self) -> usize {
+        self.slots.iter().filter(|s| s.is_some()).count()
+    }
+
+    /// Test-only diagnostic: iterate `(ConnHandle, TcpState)` for every
+    /// occupied slot. Slow-path; gated by `pressure-test`. Used by the
+    /// FSM-trajectory pressure suite to record the per-conn state vector
+    /// at each step and detect illegal transitions or stuck states that
+    /// the 121-cell state-trans counter matrix would not visibly surface
+    /// (e.g. a long-lived TIME_WAIT congealing because the reaper is
+    /// behind).
+    #[cfg(feature = "pressure-test")]
+    pub fn states(&self) -> impl Iterator<Item = (ConnHandle, crate::tcp_state::TcpState)> + '_ {
+        self.slots.iter().enumerate().filter_map(|(i, slot)| {
+            slot.as_ref().map(|c| (i as ConnHandle + 1, c.state))
+        })
+    }
+
+    /// Test-only diagnostic: total bytes currently held in every conn's
+    /// out-of-order reorder queue (sum of `ReorderQueue::total_bytes`
+    /// over all occupied slots). Slow-path; gated by `pressure-test`.
+    ///
+    /// Pressure-test suites use this to drive reorder-queue overflow
+    /// scenarios to a precise byte threshold and confirm the surfacing
+    /// drop / counter delta lines up with the configured reassembly cap.
+    /// Returns a global sum (not per-conn); callers needing per-conn
+    /// detail iterate `iter_handles` + `get`.
+    #[cfg(feature = "pressure-test")]
+    pub fn reassembly_byte_occupancy(&self) -> u64 {
+        self.slots
+            .iter()
+            .filter_map(|s| s.as_ref())
+            .map(|c| c.recv.reorder.total_bytes() as u64)
+            .sum()
+    }
+
     /// Drop every connection slot. Used during `Engine::drop` to
     /// release all mbuf-owning state (recv segments, OOO reorder ring,
     /// snd_retrans entries) BEFORE the engine's mempool fields drop.

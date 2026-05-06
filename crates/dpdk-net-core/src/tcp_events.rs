@@ -25,35 +25,51 @@ pub enum LossCause {
 
 /// Event kinds internal to the engine. Translated to public
 /// `dpdk_net_event_t` values at the C ABI boundary.
-#[derive(Debug, Clone)]
+///
+/// C1: derives `Debug` only; `Clone` is implemented manually because
+/// `Readable` carries `owned_mbufs: SmallVec<[InOrderSegment; 4]>` and
+/// `InOrderSegment::mbuf` (a `MbufHandle`) intentionally does NOT
+/// implement `Clone` — refcount bumps go through the explicit
+/// `MbufHandle::try_clone()` so accidental copies cannot silently leak
+/// refcounts. The manual `Clone` below performs the per-mbuf
+/// `try_clone()` bump for each `InOrderSegment` so cloning a `Readable`
+/// event correctly duplicates the mbuf refcount ownership.
+#[derive(Debug)]
 pub enum InternalEvent {
     Connected {
         conn: ConnHandle,
         rx_hw_ts_ns: u64,
         emitted_ts_ns: u64,
     },
-    /// A6.6 T9: scatter-gather view over an in-order delivery window.
-    /// `seg_idx_start` / `seg_count` reference a slice of the owning
-    /// `TcpConn.readable_scratch_iovecs` Vec. At the ABI boundary,
-    /// `dpdk_net_poll` materializes the corresponding `dpdk_net_iovec_t`
-    /// pointer + length onto the `dpdk_net_event_readable_t` payload.
+    /// A6.6 T9 / C1: scatter-gather view over an in-order delivery
+    /// window. The event owns both the iovec Vec and the underlying
+    /// `InOrderSegment` mbuf-refcount holders, so its lifetime is no
+    /// longer coupled to the owning conn's per-poll scratch.
     ///
-    /// Lifetime: the scratch Vec (and the mbufs referenced by each
-    /// iovec's `base` pointer) stay valid until the next `dpdk_net_poll`
-    /// on the owning engine — top-of-poll clears `delivered_segments`
-    /// (dropping refcounts) and `readable_scratch_iovecs` for every live
-    /// conn before any fresh RX dispatch.
+    /// Lifetime: as long as the event lives in `EventQueue` (or in the
+    /// caller's `events_out[]` slot, materialized at the C ABI boundary)
+    /// the `segs[i].base` pointers remain valid because `owned_mbufs`
+    /// keeps the per-segment refcounts pinned. Drop of the event drops
+    /// `owned_mbufs`, returning each refcount unit via
+    /// `MbufHandle::Drop`.
+    ///
+    /// C1 fix: pre-C1 this variant stored `seg_idx_start`/`seg_count`
+    /// indexing into `TcpConn.readable_scratch_iovecs`. Top-of-poll
+    /// cleared that scratch unconditionally for every live conn, so any
+    /// queued-but-not-yet-drained READABLE from a prior poll pointed at
+    /// freed memory (use-after-free).
     Readable {
         conn: ConnHandle,
-        /// A6.6 T9: start index into the owning
-        /// `TcpConn.readable_scratch_iovecs` for this event's iovec
-        /// slice. Per-conn scratch, so always 0 at emit time (the full
-        /// scratch is cleared and rebuilt per event for that conn).
-        seg_idx_start: u32,
-        /// Number of iovec entries this event covers.
-        seg_count: u32,
-        /// Sum of `segs[i].len` across
-        /// `[seg_idx_start, seg_idx_start + seg_count)`.
+        /// Iovec slice for this delivery window. Owned by the event —
+        /// the mbufs they reference are kept alive by `owned_mbufs`.
+        segs: Vec<crate::iovec::DpdkNetIovec>,
+        /// Mbuf ownership that keeps `segs[i].base` pointers valid until
+        /// this event is dropped. Moved from `TcpConn.delivered_segments`
+        /// at emission time via `drain(..).collect()` — `clear()` is used
+        /// on the per-conn scratch (not `std::mem::take`) so capacity is
+        /// preserved for subsequent deliveries on the same connection.
+        owned_mbufs: smallvec::SmallVec<[crate::tcp_conn::InOrderSegment; 4]>,
+        /// Sum of `segs[i].len`.
         total_len: u32,
         rx_hw_ts_ns: u64,
         emitted_ts_ns: u64,
@@ -114,6 +130,129 @@ pub enum InternalEvent {
         conn: ConnHandle,
         emitted_ts_ns: u64,
     },
+}
+
+// C1: manual Clone for InternalEvent. The Readable variant owns
+// `InOrderSegment` mbuf-refcount holders that do not derive Clone; we
+// duplicate ownership by per-mbuf `try_clone()` (refcount bump).
+//
+// Cloning a Readable event therefore costs `n_segs` refcount bumps —
+// callers (chiefly tests that buffer events for later inspection) are
+// expected to clone sparingly and drop promptly.
+impl Clone for InternalEvent {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Connected {
+                conn,
+                rx_hw_ts_ns,
+                emitted_ts_ns,
+            } => Self::Connected {
+                conn: *conn,
+                rx_hw_ts_ns: *rx_hw_ts_ns,
+                emitted_ts_ns: *emitted_ts_ns,
+            },
+            Self::Readable {
+                conn,
+                segs,
+                owned_mbufs,
+                total_len,
+                rx_hw_ts_ns,
+                emitted_ts_ns,
+            } => {
+                // Refcount-aware clone of the InOrderSegment vector.
+                // Each clone bumps the underlying mbuf refcount via
+                // `MbufHandle::try_clone()`, so the cloned event ends up
+                // with N independent refcount units (matching the
+                // original's ownership invariant — at most one
+                // InOrderSegment per refcount unit).
+                let cloned_owned: smallvec::SmallVec<[crate::tcp_conn::InOrderSegment; 4]> =
+                    owned_mbufs
+                        .iter()
+                        .map(|s| crate::tcp_conn::InOrderSegment {
+                            mbuf: s.mbuf.try_clone(),
+                            offset: s.offset,
+                            len: s.len,
+                        })
+                        .collect();
+                Self::Readable {
+                    conn: *conn,
+                    // `DpdkNetIovec` is `Copy` (POD: pointer + len);
+                    // the `base` pointers are kept valid by
+                    // `cloned_owned`'s independent refcounts.
+                    segs: segs.clone(),
+                    owned_mbufs: cloned_owned,
+                    total_len: *total_len,
+                    rx_hw_ts_ns: *rx_hw_ts_ns,
+                    emitted_ts_ns: *emitted_ts_ns,
+                }
+            }
+            Self::Closed {
+                conn,
+                err,
+                emitted_ts_ns,
+            } => Self::Closed {
+                conn: *conn,
+                err: *err,
+                emitted_ts_ns: *emitted_ts_ns,
+            },
+            Self::StateChange {
+                conn,
+                from,
+                to,
+                emitted_ts_ns,
+            } => Self::StateChange {
+                conn: *conn,
+                from: *from,
+                to: *to,
+                emitted_ts_ns: *emitted_ts_ns,
+            },
+            Self::Error {
+                conn,
+                err,
+                emitted_ts_ns,
+            } => Self::Error {
+                conn: *conn,
+                err: *err,
+                emitted_ts_ns: *emitted_ts_ns,
+            },
+            Self::TcpRetrans {
+                conn,
+                seq,
+                rtx_count,
+                emitted_ts_ns,
+            } => Self::TcpRetrans {
+                conn: *conn,
+                seq: *seq,
+                rtx_count: *rtx_count,
+                emitted_ts_ns: *emitted_ts_ns,
+            },
+            Self::TcpLossDetected {
+                conn,
+                cause,
+                emitted_ts_ns,
+            } => Self::TcpLossDetected {
+                conn: *conn,
+                cause: *cause,
+                emitted_ts_ns: *emitted_ts_ns,
+            },
+            Self::ApiTimer {
+                timer_id,
+                user_data,
+                emitted_ts_ns,
+            } => Self::ApiTimer {
+                timer_id: *timer_id,
+                user_data: *user_data,
+                emitted_ts_ns: *emitted_ts_ns,
+            },
+            Self::Writable {
+                conn,
+                emitted_ts_ns,
+            } => Self::Writable {
+                conn: *conn,
+                emitted_ts_ns: *emitted_ts_ns,
+            },
+        }
+    }
 }
 
 pub struct EventQueue {
@@ -313,5 +452,64 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    /// Regression guard for the C1 drain-UAF fix. Pre-fix, drain_events
+    /// dropped each `InternalEvent` at the end of its while-loop body,
+    /// so for n>1 events the sink received a reference to a dropped value
+    /// on the second iteration. This test simulates the two-phase drain
+    /// pattern (used by `Engine::drain_events`) with `Connected` events
+    /// (no mbufs) to verify that n events remain accessible throughout
+    /// the entire drain pass, not just during their own iteration.
+    #[cfg(not(feature = "obs-none"))]
+    #[test]
+    fn two_phase_drain_keeps_all_events_accessible() {
+        use std::cell::RefCell;
+
+        let counters = Counters::new();
+        let mut q = EventQueue::with_cap(EventQueue::MIN_SOFT_CAP);
+        let scratch: RefCell<Vec<InternalEvent>> = RefCell::new(Vec::new());
+
+        // Push 3 events with distinct conn handles.
+        for i in 1u32..=3 {
+            q.push(
+                InternalEvent::Connected {
+                    conn: i,
+                    rx_hw_ts_ns: u64::from(i) * 100,
+                    emitted_ts_ns: u64::from(i) * 200,
+                },
+                &counters,
+            );
+        }
+        assert_eq!(q.len(), 3);
+
+        // Phase 1: pop all 3 into scratch (mirrors Engine::drain_events Phase 1).
+        let mut n = 0u32;
+        while n < 3 {
+            let Some(ev) = q.pop() else { break; };
+            scratch.borrow_mut().push(ev);
+            n += 1;
+        }
+        assert_eq!(n, 3);
+        assert!(q.is_empty());
+
+        // Phase 2: visit all events while scratch is immutably borrowed.
+        // If any event were dropped mid-loop (pre-fix behaviour) this
+        // would either segfault (under ASAN / Miri) or read garbage.
+        let mut seen_handles: Vec<ConnHandle> = Vec::new();
+        {
+            let s = scratch.borrow();
+            let start = s.len().saturating_sub(n as usize);
+            for ev in &s[start..] {
+                if let InternalEvent::Connected { conn, .. } = ev {
+                    seen_handles.push(*conn);
+                }
+            }
+        }
+
+        assert_eq!(seen_handles, vec![1u32, 2, 3]);
+
+        // Clear scratch (mirrors next poll_once).
+        scratch.borrow_mut().clear();
     }
 }

@@ -65,6 +65,21 @@ pub enum Error {
     #[cfg(feature = "test-server")]
     #[error("invalid argument")]
     InvalidArgument,
+    /// A2 (Pattern P6): an argv string passed to `eal_init` contains an
+    /// interior NUL byte. Mapped to `-EINVAL` at the C ABI.
+    #[error("argv string contains interior NUL byte")]
+    ArgvNul,
+    /// A2 (Pattern P6): the EAL_INIT mutex was poisoned (a prior thread
+    /// panicked while holding it). Mapped to `-EDEADLK` at the C ABI.
+    #[error("EAL init mutex poisoned (prior thread panicked)")]
+    Reentrant,
+    /// A3 (Part 3 BLOCK-A11 B1, Pattern P6): release-build validation —
+    /// `tcp_min_rto_us > tcp_max_rto_us` would reach `u32::clamp(min, max)`
+    /// at the first RTT sample and panic. `Engine::new` rejects up front
+    /// instead. `dpdk_net_engine_create` returns `null` on this error (no
+    /// separate errno out-param for engine creation errors).
+    #[error("invalid RTO bounds: tcp_min_rto_us={min} > tcp_max_rto_us={max}")]
+    InvalidRtoBounds { min: u32, max: u32 },
 }
 
 #[cfg(test)]

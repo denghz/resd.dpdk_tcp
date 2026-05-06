@@ -162,28 +162,24 @@ fn rx_zero_copy_single_seg_roundtrip() {
         for ev in &evs {
             if let InternalEvent::Readable {
                 conn,
-                seg_idx_start,
-                seg_count,
+                segs,
                 total_len,
                 ..
             } = ev
             {
                 if *conn == handle {
-                    let ft = engine.flow_table();
-                    if let Some(c) = ft.get(handle) {
-                        let start = *seg_idx_start as usize;
-                        let end = start + *seg_count as usize;
-                        for iovec in &c.readable_scratch_iovecs[start..end] {
-                            if got_base.is_none() {
-                                got_seg_count = Some(*seg_count);
-                                got_total_len = Some(*total_len);
-                                got_base = Some(iovec.base);
-                                got_len = Some(iovec.len);
-                            }
-                            let slice =
-                                unsafe { std::slice::from_raw_parts(iovec.base, iovec.len as usize) };
-                            echoed.extend_from_slice(slice);
+                    // C1: iovec slice owned by the event itself.
+                    let seg_count = segs.len() as u32;
+                    for iovec in segs {
+                        if got_base.is_none() {
+                            got_seg_count = Some(seg_count);
+                            got_total_len = Some(*total_len);
+                            got_base = Some(iovec.base);
+                            got_len = Some(iovec.len);
                         }
+                        let slice =
+                            unsafe { std::slice::from_raw_parts(iovec.base, iovec.len as usize) };
+                        echoed.extend_from_slice(slice);
                     }
                 }
             }

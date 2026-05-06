@@ -1496,10 +1496,22 @@ fn handle_close_path(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
     }
 
     // TIME_WAIT: replay-ACK anything the peer sends; reaper will move
-    // us to CLOSED via the engine tick (Task 19).
+    // us to CLOSED via the engine tick (Task 19). Per RFC 9293 §3.10.7.8,
+    // the 2×MSL timer must only restart on in-window segments — gate that
+    // via bad_seq=true for out-of-window arrivals so the engine doesn't
+    // refresh a reaper deadline on stale duplicates.
     if conn.state == TcpState::TimeWait {
+        let seg_len = seg.payload.len() as u32 + ((seg.flags & TCP_FIN) != 0) as u32;
+        let in_win = if seg_len == 0 {
+            seg.seq == conn.rcv_nxt
+        } else {
+            let last = seg.seq.wrapping_add(seg_len).wrapping_sub(1);
+            in_window(conn.rcv_nxt, seg.seq, conn.rcv_wnd)
+                && in_window(conn.rcv_nxt, last, conn.rcv_wnd)
+        };
         return Outcome {
             tx: TxAction::Ack,
+            bad_seq: !in_win,
             ..Outcome::base()
         };
     }
@@ -1524,6 +1536,93 @@ fn handle_close_path(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
             bad_seq: true,
             ..Outcome::base()
         };
+    }
+
+    // B4: parse options (TS + SACK blocks). Mirrors the established-path
+    // contract — close-path states still need PAWS (RFC 7323 §5) and SACK
+    // (RFC 2018) processing. Pre-B4 these were skipped entirely; stale-
+    // timestamp segments slipped through and SACK info on close-state
+    // ACKs was ignored even though CLOSE_WAIT can still retransmit.
+    // Malformed → bad_option drop.
+    let parsed_opts = if seg.options.is_empty() {
+        crate::tcp_options::TcpOpts::default()
+    } else {
+        match crate::tcp_options::parse_options(seg.options) {
+            Ok(o) => o,
+            Err(_) => {
+                return Outcome {
+                    tx: TxAction::None,
+                    bad_option: true,
+                    ..Outcome::base()
+                };
+            }
+        }
+    };
+
+    // PAWS (RFC 7323 §5) — same logic as `handle_established` (verbatim
+    // copy per B4 scope). Missing TS on a TS-enabled conn is RFC 7323
+    // §3.2 MUST-24 violation.
+    let mut ts_recent_expired = false;
+    if conn.ts_enabled {
+        match parsed_opts.timestamps {
+            None => {
+                return Outcome {
+                    tx: TxAction::None,
+                    bad_option: true,
+                    ..Outcome::base()
+                };
+            }
+            Some((ts_val, _ts_ecr)) => {
+                // RFC 7323 §5.5 24-day `TS.Recent` lazy expiration. If the
+                // connection has been idle for more than 24 days, treat
+                // `TS.Recent` as absent for this segment: adopt `ts_val`,
+                // reset the age clock, and skip the PAWS drop compare.
+                let now_ns = crate::clock::now_ns();
+                let idle_ns = now_ns.saturating_sub(conn.ts_recent_age);
+                let paws_skip_this_seg =
+                    conn.ts_recent_age != 0 && idle_ns > TS_RECENT_EXPIRY_NS;
+                if paws_skip_this_seg {
+                    conn.ts_recent = ts_val;
+                    conn.ts_recent_age = now_ns;
+                    ts_recent_expired = true;
+                } else if crate::tcp_seq::seq_lt(ts_val, conn.ts_recent) {
+                    return Outcome {
+                        tx: TxAction::Ack,
+                        paws_rejected: true,
+                        ..Outcome::base()
+                    };
+                }
+                // RFC 7323 §4.3 MUST-25: only update ts_recent on a
+                // segment whose seq is at or before rcv_nxt.
+                if !paws_skip_this_seg && crate::tcp_seq::seq_le(seg.seq, conn.rcv_nxt) {
+                    conn.ts_recent = ts_val;
+                    conn.ts_recent_age = now_ns;
+                }
+            }
+        }
+    }
+
+    // B4: decode peer SACK blocks into the scoreboard (RFC 2018). Same
+    // structure as the established-path branch — DSACK-classify before
+    // insert, attribute to recent TLP probe, populate Outcome fields.
+    let mut sack_blocks_decoded = 0u32;
+    let mut rx_dsack_count = 0u32;
+    let mut tx_tlp_spurious_count = 0u32;
+    if conn.sack_enabled && parsed_opts.sack_block_count > 0 {
+        for block in &parsed_opts.sack_blocks[..parsed_opts.sack_block_count as usize] {
+            if is_dsack(block, conn.snd_una, &conn.sack_scoreboard) {
+                rx_dsack_count += 1;
+                conn.rack.dsack_seen = true;
+                let now_ns = crate::clock::now_ns();
+                if conn.attribute_dsack_to_recent_tlp_probe(block.left, block.right, now_ns) {
+                    tx_tlp_spurious_count += 1;
+                }
+                continue;
+            }
+            conn.sack_scoreboard.insert(*block);
+            conn.snd_retrans.mark_sacked(*block);
+        }
+        sack_blocks_decoded = parsed_opts.sack_block_count as u32;
     }
 
     // Advance snd_una if ack covers more of our stream.
@@ -1559,6 +1658,11 @@ fn handle_close_path(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
         tx,
         new_state,
         closed,
+        paws_rejected: false,
+        sack_blocks_decoded,
+        rx_dsack_count,
+        tx_tlp_spurious_count,
+        ts_recent_expired,
         ..Outcome::base()
     }
 }
@@ -2517,6 +2621,47 @@ mod tests {
         assert_eq!(c.ts_recent, 200); // unchanged
     }
 
+    /// B4: PAWS must run in close-path states too. Pre-B4, `handle_close_path`
+    /// skipped option parsing entirely, so a stale-TS segment in FIN_WAIT1
+    /// would slip past the PAWS gate and (worse) potentially advance state.
+    /// Verifies that a FinWait1 conn rejects a stale-TS in-window segment
+    /// with a challenge ACK and `paws_rejected = true`, leaving state and
+    /// `ts_recent` unchanged.
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
+    #[test]
+    fn close_path_paws_rejects_stale_ts_in_fin_wait1() {
+        use crate::tcp_options::TcpOpts;
+        let mut c = est_conn_ts(1000, 5000, 1024, 200);
+        c.state = TcpState::FinWait1;
+        // Local FIN was sent: snd_nxt advances by 1 past snd_una; the ACK
+        // we feed below covers data only (does not ack the FIN), so we
+        // remain in FinWait1.
+        c.snd_nxt = c.snd_una.wrapping_add(1);
+
+        let mut peer_opts = TcpOpts::default();
+        peer_opts.timestamps = Some((100, 0)); // stale: < ts_recent==200
+        let mut buf = [0u8; 40];
+        let n = peer_opts.encode(&mut buf).unwrap();
+        let seg = ParsedSegment {
+            src_port: 5000,
+            dst_port: 40000,
+            seq: 5001,
+            ack: 1001,
+            flags: TCP_ACK,
+            window: 65535,
+            header_len: 20 + n,
+            payload: b"xxx",
+            options: &buf[..n],
+        };
+        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
+        assert!(out.paws_rejected, "stale TS in FinWait1 must trip PAWS");
+        assert_eq!(out.tx, TxAction::Ack, "PAWS reject emits challenge ACK");
+        assert_eq!(out.new_state, None, "state unchanged on PAWS drop");
+        assert!(!out.closed);
+        assert_eq!(c.state, TcpState::FinWait1);
+        assert_eq!(c.ts_recent, 200, "ts_recent must not update on PAWS reject");
+    }
+
     #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn paws_accepts_fresh_tsval_and_updates_ts_recent() {
@@ -2872,7 +3017,50 @@ mod tests {
 
     #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
-    fn time_wait_replays_ack_on_any_segment() {
+    fn time_wait_fin_retransmit_acked_no_timer_refresh() {
+        // The realistic TIME_WAIT scenario: we've already received and ACKed
+        // the peer's FIN (advancing rcv_nxt to 5002), and the peer retransmits
+        // that FIN at seq=5001. The retransmit lands left-of-window under the
+        // close-path strict in-window formula (seq 5001 < rcv_nxt 5002), so
+        // B3 marks bad_seq=true — the engine will NOT restart the 2×MSL timer.
+        // We still send the replay-ACK per RFC 9293 §3.10.7.8.
+        use crate::flow_table::FourTuple;
+        use crate::tcp_conn::TcpConn;
+        let t = FourTuple {
+            local_ip: 0x0a_00_00_02,
+            local_port: 40000,
+            peer_ip: 0x0a_00_00_01,
+            peer_port: 5000,
+        };
+        let mut c = TcpConn::new_client(t, 1000, 1460, 1024, 2048, 5000, 5000, 1_000_000);
+        c.state = TcpState::TimeWait;
+        c.our_fin_seq = Some(1001);
+        c.rcv_nxt = 5002; // past peer's FIN — the realistic post-transition state
+        c.rcv_wnd = 1024;
+        let seg = ParsedSegment {
+            src_port: 5000,
+            dst_port: 40000,
+            seq: 5001, // peer retransmits their FIN (already ACKed)
+            ack: 1002,
+            flags: TCP_ACK | TCP_FIN,
+            window: 0,
+            header_len: 20,
+            payload: &[],
+            options: &[],
+        };
+        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
+        assert_eq!(out.tx, TxAction::Ack); // always replay-ACK in TIME_WAIT
+        assert_eq!(out.new_state, None); // stay in TIME_WAIT until reaper
+        // FIN retransmit is left-of-window → bad_seq=true → engine skips timer refresh.
+        assert!(out.bad_seq);
+    }
+
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
+    #[test]
+    fn time_wait_out_of_window_sets_bad_seq() {
+        // B3: an out-of-window segment in TIME_WAIT must still get a
+        // replay-ACK, but with bad_seq=true so the engine does NOT
+        // restart the 2×MSL timer (RFC 9293 §3.10.7.8).
         use crate::flow_table::FourTuple;
         use crate::tcp_conn::TcpConn;
         let t = FourTuple {
@@ -2886,12 +3074,13 @@ mod tests {
         c.our_fin_seq = Some(1001);
         c.rcv_nxt = 5002;
         c.rcv_wnd = 1024;
+        // seq is way past the receive window — clearly out-of-window.
         let seg = ParsedSegment {
             src_port: 5000,
             dst_port: 40000,
-            seq: 5001,
+            seq: 99_999,
             ack: 1002,
-            flags: TCP_ACK | TCP_FIN,
+            flags: TCP_ACK,
             window: 0,
             header_len: 20,
             payload: &[],
@@ -2899,7 +3088,8 @@ mod tests {
         };
         let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
         assert_eq!(out.tx, TxAction::Ack);
-        assert_eq!(out.new_state, None); // stay in TIME_WAIT until reaper
+        assert!(out.bad_seq);
+        assert_eq!(out.new_state, None);
     }
 
     // A4 Task 19: cross-phase backfill flags on `Outcome`.

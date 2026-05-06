@@ -1,0 +1,7 @@
+# Build artefacts — produced by `make -f Makefile.mtcp` (DPDK 20.11 +
+# libmtcp.a sidecar) and by `make -f Makefile` (F-Stack + DPDK 23.11).
+# bench-peer is the F-Stack-shaped binary; bench-peer-mtcp is the mTCP
+# echo server; mtcp-driver is the client-side workload driver.
+bench-peer
+bench-peer-mtcp
+mtcp-driver

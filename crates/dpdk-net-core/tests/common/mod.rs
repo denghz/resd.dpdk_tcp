@@ -20,6 +20,13 @@
 
 #![allow(dead_code)]
 
+// A11.0 step 3 / T2: pressure-test failure-bundle helper + counter-snapshot DSL.
+// Gated on the `pressure-test` cargo feature so non-pressure integration test
+// binaries that `mod common;` (i.e. every existing TAP smoke test) compile
+// unchanged.
+#[cfg(feature = "pressure-test")]
+pub mod pressure;
+
 /// A process-wide lock for tests that mutate `DPDK_NET_FAULT_INJECTOR`.
 /// Cargo runs tests in a binary in parallel by default; without this guard,
 /// two env-var-mutating tests can race and one will pick up the other's

@@ -13,7 +13,7 @@
 //! the two stay byte-compatible.
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct DpdkNetIovec {
     pub base: *const u8,
     pub len: u32,

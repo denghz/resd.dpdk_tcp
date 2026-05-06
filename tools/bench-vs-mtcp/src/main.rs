@@ -79,16 +79,43 @@ struct Args {
     #[arg(long, default_value_t = 10_002)]
     linux_peer_port: u16,
 
+    /// Peer TCP port for the F-Stack stack. The F-Stack peer
+    /// (`bench-peer-fstack`) listens on this port. Default 10003
+    /// matches the bench-nightly.sh wiring (echo-server 10001,
+    /// linux-tcp-sink 10002, fstack-peer 10003).
+    #[arg(long, default_value_t = 10_003)]
+    fstack_peer_port: u16,
+
+    /// F-Stack startup config file absolute path. Consumed by
+    /// `ff_init(argc, argv)` once at process start when `--stacks
+    /// fstack` is selected. Same convention as the `bench-peer-fstack`
+    /// launch in `scripts/bench-nightly.sh` (`--conf=/etc/f-stack.conf
+    /// --proc-id=0`). The file holds DPDK EAL flags + F-Stack runtime
+    /// settings (lcore mask, ports, hugepage path, ...). Image-builder
+    /// component `04b-install-f-stack.yaml` drops the AMI default at
+    /// `/etc/f-stack.conf`.
+    #[arg(long, default_value = "/etc/f-stack.conf")]
+    fstack_config: String,
+
+    /// F-Stack process id (passed to `ff_init` as `--proc-id=<n>`).
+    /// Single-process bench runs leave this at 0 — same as the AMI
+    /// peer launch. F-Stack uses this to namespace shared-memory
+    /// regions across cooperating processes; bench-vs-mtcp only ever
+    /// runs one F-Stack-using process at a time so 0 is correct.
+    #[arg(long, default_value_t = 0)]
+    fstack_proc_id: u32,
+
     /// Workload selector: `burst` (T12) or `maxtp` (T13).
     #[arg(long, default_value = "burst")]
     workload: String,
 
     /// CSV of stacks to run. Tokens: `dpdk`, `mtcp`, `linux`. Default
-    /// runs `dpdk` + `linux` (mTCP stays opt-in while the AMI rebuild
-    /// is blocked on libmtcp / gcc 13). The mTCP path errors at
-    /// startup in strict mode (see src/mtcp.rs module docs); the Linux
-    /// path is wired for the `maxtp` workload only — `burst` skips
-    /// it with a warning.
+    /// runs `dpdk` + `linux` (the mTCP comparator was dropped per spec
+    /// §11 R2 escalation — see src/mtcp.rs module docs and
+    /// docs/superpowers/reports/perf-a10-mtcp-rebuild-investigation.md;
+    /// `--stacks mtcp` is left available for shape-validation and
+    /// strict-mode error surfacing). The Linux path is wired for the
+    /// `maxtp` workload only — `burst` skips it with a warning.
     #[arg(long, default_value = "dpdk,linux")]
     stacks: String,
 
@@ -173,12 +200,42 @@ struct Args {
     #[arg(long, default_value_t = maxtp::DURATION_SECS)]
     maxtp_duration_secs: u64,
 
-    /// mTCP peer binary absolute path on the baked AMI. Default
-    /// tracks spec §11 ("`/opt/mtcp-peer/bench-peer` pre-installed").
-    /// Used only when mTCP stack is selected; stub returns
-    /// `Unimplemented` but validates the shape.
+    /// mTCP **server-side** peer binary absolute path on the baked
+    /// AMI. The peer host runs this; bench-vs-mtcp validates the path
+    /// shape but never execs it (the bench-pair script handles peer
+    /// launch).
     #[arg(long, default_value = "/opt/mtcp-peer/bench-peer")]
     mtcp_peer_binary: String,
+
+    /// mTCP **client-side** workload-driver binary absolute path on
+    /// this host. bench-vs-mtcp invokes this via subprocess (DPDK
+    /// 20.11 + libmtcp.a links cleanly here, but not in the Rust
+    /// process which already pulls DPDK 23.11). Today the driver is a
+    /// stub that returns ENOSYS; this wrapper surfaces it as
+    /// `mtcp::Error::DriverUnimplemented`. See `tools/bench-vs-mtcp/
+    /// peer/mtcp-driver.c` module docs for the frozen CLI + JSON
+    /// contracts.
+    #[arg(long, default_value = "/opt/mtcp-peer/mtcp-driver")]
+    mtcp_driver_binary: String,
+
+    /// mTCP startup config file absolute path. Passed to the driver
+    /// via `--mtcp-conf` and consumed by `mtcp_init()` inside the
+    /// driver process.
+    #[arg(long, default_value = "/opt/mtcp/etc/mtcp.conf")]
+    mtcp_conf: String,
+
+    /// mTCP core count for the driver. Single-core (1) for the burst
+    /// grid (one persistent connection); multi-core (== conn_count)
+    /// for the maxtp grid. Default 1.
+    #[arg(long, default_value_t = 1)]
+    mtcp_num_cores: u32,
+
+    /// Per-driver-invocation timeout in seconds. Hard cap on a single
+    /// burst- or maxtp-bucket subprocess run. Default 600 (10 min) —
+    /// covers the maxtp 70 s window (warmup + measurement + buffer)
+    /// plus DPDK EAL spin-up.
+    #[arg(long, default_value_t = 600)]
+    mtcp_driver_timeout_secs: u64,
 
     /// NIC line-rate cap (bits-per-second) for the post-run
     /// NIC-saturation check (spec §11.1 check 3 — "achieved rate ≤
@@ -261,6 +318,29 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    // F-Stack init — once per process, before any ff_socket / ff_connect
+    // call from the fstack arms. F-Stack's `ff_init` parses the EAL
+    // flags + runtime settings out of the file pointed to by `--conf`
+    // and brings up its internal poll loop on the lcore F-Stack
+    // claims. The `--proc-id` flag namespaces shared-memory regions
+    // across cooperating processes; single-process bench runs leave
+    // it at 0. Wired only when `Stack::FStack` is in the selection so
+    // dpdk-only / linux-only / mtcp-only invocations don't pull in
+    // F-Stack's EAL bring-up.
+    //
+    // NOTE: F-Stack performs its own DPDK EAL init internally. Selecting
+    // both `Stack::DpdkNet` and `Stack::FStack` in the same process
+    // would double-init EAL — `bench-nightly.sh` avoids this by
+    // running each stack via separate binary invocations. Strict
+    // enforcement of "one of {dpdk_net, fstack} per process" lives at
+    // the orchestrator layer.
+    #[cfg(feature = "fstack")]
+    {
+        if stacks.contains(&Stack::FStack) {
+            init_fstack(&args)?;
+        }
+    }
+
     let metadata = build_run_metadata(mode, preconditions)?;
     let mut writer = csv::Writer::from_path(&args.output_csv)
         .with_context(|| format!("creating output CSV {:?}", args.output_csv))?;
@@ -317,6 +397,18 @@ fn main() -> anyhow::Result<()> {
                              skipping burst grid for Linux"
                         );
                     }
+                    Stack::FStack => {
+                        run_burst_grid_fstack(
+                            peer_ip,
+                            args.fstack_peer_port,
+                            &grid,
+                            &args,
+                            &metadata,
+                            tsc_hz,
+                            nic_max_bps,
+                            &mut writer,
+                        )?;
+                    }
                 }
             }
         }
@@ -358,6 +450,17 @@ fn main() -> anyhow::Result<()> {
                         run_maxtp_grid_linux(
                             peer_ip,
                             args.linux_peer_port,
+                            &grid,
+                            &args,
+                            &metadata,
+                            nic_max_bps,
+                            &mut writer,
+                        )?;
+                    }
+                    Stack::FStack => {
+                        run_maxtp_grid_fstack(
+                            peer_ip,
+                            args.fstack_peer_port,
                             &grid,
                             &args,
                             &metadata,
@@ -644,11 +747,15 @@ fn run_burst_grid_mtcp_stub<W: std::io::Write>(
             peer_ip: &args.peer_ip,
             peer_port: args.peer_port,
             peer_binary: &args.mtcp_peer_binary,
+            driver_binary: &args.mtcp_driver_binary,
+            mtcp_conf: &args.mtcp_conf,
             burst_bytes: bucket.burst_bytes,
             gap_ms: bucket.gap_ms,
             bursts: args.bursts_per_bucket,
             warmup: args.warmup,
             mss: args.mss,
+            num_cores: args.mtcp_num_cores,
+            timeout: std::time::Duration::from_secs(args.mtcp_driver_timeout_secs),
         };
         // Validate shape first so a bad CLI combo fails loudly even
         // in lenient mode (strict mode handles the Unimplemented
@@ -657,9 +764,23 @@ fn run_burst_grid_mtcp_stub<W: std::io::Write>(
             anyhow::bail!("mTCP config validation failed: {reason}");
         }
         match mtcp::run_burst_workload(&cfg) {
-            Ok(_) => {
-                unreachable!(
-                    "mtcp::run_burst_workload should return Unimplemented in T12"
+            Ok(samples_bps) => {
+                // Real driver returned per-burst bps samples. Wire
+                // them into the bench-common burst pipeline by
+                // synthesising BurstSamples — the driver doesn't have
+                // engine-level introspection (counters / TSC mode), so
+                // tx_ts_mode is recorded as `n/a` and bench-report can
+                // filter the rows accordingly.
+                //
+                // NOTE: this branch is currently unreachable while the
+                // driver is a stub returning ENOSYS. Kept as a forward
+                // contract so the wiring is in place when the C-side
+                // workload pump lands.
+                let _ = samples_bps;
+                anyhow::bail!(
+                    "mtcp::run_burst_workload returned Ok but bench-common \
+                     wiring for the real driver path is not yet finalised — \
+                     tracked alongside peer/mtcp-driver.c implementation."
                 );
             }
             Err(e) => match mode {
@@ -803,71 +924,102 @@ fn run_maxtp_grid_dpdk<W: std::io::Write>(
             payload,
             tx_ts_mode,
         };
-        // Per-bucket soft-fail: a single bucket erroring (e.g. SendBufferFull
-        // at high C) should NOT abort the entire grid. Log and continue so
-        // every other bucket — and every other stack — gets to produce data.
-        let run = match dpdk_maxtp::run_bucket(&cfg).with_context(|| {
-            format!("dpdk_maxtp::run_bucket for {}", bucket.label())
-        }) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!(
-                    "bench-vs-mtcp: dpdk_maxtp bucket {} failed: {e:#}",
-                    bucket.label()
-                );
-                continue;
-            }
-        };
+        // 2026-04-29 fix (Issue #3): wrap run-bucket + sanity-invariant
+        // + emit-rows in an inner closure so the bucket-cleanup
+        // (`close_persistent_connections`) runs unconditionally on the
+        // way out — including the early-bail run_bucket-failed path
+        // and the early-return sanity-invariant-violated path. Without
+        // this, a failed bucket leaks every conn it just opened and
+        // the next bucket's open_persistent_connections inherits a
+        // shrunken slot pool.
+        let bucket_outcome = (|| -> anyhow::Result<()> {
+            // Per-bucket soft-fail: a single bucket erroring
+            // (e.g. SendBufferFull at high C) should NOT abort the
+            // entire grid. Log and return-Ok-from-closure so the
+            // outer loop drops through to teardown + the next bucket.
+            let run = match dpdk_maxtp::run_bucket(&cfg).with_context(|| {
+                format!("dpdk_maxtp::run_bucket for {}", bucket.label())
+            }) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!(
+                        "bench-vs-mtcp: dpdk_maxtp bucket {} failed: {e:#}",
+                        bucket.label()
+                    );
+                    return Ok(());
+                }
+            };
 
-        // Sanity invariant (spec §11.2): ACKed bytes during window ==
-        // `tx_payload_bytes` delta, minus in-flight bound. The
-        // `tx_payload_bytes` counter only increments with the
-        // `obs-byte-counters` feature (OFF by default) — when it's off
-        // the delta is 0 and we skip the check with a log line.
-        if run.tx_payload_bytes_delta > 0 {
-            if let Err(e) = maxtp::check_sanity_invariant(
-                run.acked_bytes_in_window,
-                run.tx_payload_bytes_delta,
-                run.inflight_bytes_at_end,
-            ) {
+            // Sanity invariant (spec §11.2): ACKed bytes during window
+            // == `tx_payload_bytes` delta, minus in-flight bound. The
+            // `tx_payload_bytes` counter only increments with the
+            // `obs-byte-counters` feature (OFF by default) — when it's
+            // off the delta is 0 and we skip the check with a log line.
+            if run.tx_payload_bytes_delta > 0 {
+                if let Err(e) = maxtp::check_sanity_invariant(
+                    run.acked_bytes_in_window,
+                    run.tx_payload_bytes_delta,
+                    run.inflight_bytes_at_end,
+                ) {
+                    eprintln!(
+                        "bench-vs-mtcp: maxtp sanity invariant violated for bucket {}: {e}",
+                        bucket.label()
+                    );
+                    anyhow::bail!(e);
+                }
+            } else {
                 eprintln!(
-                    "bench-vs-mtcp: maxtp sanity invariant violated for bucket {}: {e}",
+                    "bench-vs-mtcp: maxtp sanity invariant check skipped for bucket {} \
+                     (tx_payload_bytes counter is 0 — build with \
+                     `--features obs-byte-counters` to enable)",
                     bucket.label()
                 );
-                anyhow::bail!(e);
             }
-        } else {
+
+            // Post-run check (spec §11.1 check 3, reused for §11.2):
+            // NIC saturation. Same 70% ceiling.
+            let mut agg = maxtp::BucketAggregate::from_sample(
+                *bucket,
+                Stack::DpdkNet,
+                Some(run.sample),
+                BucketVerdict::Ok,
+                Some(tx_ts_mode),
+            );
+            if let Some(max_bps) = nic_max_bps {
+                let sat_verdict =
+                    check_nic_saturation_bps(run.sample.goodput_bps as u64, max_bps);
+                if !sat_verdict.is_ok() {
+                    eprintln!(
+                        "bench-vs-mtcp: maxtp bucket {} NIC-bound post-run: {}",
+                        bucket.label(),
+                        sat_verdict.reason().unwrap_or("<unknown>")
+                    );
+                    agg.override_verdict(sat_verdict);
+                }
+            }
+            maxtp::emit_bucket_rows(writer, metadata, &args.tool, &args.feature_set, &agg)
+                .context("emit maxtp bucket rows")
+        })();
+
+        // 2026-04-29 fix (Issue #3): close + reap the bucket's conns
+        // before the next bucket opens fresh ones. Pre-fix the maxtp
+        // grid leaked handles across buckets (slots 0..N stay full,
+        // new opens hit slots 264, 348, …) and any later bucket using
+        // those high handles would trip `InvalidConnHandle(<n>)`
+        // mid-bucket once a torn-down conn's slot got reused. Soft-
+        // fail: a stuck close shouldn't block the rest of the grid.
+        if let Err(e) = dpdk_maxtp::close_persistent_connections(engine, &conns) {
             eprintln!(
-                "bench-vs-mtcp: maxtp sanity invariant check skipped for bucket {} \
-                 (tx_payload_bytes counter is 0 — build with \
-                 `--features obs-byte-counters` to enable)",
+                "bench-vs-mtcp: dpdk_maxtp bucket {} close_persistent_connections failed: {e:#}; \
+                 continuing to next bucket",
                 bucket.label()
             );
         }
 
-        // Post-run check (spec §11.1 check 3, reused for §11.2): NIC
-        // saturation. Same 70% ceiling.
-        let mut agg = maxtp::BucketAggregate::from_sample(
-            *bucket,
-            Stack::DpdkNet,
-            Some(run.sample),
-            BucketVerdict::Ok,
-            Some(tx_ts_mode),
-        );
-        if let Some(max_bps) = nic_max_bps {
-            let sat_verdict =
-                check_nic_saturation_bps(run.sample.goodput_bps as u64, max_bps);
-            if !sat_verdict.is_ok() {
-                eprintln!(
-                    "bench-vs-mtcp: maxtp bucket {} NIC-bound post-run: {}",
-                    bucket.label(),
-                    sat_verdict.reason().unwrap_or("<unknown>")
-                );
-                agg.override_verdict(sat_verdict);
-            }
-        }
-        maxtp::emit_bucket_rows(writer, metadata, &args.tool, &args.feature_set, &agg)
-            .context("emit maxtp bucket rows")?;
+        // Propagate any hard error the inner closure returned (sanity
+        // invariant violation is the only one). Soft-fail paths
+        // (run_bucket failure) returned `Ok(())` from the closure.
+        bucket_outcome?;
     }
     Ok(())
 }
@@ -1148,19 +1300,28 @@ fn run_maxtp_grid_mtcp_stub<W: std::io::Write>(
             peer_ip: &args.peer_ip,
             peer_port: args.peer_port,
             peer_binary: &args.mtcp_peer_binary,
+            driver_binary: &args.mtcp_driver_binary,
+            mtcp_conf: &args.mtcp_conf,
             write_bytes: bucket.write_bytes,
             conn_count: bucket.conn_count,
             warmup_secs: args.maxtp_warmup_secs,
             duration_secs: args.maxtp_duration_secs,
             mss: args.mss,
+            num_cores: args.mtcp_num_cores,
+            timeout: std::time::Duration::from_secs(args.mtcp_driver_timeout_secs),
         };
         if let Err(reason) = mtcp::validate_maxtp_config(&cfg) {
             anyhow::bail!("mTCP maxtp config validation failed: {reason}");
         }
         match mtcp::run_maxtp_workload(&cfg) {
             Ok(_) => {
-                unreachable!(
-                    "mtcp::run_maxtp_workload should return Unimplemented in T13"
+                // See burst-side note above — same forward-contract
+                // shape; bench-common wiring lands alongside the C
+                // driver implementation.
+                anyhow::bail!(
+                    "mtcp::run_maxtp_workload returned Ok but bench-common \
+                     wiring for the real driver path is not yet finalised — \
+                     tracked alongside peer/mtcp-driver.c implementation."
                 );
             }
             Err(e) => match mode {
@@ -1184,6 +1345,356 @@ fn run_maxtp_grid_mtcp_stub<W: std::io::Write>(
                 }
             },
         }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// F-Stack burst + maxtp grid drivers — feature-gated behind `fstack`.
+// When the feature is off the dispatcher emits a stub-marker row so
+// downstream bench-report still sees an `fstack` row in the CSV
+// (otherwise dropped silently).
+//
+// F-Stack peer = `/opt/f-stack-peer/bench-peer` on the bench-pair AMI
+// (port 10003 default; arg --fstack-peer-port).
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "fstack")]
+#[allow(clippy::too_many_arguments)]
+fn run_burst_grid_fstack<W: std::io::Write>(
+    peer_ip: u32,
+    peer_port: u16,
+    grid: &[bench_vs_mtcp::burst::Bucket],
+    args: &Args,
+    metadata: &RunMetadata,
+    tsc_hz: u64,
+    nic_max_bps: Option<u64>,
+    writer: &mut csv::Writer<W>,
+) -> anyhow::Result<()> {
+    use bench_vs_mtcp::fstack_burst::{self, FStackBurstCfg};
+
+    // Pre-allocate one payload buffer per K (parity with dpdk path).
+    let mut payload_cache: std::collections::HashMap<u64, Vec<u8>> =
+        std::collections::HashMap::new();
+
+    // F-Stack burst opens a fresh connection per bucket. Per-bucket
+    // soft-fail mirrors the dpdk_maxtp pattern.
+    for bucket in grid {
+        eprintln!(
+            "bench-vs-mtcp: running fstack burst bucket {}",
+            bucket.label()
+        );
+        let payload = payload_cache
+            .entry(bucket.burst_bytes)
+            .or_insert_with(|| vec![0u8; bucket.burst_bytes as usize]);
+
+        let tx_ts_mode = TxTsMode::TscFallback;
+
+        let fd = match fstack_burst::open_persistent_connection(peer_ip, peer_port) {
+            Ok(fd) => fd,
+            Err(e) => {
+                eprintln!(
+                    "bench-vs-mtcp: fstack burst bucket {} open failed: {e:#}; \
+                     emitting marker + continuing",
+                    bucket.label()
+                );
+                let agg = bench_vs_mtcp::burst::BucketAggregate::from_samples(
+                    *bucket,
+                    Stack::FStack,
+                    &[],
+                    BucketVerdict::Invalid(format!("fstack open failed: {e:#}")),
+                    Some(tx_ts_mode),
+                );
+                bench_vs_mtcp::burst::emit_bucket_rows(
+                    writer,
+                    metadata,
+                    &args.tool,
+                    &args.feature_set,
+                    &agg,
+                )
+                .context("emit fstack open-fail marker row")?;
+                continue;
+            }
+        };
+
+        let cfg = FStackBurstCfg {
+            bucket: *bucket,
+            warmup: args.warmup,
+            bursts: args.bursts_per_bucket,
+            tsc_hz,
+            peer_ip_host_order: peer_ip,
+            peer_port,
+            payload,
+            tx_ts_mode,
+        };
+
+        let bucket_outcome = (|| -> anyhow::Result<()> {
+            let run = match fstack_burst::run_bucket(&cfg, fd) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!(
+                        "bench-vs-mtcp: fstack burst bucket {} failed: {e:#}; \
+                         emitting marker + continuing",
+                        bucket.label()
+                    );
+                    // Mirror the open-fail path: emit an Invalid
+                    // marker row so the downstream report scripts
+                    // see a row for every bucket.
+                    let agg = bench_vs_mtcp::burst::BucketAggregate::from_samples(
+                        *bucket,
+                        Stack::FStack,
+                        &[],
+                        BucketVerdict::Invalid(format!("fstack run_bucket failed: {e:#}")),
+                        Some(tx_ts_mode),
+                    );
+                    return bench_vs_mtcp::burst::emit_bucket_rows(
+                        writer,
+                        metadata,
+                        &args.tool,
+                        &args.feature_set,
+                        &agg,
+                    )
+                    .context("emit fstack burst run-fail marker row");
+                }
+            };
+            let mut agg = bench_vs_mtcp::burst::BucketAggregate::from_samples(
+                *bucket,
+                Stack::FStack,
+                &run.samples,
+                BucketVerdict::Ok,
+                Some(tx_ts_mode),
+            );
+            if let Some(max_bps) = nic_max_bps {
+                let achieved = mean_throughput_from_burst_samples(&run.samples) as u64;
+                let sat = check_nic_saturation_bps(achieved, max_bps);
+                if !sat.is_ok() {
+                    eprintln!(
+                        "bench-vs-mtcp: fstack burst bucket {} NIC-bound post-run: {}",
+                        bucket.label(),
+                        sat.reason().unwrap_or("<unknown>")
+                    );
+                    agg.override_verdict(sat);
+                }
+            }
+            bench_vs_mtcp::burst::emit_bucket_rows(
+                writer,
+                metadata,
+                &args.tool,
+                &args.feature_set,
+                &agg,
+            )
+            .context("emit fstack burst bucket rows")
+        })();
+
+        // Always close, even on inner-failure.
+        fstack_burst::close_persistent_connection(fd);
+        bucket_outcome?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "fstack")]
+#[allow(clippy::too_many_arguments)]
+fn run_maxtp_grid_fstack<W: std::io::Write>(
+    peer_ip: u32,
+    peer_port: u16,
+    grid: &[maxtp::Bucket],
+    args: &Args,
+    metadata: &RunMetadata,
+    nic_max_bps: Option<u64>,
+    writer: &mut csv::Writer<W>,
+) -> anyhow::Result<()> {
+    use bench_vs_mtcp::fstack_maxtp::{self, FStackMaxtpCfg};
+
+    for bucket in grid {
+        eprintln!(
+            "bench-vs-mtcp: running fstack maxtp bucket {}",
+            bucket.label()
+        );
+
+        let tx_ts_mode = dpdk_maxtp::TxTsMode::TscFallback;
+
+        // Open C F-Stack sockets. Soft-fail per-bucket so a single
+        // bucket's open-failure doesn't kill the grid. Emit an
+        // Invalid marker row so downstream bench-pair report scripts
+        // see a row for every (W, C) bucket and can detect missing
+        // data via the `bucket_invalid` dimension instead of breaking
+        // on a CSV with fewer rows than expected.
+        let conns = match fstack_maxtp::open_persistent_connections(
+            peer_ip,
+            peer_port,
+            bucket.conn_count,
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!(
+                    "bench-vs-mtcp: fstack maxtp bucket {} open failed: {e:#}; \
+                     emitting marker + continuing",
+                    bucket.label()
+                );
+                let agg = maxtp::BucketAggregate::from_sample(
+                    *bucket,
+                    Stack::FStack,
+                    None,
+                    BucketVerdict::Invalid(format!("fstack open failed: {e:#}")),
+                    Some(tx_ts_mode),
+                );
+                maxtp::emit_bucket_rows(writer, metadata, &args.tool, &args.feature_set, &agg)
+                    .context("emit fstack maxtp open-fail marker row")?;
+                continue;
+            }
+        };
+
+        let cfg = FStackMaxtpCfg {
+            bucket: *bucket,
+            warmup: std::time::Duration::from_secs(args.maxtp_warmup_secs),
+            duration: std::time::Duration::from_secs(args.maxtp_duration_secs),
+            peer_ip_host_order: peer_ip,
+            peer_port,
+            payload: vec![0u8; bucket.write_bytes as usize],
+            tx_ts_mode,
+        };
+
+        let bucket_outcome = (|| -> anyhow::Result<()> {
+            let run = match fstack_maxtp::run_bucket(&cfg, &conns) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!(
+                        "bench-vs-mtcp: fstack maxtp bucket {} failed: {e:#}; \
+                         emitting marker + continuing",
+                        bucket.label()
+                    );
+                    // Mirror the open-fail path: emit an Invalid
+                    // marker row so the downstream report scripts
+                    // see a row for every bucket.
+                    let agg = maxtp::BucketAggregate::from_sample(
+                        *bucket,
+                        Stack::FStack,
+                        None,
+                        BucketVerdict::Invalid(format!("fstack run_bucket failed: {e:#}")),
+                        Some(tx_ts_mode),
+                    );
+                    return maxtp::emit_bucket_rows(
+                        writer,
+                        metadata,
+                        &args.tool,
+                        &args.feature_set,
+                        &agg,
+                    )
+                    .context("emit fstack maxtp run-fail marker row");
+                }
+            };
+            let mut agg = maxtp::BucketAggregate::from_sample(
+                *bucket,
+                Stack::FStack,
+                Some(run.sample),
+                BucketVerdict::Ok,
+                Some(tx_ts_mode),
+            );
+            if let Some(max_bps) = nic_max_bps {
+                let sat = check_nic_saturation_bps(run.sample.goodput_bps as u64, max_bps);
+                if !sat.is_ok() {
+                    eprintln!(
+                        "bench-vs-mtcp: fstack maxtp bucket {} NIC-bound post-run: {}",
+                        bucket.label(),
+                        sat.reason().unwrap_or("<unknown>")
+                    );
+                    agg.override_verdict(sat);
+                }
+            }
+            maxtp::emit_bucket_rows(writer, metadata, &args.tool, &args.feature_set, &agg)
+                .context("emit fstack maxtp bucket rows")
+        })();
+
+        // Always close, even on inner-failure.
+        fstack_maxtp::close_persistent_connections(&conns);
+        bucket_outcome?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "fstack")]
+fn mean_throughput_from_burst_samples(samples: &[bench_vs_mtcp::burst::BurstSample]) -> f64 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let sum: f64 = samples.iter().map(|s| s.throughput_bps).sum();
+    sum / (samples.len() as f64)
+}
+
+// ----- F-Stack stubs (when fstack feature is off) -------------------
+//
+// Default builds skip the F-Stack arms entirely; if --stacks fstack is
+// passed without the feature, we emit an Invalid marker row so
+// bench-report still sees the row instead of silently dropping it.
+
+#[cfg(not(feature = "fstack"))]
+#[allow(clippy::too_many_arguments)]
+fn run_burst_grid_fstack<W: std::io::Write>(
+    _peer_ip: u32,
+    _peer_port: u16,
+    grid: &[bench_vs_mtcp::burst::Bucket],
+    args: &Args,
+    metadata: &RunMetadata,
+    _tsc_hz: u64,
+    _nic_max_bps: Option<u64>,
+    writer: &mut csv::Writer<W>,
+) -> anyhow::Result<()> {
+    eprintln!(
+        "bench-vs-mtcp: WARN fstack stack selected but binary built without `fstack` \
+         feature; emitting marker rows. Rebuild with `--features fstack` on the \
+         AMI where libfstack.a is installed."
+    );
+    for bucket in grid {
+        let agg = bench_vs_mtcp::burst::BucketAggregate::from_samples(
+            *bucket,
+            Stack::FStack,
+            &[],
+            BucketVerdict::Invalid(
+                "fstack feature not compiled in (libfstack.a not available)".to_string(),
+            ),
+            None,
+        );
+        bench_vs_mtcp::burst::emit_bucket_rows(
+            writer,
+            metadata,
+            &args.tool,
+            &args.feature_set,
+            &agg,
+        )
+        .context("emit fstack-stub burst marker row")?;
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "fstack"))]
+#[allow(clippy::too_many_arguments)]
+fn run_maxtp_grid_fstack<W: std::io::Write>(
+    _peer_ip: u32,
+    _peer_port: u16,
+    grid: &[maxtp::Bucket],
+    args: &Args,
+    metadata: &RunMetadata,
+    _nic_max_bps: Option<u64>,
+    writer: &mut csv::Writer<W>,
+) -> anyhow::Result<()> {
+    eprintln!(
+        "bench-vs-mtcp: WARN fstack stack selected but binary built without `fstack` \
+         feature; emitting marker rows. Rebuild with `--features fstack` on the \
+         AMI where libfstack.a is installed."
+    );
+    for bucket in grid {
+        let agg = maxtp::BucketAggregate::from_sample(
+            *bucket,
+            Stack::FStack,
+            None,
+            BucketVerdict::Invalid(
+                "fstack feature not compiled in (libfstack.a not available)".to_string(),
+            ),
+            None,
+        );
+        maxtp::emit_bucket_rows(writer, metadata, &args.tool, &args.feature_set, &agg)
+            .context("emit fstack-stub maxtp marker row")?;
     }
     Ok(())
 }
@@ -1265,6 +1776,39 @@ fn eal_init(args: &Args) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("eal_init failed: {e:?}"))
 }
 
+/// One-shot F-Stack init. Builds an argv mirroring the AMI peer launch
+/// (`/opt/f-stack-peer/bench-peer 10003 --conf=/etc/f-stack.conf
+/// --proc-id=0`) and hands it to `ff_init`. argv[0] is the program
+/// name (informational; F-Stack ignores it). The remaining flags are
+/// the only two F-Stack's parser consumes from the bench harness:
+/// `--conf` (config file path) and `--proc-id` (shared-mem
+/// namespace). A missing config file is surfaced as `Err` to the
+/// caller before `ff_init` has a chance to crash inside DPDK EAL —
+/// otherwise the operator sees an opaque ff_init failure with no
+/// pointer at the missing file.
+#[cfg(feature = "fstack")]
+fn init_fstack(args: &Args) -> anyhow::Result<()> {
+    if !std::path::Path::new(&args.fstack_config).exists() {
+        anyhow::bail!(
+            "F-Stack config file not found at `{}` (set --fstack-config to override). \
+             AMI default is /etc/f-stack.conf — see image-builder component \
+             04b-install-f-stack.yaml.",
+            args.fstack_config
+        );
+    }
+    let argv: Vec<String> = vec![
+        "bench-vs-mtcp".to_string(),
+        format!("--conf={}", args.fstack_config),
+        format!("--proc-id={}", args.fstack_proc_id),
+    ];
+    eprintln!(
+        "bench-vs-mtcp: ff_init with --conf={} --proc-id={}",
+        args.fstack_config, args.fstack_proc_id
+    );
+    bench_vs_mtcp::fstack_ffi::ff_init_from_args(&argv)
+        .map_err(|e| anyhow::anyhow!("ff_init failed: {e}"))
+}
+
 fn build_engine(args: &Args) -> anyhow::Result<Engine> {
     if args.lcore > u16::MAX as u32 {
         anyhow::bail!(
@@ -1294,6 +1838,24 @@ fn build_engine(args: &Args) -> anyhow::Result<Engine> {
         // proportional to `max_connections` — small relative to the
         // mempool / mbuf footprint.
         max_connections: 512,
+        // 2026-04-29 fix (Issue #2/#4): explicitly size the TX data
+        // mempool for the maxtp grid's worst-case in-flight working
+        // set. With `max_connections=512` × `send_buffer_bytes=256
+        // KiB` / `mbuf_data_room=2048`, the formula default would
+        // allocate 2*512*128+8192 ≈ 140K mbufs (≈280 MiB at 2 KiB
+        // per mbuf). The maxtp grid's actual max C is 64, so the
+        // working-set bound is ~16K mbufs (64 × 128). Pin 32K to
+        // give 2× headroom over that bound — covers the conns-in-
+        // teardown overlap window where a closing bucket's mbufs
+        // are still being released to the pool while the next
+        // bucket starts pumping.
+        //
+        // Bumped from the legacy hardcoded 4096 → 32768 (8×) to fix
+        // the 2026-05-04 `K=1MiB G=0ms` burst stall + W ≥ 4096
+        // maxtp `SendBufferFull` cells. See engine.rs
+        // `EngineConfig.tx_data_mempool_size` for the formula
+        // default and the doc-comment for the regression history.
+        tx_data_mempool_size: 32_768,
         ..dpdk_net_core::engine::EngineConfig::default()
     };
     Engine::new(cfg).map_err(|e| anyhow::anyhow!("Engine::new failed: {e:?}"))
@@ -1724,5 +2286,59 @@ mod tests {
             "reason was {:?}",
             agg.verdict.reason()
         );
+    }
+
+    // ------------------------------------------------------------------
+    // D1 review fix: clap parse coverage for the F-Stack init args
+    // (--fstack-config, --fstack-proc-id) added in commit 0372dbd.
+    //
+    // The original D1 landing wired `ff_init_from_args` behind a CLI
+    // surface but shipped no parse-test, so a typo in the `#[arg]`
+    // attribute (long name, default_value, type) would only surface at
+    // runtime. These tests pin:
+    //   - default `--fstack-config` resolves to `/etc/f-stack.conf`
+    //     (matches the AMI drop site from
+    //     image-builder/components/04b-install-f-stack.yaml)
+    //   - default `--fstack-proc-id` resolves to `0` (matches the
+    //     bench-nightly.sh peer launch)
+    //   - explicit `--fstack-config` / `--fstack-proc-id` overrides
+    //     thread through to the parsed struct
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn fstack_args_have_expected_defaults() {
+        use clap::Parser;
+        // Minimum required args: --peer-ip and --output-csv (no
+        // default_value on either). Everything else falls back to the
+        // attribute defaults.
+        let args = Args::try_parse_from([
+            "bench-vs-mtcp",
+            "--peer-ip",
+            "10.0.0.1",
+            "--output-csv",
+            "/tmp/bench-vs-mtcp-test.csv",
+        ])
+        .expect("minimum-required args should parse");
+        assert_eq!(args.fstack_config, "/etc/f-stack.conf");
+        assert_eq!(args.fstack_proc_id, 0u32);
+    }
+
+    #[test]
+    fn fstack_args_accept_overrides() {
+        use clap::Parser;
+        let args = Args::try_parse_from([
+            "bench-vs-mtcp",
+            "--peer-ip",
+            "10.0.0.1",
+            "--output-csv",
+            "/tmp/bench-vs-mtcp-test.csv",
+            "--fstack-config",
+            "/tmp/test-fstack.conf",
+            "--fstack-proc-id",
+            "2",
+        ])
+        .expect("override args should parse");
+        assert_eq!(args.fstack_config, "/tmp/test-fstack.conf");
+        assert_eq!(args.fstack_proc_id, 2u32);
     }
 }

@@ -264,11 +264,55 @@ fn send_one_burst_and_drain_acks(
         let _drained = drain_and_accumulate_readable(engine, conn, &mut _last_rx)
             .context("warmup drain")?;
         if last_progress.elapsed() >= STALL_TIMEOUT {
+            // T21 diag: on stall, dump TCP send-side state so the
+            // operator can attribute root cause without a fresh bench-
+            // pair run. Three suspects: (a) snd_wnd never grew past
+            // initial value (peer's recv buf small / ACKs not arriving
+            // / ws_shift_out wrong), (b) send_buf_bytes_pending pinned
+            // (in-flight not draining → ACKs not advancing snd_una),
+            // (c) RTO/RTX storm (rto_us > sane bound).
+            let diag = engine
+                .diag_conn_stats(conn)
+                .map(|s| {
+                    // T21 (per af6a487 investigation): emit `in_flight`
+                    // and `room_in_peer_wnd` directly — those are the
+                    // values `Engine::send_bytes` (engine.rs:5286-5292)
+                    // actually clamps acceptance against. The stale
+                    // `send_buf_bytes_pending` field (always 0 in
+                    // production — `snd.pending` is TLP-probe-only,
+                    // see engine.rs:3121) is no longer surfaced.
+                    let in_flight = s.snd_nxt.wrapping_sub(s.snd_una);
+                    let room_in_peer_wnd = s.snd_wnd.saturating_sub(in_flight);
+                    format!(
+                        "snd_una={} snd_nxt={} in_flight={} \
+                         snd_wnd={} room_in_peer_wnd={} \
+                         srtt_us={} rto_us={}",
+                        s.snd_una,
+                        s.snd_nxt,
+                        in_flight,
+                        s.snd_wnd,
+                        room_in_peer_wnd,
+                        s.srtt_us,
+                        s.rto_us,
+                    )
+                })
+                .unwrap_or_else(|| "<conn handle unknown>".to_string());
+            // T21 follow-up: engine-wide drop-site counters. Attribute
+            // which `handle_established` validation rejected peer ACKs.
+            let drops = engine.diag_input_drops();
             anyhow::bail!(
                 "warmup burst stalled with {sent}/{} bytes accepted \
-                 (no forward progress in {:?})",
+                 (no forward progress in {:?}) | diag: {} | input_drops: \
+                 bad_seq={} bad_option={} paws_rejected={} bad_ack={} \
+                 urgent_dropped={}",
                 payload.len(),
                 STALL_TIMEOUT,
+                diag,
+                drops.bad_seq,
+                drops.bad_option,
+                drops.paws_rejected,
+                drops.bad_ack,
+                drops.urgent_dropped,
             );
         }
     }
@@ -306,9 +350,35 @@ fn send_first_segment_and_capture_wire_time(
                 // the first byte is actually accepted.
                 engine.poll_once();
                 if start.elapsed() >= STALL_TIMEOUT {
+                    let diag = engine
+                        .diag_conn_stats(conn)
+                        .map(|s| {
+                            format!(
+                                "snd_una={} snd_nxt={} snd_wnd={} \
+                                 send_buf_pending={} send_buf_free={} \
+                                 srtt_us={} rto_us={}",
+                                s.snd_una,
+                                s.snd_nxt,
+                                s.snd_wnd,
+                                s.send_buf_bytes_pending,
+                                s.send_buf_bytes_free,
+                                s.srtt_us,
+                                s.rto_us,
+                            )
+                        })
+                        .unwrap_or_else(|| "<conn handle unknown>".to_string());
+                    let drops = engine.diag_input_drops();
                     anyhow::bail!(
-                        "first-segment send did not accept any byte within {:?}",
+                        "first-segment send did not accept any byte within {:?} | \
+                         diag: {} | input_drops: bad_seq={} bad_option={} \
+                         paws_rejected={} bad_ack={} urgent_dropped={}",
                         STALL_TIMEOUT,
+                        diag,
+                        drops.bad_seq,
+                        drops.bad_option,
+                        drops.paws_rejected,
+                        drops.bad_ack,
+                        drops.urgent_dropped,
                     );
                 }
             }
@@ -377,11 +447,37 @@ fn drive_burst_remainder_to_completion(
                 let _ = drain_and_accumulate_readable(engine, conn, &mut last_rx)
                     .context("burst drain mid-flight")?;
                 if last_progress.elapsed() >= STALL_TIMEOUT {
+                    let diag = engine
+                        .diag_conn_stats(conn)
+                        .map(|s| {
+                            format!(
+                                "snd_una={} snd_nxt={} snd_wnd={} \
+                                 send_buf_pending={} send_buf_free={} \
+                                 srtt_us={} rto_us={}",
+                                s.snd_una,
+                                s.snd_nxt,
+                                s.snd_wnd,
+                                s.send_buf_bytes_pending,
+                                s.send_buf_bytes_free,
+                                s.srtt_us,
+                                s.rto_us,
+                            )
+                        })
+                        .unwrap_or_else(|| "<conn handle unknown>".to_string());
+                    let drops = engine.diag_input_drops();
                     anyhow::bail!(
                         "burst drain stalled with {sent}/{} bytes accepted \
-                         (no forward progress in {:?})",
+                         (no forward progress in {:?}) | diag: {} | input_drops: \
+                         bad_seq={} bad_option={} paws_rejected={} bad_ack={} \
+                         urgent_dropped={}",
                         payload.len(),
                         STALL_TIMEOUT,
+                        diag,
+                        drops.bad_seq,
+                        drops.bad_option,
+                        drops.paws_rejected,
+                        drops.bad_ack,
+                        drops.urgent_dropped,
                     );
                 }
             }

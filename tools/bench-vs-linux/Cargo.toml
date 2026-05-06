@@ -33,9 +33,23 @@ path = "src/lib.rs"
 name = "bench-vs-linux"
 path = "src/main.rs"
 
+[features]
+default = ["fstack"]
+# Enables the F-Stack RTT arm. Requires libfstack.a + DPDK 23.11
+# at /opt/f-stack/lib (image-builder component
+# 04b-install-f-stack.yaml). Default-on as of T23 (AMI 1.0.15
+# ami-0e483926d07d19647) since the bench-pair image ships F-Stack
+# pre-installed; pass `--no-default-features` on dev hosts without it.
+fstack = ["bench-vs-mtcp/fstack"]
+
 [dependencies]
 bench-common = { path = "../bench-common" }
 bench-e2e = { path = "../bench-e2e" }
+# F-Stack FFI bindings live in bench-vs-mtcp; reuse them for the
+# bench-vs-linux mode A F-Stack arm so we don't duplicate `extern "C"`
+# blocks. The path-dep is free; we only consume the `fstack_ffi`
+# module surface.
+bench-vs-mtcp = { path = "../bench-vs-mtcp" }
 dpdk-net-core = { path = "../../crates/dpdk-net-core" }
 # Task 9: imported for `apply_preset(DPDK_NET_PRESET_RFC_COMPLIANCE, ..)`
 # so mode B's engine build goes through the same preset entry point as

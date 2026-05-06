@@ -31,11 +31,11 @@ pub struct dpdk_net_engine_config_t {
     pub tcp_nagle: bool,
     pub tcp_delayed_ack: bool,
     pub cc_mode: u8,
-    pub tcp_min_rto_ms: u32,
-    // A5 Task 21: RTO config in µs. `tcp_initial_rto_ms` was removed
-    // in favor of `tcp_initial_rto_us`; the surrounding `_us` fields
-    // replace the A3 single-value knob with a full floor/initial/max
-    // tuple plus the per-segment retransmit budget.
+    // A5 Task 21: RTO config in µs. The earlier `tcp_min_rto_ms` /
+    // `tcp_initial_rto_ms` ms-resolution fields were superseded by the
+    // µs-resolution floor/initial/max tuple plus the per-segment
+    // retransmit budget below; the legacy ms knob was removed in the
+    // A1 cross-phase fix (it had been dead since A5 Task 21 landed).
     pub tcp_min_rto_us: u32,
     pub tcp_initial_rto_us: u32,
     pub tcp_max_rto_us: u32,
@@ -358,7 +358,12 @@ pub struct dpdk_net_eth_counters_t {
     pub rx_q0_bad_desc_num: u64,
     pub rx_q0_bad_req_id: u64,
     pub rx_q0_mbuf_alloc_fail: u64,
-    pub _pad: [u64; 2],
+    // C2 cross-phase retro fix — multi-segment RX linearization counter.
+    // Mirror of `dpdk_net_core::counters::EthCounters::rx_multi_seg_linearized`.
+    // Slow-path per spec §9.1.1; bumped exactly once per linearized chain
+    // in `mbuf_data_slice_for_rx`. See core counters.rs for the full doc.
+    pub rx_multi_seg_linearized: u64,
+    pub _pad: [u64; 1],
 }
 #[repr(C, align(64))]
 pub struct dpdk_net_ip_counters_t {
