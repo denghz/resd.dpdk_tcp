@@ -1455,7 +1455,11 @@ fn run_maxtp_grid_fstack<W: std::io::Write>(
         let tx_ts_mode = dpdk_maxtp::TxTsMode::TscFallback;
 
         // Open C F-Stack sockets. Soft-fail per-bucket so a single
-        // bucket's open-failure doesn't kill the grid.
+        // bucket's open-failure doesn't kill the grid. Emit an
+        // Invalid marker row so downstream bench-pair report scripts
+        // see a row for every (W, C) bucket and can detect missing
+        // data via the `bucket_invalid` dimension instead of breaking
+        // on a CSV with fewer rows than expected.
         let conns = match fstack_maxtp::open_persistent_connections(
             peer_ip,
             peer_port,
@@ -1464,9 +1468,19 @@ fn run_maxtp_grid_fstack<W: std::io::Write>(
             Ok(c) => c,
             Err(e) => {
                 eprintln!(
-                    "bench-vs-mtcp: fstack maxtp bucket {} open failed: {e:#}",
+                    "bench-vs-mtcp: fstack maxtp bucket {} open failed: {e:#}; \
+                     emitting marker + continuing",
                     bucket.label()
                 );
+                let agg = maxtp::BucketAggregate::from_sample(
+                    *bucket,
+                    Stack::FStack,
+                    None,
+                    BucketVerdict::Invalid(format!("fstack open failed: {e:#}")),
+                    Some(tx_ts_mode),
+                );
+                maxtp::emit_bucket_rows(writer, metadata, &args.tool, &args.feature_set, &agg)
+                    .context("emit fstack maxtp open-fail marker row")?;
                 continue;
             }
         };
@@ -1486,10 +1500,28 @@ fn run_maxtp_grid_fstack<W: std::io::Write>(
                 Ok(r) => r,
                 Err(e) => {
                     eprintln!(
-                        "bench-vs-mtcp: fstack maxtp bucket {} failed: {e:#}",
+                        "bench-vs-mtcp: fstack maxtp bucket {} failed: {e:#}; \
+                         emitting marker + continuing",
                         bucket.label()
                     );
-                    return Ok(());
+                    // Mirror the open-fail path: emit an Invalid
+                    // marker row so the downstream report scripts
+                    // see a row for every bucket.
+                    let agg = maxtp::BucketAggregate::from_sample(
+                        *bucket,
+                        Stack::FStack,
+                        None,
+                        BucketVerdict::Invalid(format!("fstack run_bucket failed: {e:#}")),
+                        Some(tx_ts_mode),
+                    );
+                    return maxtp::emit_bucket_rows(
+                        writer,
+                        metadata,
+                        &args.tool,
+                        &args.feature_set,
+                        &agg,
+                    )
+                    .context("emit fstack maxtp run-fail marker row");
                 }
             };
             let mut agg = maxtp::BucketAggregate::from_sample(
