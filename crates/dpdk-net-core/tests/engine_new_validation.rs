@@ -65,3 +65,22 @@ fn valid_rto_bounds_do_not_trip_invalid_rto_bounds() {
         );
     }
 }
+
+#[test]
+fn equal_rto_bounds_are_valid() {
+    // min == max is intentional in latency-sensitive production configs
+    // (e.g. multiseg_retrans_tap.rs sets both to 1_000_000 us). The guard
+    // uses strict `>`, so equal bounds must never return InvalidRtoBounds.
+    let cfg = EngineConfig {
+        tcp_min_rto_us: 1_000_000,
+        tcp_max_rto_us: 1_000_000,
+        ..EngineConfig::default()
+    };
+    let result = Engine::new(cfg);
+    if let Err(dpdk_net_core::Error::InvalidRtoBounds { min, max }) = result {
+        panic!(
+            "min == max must not trip RTO bounds check, got min={} max={}",
+            min, max
+        );
+    }
+}
