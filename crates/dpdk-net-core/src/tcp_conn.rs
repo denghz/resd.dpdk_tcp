@@ -333,6 +333,13 @@ pub struct TcpConn {
     /// at close time. `reap_time_wait` short-circuits the 2×MSL wait
     /// when this is set.
     pub force_tw_skip: bool,
+    /// RFC 9293 §3.8.6.1 persist timer handle. `Some` iff a zero-window
+    /// probe timer is armed. Cleared when snd_wnd opens or on close.
+    pub persist_timer_id: Option<crate::tcp_timer_wheel::TimerId>,
+    /// Exponential backoff shift for persist probes (0→1→2…capped at 6
+    /// so the inter-probe interval stays within ~64× RTO).
+    pub persist_backoff_shift: u8,
+
     /// A6 (spec §3.8): per-connection RTT histogram — 16 × u32
     /// buckets on one cacheline. Updated after each `rtt_est.sample()`
     /// in `tcp_input.rs` (Task 15). Slow-path update (~5–10 ns).
@@ -468,6 +475,8 @@ impl TcpConn {
             syn_tx_ts_ns: 0,
             send_refused_pending: false,
             force_tw_skip: false,
+            persist_timer_id: None,
+            persist_backoff_shift: 0,
             rtt_histogram: crate::rtt_histogram::RttHistogram::default(),
             // A6.6 Task 7: per-conn scratch for READABLE iovec
             // materialization + segment-ref holding. Both cleared at

@@ -268,6 +268,8 @@ pub struct TcpCounters {
     /// consumer is draining non-segment-aligned byte counts, which is
     /// the common case for byte-stream protocols.
     pub rx_partial_read_splits: AtomicU64,
+    /// RFC 9293 §3.8.6.1: persist probe sent (zero-window probe TX).
+    pub tx_persist: AtomicU64,
     // --- A10 deferred-fix Stage A: RX-side leak diagnostics (slow-path) ---
     // Forensic-only: intentionally NOT mirrored in `dpdk_net_tcp_counters_t`
     // (crates/dpdk-net/src/api.rs). Consumed by the Rust-side bench-stress
@@ -529,6 +531,7 @@ pub const ALL_COUNTER_NAMES: &[&str] = &[
     "tcp.rx_iovec_segs_total",
     "tcp.rx_multi_seg_events",
     "tcp.rx_partial_read_splits",
+    "tcp.tx_persist",
     // A10 deferred-fix Stage A: leak-detect diagnostic. Forensic-only,
     // not mirrored on the C-ABI side. tcp.rx_mempool_avail is AtomicU32
     // (last-sampled value) and is intentionally absent from this list —
@@ -574,7 +577,7 @@ pub const ALL_COUNTER_NAMES: &[&str] = &[
 /// compile-time `size_of::<*Counters>()` pins above — they fail at
 /// compile time when a new field shifts struct size past the pinned
 /// byte count.
-pub const KNOWN_COUNTER_COUNT: usize = 118;
+pub const KNOWN_COUNTER_COUNT: usize = 119;
 
 /// Resolve a counter path from ALL_COUNTER_NAMES to a live &AtomicU64
 /// on the given Counters. Returns None for typos or paths that have
@@ -703,6 +706,7 @@ pub fn lookup_counter<'a>(c: &'a Counters, name: &str) -> Option<&'a AtomicU64> 
         "tcp.rx_iovec_segs_total" => &c.tcp.rx_iovec_segs_total,
         "tcp.rx_multi_seg_events" => &c.tcp.rx_multi_seg_events,
         "tcp.rx_partial_read_splits" => &c.tcp.rx_partial_read_splits,
+        "tcp.tx_persist" => &c.tcp.tx_persist,
         // A10 deferred-fix Stage A leak-detect (rx_mempool_avail is
         // AtomicU32, absent from this u64-typed lookup — see
         // ALL_COUNTER_NAMES site comment).

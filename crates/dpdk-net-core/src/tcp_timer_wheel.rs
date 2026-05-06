@@ -26,6 +26,8 @@ pub enum TimerKind {
     SynRetrans,
     /// Reserved for A6 public `dpdk_net_timer_add`.
     ApiPublic,
+    /// RFC 9293 §3.8.6.1 zero-window probe timer.
+    Persist,
 }
 
 #[derive(Debug, Clone, Copy)]
