@@ -194,11 +194,10 @@ pub fn close_persistent_connections(
         return Ok(());
     }
     // Phase 0: drain any TX data still queued from the last pump round.
-    // The bucket's pump loop bails immediately on SendBufferFull without
-    // calling poll_once, leaving up to tx_ring_size (512) unsent data
-    // mbufs in the tx_pending_data ring. drain_tx_pending_data (called
-    // inside poll_once) flushes them to the NIC so the TX ring has
-    // space for the FINs below.
+    // pool exhaustion causes send_bytes to return Ok(0) without calling
+    // poll_once, leaving unsent data mbufs in tx_pending_data ring.
+    // drain_tx_pending_data (called inside poll_once) flushes them to
+    // the NIC so the TX ring has space for the FINs below.
     engine.poll_once();
 
     // Phase 1: emit FINs. `close_conn_with_flags` is idempotent for
@@ -260,21 +259,28 @@ pub fn close_persistent_connections(
             return Ok(());
         }
         if Instant::now() >= deadline {
-            // Soft-fail: log the residual count and return Ok so
-            // the grid keeps marching. The next bucket's
-            // open_persistent_connections will fail with
-            // TooManyConns if `max_connections` is exhausted —
-            // that's the harder failure mode the maxtp grid
-            // already handles via per-bucket soft-fail.
-            let residual = {
-                let ft = engine.flow_table();
-                conns.iter().filter(|h| ft.get(**h).is_some()).count()
-            };
-            eprintln!(
-                "dpdk_maxtp: close_persistent_connections: timed out with \
-                 {residual}/{} conns still alive after 15s; continuing",
-                conns.len()
-            );
+            // Grace period expired. Force-abort all remaining connections so
+            // their snd_retrans mbufs return to the pool and their flow-table
+            // slots are freed before the next bucket starts — prevents pool
+            // exhaustion and handle contamination across bucket boundaries.
+            let mut residual = 0usize;
+            for &h in conns.iter() {
+                let is_alive = {
+                    let ft = engine.flow_table();
+                    ft.get(h).is_some()
+                };
+                if is_alive {
+                    residual += 1;
+                    engine.abort_conn(h);
+                }
+            }
+            if residual > 0 {
+                eprintln!(
+                    "dpdk_maxtp: close_persistent_connections: timed out; \
+                     force-aborted {residual}/{} conns after 15s",
+                    conns.len()
+                );
+            }
             engine.drain_events(u32::MAX, |_, _| {});
             return Ok(());
         }
@@ -321,7 +327,7 @@ pub fn run_bucket(cfg: &DpdkMaxtpCfg<'_>) -> anyhow::Result<BucketRun> {
     // sum, to avoid losing wrap bits when subtracting). The borrow on
     // `flow_table` is released inside the snapshot helper before this
     // call returns; subsequent drain calls are safe.
-    let pre_snd_una: Vec<u32> = snapshot_snd_una_per_conn(cfg.engine, cfg.conns);
+    let pre_snd_una: Vec<u32> = snapshot_snd_una_per_conn(cfg.engine, cfg.conns, None);
     let pre_tx_payload = cfg
         .engine
         .counters()
@@ -334,6 +340,22 @@ pub fn run_bucket(cfg: &DpdkMaxtpCfg<'_>) -> anyhow::Result<BucketRun> {
         .eth
         .tx_pkts
         .load(std::sync::atomic::Ordering::Relaxed);
+
+    // Pre-measurement pool + state snapshot (diag only).
+    let pre_tx_data_avail = cfg.engine.tx_data_mempool_avail();
+    let pre_tx_hdr_avail  = cfg.engine.tx_hdr_mempool_avail();
+    let pre_states: Vec<_> = cfg.conns.iter().map(|&h| {
+        cfg.engine.conn_state(h).map(|s| format!("{s:?}")).unwrap_or_else(|| "missing".into())
+    }).collect();
+    eprintln!(
+        "dpdk_maxtp POOL bucket(C={}, W={}) pre-measure: \
+         tx_data_avail={} tx_hdr_avail={} conn_states=[{}]",
+        cfg.bucket.conn_count,
+        cfg.bucket.write_bytes,
+        pre_tx_data_avail,
+        pre_tx_hdr_avail,
+        pre_states.join(","),
+    );
 
     // Measurement — pump while sampling per-conn `snd_una` every
     // SAMPLE_INTERVAL. This handles sustained-rate wraps of the u32
@@ -364,7 +386,8 @@ pub fn run_bucket(cfg: &DpdkMaxtpCfg<'_>) -> anyhow::Result<BucketRun> {
     // Final sample: fold the [last_sample .. window_close] delta into
     // the accumulator so no tail sub-sample is lost.
     // (Borrow released inside the helper before returning.)
-    let post_snd_una: Vec<u32> = snapshot_snd_una_per_conn(cfg.engine, cfg.conns);
+    let post_snd_una: Vec<u32> =
+        snapshot_snd_una_per_conn(cfg.engine, cfg.conns, Some(&accumulator.last_sample));
     accumulator.accumulate(&post_snd_una);
     let post_tx_payload = cfg
         .engine
@@ -406,7 +429,12 @@ pub fn run_bucket(cfg: &DpdkMaxtpCfg<'_>) -> anyhow::Result<BucketRun> {
         // conn), so sample once per wedged-bucket — log alongside each conn
         // line for grep-affinity.
         let drops = cfg.engine.diag_input_drops();
+        let post_tx_data_avail = cfg.engine.tx_data_mempool_avail();
+        let post_tx_hdr_avail  = cfg.engine.tx_hdr_mempool_avail();
         for &conn in cfg.conns {
+            let state_str = cfg.engine.conn_state(conn)
+                .map(|s| format!("{s:?}"))
+                .unwrap_or_else(|| "missing".into());
             if let Some(s) = cfg.engine.diag_conn_stats(conn) {
                 // T21 (per af6a487): emit `in_flight` + `room_in_peer_wnd`
                 // directly — what `Engine::send_bytes` actually clamps on.
@@ -417,8 +445,9 @@ pub fn run_bucket(cfg: &DpdkMaxtpCfg<'_>) -> anyhow::Result<BucketRun> {
                 eprintln!(
                     "dpdk_maxtp DIAG bucket(C={}, W={}) conn={} wedged: \
                      snd_una={} snd_nxt={} in_flight={} \
-                     snd_wnd={} room_in_peer_wnd={} \
-                     srtt_us={} rto_us={} | input_drops: \
+                     snd_wnd={} room_in_peer_wnd={} state={} \
+                     srtt_us={} rto_us={} \
+                     tx_data_avail={} tx_hdr_avail={} | input_drops: \
                      bad_seq={} bad_option={} paws_rejected={} \
                      bad_ack={} urgent_dropped={}",
                     cfg.bucket.conn_count,
@@ -429,8 +458,11 @@ pub fn run_bucket(cfg: &DpdkMaxtpCfg<'_>) -> anyhow::Result<BucketRun> {
                     in_flight,
                     s.snd_wnd,
                     room_in_peer_wnd,
+                    state_str,
                     s.srtt_us,
                     s.rto_us,
+                    post_tx_data_avail,
+                    post_tx_hdr_avail,
                     drops.bad_seq,
                     drops.bad_option,
                     drops.paws_rejected,
@@ -440,11 +472,15 @@ pub fn run_bucket(cfg: &DpdkMaxtpCfg<'_>) -> anyhow::Result<BucketRun> {
             } else {
                 eprintln!(
                     "dpdk_maxtp DIAG bucket(C={}, W={}) conn={} wedged: <handle unknown> \
+                     state={} tx_data_avail={} tx_hdr_avail={} \
                      | input_drops: bad_seq={} bad_option={} paws_rejected={} \
                      bad_ack={} urgent_dropped={}",
                     cfg.bucket.conn_count,
                     cfg.bucket.write_bytes,
                     conn,
+                    state_str,
+                    post_tx_data_avail,
+                    post_tx_hdr_avail,
                     drops.bad_seq,
                     drops.bad_option,
                     drops.paws_rejected,
@@ -533,7 +569,8 @@ impl SndUnaAccumulator {
             Some(t) => t,
         };
         if now >= due {
-            let current = snapshot_snd_una_per_conn(engine, conns);
+            let current =
+                snapshot_snd_una_per_conn(engine, conns, Some(&self.last_sample));
             self.accumulate(&current);
             self.next_sample_at = Some(now + SAMPLE_INTERVAL);
         }
@@ -582,11 +619,14 @@ fn pump_round_robin(
             match engine.send_bytes(conn, payload) {
                 Ok(_) => {
                     // Accepted 0..=payload.len() bytes. A 0 here means
-                    // peer window / send buffer is full for this conn —
-                    // just move on to the next conn in the round, don't
-                    // retry-spin. The next full round will try again
-                    // after `poll_once` drains ACKs + advances the peer
-                    // window.
+                    // peer window / send buffer / pool pressure — just
+                    // move on; next round retries after poll_once drains
+                    // ACKs and refills the pool.
+                }
+                Err(dpdk_net_core::Error::InvalidConnHandle(_)) => {
+                    // Connection was force-closed by engine RTO timeout
+                    // (force_close_etimedout); skip it and continue.
+                    // Measurement data is still valid for remaining conns.
                 }
                 Err(e) => {
                     anyhow::bail!("dpdk_maxtp: send_bytes failed: {e:?}");
@@ -628,21 +668,25 @@ fn pump_round_robin(
 /// may issue drain / write calls on the same conn without triggering
 /// an `already borrowed` panic (I1).
 ///
-/// A conn missing from the flow table yields `0` (the connection
-/// vanishing mid-window would surface as goodput=0 for that conn — a
-/// benign under-count rather than a panic).
-fn snapshot_snd_una_per_conn(engine: &Engine, conns: &[ConnHandle]) -> Vec<u32> {
-    // Materialise the per-conn snapshot into an owned Vec *before*
-    // the `RefMut` from `flow_table()` is dropped — no callback or
-    // re-entrant engine access can happen while the borrow is live
-    // (I1 / I6 safety note).
+/// When `fallback` is `Some`, a conn missing from the flow table (e.g.
+/// force-closed mid-window) uses the corresponding fallback value so
+/// the subsequent delta is 0 rather than wrapping around u32::MAX.
+/// Pass `None` (or `Some(&[])`) only for the initial snapshot where
+/// there is no prior value and 0 is an acceptable sentinel.
+fn snapshot_snd_una_per_conn(
+    engine: &Engine,
+    conns: &[ConnHandle],
+    fallback: Option<&[u32]>,
+) -> Vec<u32> {
     let ft = engine.flow_table();
     let mut out = Vec::with_capacity(conns.len());
-    for &conn in conns {
-        let v = ft.get(conn).map(|c| c.snd_una).unwrap_or(0);
+    for (i, &conn) in conns.iter().enumerate() {
+        let v = ft
+            .get(conn)
+            .map(|c| c.snd_una)
+            .unwrap_or_else(|| fallback.and_then(|fb| fb.get(i).copied()).unwrap_or(0));
         out.push(v);
     }
-    // Borrow `ft` drops here, before return.
     out
 }
 

@@ -2005,6 +2005,24 @@ impl Engine {
         self.tx_data_mempool.as_ptr()
     }
 
+    /// Bench-arm diagnostic: available mbufs in the TX data mempool.
+    /// Slow-path (calls into DPDK mempool internals); safe to call
+    /// from the measurement thread between `poll_once` calls.
+    pub fn tx_data_mempool_avail(&self) -> u32 {
+        unsafe { sys::shim_rte_mempool_avail_count(self.tx_data_mempool.as_ptr()) }
+    }
+
+    /// Bench-arm diagnostic: available mbufs in the TX header mempool.
+    pub fn tx_hdr_mempool_avail(&self) -> u32 {
+        unsafe { sys::shim_rte_mempool_avail_count(self.tx_hdr_mempool.as_ptr()) }
+    }
+
+    /// Bench-arm diagnostic: current TCP state for a connection handle.
+    /// Returns `None` if the handle is not in the flow table.
+    pub fn conn_state(&self, h: crate::flow_table::ConnHandle) -> Option<crate::tcp_state::TcpState> {
+        self.flow_table.borrow().get(h).map(|c| c.state)
+    }
+
     /// A10 deferred-fix follow-up: TX-header mempool pointer for sustained
     /// stability tests. Production callers should not use this — the only
     /// legitimate consumer is the `long_soak_stability` test. The TX-hdr
@@ -2734,6 +2752,27 @@ impl Engine {
         use crate::counters::{add, inc};
         let mut ring = self.tx_pending_data.borrow_mut();
         if ring.is_empty() {
+            // Even with no new data to enqueue, call rte_eth_tx_done_cleanup
+            // to process pending NIC TX completions.  Without this, mbufs
+            // whose ACK-prune path ran before the ENA driver's ena_tx_cleanup
+            // fired stay at refcnt=1 in the driver's completion queue and
+            // never return to the pool — observable as permanent pool
+            // depletion when the tx_pending_data ring stays empty for an
+            // extended period (e.g., after pool exhaustion during warmup,
+            // across the entire measurement window and close sequence).
+            // rte_eth_tx_done_cleanup(port, queue, 0) calls ena_tx_cleanup
+            // with cleanup_budget=ring_size, processing all completed
+            // descriptors.  ENA implements tx_done_cleanup_fn so this is
+            // supported; drivers that don't return -ENOTSUP (harmless).
+            // Not compiled in test-server mode (no real NIC present).
+            #[cfg(not(feature = "test-server"))]
+            unsafe {
+                sys::rte_eth_tx_done_cleanup(
+                    self.cfg.port_id as u16,
+                    self.cfg.tx_queue_id,
+                    0,
+                );
+            }
             return;
         }
         #[cfg_attr(feature = "test-server", allow(unused_variables))]
@@ -3807,6 +3846,20 @@ impl Engine {
                 }
             }
             drop(to_cancel);
+            // Drain any residual snd_retrans mbufs (Mbuf has no Drop impl).
+            // TIME_WAIT connections should have empty snd_retrans (all data
+            // ACKed before 4-way FIN completes), but drain defensively.
+            let retrans_to_free: Vec<crate::tcp_retrans::RetransEntry> = {
+                let mut ft = self.flow_table.borrow_mut();
+                if let Some(conn) = ft.get_mut(h) {
+                    conn.snd_retrans.entries.drain(..).collect()
+                } else {
+                    vec![]
+                }
+            };
+            for entry in retrans_to_free {
+                unsafe { sys::shim_rte_pktmbuf_free(entry.mbuf.as_ptr()); }
+            }
             self.flow_table.borrow_mut().remove(h);
         }
     }
@@ -4851,6 +4904,29 @@ impl Engine {
                     }
                 }
                 drop(to_cancel);
+                // Drain snd_retrans mbufs before dropping TcpConn.
+                // `Mbuf` is Copy with no Drop impl: simply removing the conn
+                // from the flow table silently drops the raw mbuf pointers
+                // without calling shim_rte_pktmbuf_free → permanent pool
+                // depletion on every normal-close bucket (mbufs stay at
+                // rc=1/rc=2, never returned).  Mirror the drain in
+                // force_close_etimedout: at normal-close time the data was
+                // sent long ago so NIC TX completion has fired (rc=1); our
+                // free takes rc 1→0 → pool.  If NIC completion hasn't fired
+                // yet (rc=2), our free leaves rc=1; the NIC completion will
+                // take rc 1→0 — tx_done_cleanup or the next send burst
+                // handles that path.
+                let retrans_to_free: Vec<crate::tcp_retrans::RetransEntry> = {
+                    let mut ft = self.flow_table.borrow_mut();
+                    if let Some(conn) = ft.get_mut(handle) {
+                        conn.snd_retrans.entries.drain(..).collect()
+                    } else {
+                        vec![]
+                    }
+                };
+                for entry in retrans_to_free {
+                    unsafe { sys::shim_rte_pktmbuf_free(entry.mbuf.as_ptr()); }
+                }
                 self.flow_table.borrow_mut().remove(handle);
             }
         }
@@ -5519,14 +5595,11 @@ impl Engine {
     }
 
     /// Enqueue `bytes` on the connection's send path. Returns the number
-    /// of bytes accepted (could be < bytes.len() under send-buffer or
-    /// peer-window backpressure). On `tx_data_mempool` exhaustion mid-send,
-    /// returns `Err(Error::SendBufferFull)` (mapped to `-ENOMEM` at the
-    /// public-API layer). After A6 Task 12, NIC TX-ring saturation no
-    /// longer surfaces as `SendBufferFull` — `send_bytes` pushes segments
-    /// onto the engine-scope `tx_pending_data` batch ring and the
-    /// end-of-poll drain retries via `rte_eth_tx_burst`, so only
-    /// `tx_data_mempool` alloc failure produces this error now.
+    /// of bytes accepted (0..=bytes.len()). Returns 0 under send-buffer
+    /// backpressure, peer-window backpressure, or `tx_data_mempool`
+    /// exhaustion — all three cases are treated as transient backpressure.
+    /// Callers spin on `poll_once()` which drains ACKs and retires
+    /// `snd_retrans` mbufs back to the pool.
     pub fn send_bytes(&self, handle: ConnHandle, bytes: &[u8]) -> Result<u32, Error> {
         use crate::counters::inc;
         use crate::tcp_output::{build_segment, SegmentTx, TCP_ACK, TCP_PSH};
@@ -5659,18 +5732,15 @@ impl Engine {
             let m = unsafe { sys::shim_rte_pktmbuf_alloc(self.tx_data_mempool.as_ptr()) };
             if m.is_null() {
                 inc(&self.counters.eth.tx_drop_nomem);
-                if accepted == 0 {
-                    return Err(Error::SendBufferFull);
-                }
+                // Pool exhaustion is backpressure, not a hard error. Return Ok(accepted)
+                // (Ok(0) on first alloc) so the caller spins on poll_once() until ACKs
+                // retire snd_retrans mbufs and the pool refills.
                 break;
             }
             let dst = unsafe { sys::shim_rte_pktmbuf_append(m, n as u16) };
             if dst.is_null() {
                 unsafe { sys::shim_rte_pktmbuf_free(m) };
                 inc(&self.counters.eth.tx_drop_nomem);
-                if accepted == 0 {
-                    return Err(Error::SendBufferFull);
-                }
                 break;
             }
             // Safety: `dst` points to `n` writable bytes inside the freshly
@@ -5901,6 +5971,14 @@ impl Engine {
             c.tlp_timer_id = Some(id);
             c.timer_ids.push(id);
         }
+    }
+
+    /// Immediately remove a connection from the flow table, free its TX mbufs,
+    /// and cancel its timers — without waiting for the peer to cooperate.
+    /// Use only when graceful close has timed out; this is a thin public
+    /// wrapper over `force_close_etimedout` (same cleanup, same diagnostic).
+    pub fn abort_conn(&self, handle: ConnHandle) {
+        self.force_close_etimedout(handle);
     }
 
     pub fn close_conn(&self, handle: ConnHandle) -> Result<(), Error> {

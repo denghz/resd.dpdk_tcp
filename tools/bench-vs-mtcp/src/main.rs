@@ -857,6 +857,11 @@ fn run_maxtp_grid_dpdk<W: std::io::Write>(
         // Open C persistent connections. Soft-fail per-bucket (e.g.
         // TooManyConns / InvalidConnHandle from prior bucket leaks)
         // so the grid loop continues and Linux comparator gets to run.
+        eprintln!(
+            "POOL pre-open bucket(C={},W={}): tx_data_avail={}",
+            bucket.conn_count, bucket.write_bytes,
+            engine.tx_data_mempool_avail(),
+        );
         let conns = match dpdk_maxtp::open_persistent_connections(
             engine,
             peer_ip,
@@ -872,6 +877,11 @@ fn run_maxtp_grid_dpdk<W: std::io::Write>(
                 continue;
             }
         };
+        eprintln!(
+            "POOL post-open bucket(C={},W={}): tx_data_avail={}",
+            bucket.conn_count, bucket.write_bytes,
+            engine.tx_data_mempool_avail(),
+        );
 
         let cfg = DpdkMaxtpCfg {
             engine,
@@ -891,10 +901,9 @@ fn run_maxtp_grid_dpdk<W: std::io::Write>(
         // the next bucket's open_persistent_connections inherits a
         // shrunken slot pool.
         let bucket_outcome = (|| -> anyhow::Result<()> {
-            // Per-bucket soft-fail: a single bucket erroring
-            // (e.g. SendBufferFull at high C) should NOT abort the
-            // entire grid. Log and return-Ok-from-closure so the
-            // outer loop drops through to teardown + the next bucket.
+            // Per-bucket soft-fail: a single bucket erroring should NOT
+            // abort the entire grid. Log and return-Ok-from-closure so
+            // the outer loop drops through to teardown + the next bucket.
             let run = match dpdk_maxtp::run_bucket(&cfg).with_context(|| {
                 format!("dpdk_maxtp::run_bucket for {}", bucket.label())
             }) {
@@ -973,6 +982,11 @@ fn run_maxtp_grid_dpdk<W: std::io::Write>(
                 bucket.label()
             );
         }
+        eprintln!(
+            "POOL post-close bucket(C={},W={}): tx_data_avail={}",
+            bucket.conn_count, bucket.write_bytes,
+            engine.tx_data_mempool_avail(),
+        );
 
         // Propagate any hard error the inner closure returned (sanity
         // invariant violation is the only one). Soft-fail paths
