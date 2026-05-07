@@ -4898,12 +4898,32 @@ impl Engine {
         );
     }
 
+    /// Discard all buffered received data for `handle` and clear
+    /// `delivered_segments`.
+    ///
+    /// Used by the close drain loop before `send_window_update`: the
+    /// echo-server fills `recv.bytes` to capacity during the measurement
+    /// window (rwnd → 0), then stalls on `write()`. No new packets arrive
+    /// so `poll_once` never calls `deliver_readable` and the window stays
+    /// zero. Explicitly clearing `recv.bytes` frees the space so the next
+    /// `send_window_update` can advertise the full buffer, unblocking the
+    /// echo-server's stalled write and letting the drain complete.
+    ///
+    /// Safety: correct only inside a controlled close path where the
+    /// application has already discarded its interest in receive data.
+    pub fn discard_received(&self, handle: ConnHandle) {
+        let mut ft = self.flow_table.borrow_mut();
+        if let Some(conn) = ft.get_mut(handle) {
+            conn.delivered_segments.clear();
+            conn.recv.bytes.clear();
+        }
+    }
+
     /// Send a window update ACK for `handle`.
     ///
-    /// Used by the close drain loop to unblock a peer stalled on a zero
-    /// receive window: after `poll_once` moves bytes out of `recv.bytes`,
-    /// this advertises the recovered window so the peer's blocked write
-    /// can complete and its FIN can arrive.
+    /// Used by the close drain loop after `discard_received` to advertise
+    /// the now-open receive window to the peer, unblocking its stalled
+    /// `write()` so the FIN can arrive and the close can complete.
     pub fn send_window_update(&self, handle: ConnHandle) {
         self.emit_ack(handle);
     }

@@ -41,8 +41,12 @@ SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30 -o Proxy
 STATE_FILE="/tmp/bench-quick-state.json"
 
 # ── Bench params ──────────────────────────────────────────────────────────────
-BENCH_ITERATIONS="${BENCH_ITERATIONS:-200}"
-BENCH_WARMUP="${BENCH_WARMUP:-20}"
+# burst workload
+BENCH_BURSTS_PER_BUCKET="${BENCH_BURSTS_PER_BUCKET:-200}"
+BENCH_BURST_WARMUP="${BENCH_BURST_WARMUP:-20}"
+# maxtp workload
+BENCH_MAXTP_WARMUP_SECS="${BENCH_MAXTP_WARMUP_SECS:-3}"
+BENCH_MAXTP_DURATION_SECS="${BENCH_MAXTP_DURATION_SECS:-10}"
 
 WORKDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export AWS_PROFILE AWS_REGION
@@ -181,6 +185,17 @@ cmd_run() {
 
     local csv_out="/tmp/bench-quick-${workload}.csv"
     log "[2/2] Running bench-vs-mtcp ${workload} → $csv_out"
+
+    local workload_args=()
+    case "$workload" in
+        burst)
+            workload_args+=(--bursts-per-bucket "$BENCH_BURSTS_PER_BUCKET"
+                            --warmup            "$BENCH_BURST_WARMUP") ;;
+        maxtp)
+            workload_args+=(--maxtp-warmup-secs    "$BENCH_MAXTP_WARMUP_SECS"
+                            --maxtp-duration-secs  "$BENCH_MAXTP_DURATION_SECS") ;;
+    esac
+
     sudo target/release/bench-vs-mtcp \
         --workload            "$workload" \
         --stacks              dpdk \
@@ -190,12 +205,11 @@ cmd_run() {
         --peer-port           "$PEER_ECHO_PORT" \
         --eal-args            "$DUT_EAL_ARGS" \
         --lcore               "$DUT_LCORE" \
-        --iterations          "$BENCH_ITERATIONS" \
-        --warmup              "$BENCH_WARMUP" \
+        "${workload_args[@]}" \
         --nic-max-bps         "$DUT_NIC_MAX_BPS" \
         --tool                bench-vs-mtcp \
         --feature-set         trading-latency \
-        --precondition-mode   warn \
+        --precondition-mode   lenient \
         --output-csv          "$csv_out" \
         "$@"
     log "CSV written: $csv_out"
@@ -246,8 +260,10 @@ Commands:
   teardown            terminate peer instance + rebind DUT NIC to ena
 
 Env overrides (export before calling):
-  BENCH_ITERATIONS=200   per-bucket sample count
-  BENCH_WARMUP=20        discarded warm-up iterations
+  BENCH_BURSTS_PER_BUCKET=200   burst: bursts per bucket post-warmup
+  BENCH_BURST_WARMUP=20         burst: discarded warm-up bursts
+  BENCH_MAXTP_WARMUP_SECS=3     maxtp: warmup duration in seconds
+  BENCH_MAXTP_DURATION_SECS=10  maxtp: measurement duration in seconds
   AWS_PROFILE=resd-infra-operator
 
 Examples:
