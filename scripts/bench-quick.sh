@@ -30,14 +30,14 @@ DUT_NIC_MAX_BPS=10000000000   # c6a.2xlarge baseline: 10 Gbps
 PEER_AMI="ami-0e483926d07d19647"
 PEER_SUBNET="subnet-05d4a1cf65e5df23c"
 PEER_SG="sg-093d563579a51ca88"
-PEER_INSTANCE_TYPE="c6a.large"
+PEER_INSTANCE_TYPE="c6a.xlarge"
 PEER_ECHO_PORT=10001
 
 # ── AWS / SSH ─────────────────────────────────────────────────────────────────
 AWS_PROFILE="${AWS_PROFILE:-resd-infra-operator}"
 AWS_REGION="${AWS_REGION:-ap-south-1}"
 SSH_KEY="${HOME}/.ssh/id_ed25519"
-SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30 -i "$SSH_KEY")
+SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30 -o ProxyCommand=none -i "$SSH_KEY")
 STATE_FILE="/tmp/bench-quick-state.json"
 
 # ── Bench params ──────────────────────────────────────────────────────────────
