@@ -227,8 +227,18 @@ pub fn close_persistent_connections(
             // Proactive window update — unblocks echo-server write() stalled
             // on rwnd=0 so it can drain its send buffer and send its FIN.
             engine.send_window_update(h);
-            // FIN retry: no-op for FIN_WAIT1+; sends FIN for ESTABLISHED.
-            let _ = engine.close_conn_with_flags(h, CLOSE_FLAG_FORCE_TW_SKIP);
+            // FIN retry: only call close_conn_with_flags for handles still
+            // in the flow table. Calling it on an already-reaped handle causes
+            // ts_enabled to default false → spurious EPERM event emitted with
+            // the old handle number, which then contaminates the next bucket if
+            // the same handle slot is reused for a new connection.
+            let is_alive = {
+                let ft = engine.flow_table();
+                ft.get(h).is_some()
+            };
+            if is_alive {
+                let _ = engine.close_conn_with_flags(h, CLOSE_FLAG_FORCE_TW_SKIP);
+            }
             // Drain post-FIN Readable/Closed events so the queue
             // doesn't fill up and drop events for other connections.
             let mut _last: Option<u64> = None;
@@ -241,6 +251,12 @@ pub fn close_persistent_connections(
             conns.iter().any(|h| ft.get(*h).is_some())
         };
         if !any_alive {
+            // Flush any residual events (e.g. Closed from reap_time_wait
+            // that drain_and_accumulate_readable didn't consume due to
+            // early-bail on a prior event for the same handle) so the next
+            // bucket's connections don't see phantom events on reused
+            // handle numbers.
+            engine.drain_events(u32::MAX, |_, _| {});
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -259,6 +275,7 @@ pub fn close_persistent_connections(
                  {residual}/{} conns still alive after 15s; continuing",
                 conns.len()
             );
+            engine.drain_events(u32::MAX, |_, _| {});
             return Ok(());
         }
     }
