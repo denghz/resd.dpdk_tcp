@@ -1551,6 +1551,24 @@ fn handle_close_path(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
         conn.snd_una = seg.ack;
     }
 
+    // RFC 9293 §3.10.7.4: in FIN-WAIT-1 and FIN-WAIT-2, the remote side
+    // may still send data after we sent our FIN (half-close). We MUST
+    // advance rcv_nxt and ACK the data so the remote can drain its send
+    // buffer. We do NOT buffer into recv.bytes (close is in progress), but
+    // rcv_nxt MUST track the stream so `peer_has_fin` below fires correctly
+    // when the remote FIN finally arrives.
+    let data_accepted = if (conn.state == TcpState::FinWait1
+        || conn.state == TcpState::FinWait2)
+        && !seg.payload.is_empty()
+        && seg.seq == conn.rcv_nxt
+    {
+        let n = seg.payload.len() as u32;
+        conn.rcv_nxt = conn.rcv_nxt.wrapping_add(n);
+        n
+    } else {
+        0
+    };
+
     let peer_has_fin = (seg.flags & TCP_FIN) != 0
         && seg.seq.wrapping_add(seg.payload.len() as u32) == conn.rcv_nxt;
     if peer_has_fin {
@@ -1558,7 +1576,7 @@ fn handle_close_path(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
     }
 
     // State transitions keyed by (current_state, fin_acked, peer_has_fin).
-    let (new_state, tx) = match (conn.state, fin_acked, peer_has_fin) {
+    let (new_state, mut tx) = match (conn.state, fin_acked, peer_has_fin) {
         (TcpState::FinWait1, true, true) => (Some(TcpState::TimeWait), TxAction::Ack),
         (TcpState::FinWait1, true, false) => (Some(TcpState::FinWait2), TxAction::None),
         (TcpState::FinWait1, false, true) => (Some(TcpState::Closing), TxAction::Ack),
@@ -1572,6 +1590,12 @@ fn handle_close_path(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
         (TcpState::CloseWait, _, _) => (None, TxAction::None),
         _ => (None, TxAction::None),
     };
+
+    // ACK the data if we advanced rcv_nxt but the state machine didn't
+    // already schedule an ACK (e.g. FIN_WAIT-2 with data but no FIN yet).
+    if data_accepted > 0 && tx == TxAction::None {
+        tx = TxAction::Ack;
+    }
 
     let closed = new_state == Some(TcpState::Closed);
     Outcome {

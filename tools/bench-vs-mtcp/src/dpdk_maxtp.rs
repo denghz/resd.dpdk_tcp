@@ -224,12 +224,8 @@ pub fn close_persistent_connections(
     loop {
         engine.poll_once();
         for &h in conns {
-            // Discard buffered receive data so free_space_total() returns
-            // the full cap. recv.bytes is filled by the echo-server during
-            // the measurement window (rwnd → 0). With no new packets
-            // arriving the window stays zero unless we clear it explicitly.
-            engine.discard_received(h);
-            // Advertise the now-open window — unblocks echo-server write().
+            // Proactive window update — unblocks echo-server write() stalled
+            // on rwnd=0 so it can drain its send buffer and send its FIN.
             engine.send_window_update(h);
             // FIN retry: no-op for FIN_WAIT1+; sends FIN for ESTABLISHED.
             let _ = engine.close_conn_with_flags(h, CLOSE_FLAG_FORCE_TW_SKIP);
