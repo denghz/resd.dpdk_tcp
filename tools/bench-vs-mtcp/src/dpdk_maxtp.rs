@@ -224,6 +224,8 @@ pub fn close_persistent_connections(
     loop {
         engine.poll_once();
         for &h in conns {
+            // Proactive window update — unblocks echo-server write() stalled on rwnd=0.
+            engine.send_window_update(h);
             // FIN retry: no-op for FIN_WAIT1+; sends FIN for ESTABLISHED.
             let _ = engine.close_conn_with_flags(h, CLOSE_FLAG_FORCE_TW_SKIP);
             // Drain post-FIN Readable/Closed events so the queue

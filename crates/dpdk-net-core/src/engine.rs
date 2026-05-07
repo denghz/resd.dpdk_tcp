@@ -4898,6 +4898,16 @@ impl Engine {
         );
     }
 
+    /// Send a window update ACK for `handle`.
+    ///
+    /// Used by the close drain loop to unblock a peer stalled on a zero
+    /// receive window: after `poll_once` moves bytes out of `recv.bytes`,
+    /// this advertises the recovered window so the peer's blocked write
+    /// can complete and its FIN can arrive.
+    pub fn send_window_update(&self, handle: ConnHandle) {
+        self.emit_ack(handle);
+    }
+
     /// Emit a bare ACK for `handle`. Post-handshake ACKs carry the full
     /// Stage-1 option set per spec §6.2:
     ///
