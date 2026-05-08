@@ -34,6 +34,10 @@ fn main() {
     println!("cargo:rustc-link-search=native={ff_path}/lib");
     // libfstack.a — whole-archive so static-link discards aren't
     // applied to F-Stack's per-cpu init path.
+    // -z nostart-stop-gc: lld ≥ 14 may GC __start_set_sysctl_set /
+    // __stop_set_sysctl_set encapsulation symbols from libfstack.a;
+    // this flag keeps them.
+    println!("cargo:rustc-link-arg=-Wl,-z,nostart-stop-gc");
     println!("cargo:rustc-link-arg=-Wl,--whole-archive");
     println!("cargo:rustc-link-arg=-lfstack");
     println!("cargo:rustc-link-arg=-Wl,--no-whole-archive");

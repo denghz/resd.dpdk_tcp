@@ -79,11 +79,10 @@ struct Args {
     #[arg(long, default_value_t = 10_002)]
     linux_peer_port: u16,
 
-    /// Peer TCP port for the F-Stack stack. The F-Stack peer
-    /// (`bench-peer-fstack`) listens on this port. Default 10003
-    /// matches the bench-nightly.sh wiring (echo-server 10001,
-    /// linux-tcp-sink 10002, fstack-peer 10003).
-    #[arg(long, default_value_t = 10_003)]
+    /// Peer TCP port for the F-Stack stack. Default 10001 reuses the
+    /// dpdk echo-server port — fstack sends standard TCP packets so the
+    /// peer DPDK echo-server handles both stacks transparently.
+    #[arg(long, default_value_t = 10_001)]
     fstack_peer_port: u16,
 
     /// Workload selector: `burst` (T12) or `maxtp` (T13).
@@ -260,21 +259,8 @@ fn main() -> anyhow::Result<()> {
     let mode = parse_precondition_mode(&args.precondition_mode)?;
     let workload = Workload::parse(&args.workload).map_err(|e| anyhow::anyhow!(e))?;
 
-    let mut stacks = parse_stacks(&args.stacks)?;
+    let stacks = parse_stacks(&args.stacks)?;
 
-    // In lenient mode, drop mTCP from the selection with a warning —
-    // its implementation is deferred. Strict mode keeps it so the
-    // per-stack bring-up surfaces the `Unimplemented` error.
-    if matches!(mode, PreconditionMode::Lenient) {
-        let before = stacks.len();
-        stacks.retain(|s| !matches!(s, Stack::Mtcp));
-        if stacks.len() != before {
-            eprintln!(
-                "bench-vs-mtcp: WARN dropping mtcp stack in lenient mode \
-                 (Plan B T12 stub — see src/mtcp.rs)"
-            );
-        }
-    }
     if stacks.is_empty() {
         anyhow::bail!("no stacks selected (--stacks resolved to empty)");
     }
@@ -377,7 +363,7 @@ fn main() -> anyhow::Result<()> {
                         )?;
                     }
                     Stack::Mtcp => {
-                        run_burst_grid_mtcp_stub(&args, &grid, &metadata, mode, &mut writer)?;
+                        run_burst_grid_mtcp(&args, &grid, &metadata, mode, &mut writer)?;
                     }
                     Stack::Linux => {
                         // Linux burst arm is out of scope for the
@@ -432,7 +418,7 @@ fn main() -> anyhow::Result<()> {
                         )?;
                     }
                     Stack::Mtcp => {
-                        run_maxtp_grid_mtcp_stub(&args, &grid, &metadata, mode, &mut writer)?;
+                        run_maxtp_grid_mtcp(&args, &grid, &metadata, mode, &mut writer)?;
                     }
                     Stack::Linux => {
                         // Use linux_peer_port (default 10002, linux-tcp-sink)
@@ -729,7 +715,7 @@ fn mean_throughput_bps(run: &dpdk_burst::BucketRun) -> f64 {
 // mTCP stub driver.
 // ---------------------------------------------------------------------------
 
-fn run_burst_grid_mtcp_stub<W: std::io::Write>(
+fn run_burst_grid_mtcp<W: std::io::Write>(
     args: &Args,
     grid: &[bench_vs_mtcp::burst::Bucket],
     metadata: &RunMetadata,
@@ -1297,7 +1283,7 @@ fn emit_linux_bucket_rows<W: std::io::Write>(
 // mTCP maxtp stub driver.
 // ---------------------------------------------------------------------------
 
-fn run_maxtp_grid_mtcp_stub<W: std::io::Write>(
+fn run_maxtp_grid_mtcp<W: std::io::Write>(
     args: &Args,
     grid: &[maxtp::Bucket],
     metadata: &RunMetadata,
