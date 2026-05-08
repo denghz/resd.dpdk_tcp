@@ -52,6 +52,16 @@ pub struct LinuxSockaddr {
     pub sa_data: [u8; 14],
 }
 
+/// `struct pollfd` mirror for `ff_poll`. On all platforms we target,
+/// `short` = i16. Wire layout: fd(4) events(2) revents(2) = 8 bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PollFd {
+    pub fd: c_int,
+    pub events: i16,
+    pub revents: i16,
+}
+
 unsafe extern "C" {
     /// Initialise F-Stack (parses argv for EAL + F-Stack config). Must
     /// be called exactly once per process. Returns 0 on success.
@@ -92,9 +102,10 @@ unsafe extern "C" {
     /// callback completes. rte_eal_cleanup() fires on ff_run return.
     pub fn ff_stop_run();
 
-    /// Get a socket option. Uses FreeBSD-namespace level + optname
-    /// constants (SOL_SOCKET=0xffff, SO_ERROR=0x1007, etc.) — NOT
-    /// Linux values, even though F-Stack runs on Linux.
+    /// Get a socket option. Uses LINUX-namespace level + optname constants
+    /// (SOL_SOCKET=1, SO_ERROR=4). F-Stack also exposes
+    /// `ff_getsockopt_freebsd` for FreeBSD-namespace constants; we use
+    /// the Linux-compatible variant here.
     pub fn ff_getsockopt(
         s: c_int,
         level: c_int,
@@ -102,6 +113,13 @@ unsafe extern "C" {
         optval: *mut c_void,
         optlen: *mut c_uint,
     ) -> c_int;
+
+    /// Non-blocking I/O readiness check. `nfds_t` is `unsigned long` on
+    /// Linux x86_64; mapped to u64 here. Pass `timeout=0` for a
+    /// non-blocking poll (returns immediately with current state).
+    /// Used in WaitConnect to detect when a non-blocking connect
+    /// completes — POLLOUT fires once the TCP handshake finishes.
+    pub fn ff_poll(fds: *mut PollFd, nfds: u64, timeout: c_int) -> c_int;
 }
 
 /// AF_INET (IPv4) — Linux-style value used by F-Stack's
@@ -115,13 +133,21 @@ pub const SOCK_STREAM: c_int = 1;
 /// F-Stack accepts the Linux constant via its compat layer.
 pub const FIONBIO: usize = 0x5421;
 
-/// Socket-level option identifier — FreeBSD value.
-/// Linux uses SOL_SOCKET=1; F-Stack uses the FreeBSD value 0xffff.
-pub const SOL_SOCKET: c_int = 0xffff_u32 as c_int;
+/// POLLOUT — socket is writable (connect complete, or send buffer has space).
+/// Linux value; used with `ff_poll` to detect non-blocking connect completion.
+pub const POLLOUT: i16 = 0x0004;
+
+/// Socket-level option identifier — Linux value, for use with
+/// `ff_getsockopt` / `ff_setsockopt` (NOT the `_freebsd` variants).
+/// F-Stack exposes two getsockopt APIs: `ff_getsockopt` takes Linux-
+/// namespace level/optname; `ff_getsockopt_freebsd` takes FreeBSD-
+/// namespace. We use `ff_getsockopt` so this is 1, not FreeBSD 0xffff.
+pub const SOL_SOCKET: c_int = 1;
 
 /// Socket option: pending connect error (getsockopt after EINPROGRESS).
-/// FreeBSD value 0x1007; Linux SO_ERROR=4.
-pub const SO_ERROR: c_int = 0x1007_u32 as c_int;
+/// Linux value 4; for use with `ff_getsockopt` (Linux-namespace variant).
+/// FreeBSD SO_ERROR=0x1007 is only valid with `ff_getsockopt_freebsd`.
+pub const SO_ERROR: c_int = 4;
 
 /// errno values F-Stack writes to system errno after each call.
 ///

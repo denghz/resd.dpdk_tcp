@@ -52,10 +52,11 @@ use std::time::{Duration, Instant};
 use crate::burst::{Bucket, BurstSample};
 use crate::dpdk_burst::TxTsMode;
 use crate::fstack_ffi::{
-    ff_close, ff_connect, ff_getsockopt, ff_ioctl, ff_run, ff_socket, ff_stop_run, ff_write,
-    fstack_errno, make_linux_sockaddr_in, AF_INET, FF_EAGAIN, FF_EINPROGRESS, FIONBIO, SOCK_STREAM,
-    SO_ERROR, SOL_SOCKET,
+    ff_close, ff_connect, ff_getsockopt, ff_ioctl, ff_poll, ff_run, ff_socket, ff_stop_run,
+    ff_write, fstack_errno, make_linux_sockaddr_in, AF_INET, FF_EAGAIN, FF_EINPROGRESS, FIONBIO,
+    POLLOUT, SOCK_STREAM, SO_ERROR, SOL_SOCKET,
 };
+use crate::fstack_ffi::PollFd;
 
 /// One bucket's raw measurement product. Mirrors the dpdk_burst shape.
 pub struct BucketRun {
@@ -352,6 +353,23 @@ fn phase_connect(state: &mut BurstGridState<'_>) -> Step {
 }
 
 fn phase_wait_connect(state: &mut BurstGridState<'_>) -> Step {
+    // Use ff_poll(POLLOUT, timeout=0) to detect when the non-blocking
+    // connect completes. SO_ERROR alone is unreliable: it returns 0 both
+    // while the handshake is in flight (SYN_SENT) and after it succeeds,
+    // making the two states indistinguishable without a writability check.
+    let mut pfd = PollFd { fd: state.fd, events: POLLOUT, revents: 0 };
+    let n = unsafe { ff_poll(&mut pfd, 1, 0) };
+    if n < 0 {
+        let errno = fstack_errno();
+        state.phase = Phase::BucketError(format!("ff_poll failed: errno={errno}"));
+        return Step::Continue;
+    }
+    if n == 0 || (pfd.revents & POLLOUT) == 0 {
+        // Not writable yet — handshake still in flight.
+        state.phase = Phase::WaitConnect;
+        return Step::Yield;
+    }
+    // POLLOUT fired: handshake complete or failed. Check SO_ERROR.
     let mut sock_err: c_int = 0;
     let mut len: c_uint = std::mem::size_of::<c_int>() as c_uint;
     let rc = unsafe {
@@ -370,16 +388,8 @@ fn phase_wait_connect(state: &mut BurstGridState<'_>) -> Step {
         return Step::Continue;
     }
     if sock_err == 0 {
-        state.phase = Phase::Warmup {
-            bursts_done: 0,
-            sent: 0,
-        };
+        state.phase = Phase::Warmup { bursts_done: 0, sent: 0 };
         return Step::Continue;
-    }
-    if sock_err == FF_EINPROGRESS || sock_err == FF_EAGAIN {
-        // Still pending; restore the wait phase and yield.
-        state.phase = Phase::WaitConnect;
-        return Step::Yield;
     }
     state.phase = Phase::BucketError(format!("connect SO_ERROR={sock_err}"));
     Step::Continue

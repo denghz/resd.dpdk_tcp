@@ -48,10 +48,11 @@ use std::time::{Duration, Instant};
 
 use crate::dpdk_maxtp::TxTsMode;
 use crate::fstack_ffi::{
-    ff_close, ff_connect, ff_getsockopt, ff_ioctl, ff_read, ff_run, ff_socket, ff_stop_run,
-    ff_write, fstack_errno, make_linux_sockaddr_in, AF_INET, FF_EAGAIN, FF_EINPROGRESS, FIONBIO,
-    SOCK_STREAM, SO_ERROR, SOL_SOCKET,
+    ff_close, ff_connect, ff_getsockopt, ff_ioctl, ff_poll, ff_read, ff_run, ff_socket,
+    ff_stop_run, ff_write, fstack_errno, make_linux_sockaddr_in, AF_INET, FF_EINPROGRESS, FIONBIO,
+    POLLOUT, SOCK_STREAM, SO_ERROR, SOL_SOCKET,
 };
+use crate::fstack_ffi::PollFd;
 use crate::maxtp::{Bucket, MaxtpSample};
 
 /// One bucket's raw measurement product. Mirrors `linux_maxtp::BucketRun`.
@@ -271,6 +272,21 @@ fn phase_connect_all(state: &mut MaxtpGridState<'_>) -> Step {
 fn phase_wait_connect_all(state: &mut MaxtpGridState<'_>, mut checked: usize) -> Step {
     while checked < state.fds.len() {
         let fd = state.fds[checked];
+        // Poll POLLOUT to detect handshake completion — SO_ERROR alone
+        // returns 0 for both "still connecting" and "connected".
+        let mut pfd = PollFd { fd, events: POLLOUT, revents: 0 };
+        let n = unsafe { ff_poll(&mut pfd, 1, 0) };
+        if n < 0 {
+            let errno = fstack_errno();
+            state.phase = Phase::BucketError(format!("ff_poll failed: errno={errno}"));
+            return Step::Continue;
+        }
+        if n == 0 || (pfd.revents & POLLOUT) == 0 {
+            // This connection not ready yet; yield and retry all from here.
+            state.phase = Phase::WaitConnectAll { checked };
+            return Step::Yield;
+        }
+        // POLLOUT: check SO_ERROR for outcome.
         let mut sock_err: c_int = 0;
         let mut len: c_uint = std::mem::size_of::<c_int>() as c_uint;
         let rc = unsafe {
@@ -292,11 +308,6 @@ fn phase_wait_connect_all(state: &mut MaxtpGridState<'_>, mut checked: usize) ->
         if sock_err == 0 {
             checked += 1;
             continue;
-        }
-        if sock_err == FF_EINPROGRESS || sock_err == FF_EAGAIN {
-            // Still pending; restore the wait phase and yield.
-            state.phase = Phase::WaitConnectAll { checked };
-            return Step::Yield;
         }
         state.phase = Phase::BucketError(format!(
             "connect SO_ERROR={sock_err} on conn {checked}"
