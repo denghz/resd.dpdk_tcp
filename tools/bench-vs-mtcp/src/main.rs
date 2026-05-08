@@ -238,6 +238,21 @@ struct Args {
     /// the real introspection path (A10 Plan B T15-B / T12-I4).
     #[arg(long)]
     peer_ssh: Option<String>,
+
+    /// F-Stack startup config file path (`--conf` forwarded to
+    /// `ff_init`). Required when `fstack` is in the stacks list and
+    /// the binary is built with `--features fstack`. Default
+    /// `/etc/f-stack.conf` matches the bench-pair AMI path.
+    #[arg(long, default_value = "/etc/f-stack.conf")]
+    fstack_conf: String,
+
+    /// Reserved for future F-Stack variants that accept EAL flags on
+    /// the command line. Current F-Stack reads EAL config (lcore_mask,
+    /// channel, allow=PCI) from the `[dpdk]` section of `--fstack-conf`
+    /// and does NOT accept EAL flags via argv. This arg is accepted
+    /// but currently unused; its presence does not affect ff_init.
+    #[arg(long, default_value = "", allow_hyphen_values = true)]
+    fstack_eal_args: String,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -285,6 +300,19 @@ fn main() -> anyhow::Result<()> {
     // declaration order, so declare _eal_guard first, engine second.
     // Same pattern as bench-vs-linux / bench-e2e.
     let needs_dpdk = stacks.contains(&Stack::DpdkNet);
+    let needs_fstack = stacks.contains(&Stack::FStack);
+
+    // Fail fast before EAL init if both dpdk and fstack are selected.
+    // Moving this check here avoids burning a full EAL bring-up just to
+    // bail; the EAL init (rte_eal_init) is not trivially reversible.
+    if needs_fstack && needs_dpdk {
+        anyhow::bail!(
+            "--stacks cannot include both `dpdk` and `fstack` in the same process: \
+             both stacks call rte_eal_init internally and DPDK does not support \
+             multiple EAL initialisations. Run them as separate bench-vs-mtcp \
+             invocations: `--stacks dpdk,linux` first, then `--stacks fstack`."
+        );
+    }
     let mut _eal_guard: Option<EalGuard> = None;
     let mut engine: Option<Engine> = None;
     let mut tsc_hz: u64 = 0;
@@ -297,6 +325,14 @@ fn main() -> anyhow::Result<()> {
         if tsc_hz == 0 {
             anyhow::bail!("rte_get_tsc_hz() returned 0 — EAL not initialised?");
         }
+    }
+
+    // F-Stack init — only if fstack is selected. The dpdk/fstack conflict
+    // check already happened above before EAL init.
+    #[cfg(feature = "fstack")]
+    if needs_fstack {
+        validate_fstack_args(&args)?;
+        init_fstack(&args)?;
     }
 
     let metadata = build_run_metadata(mode, preconditions)?;
@@ -1470,7 +1506,8 @@ fn run_maxtp_grid_fstack<W: std::io::Write>(
         let tx_ts_mode = dpdk_maxtp::TxTsMode::TscFallback;
 
         // Open C F-Stack sockets. Soft-fail per-bucket so a single
-        // bucket's open-failure doesn't kill the grid.
+        // bucket's open-failure doesn't kill the grid. Emit an
+        // invalid-marker row so bench-report sees the bucket.
         let conns = match fstack_maxtp::open_persistent_connections(
             peer_ip,
             peer_port,
@@ -1482,6 +1519,15 @@ fn run_maxtp_grid_fstack<W: std::io::Write>(
                     "bench-vs-mtcp: fstack maxtp bucket {} open failed: {e:#}",
                     bucket.label()
                 );
+                let agg = maxtp::BucketAggregate::from_sample(
+                    *bucket,
+                    Stack::FStack,
+                    None,
+                    BucketVerdict::Invalid(format!("fstack open failed: {e:#}")),
+                    Some(tx_ts_mode),
+                );
+                maxtp::emit_bucket_rows(writer, metadata, &args.tool, &args.feature_set, &agg)
+                    .context("emit fstack open-fail maxtp marker row")?;
                 continue;
             }
         };
@@ -1620,6 +1666,47 @@ fn run_maxtp_grid_fstack<W: std::io::Write>(
             .context("emit fstack-stub maxtp marker row")?;
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// F-Stack init helpers (feature-gated).
+// ---------------------------------------------------------------------------
+
+/// Validate F-Stack args when the `fstack` feature is compiled in.
+#[cfg(feature = "fstack")]
+fn validate_fstack_args(args: &Args) -> anyhow::Result<()> {
+    if !std::path::Path::new(&args.fstack_conf).exists() {
+        anyhow::bail!(
+            "--fstack-conf path `{}` does not exist; create it with the \
+             [dpdk] lcore_mask + allow=<PCI> + [port0] sections for the DUT",
+            args.fstack_conf
+        );
+    }
+    Ok(())
+}
+
+/// Call `ff_init` exactly once.
+///
+/// F-Stack reads EAL configuration (lcore_mask, channel, allow=PCI,
+/// etc.) from the `[dpdk]` section of the --fstack-conf file; it does
+/// NOT accept EAL flags on the command line. We pass only the F-Stack
+/// flags: `--conf=<path>` and `--proc-id=0`.
+///
+/// The `--fstack-eal-args` CLI arg is reserved for future F-Stack
+/// variants that accept EAL flags directly; today it is unused.
+#[cfg(feature = "fstack")]
+fn init_fstack(args: &Args) -> anyhow::Result<()> {
+    let argv: Vec<String> = vec![
+        "bench-vs-mtcp".to_string(),
+        format!("--conf={}", args.fstack_conf),
+        "--proc-id=0".to_string(),
+    ];
+    eprintln!(
+        "bench-vs-mtcp: ff_init argv={:?}",
+        argv
+    );
+    bench_vs_mtcp::fstack_ffi::ff_init_from_args(&argv)
+        .map_err(|e| anyhow::anyhow!("ff_init failed: {e}"))
 }
 
 // ---------------------------------------------------------------------------

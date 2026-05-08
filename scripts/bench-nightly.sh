@@ -457,6 +457,65 @@ ssh "${SSH_OPTS[@]}" "ubuntu@$PEER_SSH" \
      fi" \
     || log "  WARN starting fstack peer failed; fstack stack may produce no data"
 
+# Fix F-Stack peer config: the AMI bake sets a placeholder IP. Patch it
+# to the actual peer data-plane IP before bench-peer-fstack starts.
+refresh_ec2_ic_grants
+ssh "${SSH_OPTS[@]}" "ubuntu@$PEER_SSH" \
+    "if [ -f /etc/f-stack.conf ]; then \
+       sudo sed -i \"/^\[port0\]/,/^\[/{s|^addr=.*|addr=${PEER_IP}|;s|^broadcast=.*|broadcast=$(awk -F. '{printf \"%s.%s.%s.255\",\$1,\$2,\$3}' <<<${PEER_IP})|;s|^gateway=.*|gateway=${GATEWAY_IP}|}\" /etc/f-stack.conf && \
+       echo 'peer f-stack.conf patched'; \
+     fi" \
+    || log "  WARN peer f-stack.conf patch failed"
+
+# Create /etc/f-stack.conf on DUT for the fstack bench pass.
+# F-Stack and dpdk_net cannot share an EAL process, so bench-vs-mtcp
+# runs them as separate invocations; the fstack pass needs its own
+# config with the DUT's data-plane IP.
+refresh_ec2_ic_grants
+ssh "${SSH_OPTS[@]}" "ubuntu@$DUT_SSH" \
+    "sudo tee /etc/f-stack.conf > /dev/null <<'FSTACK_CONF'
+[dpdk]
+lcore_mask=1
+channel=4
+promiscuous=1
+numa_on=1
+tx_csum_offoad_skip=0
+tso=0
+vlan_strip=1
+port_list=0
+nb_vdev=0
+nb_bond=0
+
+[port0]
+addr=${DUT_IP}
+netmask=255.255.255.0
+broadcast=$(awk -F. '{printf "%s.%s.%s.255",$1,$2,$3}' <<<"$DUT_IP")
+gateway=${GATEWAY_IP}
+
+[freebsd.boot]
+hz=100
+fd_reserve=1024
+kern.ipc.maxsockets=262144
+net.inet.tcp.syncache.hashsize=4096
+net.inet.tcp.syncache.bucketlimit=100
+net.inet.tcp.tcbhashsize=65536
+kern.ncallout=262144
+kern.features.inet6=1
+
+[freebsd.sysctl]
+kern.ipc.somaxconn=32768
+kern.ipc.maxsockbuf=16777216
+net.inet.tcp.sendspace=16384
+net.inet.tcp.recvspace=8192
+net.inet.tcp.cc.algorithm=cubic
+net.inet.tcp.sendbuf_max=16777216
+net.inet.tcp.recvbuf_max=16777216
+net.inet.tcp.sendbuf_auto=1
+net.inet.tcp.recvbuf_auto=1
+FSTACK_CONF
+echo 'DUT f-stack.conf created'" \
+    || log "  WARN DUT f-stack.conf creation failed; fstack bench pass may fail"
+
 # Give the peer services a moment to bind listen sockets.
 sleep 1
 
@@ -832,43 +891,71 @@ scp "${SCP_OPTS[@]}" \
 # mTCP stub is strict-mode-fatal; pass --stacks dpdk to run the DPDK
 # arm only until Plan 2 T21 lands the real bench-peer binary.
 # ---------------------------------------------------------------------------
-log "[11/12] bench-vs-mtcp burst grid (dpdk + fstack comparator)"
-# 2026-04-29: F-Stack arm landed alongside dpdk_net on the burst grid.
-# F-Stack peer = /opt/f-stack-peer/bench-peer on port 10003 (started
-# in step [6/12]). The dpdk arm continues to use echo-server on
-# 10001. fstack arm requires the binary built with `--features
-# fstack`; default release builds emit invalid-marker rows when
-# `--stacks fstack` is selected without the feature compiled in.
+log "[11/12] bench-vs-mtcp burst grid — pass 1: dpdk"
+# dpdk and fstack cannot share a process (both call rte_eal_init).
+# Run dpdk alone for burst; fstack burst runs as pass 2 below.
 run_dut_bench bench-vs-mtcp bench-vs-mtcp-burst \
     "${DPDK_COMMON[@]}" \
     --workload burst \
     --peer-port 10001 \
-    --fstack-peer-port 10003 \
-    --stacks dpdk,fstack \
+    --stacks dpdk \
     --tool bench-vs-mtcp \
     --feature-set trading-latency \
     --nic-max-bps "$NIC_MAX_BPS" \
-    || log "  [11/12] bench-vs-mtcp burst exited non-zero — continuing"
+    || log "  [11/12] bench-vs-mtcp burst dpdk exited non-zero — continuing"
 
-log "[11b/12] bench-vs-mtcp maxtp grid (dpdk + linux + fstack comparators)"
-# 2026-05-03: Linux kernel-TCP arm landed in bench-vs-mtcp (mTCP arm
-# stays stubbed while AMI rebuild is blocked on libmtcp / gcc 13).
-# 2026-04-29: F-Stack arm landed alongside Linux + dpdk_net. The
-# three peers run on distinct ports (echo-server 10001, linux-tcp-
-# sink 10002, fstack-peer 10003). Linux uses linux-tcp-sink to
-# avoid recv-buffer backpressure; fstack + dpdk both use echo-style
-# peers since their writes are bounded by the user-side app and
-# F-Stack's send buffer drains predictably.
+log "[11a/12] bench-vs-mtcp burst grid — pass 2: fstack"
+# Separate invocation: dpdk pass above released the NIC (EAL cleanup).
+# fstack's ff_init can now take the same vfio-pci-bound NIC.
+# Soft-fail: fstack peer may not be listening (pre-04b AMI or stub).
+run_dut_bench bench-vs-mtcp bench-vs-mtcp-burst-fstack \
+    --peer-ip "$PEER_IP" \
+    --local-ip "$DUT_IP" \
+    --workload burst \
+    --stacks fstack \
+    --fstack-peer-port 10003 \
+    --fstack-conf /etc/f-stack.conf \
+    --fstack-eal-args "$EAL_ARGS" \
+    --lcore 2 \
+    --precondition-mode lenient \
+    --tool bench-vs-mtcp \
+    --feature-set trading-latency \
+    --nic-max-bps "$NIC_MAX_BPS" \
+    || log "  [11a/12] bench-vs-mtcp burst fstack exited non-zero — continuing"
+
+log "[11b/12] bench-vs-mtcp maxtp grid — pass 1: dpdk + linux"
+# 2026-05-03: Linux kernel-TCP arm landed (mTCP arm stays stubbed).
+# dpdk uses echo-server (10001); linux uses linux-tcp-sink (10002) to
+# avoid recv-buffer backpressure. fstack is a separate pass below.
 run_dut_bench bench-vs-mtcp bench-vs-mtcp-maxtp \
     "${DPDK_COMMON[@]}" \
     --workload maxtp \
     --peer-port 10001 \
-    --fstack-peer-port 10003 \
-    --stacks dpdk,linux,fstack \
+    --linux-peer-port 10002 \
+    --stacks dpdk,linux \
     --tool bench-vs-mtcp \
     --feature-set trading-latency \
     --nic-max-bps "$NIC_MAX_BPS" \
-    || log "  [11b/12] bench-vs-mtcp maxtp exited non-zero — continuing"
+    || log "  [11b/12] bench-vs-mtcp maxtp dpdk+linux exited non-zero — continuing"
+
+log "[11c/12] bench-vs-mtcp maxtp grid — pass 2: fstack"
+# Separate invocation after the dpdk+linux pass so ff_init gets an
+# exclusive EAL. The NIC is still vfio-pci-bound after the dpdk pass.
+# Soft-fail: fstack peer is a stub until AMI bake #08 lands.
+run_dut_bench bench-vs-mtcp bench-vs-mtcp-maxtp-fstack \
+    --peer-ip "$PEER_IP" \
+    --local-ip "$DUT_IP" \
+    --workload maxtp \
+    --stacks fstack \
+    --fstack-peer-port 10003 \
+    --fstack-conf /etc/f-stack.conf \
+    --fstack-eal-args "$EAL_ARGS" \
+    --lcore 2 \
+    --precondition-mode lenient \
+    --tool bench-vs-mtcp \
+    --feature-set trading-latency \
+    --nic-max-bps "$NIC_MAX_BPS" \
+    || log "  [11c/12] bench-vs-mtcp maxtp fstack exited non-zero — continuing"
 
 # ---------------------------------------------------------------------------
 # [12/12] Local bench-micro + summarize + bench-report.
