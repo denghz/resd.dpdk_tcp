@@ -52,9 +52,9 @@ use std::time::{Duration, Instant};
 use crate::burst::{Bucket, BurstSample};
 use crate::dpdk_burst::TxTsMode;
 use crate::fstack_ffi::{
-    ff_close, ff_connect, ff_getsockopt, ff_ioctl, ff_poll, ff_run, ff_socket, ff_stop_run,
-    ff_write, fstack_errno, make_linux_sockaddr_in, AF_INET, FF_EAGAIN, FF_EINPROGRESS, FIONBIO,
-    POLLOUT, SOCK_STREAM, SO_ERROR, SOL_SOCKET,
+    ff_close, ff_connect, ff_getsockopt, ff_ioctl, ff_poll, ff_read, ff_run, ff_socket,
+    ff_stop_run, ff_write, fstack_errno, make_linux_sockaddr_in, AF_INET, FF_EAGAIN,
+    FF_EINPROGRESS, FIONBIO, POLLOUT, SOCK_STREAM, SO_ERROR, SOL_SOCKET,
 };
 use crate::fstack_ffi::PollFd;
 
@@ -92,6 +92,8 @@ enum Phase {
     WaitConnect,
     /// Pump warmup bursts; no samples recorded.
     Warmup { bursts_done: u64, sent: usize },
+    /// Drain echo bytes after a warmup burst write (prevents recv-buf fill).
+    WarmupRead { bursts_done: u64, recvd: usize },
     /// Inter-burst gap during warmup.
     WarmupGap { bursts_done: u64, gap_until: Instant },
     /// Capture t0 and start a measurement burst.
@@ -107,6 +109,14 @@ enum Phase {
         sent: usize,
         t0_tsc: u64,
         t_first_wire: Option<u64>,
+        samples: Vec<BurstSample>,
+        sum: u64,
+    },
+    /// Drain echo bytes after a measurement burst write. Sample already
+    /// recorded; drain must complete before gap/next-burst/close.
+    MeasureRead {
+        bursts_done: u64,
+        recvd: usize,
         samples: Vec<BurstSample>,
         sum: u64,
     },
@@ -280,6 +290,7 @@ fn advance(state: &mut BurstGridState<'_>) -> Step {
         Phase::Connect => phase_connect(state),
         Phase::WaitConnect => phase_wait_connect(state),
         Phase::Warmup { bursts_done, sent } => phase_warmup(state, bursts_done, sent),
+        Phase::WarmupRead { bursts_done, recvd } => phase_warmup_read(state, bursts_done, recvd),
         Phase::WarmupGap {
             bursts_done,
             gap_until,
@@ -297,6 +308,12 @@ fn advance(state: &mut BurstGridState<'_>) -> Step {
             samples,
             sum,
         } => phase_measure_write(state, bursts_done, sent, t0_tsc, t_first_wire, samples, sum),
+        Phase::MeasureRead {
+            bursts_done,
+            recvd,
+            samples,
+            sum,
+        } => phase_measure_read(state, bursts_done, recvd, samples, sum),
         Phase::MeasureGap {
             bursts_done,
             gap_until,
@@ -398,55 +415,74 @@ fn phase_wait_connect(state: &mut BurstGridState<'_>) -> Step {
 fn phase_warmup(state: &mut BurstGridState<'_>, mut bursts_done: u64, mut sent: usize) -> Step {
     let payload = state.payload_for_bucket[state.bucket_idx];
     if payload.is_empty() {
-        // 0-byte burst is meaningless; treat as already done.
         bursts_done = state.warmup_bursts;
     }
 
-    // Try to push as much of the current burst as possible in this callback.
-    while bursts_done < state.warmup_bursts {
-        let made_progress_or_eagain = pump_one_burst(state.fd, payload, &mut sent, &mut None);
-        match made_progress_or_eagain {
-            PumpStep::Progress => {
-                if sent == payload.len() {
-                    // Burst complete. Advance to next warmup burst.
-                    bursts_done = bursts_done.saturating_add(1);
-                    sent = 0;
-                    if bursts_done == state.warmup_bursts {
-                        break;
-                    }
-                    let gap_ms = state.grid[state.bucket_idx].gap_ms;
-                    if gap_ms > 0 {
-                        state.phase = Phase::WarmupGap {
-                            bursts_done,
-                            gap_until: Instant::now() + Duration::from_millis(gap_ms),
-                        };
-                        return Step::Yield;
-                    }
-                    // gap=0: continue immediately.
-                    continue;
-                }
-                // Partial burst — loop to try the remainder right away.
-                continue;
-            }
-            PumpStep::WouldBlock => {
-                // EAGAIN — yield to let the kernel drain.
-                state.phase = Phase::Warmup { bursts_done, sent };
-                return Step::Yield;
-            }
-            PumpStep::Error(msg) => {
-                state.phase = Phase::BucketError(msg);
-                return Step::Continue;
-            }
-        }
+    if bursts_done >= state.warmup_bursts {
+        state.phase = Phase::MeasureStart {
+            bursts_done: 0,
+            samples: Vec::with_capacity(state.measure_bursts as usize),
+            sum: 0,
+        };
+        return Step::Continue;
     }
 
-    // Warmup complete; transition to measurement.
-    state.phase = Phase::MeasureStart {
-        bursts_done: 0,
-        samples: Vec::with_capacity(state.measure_bursts as usize),
-        sum: 0,
-    };
-    Step::Continue
+    match pump_one_burst(state.fd, payload, &mut sent, &mut None) {
+        PumpStep::Progress => {
+            if sent == payload.len() {
+                // Write complete — drain echo before starting next burst to
+                // prevent recv-buf fill → zero-window → deadlock.
+                state.phase = Phase::WarmupRead { bursts_done, recvd: 0 };
+                return Step::Continue;
+            }
+            // Partial write — retry remainder immediately.
+            state.phase = Phase::Warmup { bursts_done, sent };
+            Step::Continue
+        }
+        PumpStep::WouldBlock => {
+            state.phase = Phase::Warmup { bursts_done, sent };
+            Step::Yield
+        }
+        PumpStep::Error(msg) => {
+            state.phase = Phase::BucketError(msg);
+            Step::Continue
+        }
+    }
+}
+
+fn phase_warmup_read(state: &mut BurstGridState<'_>, bursts_done: u64, mut recvd: usize) -> Step {
+    let payload = state.payload_for_bucket[state.bucket_idx];
+    match pump_drain(state.fd, payload.len(), &mut recvd) {
+        DrainStep::Done => {
+            let bursts_done_next = bursts_done.saturating_add(1);
+            if bursts_done_next >= state.warmup_bursts {
+                state.phase = Phase::MeasureStart {
+                    bursts_done: 0,
+                    samples: Vec::with_capacity(state.measure_bursts as usize),
+                    sum: 0,
+                };
+                return Step::Continue;
+            }
+            let gap_ms = state.grid[state.bucket_idx].gap_ms;
+            if gap_ms > 0 {
+                state.phase = Phase::WarmupGap {
+                    bursts_done: bursts_done_next,
+                    gap_until: Instant::now() + Duration::from_millis(gap_ms),
+                };
+                return Step::Yield;
+            }
+            state.phase = Phase::Warmup { bursts_done: bursts_done_next, sent: 0 };
+            Step::Continue
+        }
+        DrainStep::WouldBlock => {
+            state.phase = Phase::WarmupRead { bursts_done, recvd };
+            Step::Yield
+        }
+        DrainStep::Error(msg) => {
+            state.phase = Phase::BucketError(msg);
+            Step::Continue
+        }
+    }
 }
 
 fn phase_warmup_gap(state: &mut BurstGridState<'_>, bursts_done: u64, gap_until: Instant) -> Step {
@@ -541,22 +577,11 @@ fn phase_measure_write(
             }
 
             let bursts_done_next = bursts_done.saturating_add(1);
-            if bursts_done_next == state.measure_bursts {
-                state.phase = Phase::CloseAndNext { samples, sum };
-                return Step::Continue;
-            }
-            if bucket.gap_ms > 0 {
-                state.phase = Phase::MeasureGap {
-                    bursts_done: bursts_done_next,
-                    gap_until: Instant::now() + Duration::from_millis(bucket.gap_ms),
-                    samples,
-                    sum,
-                };
-                return Step::Yield;
-            }
-            // gap=0 → next burst right away.
-            state.phase = Phase::MeasureStart {
+            // Must drain echo before next burst (or close) to prevent
+            // recv-buf fill → zero-window → deadlock.
+            state.phase = Phase::MeasureRead {
                 bursts_done: bursts_done_next,
+                recvd: 0,
                 samples,
                 sum,
             };
@@ -574,6 +599,44 @@ fn phase_measure_write(
             Step::Yield
         }
         PumpStep::Error(msg) => {
+            state.phase = Phase::BucketError(msg);
+            Step::Continue
+        }
+    }
+}
+
+fn phase_measure_read(
+    state: &mut BurstGridState<'_>,
+    bursts_done: u64,
+    mut recvd: usize,
+    samples: Vec<BurstSample>,
+    sum: u64,
+) -> Step {
+    let bucket = state.grid[state.bucket_idx];
+    let payload = state.payload_for_bucket[state.bucket_idx];
+    match pump_drain(state.fd, payload.len(), &mut recvd) {
+        DrainStep::Done => {
+            if bursts_done >= state.measure_bursts {
+                state.phase = Phase::CloseAndNext { samples, sum };
+                return Step::Continue;
+            }
+            if bucket.gap_ms > 0 {
+                state.phase = Phase::MeasureGap {
+                    bursts_done,
+                    gap_until: Instant::now() + Duration::from_millis(bucket.gap_ms),
+                    samples,
+                    sum,
+                };
+                return Step::Yield;
+            }
+            state.phase = Phase::MeasureStart { bursts_done, samples, sum };
+            Step::Continue
+        }
+        DrainStep::WouldBlock => {
+            state.phase = Phase::MeasureRead { bursts_done, recvd, samples, sum };
+            Step::Yield
+        }
+        DrainStep::Error(msg) => {
             state.phase = Phase::BucketError(msg);
             Step::Continue
         }
@@ -716,6 +779,50 @@ fn pump_one_burst(
             return PumpStep::Progress;
         }
         return PumpStep::WouldBlock;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Inner drain — consume echo bytes from the peer.
+// ---------------------------------------------------------------------------
+
+enum DrainStep {
+    /// All `expected` bytes received.
+    Done,
+    /// EAGAIN — no data available; caller must yield.
+    WouldBlock,
+    /// Hard error from F-Stack; bucket is dead.
+    Error(String),
+}
+
+/// Tight-loop on `ff_read` until `recvd >= expected` OR EAGAIN.
+/// Advances `*recvd` in place so caller can resume across yields.
+fn pump_drain(fd: c_int, expected: usize, recvd: &mut usize) -> DrainStep {
+    if *recvd >= expected {
+        return DrainStep::Done;
+    }
+    let mut buf = [0u8; 4096];
+    loop {
+        let want = (expected - *recvd).min(buf.len());
+        let n = unsafe { ff_read(fd, buf.as_mut_ptr() as *mut c_void, want) };
+        if n > 0 {
+            *recvd += n as usize;
+            if *recvd >= expected {
+                return DrainStep::Done;
+            }
+            continue;
+        }
+        if n < 0 {
+            let errno = fstack_errno();
+            if errno == FF_EAGAIN {
+                return DrainStep::WouldBlock;
+            }
+            return DrainStep::Error(format!("ff_read failed: errno={errno}"));
+        }
+        // n == 0: peer closed connection during echo.
+        return DrainStep::Error(
+            "ff_read returned 0 (connection closed during echo drain)".to_string(),
+        );
     }
 }
 
