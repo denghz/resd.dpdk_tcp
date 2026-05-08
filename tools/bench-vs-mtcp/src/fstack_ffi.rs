@@ -123,16 +123,19 @@ pub const SOL_SOCKET: c_int = 0xffff_u32 as c_int;
 /// FreeBSD value 0x1007; Linux SO_ERROR=4.
 pub const SO_ERROR: c_int = 0x1007_u32 as c_int;
 
-/// errno equivalents — F-Stack's `ff_errno.h` re-exports BSD-flavour
-/// EAGAIN/EWOULDBLOCK/EINPROGRESS. F-Stack writes these to the system
-/// (thread-local) errno, readable via `fstack_errno()`. Values are
-/// FreeBSD-namespace even though F-Stack runs on Linux.
-pub const FF_EAGAIN: i32 = 35;      // FreeBSD EAGAIN (Linux is 11)
-pub const FF_EINPROGRESS: i32 = 36; // FreeBSD EINPROGRESS (Linux is 115)
+/// errno values F-Stack writes to system errno after each call.
+///
+/// Despite running on Linux, F-Stack translates its internal FreeBSD
+/// errno through `__errno_location` — but the translation produces
+/// Linux-namespace values in system errno (confirmed by T50: ff_connect
+/// returned errno=115, not FreeBSD 36). Compare `fstack_errno()` against
+/// these Linux values.
+pub const FF_EAGAIN: i32 = 11;       // Linux EAGAIN
+pub const FF_EINPROGRESS: i32 = 115; // Linux EINPROGRESS
 
 /// Read the system errno set by the last F-Stack call.
-/// F-Stack populates system errno with FreeBSD-namespace values; compare
-/// against `FF_EAGAIN`, `FF_EINPROGRESS`, etc. — not `libc::EAGAIN`.
+/// F-Stack writes Linux-namespace errno values; compare against
+/// `FF_EAGAIN`, `FF_EINPROGRESS`, etc.
 #[inline]
 pub fn fstack_errno() -> i32 {
     std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
