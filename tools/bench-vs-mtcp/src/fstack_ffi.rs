@@ -76,14 +76,32 @@ unsafe extern "C" {
 
     pub fn ff_ioctl(fd: c_int, request: usize, ...) -> c_int;
 
-    /// F-Stack's main loop driver — calls the user-provided callback in
-    /// a loop. Bench-vs-mtcp does NOT use this entry point; it pumps
-    /// directly via `ff_socket` / `ff_write` from the main thread (the
-    /// `ff_init` call already brings F-Stack's internal poll loop up
-    /// in lcore-pinned mode). We bind the symbol for completeness but
-    /// the burst + maxtp arms call `ff_run`-free code paths.
-    #[allow(dead_code)]
+    /// F-Stack's main event loop — calls `loop_fn(arg)` once per poll
+    /// iteration. All socket operations (ff_socket, ff_connect,
+    /// ff_write, ff_read, ff_getsockopt) MUST be called from inside
+    /// this callback; calling them outside ff_run is a no-op because
+    /// DPDK packet processing only runs inside ff_run's poll loop.
+    ///
+    /// ff_run calls rte_eal_cleanup() when the loop exits, so it may
+    /// be invoked AT MOST ONCE per process. The entire measurement grid
+    /// (all buckets) must complete inside a single ff_run invocation.
     pub fn ff_run(loop_fn: extern "C" fn(*mut c_void) -> c_int, arg: *mut c_void);
+
+    /// Signal ff_run to stop after the current callback returns.
+    /// Safe to call from inside the callback; ff_run returns after the
+    /// callback completes. rte_eal_cleanup() fires on ff_run return.
+    pub fn ff_stop_run();
+
+    /// Get a socket option. Uses FreeBSD-namespace level + optname
+    /// constants (SOL_SOCKET=0xffff, SO_ERROR=0x1007, etc.) — NOT
+    /// Linux values, even though F-Stack runs on Linux.
+    pub fn ff_getsockopt(
+        s: c_int,
+        level: c_int,
+        optname: c_int,
+        optval: *mut c_void,
+        optlen: *mut c_uint,
+    ) -> c_int;
 }
 
 /// AF_INET (IPv4) — Linux-style value used by F-Stack's
@@ -97,11 +115,28 @@ pub const SOCK_STREAM: c_int = 1;
 /// F-Stack accepts the Linux constant via its compat layer.
 pub const FIONBIO: usize = 0x5421;
 
+/// Socket-level option identifier — FreeBSD value.
+/// Linux uses SOL_SOCKET=1; F-Stack uses the FreeBSD value 0xffff.
+pub const SOL_SOCKET: c_int = 0xffff_u32 as c_int;
+
+/// Socket option: pending connect error (getsockopt after EINPROGRESS).
+/// FreeBSD value 0x1007; Linux SO_ERROR=4.
+pub const SO_ERROR: c_int = 0x1007_u32 as c_int;
+
 /// errno equivalents — F-Stack's `ff_errno.h` re-exports BSD-flavour
-/// EAGAIN/EWOULDBLOCK/etc. We probe via `errno_location`-style helpers
-/// in the burst/maxtp callers; here we just record the EAGAIN value
-/// F-Stack returns for "would block".
-pub const FF_EAGAIN: i32 = 35; // FreeBSD EAGAIN (Linux is 11)
+/// EAGAIN/EWOULDBLOCK/EINPROGRESS. F-Stack writes these to the system
+/// (thread-local) errno, readable via `fstack_errno()`. Values are
+/// FreeBSD-namespace even though F-Stack runs on Linux.
+pub const FF_EAGAIN: i32 = 35;      // FreeBSD EAGAIN (Linux is 11)
+pub const FF_EINPROGRESS: i32 = 36; // FreeBSD EINPROGRESS (Linux is 115)
+
+/// Read the system errno set by the last F-Stack call.
+/// F-Stack populates system errno with FreeBSD-namespace values; compare
+/// against `FF_EAGAIN`, `FF_EINPROGRESS`, etc. — not `libc::EAGAIN`.
+#[inline]
+pub fn fstack_errno() -> i32 {
+    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+}
 
 /// Build a `LinuxSockaddr` for AF_INET targeting `(ip_host_order, port)`.
 ///

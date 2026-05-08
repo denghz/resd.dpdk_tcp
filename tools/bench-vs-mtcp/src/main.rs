@@ -319,6 +319,11 @@ fn main() -> anyhow::Result<()> {
     if needs_fstack {
         validate_fstack_args(&args)?;
         init_fstack(&args)?;
+        // ff_init initialises EAL, so rte_get_tsc_hz() is valid now.
+        tsc_hz = unsafe { dpdk_net_sys::rte_get_tsc_hz() };
+        if tsc_hz == 0 {
+            anyhow::bail!("rte_get_tsc_hz() returned 0 after ff_init");
+        }
     }
 
     let metadata = build_run_metadata(mode, preconditions)?;
@@ -1366,38 +1371,37 @@ fn run_burst_grid_fstack<W: std::io::Write>(
     nic_max_bps: Option<u64>,
     writer: &mut csv::Writer<W>,
 ) -> anyhow::Result<()> {
-    use bench_vs_mtcp::fstack_burst::{self, FStackBurstCfg};
+    use bench_vs_mtcp::dpdk_burst::TxTsMode;
+    use bench_vs_mtcp::fstack_burst;
 
-    // Pre-allocate one payload buffer per K (parity with dpdk path).
-    let mut payload_cache: std::collections::HashMap<u64, Vec<u8>> =
-        std::collections::HashMap::new();
+    let tx_ts_mode = TxTsMode::TscFallback;
 
-    // F-Stack burst opens a fresh connection per bucket. Per-bucket
-    // soft-fail mirrors the dpdk_maxtp pattern.
-    for bucket in grid {
-        eprintln!(
-            "bench-vs-mtcp: running fstack burst bucket {}",
-            bucket.label()
-        );
-        let payload = payload_cache
-            .entry(bucket.burst_bytes)
-            .or_insert_with(|| vec![0u8; bucket.burst_bytes as usize]);
+    // Drive the entire grid inside one ff_run invocation.
+    // ff_run is synchronous and calls rte_eal_cleanup on exit.
+    let grid_results = fstack_burst::run_burst_grid(
+        grid,
+        args.warmup,
+        args.bursts_per_bucket,
+        tsc_hz,
+        peer_ip,
+        peer_port,
+        tx_ts_mode,
+    );
 
-        let tx_ts_mode = TxTsMode::TscFallback;
-
-        let fd = match fstack_burst::open_persistent_connection(peer_ip, peer_port) {
-            Ok(fd) => fd,
+    // Post-process: apply NIC saturation check and emit CSV rows.
+    for gr in grid_results {
+        let bucket = gr.bucket;
+        match gr.result {
             Err(e) => {
                 eprintln!(
-                    "bench-vs-mtcp: fstack burst bucket {} open failed: {e:#}; \
-                     emitting marker + continuing",
+                    "bench-vs-mtcp: fstack burst bucket {} failed: {e}",
                     bucket.label()
                 );
                 let agg = bench_vs_mtcp::burst::BucketAggregate::from_samples(
-                    *bucket,
+                    bucket,
                     Stack::FStack,
                     &[],
-                    BucketVerdict::Invalid(format!("fstack open failed: {e:#}")),
+                    BucketVerdict::Invalid(e),
                     Some(tx_ts_mode),
                 );
                 bench_vs_mtcp::burst::emit_bucket_rows(
@@ -1407,65 +1411,38 @@ fn run_burst_grid_fstack<W: std::io::Write>(
                     &args.feature_set,
                     &agg,
                 )
-                .context("emit fstack open-fail marker row")?;
-                continue;
+                .context("emit fstack burst bucket rows")?;
             }
-        };
-
-        let cfg = FStackBurstCfg {
-            bucket: *bucket,
-            warmup: args.warmup,
-            bursts: args.bursts_per_bucket,
-            tsc_hz,
-            peer_ip_host_order: peer_ip,
-            peer_port,
-            payload,
-            tx_ts_mode,
-        };
-
-        let bucket_outcome = (|| -> anyhow::Result<()> {
-            let run = match fstack_burst::run_bucket(&cfg, fd) {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!(
-                        "bench-vs-mtcp: fstack burst bucket {} failed: {e:#}",
-                        bucket.label()
-                    );
-                    return Ok(());
+            Ok(run) => {
+                let mut agg = bench_vs_mtcp::burst::BucketAggregate::from_samples(
+                    bucket,
+                    Stack::FStack,
+                    &run.samples,
+                    BucketVerdict::Ok,
+                    Some(tx_ts_mode),
+                );
+                if let Some(max_bps) = nic_max_bps {
+                    let achieved = mean_throughput_from_burst_samples(&run.samples) as u64;
+                    let sat = check_nic_saturation_bps(achieved, max_bps);
+                    if !sat.is_ok() {
+                        eprintln!(
+                            "bench-vs-mtcp: fstack burst bucket {} NIC-bound post-run: {}",
+                            bucket.label(),
+                            sat.reason().unwrap_or("<unknown>")
+                        );
+                        agg.override_verdict(sat);
+                    }
                 }
-            };
-            let mut agg = bench_vs_mtcp::burst::BucketAggregate::from_samples(
-                *bucket,
-                Stack::FStack,
-                &run.samples,
-                BucketVerdict::Ok,
-                Some(tx_ts_mode),
-            );
-            if let Some(max_bps) = nic_max_bps {
-                let achieved = mean_throughput_from_burst_samples(&run.samples) as u64;
-                let sat = check_nic_saturation_bps(achieved, max_bps);
-                if !sat.is_ok() {
-                    eprintln!(
-                        "bench-vs-mtcp: fstack burst bucket {} NIC-bound post-run: {}",
-                        bucket.label(),
-                        sat.reason().unwrap_or("<unknown>")
-                    );
-                    agg.override_verdict(sat);
-                }
+                bench_vs_mtcp::burst::emit_bucket_rows(
+                    writer,
+                    metadata,
+                    &args.tool,
+                    &args.feature_set,
+                    &agg,
+                )
+                .context("emit fstack burst bucket rows")?;
             }
-            bench_vs_mtcp::burst::emit_bucket_rows(
-                writer,
-                metadata,
-                &args.tool,
-                &args.feature_set,
-                &agg,
-            )
-            .context("emit fstack burst bucket rows")
-        })();
-
-        // Always close, even on inner-failure.
-        fstack_burst::close_persistent_connection(fd);
-        bucket_outcome?;
+        }
     }
     Ok(())
 }
@@ -1481,89 +1458,58 @@ fn run_maxtp_grid_fstack<W: std::io::Write>(
     nic_max_bps: Option<u64>,
     writer: &mut csv::Writer<W>,
 ) -> anyhow::Result<()> {
-    use bench_vs_mtcp::fstack_maxtp::{self, FStackMaxtpCfg};
+    use bench_vs_mtcp::dpdk_maxtp::TxTsMode;
+    use bench_vs_mtcp::fstack_maxtp;
 
-    for bucket in grid {
-        eprintln!(
-            "bench-vs-mtcp: running fstack maxtp bucket {}",
-            bucket.label()
-        );
+    let tx_ts_mode = TxTsMode::TscFallback;
+    let warmup = std::time::Duration::from_secs(args.maxtp_warmup_secs);
+    let duration = std::time::Duration::from_secs(args.maxtp_duration_secs);
 
-        let tx_ts_mode = dpdk_maxtp::TxTsMode::TscFallback;
+    let grid_results = fstack_maxtp::run_maxtp_grid(
+        grid, warmup, duration, peer_ip, peer_port, tx_ts_mode,
+    );
 
-        // Open C F-Stack sockets. Soft-fail per-bucket so a single
-        // bucket's open-failure doesn't kill the grid. Emit an
-        // invalid-marker row so bench-report sees the bucket.
-        let conns = match fstack_maxtp::open_persistent_connections(
-            peer_ip,
-            peer_port,
-            bucket.conn_count,
-        ) {
-            Ok(c) => c,
+    for gr in grid_results {
+        let bucket = gr.bucket;
+        match gr.result {
             Err(e) => {
                 eprintln!(
-                    "bench-vs-mtcp: fstack maxtp bucket {} open failed: {e:#}",
+                    "bench-vs-mtcp: fstack maxtp bucket {} failed: {e}",
                     bucket.label()
                 );
                 let agg = maxtp::BucketAggregate::from_sample(
-                    *bucket,
+                    bucket,
                     Stack::FStack,
                     None,
-                    BucketVerdict::Invalid(format!("fstack open failed: {e:#}")),
+                    BucketVerdict::Invalid(e),
                     Some(tx_ts_mode),
                 );
                 maxtp::emit_bucket_rows(writer, metadata, &args.tool, &args.feature_set, &agg)
-                    .context("emit fstack open-fail maxtp marker row")?;
-                continue;
+                    .context("emit fstack maxtp bucket rows")?;
             }
-        };
-
-        let cfg = FStackMaxtpCfg {
-            bucket: *bucket,
-            warmup: std::time::Duration::from_secs(args.maxtp_warmup_secs),
-            duration: std::time::Duration::from_secs(args.maxtp_duration_secs),
-            peer_ip_host_order: peer_ip,
-            peer_port,
-            payload: vec![0u8; bucket.write_bytes as usize],
-            tx_ts_mode,
-        };
-
-        let bucket_outcome = (|| -> anyhow::Result<()> {
-            let run = match fstack_maxtp::run_bucket(&cfg, &conns) {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!(
-                        "bench-vs-mtcp: fstack maxtp bucket {} failed: {e:#}",
-                        bucket.label()
-                    );
-                    return Ok(());
+            Ok(run) => {
+                let mut agg = maxtp::BucketAggregate::from_sample(
+                    bucket,
+                    Stack::FStack,
+                    Some(run.sample),
+                    BucketVerdict::Ok,
+                    Some(tx_ts_mode),
+                );
+                if let Some(max_bps) = nic_max_bps {
+                    let sat = check_nic_saturation_bps(run.sample.goodput_bps as u64, max_bps);
+                    if !sat.is_ok() {
+                        eprintln!(
+                            "bench-vs-mtcp: fstack maxtp bucket {} NIC-bound post-run: {}",
+                            bucket.label(),
+                            sat.reason().unwrap_or("<unknown>")
+                        );
+                        agg.override_verdict(sat);
+                    }
                 }
-            };
-            let mut agg = maxtp::BucketAggregate::from_sample(
-                *bucket,
-                Stack::FStack,
-                Some(run.sample),
-                BucketVerdict::Ok,
-                Some(tx_ts_mode),
-            );
-            if let Some(max_bps) = nic_max_bps {
-                let sat = check_nic_saturation_bps(run.sample.goodput_bps as u64, max_bps);
-                if !sat.is_ok() {
-                    eprintln!(
-                        "bench-vs-mtcp: fstack maxtp bucket {} NIC-bound post-run: {}",
-                        bucket.label(),
-                        sat.reason().unwrap_or("<unknown>")
-                    );
-                    agg.override_verdict(sat);
-                }
+                maxtp::emit_bucket_rows(writer, metadata, &args.tool, &args.feature_set, &agg)
+                    .context("emit fstack maxtp bucket rows")?;
             }
-            maxtp::emit_bucket_rows(writer, metadata, &args.tool, &args.feature_set, &agg)
-                .context("emit fstack maxtp bucket rows")
-        })();
-
-        // Always close, even on inner-failure.
-        fstack_maxtp::close_persistent_connections(&conns);
-        bucket_outcome?;
+        }
     }
     Ok(())
 }

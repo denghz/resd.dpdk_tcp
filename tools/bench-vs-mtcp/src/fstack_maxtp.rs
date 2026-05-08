@@ -2,9 +2,18 @@
 //!
 //! Drives the W × C grid against a live F-Stack peer
 //! (`/opt/f-stack-peer/bench-peer` on the baked AMI, port 10003) using
-//! `C` persistent F-Stack connections. Mirrors `dpdk_maxtp.rs`'s shape
-//! and `linux_maxtp.rs`'s round-robin pump, both of which are the
-//! existing comparator arms on this grid.
+//! `C` persistent F-Stack connections.
+//!
+//! # Why ff_run-driven state machine
+//!
+//! F-Stack's BSD-shaped API is NOT usable outside the `ff_run`
+//! callback: DPDK packet processing only runs inside ff_run's poll
+//! loop, so a call sequence outside it never makes wire progress.
+//! Additionally, ff_run calls `rte_eal_cleanup()` on exit, which can
+//! only be invoked once per process. Together, these constraints
+//! force the entire W × C measurement grid to complete inside a
+//! SINGLE ff_run invocation, driven by a state machine that the
+//! per-iteration callback advances.
 //!
 //! # Why F-Stack
 //!
@@ -34,215 +43,411 @@
 //! handles don't leak across buckets — same hygiene the dpdk_maxtp
 //! arm does to avoid `InvalidConnHandle` on later buckets.
 
-use std::io::ErrorKind;
-use std::os::raw::c_int;
+use std::os::raw::{c_int, c_uint, c_void};
 use std::time::{Duration, Instant};
-
-use anyhow::Context;
 
 use crate::dpdk_maxtp::TxTsMode;
 use crate::fstack_ffi::{
-    ff_close, ff_connect, ff_ioctl, ff_read, ff_socket, ff_write, make_linux_sockaddr_in, AF_INET,
-    FIONBIO, SOCK_STREAM,
+    ff_close, ff_connect, ff_getsockopt, ff_ioctl, ff_read, ff_run, ff_socket, ff_stop_run,
+    ff_write, fstack_errno, make_linux_sockaddr_in, AF_INET, FF_EAGAIN, FF_EINPROGRESS, FIONBIO,
+    SOCK_STREAM, SO_ERROR, SOL_SOCKET,
 };
 use crate::maxtp::{Bucket, MaxtpSample};
-
-/// Per-bucket runner configuration.
-pub struct FStackMaxtpCfg {
-    pub bucket: Bucket,
-    pub warmup: Duration,
-    pub duration: Duration,
-    pub peer_ip_host_order: u32,
-    pub peer_port: u16,
-    /// Payload — caller allocates once per bucket entry.
-    pub payload: Vec<u8>,
-    pub tx_ts_mode: TxTsMode,
-}
 
 /// One bucket's raw measurement product. Mirrors `linux_maxtp::BucketRun`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BucketRun {
     pub sample: MaxtpSample,
-    /// Bytes the F-Stack send path accepted across the measurement
-    /// window. Surfaced for the post-run sanity-invariant check (the
-    /// caller asserts this is roughly `goodput_bps × duration / 8`).
+    /// Bytes the F-Stack send path accepted across the measurement window.
     pub bytes_sent_in_window: u64,
     pub tx_ts_mode: TxTsMode,
 }
 
-/// Open `C` persistent F-Stack connections to the peer. Each carries
-/// non-blocking mode (`FIONBIO`) so partial-accept doesn't stall the
-/// round-robin pump.
-pub fn open_persistent_connections(
+/// Outcome of a single bucket inside the grid run. Per-bucket soft-fail.
+pub struct MaxtpGridResult {
+    pub bucket: Bucket,
+    pub result: Result<BucketRun, String>,
+}
+
+// ---------------------------------------------------------------------------
+// State machine.
+// ---------------------------------------------------------------------------
+
+enum Phase {
+    /// Open all C sockets, set non-blocking, issue non-blocking connects.
+    ConnectAll,
+    /// Wait for every connect to complete (poll SO_ERROR per fd).
+    WaitConnectAll { checked: usize },
+    /// Pump writes round-robin during the warmup window.
+    Warmup { warmup_deadline: Instant },
+    /// Pump writes round-robin during the measurement window. `bytes`
+    /// accumulates across callback invocations.
+    Measure {
+        t_start: Instant,
+        measure_deadline: Instant,
+        bytes: u64,
+    },
+    /// Close every fd; advance to next bucket when done.
+    CloseAll {
+        idx: usize,
+        result: Result<BucketRun, String>,
+    },
+    /// Bucket failed before connections fully opened.
+    BucketError(String),
+    /// All buckets done — call ff_stop_run() and return.
+    Done,
+}
+
+struct MaxtpGridState<'a> {
+    grid: &'a [Bucket],
+    bucket_idx: usize,
+    /// Current bucket's connection set. Empty when no bucket is in flight.
+    fds: Vec<c_int>,
+    phase: Phase,
+    /// Output — one entry pushed per finished bucket.
+    results: Vec<MaxtpGridResult>,
+    /// Static run-wide config.
+    warmup: Duration,
+    duration: Duration,
     peer_ip_host_order: u32,
     peer_port: u16,
-    conn_count: u64,
-) -> anyhow::Result<Vec<c_int>> {
-    if conn_count == 0 {
-        anyhow::bail!("fstack_maxtp: conn_count must be > 0");
+    tx_ts_mode: TxTsMode,
+    /// Pre-allocated payload for the CURRENT bucket (resized on bucket entry).
+    payload: Vec<u8>,
+    /// Shared discard buffer for inbound drain (echo-server replies).
+    discard: Vec<u8>,
+    /// Set true once ff_stop_run has been called.
+    stopped: bool,
+}
+
+/// Drive the entire W × C maxtp grid inside a single ff_run invocation.
+///
+/// `ff_run` is one-shot per process (it calls `rte_eal_cleanup` on
+/// exit), so ALL buckets must complete before `ff_stop_run` fires.
+pub fn run_maxtp_grid(
+    grid: &[Bucket],
+    warmup: Duration,
+    duration: Duration,
+    peer_ip_host_order: u32,
+    peer_port: u16,
+    tx_ts_mode: TxTsMode,
+) -> Vec<MaxtpGridResult> {
+    if grid.is_empty() {
+        return Vec::new();
     }
-    let mut out: Vec<c_int> = Vec::with_capacity(conn_count as usize);
-    for i in 0..conn_count {
+
+    // Initial payload size = first bucket's write_bytes; resized on
+    // bucket entry (CloseAll → next ConnectAll transition).
+    let initial_payload = vec![0u8; grid[0].write_bytes as usize];
+
+    let mut state = MaxtpGridState {
+        grid,
+        bucket_idx: 0,
+        fds: Vec::new(),
+        phase: Phase::ConnectAll,
+        results: Vec::with_capacity(grid.len()),
+        warmup,
+        duration,
+        peer_ip_host_order,
+        peer_port,
+        tx_ts_mode,
+        payload: initial_payload,
+        discard: vec![0u8; 65536],
+        stopped: false,
+    };
+
+    // SAFETY: ff_run is synchronous. The stack frame of `state` lives
+    // for the entire duration of this unsafe block.
+    unsafe {
+        let arg = &mut state as *mut MaxtpGridState<'_> as *mut c_void;
+        ff_run(maxtp_grid_callback, arg);
+    }
+
+    state.results
+}
+
+extern "C" fn maxtp_grid_callback(arg: *mut c_void) -> c_int {
+    // SAFETY: `arg` came from `&mut MaxtpGridState as *mut _ as *mut c_void`.
+    let state = unsafe { &mut *(arg as *mut MaxtpGridState<'_>) };
+
+    if state.stopped {
+        return 0;
+    }
+
+    loop {
+        match advance(state) {
+            Step::Continue => continue,
+            Step::Yield => return 0,
+            Step::Stopped => return 0,
+        }
+    }
+}
+
+enum Step {
+    Continue,
+    Yield,
+    Stopped,
+}
+
+fn advance(state: &mut MaxtpGridState<'_>) -> Step {
+    let phase = std::mem::replace(&mut state.phase, Phase::Done);
+
+    match phase {
+        Phase::ConnectAll => phase_connect_all(state),
+        Phase::WaitConnectAll { checked } => phase_wait_connect_all(state, checked),
+        Phase::Warmup { warmup_deadline } => phase_warmup(state, warmup_deadline),
+        Phase::Measure {
+            t_start,
+            measure_deadline,
+            bytes,
+        } => phase_measure(state, t_start, measure_deadline, bytes),
+        Phase::CloseAll { idx, result } => phase_close_all(state, idx, result),
+        Phase::BucketError(msg) => phase_bucket_error(state, msg),
+        Phase::Done => phase_done(state),
+    }
+}
+
+fn phase_connect_all(state: &mut MaxtpGridState<'_>) -> Step {
+    let bucket = state.grid[state.bucket_idx];
+
+    // Resize per-bucket payload for the current write_bytes.
+    state.payload.clear();
+    state.payload.resize(bucket.write_bytes as usize, 0);
+
+    // Build C fds. On any failure mid-loop, close what we've already
+    // opened and route to BucketError.
+    let mut fds: Vec<c_int> = Vec::with_capacity(bucket.conn_count as usize);
+    for i in 0..bucket.conn_count {
         let fd = unsafe { ff_socket(AF_INET as c_int, SOCK_STREAM, 0) };
         if fd < 0 {
-            close_all(&out);
-            anyhow::bail!("fstack_maxtp: ff_socket on conn {i} returned {fd}");
+            let errno = fstack_errno();
+            for &fd in &fds {
+                let _ = unsafe { ff_close(fd) };
+            }
+            state.phase =
+                Phase::BucketError(format!("ff_socket on conn {i} failed: errno={errno}"));
+            return Step::Continue;
         }
-        // Connect first (blocking — F-Stack starts socket in default
-        // blocking mode), then flip to non-blocking for the pump
-        // loop. This avoids EINPROGRESS handling we'd otherwise need
-        // to thread through ff_kqueue.
-        let sa = make_linux_sockaddr_in(peer_ip_host_order, peer_port);
-        let rc = unsafe { ff_connect(fd, &sa, std::mem::size_of_val(&sa) as u32) };
-        if rc != 0 {
-            unsafe { ff_close(fd) };
-            close_all(&out);
-            anyhow::bail!(
-                "fstack_maxtp: ff_connect on conn {i} returned {rc} (peer {ip}:{peer_port})",
-                ip = format_ip_host_order(peer_ip_host_order)
-            );
-        }
-        // Flip to non-blocking for the pump.
+        // Non-blocking BEFORE connect so the handshake can be polled
+        // through ff_run rather than blocking the callback.
         let on: c_int = 1;
         let rc = unsafe { ff_ioctl(fd, FIONBIO, &on as *const c_int) };
         if rc != 0 {
-            unsafe { ff_close(fd) };
-            close_all(&out);
-            anyhow::bail!("fstack_maxtp: ff_ioctl(FIONBIO) on conn {i} returned {rc}");
+            let errno = fstack_errno();
+            let _ = unsafe { ff_close(fd) };
+            for &fd in &fds {
+                let _ = unsafe { ff_close(fd) };
+            }
+            state.phase = Phase::BucketError(format!(
+                "ff_ioctl(FIONBIO) on conn {i} failed: rc={rc} errno={errno}"
+            ));
+            return Step::Continue;
         }
-        out.push(fd);
-    }
-    Ok(out)
-}
-
-/// Close every F-Stack socket from a finished bucket. Soft-fail on
-/// per-fd errors — the bucket's CSV row is already emitted, this is
-/// hygiene for the next bucket's open.
-pub fn close_persistent_connections(conns: &[c_int]) {
-    for &fd in conns {
-        let rc = unsafe { ff_close(fd) };
+        let sa = make_linux_sockaddr_in(state.peer_ip_host_order, state.peer_port);
+        let rc = unsafe { ff_connect(fd, &sa, std::mem::size_of_val(&sa) as u32) };
         if rc != 0 {
-            eprintln!("fstack_maxtp: ff_close({fd}) returned {rc}; continuing");
-        }
-    }
-}
-
-/// Drive one bucket on the F-Stack side. Mirrors
-/// `dpdk_maxtp::run_bucket` / `linux_maxtp::run_bucket` shape.
-pub fn run_bucket(cfg: &FStackMaxtpCfg, conns: &[c_int]) -> anyhow::Result<BucketRun> {
-    if conns.len() as u64 != cfg.bucket.conn_count {
-        anyhow::bail!(
-            "fstack_maxtp: conns.len() = {} does not match bucket.conn_count = {}",
-            conns.len(),
-            cfg.bucket.conn_count
-        );
-    }
-    if cfg.payload.len() as u64 != cfg.bucket.write_bytes {
-        anyhow::bail!(
-            "fstack_maxtp: payload.len() = {} does not match bucket.write_bytes = {}",
-            cfg.payload.len(),
-            cfg.bucket.write_bytes
-        );
-    }
-    if cfg.duration.as_nanos() == 0 {
-        anyhow::bail!("fstack_maxtp: measurement duration must be > 0");
-    }
-
-    // Warmup.
-    let warmup_deadline = Instant::now() + cfg.warmup;
-    let _ = pump_round_robin(conns, &cfg.payload, warmup_deadline)
-        .context("fstack_maxtp warmup phase")?;
-
-    // Measurement window.
-    let t_measure_start = Instant::now();
-    let measure_deadline = t_measure_start + cfg.duration;
-    let bytes_sent_in_window = pump_round_robin(conns, &cfg.payload, measure_deadline)
-        .context("fstack_maxtp measurement phase")?;
-    let t_measure_end = Instant::now();
-
-    let elapsed_ns = t_measure_end
-        .saturating_duration_since(t_measure_start)
-        .as_nanos() as u64;
-    let sample = MaxtpSample::from_window(bytes_sent_in_window, 0, elapsed_ns);
-
-    Ok(BucketRun {
-        sample,
-        bytes_sent_in_window,
-        tx_ts_mode: cfg.tx_ts_mode,
-    })
-}
-
-/// Pump writes round-robin across F-Stack sockets until `deadline`.
-/// Returns the total bytes accepted (sum of successful `ff_write`
-/// return values).
-fn pump_round_robin(
-    conns: &[c_int],
-    payload: &[u8],
-    deadline: Instant,
-) -> anyhow::Result<u64> {
-    if conns.is_empty() {
-        anyhow::bail!("fstack_maxtp: pump_round_robin: conns is empty");
-    }
-    let mut total: u64 = 0;
-    let check_between_conns = conns.len() == 1;
-    // Per-conn discard buffer — drain inbound bytes the peer echoes
-    // (F-Stack peer is an echo-server, same as bench-e2e's). Without
-    // draining, the recv buffer fills + backpressures the writer
-    // through the BSD layer.
-    let mut discard = vec![0u8; 65536];
-    loop {
-        if Instant::now() >= deadline {
-            return Ok(total);
-        }
-        for &fd in conns {
-            // Drain inbound (non-blocking). EAGAIN -> nothing pending.
-            let mut drained = 0usize;
-            while drained < discard.len() * 4 {
-                let n = unsafe { ff_read(fd, discard.as_mut_ptr() as *mut _, discard.len()) };
-                if n > 0 {
-                    drained += n as usize;
-                    if (n as usize) < discard.len() {
-                        break;
-                    }
-                } else {
-                    // 0 = EOF, <0 = error/EAGAIN — both stop the inner
-                    // drain loop. A genuine connection error will surface
-                    // on the subsequent ff_write below.
-                    break;
+            let errno = fstack_errno();
+            if errno != FF_EINPROGRESS {
+                let _ = unsafe { ff_close(fd) };
+                for &fd in &fds {
+                    let _ = unsafe { ff_close(fd) };
                 }
-            }
-
-            // Write payload.
-            let n = unsafe { ff_write(fd, payload.as_ptr() as *const _, payload.len()) };
-            if n > 0 {
-                total = total.saturating_add(n as u64);
-            } else if n < 0 {
-                // EAGAIN / send-buffer-full — skip to next conn.
-                // Without an errno-location FFI we can't distinguish
-                // EAGAIN from a genuine ECONNRESET; treat all <0
-                // returns as transient and rely on the deadline to
-                // bound the bucket. A wedged conn would result in a
-                // low byte count on this bucket — operator sees the
-                // anomaly in the CSV.
-                let _ = ErrorKind::WouldBlock; // documentation
-            }
-
-            if check_between_conns && Instant::now() >= deadline {
-                return Ok(total);
+                state.phase = Phase::BucketError(format!(
+                    "ff_connect on conn {i} failed: rc={rc} errno={errno} \
+                     (expected FF_EINPROGRESS={FF_EINPROGRESS})"
+                ));
+                return Step::Continue;
             }
         }
+        fds.push(fd);
     }
+    state.fds = fds;
+    state.phase = Phase::WaitConnectAll { checked: 0 };
+    // Yield once so the kernel has a chance to advance the handshakes
+    // before we start polling SO_ERROR.
+    Step::Yield
 }
 
-/// Close-all helper for per-conn open failure. Drops every fd opened
-/// up to that point; soft-fails on per-fd errors.
-fn close_all(conns: &[c_int]) {
-    for &fd in conns {
+fn phase_wait_connect_all(state: &mut MaxtpGridState<'_>, mut checked: usize) -> Step {
+    while checked < state.fds.len() {
+        let fd = state.fds[checked];
+        let mut sock_err: c_int = 0;
+        let mut len: c_uint = std::mem::size_of::<c_int>() as c_uint;
+        let rc = unsafe {
+            ff_getsockopt(
+                fd,
+                SOL_SOCKET,
+                SO_ERROR,
+                &mut sock_err as *mut c_int as *mut c_void,
+                &mut len as *mut c_uint,
+            )
+        };
+        if rc != 0 {
+            let errno = fstack_errno();
+            state.phase = Phase::BucketError(format!(
+                "ff_getsockopt(SO_ERROR) on conn {checked} failed: rc={rc} errno={errno}"
+            ));
+            return Step::Continue;
+        }
+        if sock_err == 0 {
+            checked += 1;
+            continue;
+        }
+        if sock_err == FF_EINPROGRESS || sock_err == FF_EAGAIN {
+            // Still pending; restore the wait phase and yield.
+            state.phase = Phase::WaitConnectAll { checked };
+            return Step::Yield;
+        }
+        state.phase = Phase::BucketError(format!(
+            "connect SO_ERROR={sock_err} on conn {checked}"
+        ));
+        return Step::Continue;
+    }
+    // All connections established.
+    state.phase = Phase::Warmup {
+        warmup_deadline: Instant::now() + state.warmup,
+    };
+    Step::Continue
+}
+
+fn phase_warmup(state: &mut MaxtpGridState<'_>, warmup_deadline: Instant) -> Step {
+    // Pump for a single sweep across all fds, then re-check the deadline.
+    let _ = pump_round_robin_once(&state.fds, &state.payload, &mut state.discard);
+    if Instant::now() >= warmup_deadline {
+        let now = Instant::now();
+        state.phase = Phase::Measure {
+            t_start: now,
+            measure_deadline: now + state.duration,
+            bytes: 0,
+        };
+        return Step::Continue;
+    }
+    state.phase = Phase::Warmup { warmup_deadline };
+    // Yield to let the kernel drain ACKs / fill recv buffer between sweeps.
+    Step::Yield
+}
+
+fn phase_measure(
+    state: &mut MaxtpGridState<'_>,
+    t_start: Instant,
+    measure_deadline: Instant,
+    mut bytes: u64,
+) -> Step {
+    let written = pump_round_robin_once(&state.fds, &state.payload, &mut state.discard);
+    bytes = bytes.saturating_add(written);
+    if Instant::now() >= measure_deadline {
+        let elapsed_ns = Instant::now()
+            .saturating_duration_since(t_start)
+            .as_nanos() as u64;
+        let elapsed_ns = elapsed_ns.max(1); // MaxtpSample::from_window asserts >0.
+        let sample = MaxtpSample::from_window(bytes, 0, elapsed_ns);
+        let run = BucketRun {
+            sample,
+            bytes_sent_in_window: bytes,
+            tx_ts_mode: state.tx_ts_mode,
+        };
+        state.phase = Phase::CloseAll {
+            idx: 0,
+            result: Ok(run),
+        };
+        return Step::Continue;
+    }
+    state.phase = Phase::Measure {
+        t_start,
+        measure_deadline,
+        bytes,
+    };
+    Step::Yield
+}
+
+fn phase_close_all(
+    state: &mut MaxtpGridState<'_>,
+    mut idx: usize,
+    result: Result<BucketRun, String>,
+) -> Step {
+    while idx < state.fds.len() {
+        let _ = unsafe { ff_close(state.fds[idx]) };
+        idx += 1;
+    }
+    let bucket = state.grid[state.bucket_idx];
+    state.fds.clear();
+    state.results.push(MaxtpGridResult { bucket, result });
+    state.bucket_idx += 1;
+    if state.bucket_idx < state.grid.len() {
+        state.phase = Phase::ConnectAll;
+    } else {
+        state.phase = Phase::Done;
+    }
+    Step::Continue
+}
+
+fn phase_bucket_error(state: &mut MaxtpGridState<'_>, msg: String) -> Step {
+    // ConnectAll already closed any partial fds before raising
+    // BucketError, so state.fds is either fully populated (failure
+    // detected mid-handshake) or empty (failure during socket open).
+    for &fd in &state.fds {
         let _ = unsafe { ff_close(fd) };
     }
+    state.fds.clear();
+    let bucket = state.grid[state.bucket_idx];
+    state.results.push(MaxtpGridResult {
+        bucket,
+        result: Err(msg),
+    });
+    state.bucket_idx += 1;
+    if state.bucket_idx < state.grid.len() {
+        state.phase = Phase::ConnectAll;
+    } else {
+        state.phase = Phase::Done;
+    }
+    Step::Continue
 }
 
+fn phase_done(state: &mut MaxtpGridState<'_>) -> Step {
+    if !state.stopped {
+        unsafe { ff_stop_run() };
+        state.stopped = true;
+    }
+    state.phase = Phase::Done;
+    Step::Stopped
+}
+
+/// One round-robin sweep across every connection: drain inbound first,
+/// then issue a single non-blocking write attempt. Returns the total
+/// bytes written across this sweep.
+fn pump_round_robin_once(fds: &[c_int], payload: &[u8], discard: &mut [u8]) -> u64 {
+    if fds.is_empty() || payload.is_empty() {
+        return 0;
+    }
+    let mut total: u64 = 0;
+    for &fd in fds {
+        // Drain inbound (non-blocking). Cap at 8 reads per conn per
+        // sweep so a fast peer cannot starve other conns this callback.
+        for _ in 0..8 {
+            let n = unsafe { ff_read(fd, discard.as_mut_ptr() as *mut c_void, discard.len()) };
+            if n <= 0 {
+                break; // EAGAIN or EOF
+            }
+            if (n as usize) < discard.len() {
+                break; // partial read → recv buffer now empty
+            }
+        }
+        // Single non-blocking write attempt.
+        let n = unsafe { ff_write(fd, payload.as_ptr() as *const c_void, payload.len()) };
+        if n > 0 {
+            total = total.saturating_add(n as u64);
+        }
+        // n <= 0 → EAGAIN or per-conn error; round-robin continues.
+    }
+    total
+}
+
+// ---------------------------------------------------------------------------
+// Helpers retained from the old API.
+// ---------------------------------------------------------------------------
+
 /// Format an IP host-order u32 as dotted-quad for log messages.
+#[allow(dead_code)]
 fn format_ip_host_order(ip: u32) -> String {
     let b = ip.to_be_bytes();
     format!("{}.{}.{}.{}", b[0], b[1], b[2], b[3])
@@ -251,12 +456,6 @@ fn format_ip_host_order(ip: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn open_rejects_zero_conn_count() {
-        let err = open_persistent_connections(0x7f00_0001, 1, 0).unwrap_err();
-        assert!(err.to_string().contains("conn_count must be > 0"));
-    }
 
     /// `format_ip_host_order` produces dotted-quad — verify the byte
     /// order matches `Ipv4Addr::to_string()`.

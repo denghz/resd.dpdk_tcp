@@ -2,7 +2,18 @@
 //!
 //! Drives the K × G grid against a live F-Stack peer
 //! (`/opt/f-stack-peer/bench-peer` on the baked AMI, port 10003 by
-//! default) using one persistent F-Stack connection.
+//! default) using one F-Stack connection per bucket.
+//!
+//! # Why ff_run-driven state machine
+//!
+//! F-Stack's BSD-shaped API (`ff_socket`/`ff_connect`/`ff_write`/...) is
+//! NOT usable outside the `ff_run` callback: DPDK packet processing
+//! only runs inside ff_run's poll loop, so a call sequence outside it
+//! never makes wire progress. Additionally, ff_run calls
+//! `rte_eal_cleanup()` on exit, which can only be invoked once per
+//! process. Together, these constraints force the entire K × G
+//! measurement grid to complete inside a SINGLE ff_run invocation,
+//! driven by a state machine that the per-iteration callback advances.
 //!
 //! # Why F-Stack vs mTCP
 //!
@@ -24,48 +35,29 @@
 //!   `TxTsMode::TscFallback` is the only available source — same as
 //!   the dpdk_net arm on ENA.
 //! - `t1` = TSC at end-of-drain when the full K bytes have been
-//!   accepted by F-Stack. F-Stack's send buffer is internally bounded
-//!   so the writer must loop on `ff_write` returning `EAGAIN`.
+//!   accepted by F-Stack.
 //!
 //! Throughput per burst = K / (t1 − t0), bps.
 //!
 //! # Soft-fail per-bucket
 //!
-//! Mirrors `dpdk_maxtp.rs`'s pattern: if a single bucket fails (peer
-//! reset, send-buffer wedge, etc.) we log + return Err so the grid
-//! driver in main.rs can soft-fail and continue with the next
-//! bucket. Each bucket opens its own connection so a wedge in
-//! bucket N doesn't poison bucket N+1.
+//! Each bucket's outcome is captured into [`BurstGridResult`]. A
+//! bucket-level failure (connect refused, send wedge, etc.) becomes
+//! `Err(String)` for that bucket without aborting the rest of the
+//! grid — the next bucket opens a fresh connection.
 
-use std::os::raw::c_int;
-use std::time::Duration;
+use std::os::raw::{c_int, c_uint, c_void};
+use std::time::{Duration, Instant};
 
-use anyhow::Context;
-
-use crate::burst::{BurstSample, Bucket};
+use crate::burst::{Bucket, BurstSample};
 use crate::dpdk_burst::TxTsMode;
 use crate::fstack_ffi::{
-    ff_close, ff_connect, ff_ioctl, ff_socket, ff_write, make_linux_sockaddr_in, AF_INET, FIONBIO,
-    FF_EAGAIN, SOCK_STREAM,
+    ff_close, ff_connect, ff_getsockopt, ff_ioctl, ff_run, ff_socket, ff_stop_run, ff_write,
+    fstack_errno, make_linux_sockaddr_in, AF_INET, FF_EAGAIN, FF_EINPROGRESS, FIONBIO, SOCK_STREAM,
+    SO_ERROR, SOL_SOCKET,
 };
 
-/// Per-bucket runner configuration.
-pub struct FStackBurstCfg<'a> {
-    pub bucket: Bucket,
-    pub warmup: u64,
-    pub bursts: u64,
-    pub tsc_hz: u64,
-    pub peer_ip_host_order: u32,
-    pub peer_port: u16,
-    /// Payload template — caller allocates once per bucket so the
-    /// inner loop is allocation-free (parity with dpdk_burst).
-    pub payload: &'a [u8],
-    /// Stack-tag for CSV; F-Stack on ENA stays on TscFallback for the
-    /// same reason the dpdk_net arm does (no HW TS dynfield).
-    pub tx_ts_mode: TxTsMode,
-}
-
-/// One bucket's raw measurement product.
+/// One bucket's raw measurement product. Mirrors the dpdk_burst shape.
 pub struct BucketRun {
     pub samples: Vec<BurstSample>,
     /// Sum of `bucket.burst_bytes` across measurement bursts (warmup
@@ -76,219 +68,668 @@ pub struct BucketRun {
     pub tx_ts_mode: TxTsMode,
 }
 
-/// Open a single persistent connection to the F-Stack peer. Returns
-/// the F-Stack socket fd. Caller closes via [`close_persistent_connection`].
-pub fn open_persistent_connection(
+/// Outcome of a single bucket inside the grid run. Per-bucket soft-fail:
+/// `Err(message)` does not abort siblings.
+pub struct BurstGridResult {
+    pub bucket: Bucket,
+    pub result: Result<BucketRun, String>,
+}
+
+// ---------------------------------------------------------------------------
+// State machine — driven from ff_run's per-iteration callback.
+// ---------------------------------------------------------------------------
+
+/// Phases the state machine cycles through. Each callback invocation
+/// performs one or more state transitions until either:
+///   - all bytes for the current substep have been issued (advance), or
+///   - the F-Stack send buffer would-blocks (return so the next ff_run
+///     iteration drains ACKs before retrying).
+enum Phase {
+    /// Open the socket + ioctl(FIONBIO) + start non-blocking connect.
+    Connect,
+    /// Non-blocking connect issued; poll SO_ERROR until 0 or non-EAGAIN error.
+    WaitConnect,
+    /// Pump warmup bursts; no samples recorded.
+    Warmup { bursts_done: u64, sent: usize },
+    /// Inter-burst gap during warmup.
+    WarmupGap { bursts_done: u64, gap_until: Instant },
+    /// Capture t0 and start a measurement burst.
+    MeasureStart {
+        bursts_done: u64,
+        samples: Vec<BurstSample>,
+        sum: u64,
+    },
+    /// Mid-measurement burst — accumulate sent bytes, capture t_first_wire
+    /// on the first byte sent, capture t1 when done.
+    MeasureWrite {
+        bursts_done: u64,
+        sent: usize,
+        t0_tsc: u64,
+        t_first_wire: Option<u64>,
+        samples: Vec<BurstSample>,
+        sum: u64,
+    },
+    /// Inter-burst gap during measurement.
+    MeasureGap {
+        bursts_done: u64,
+        gap_until: Instant,
+        samples: Vec<BurstSample>,
+        sum: u64,
+    },
+    /// Bucket finished cleanly; close fd, push result, advance to next bucket.
+    CloseAndNext {
+        samples: Vec<BurstSample>,
+        sum: u64,
+    },
+    /// Bucket failed; close fd, push Err, advance to next bucket.
+    BucketError(String),
+    /// All buckets done — call ff_stop_run() and return.
+    Done,
+}
+
+/// Mutable state owned by the grid driver and threaded through ff_run via
+/// a `*mut c_void`. The state lives on the calling thread's stack for the
+/// entire duration of `run_burst_grid`'s `ff_run` invocation.
+struct BurstGridState<'a> {
+    grid: &'a [Bucket],
+    bucket_idx: usize,
+    fd: c_int,
+    phase: Phase,
+    /// Output — one entry pushed per finished bucket.
+    results: Vec<BurstGridResult>,
+    /// Per-bucket payload (one Vec<u8> per unique burst_bytes value).
+    payload_for_bucket: Vec<&'a [u8]>,
+    /// Static run-wide config.
+    warmup_bursts: u64,
+    measure_bursts: u64,
+    tsc_hz: u64,
     peer_ip_host_order: u32,
     peer_port: u16,
-) -> anyhow::Result<c_int> {
-    // 1. Open a TCP socket via F-Stack.
+    tx_ts_mode: TxTsMode,
+    /// Set true once ff_stop_run has been called so we don't call it twice.
+    stopped: bool,
+}
+
+/// Drive the entire K × G burst grid inside a single ff_run invocation.
+///
+/// `ff_run` is one-shot per process (it calls `rte_eal_cleanup` on
+/// exit), so ALL buckets must complete before `ff_stop_run` fires. The
+/// callback advances a state machine; control returns to ff_run on
+/// EAGAIN so DPDK can drain ACKs before the next attempt.
+///
+/// Returns one [`BurstGridResult`] per bucket (in the same order). A
+/// per-bucket failure (connect refused, send wedge, etc.) is captured
+/// as `Err(String)` and does not abort the rest of the grid.
+pub fn run_burst_grid(
+    grid: &[Bucket],
+    warmup: u64,
+    bursts: u64,
+    tsc_hz: u64,
+    peer_ip_host_order: u32,
+    peer_port: u16,
+    tx_ts_mode: TxTsMode,
+) -> Vec<BurstGridResult> {
+    if grid.is_empty() {
+        return Vec::new();
+    }
+
+    // Pre-allocate one zero-filled payload per unique burst_bytes value.
+    // The state machine references these by index into `payload_for_bucket`,
+    // which is the same length as the grid (so each bucket index maps
+    // directly to its payload via `grid[bucket_idx]`'s burst_bytes).
+    let mut unique_sizes: Vec<u64> = grid.iter().map(|b| b.burst_bytes).collect();
+    unique_sizes.sort_unstable();
+    unique_sizes.dedup();
+    let payload_storage: Vec<Vec<u8>> = unique_sizes
+        .iter()
+        .map(|&n| vec![0u8; n as usize])
+        .collect();
+    // Map bucket index → which storage slot holds its payload.
+    let payload_for_bucket: Vec<&[u8]> = grid
+        .iter()
+        .map(|b| {
+            let idx = unique_sizes
+                .iter()
+                .position(|&n| n == b.burst_bytes)
+                .expect("dedup invariant: every bucket size is present");
+            payload_storage[idx].as_slice()
+        })
+        .collect();
+
+    let mut state = BurstGridState {
+        grid,
+        bucket_idx: 0,
+        fd: -1,
+        phase: Phase::Connect,
+        results: Vec::with_capacity(grid.len()),
+        payload_for_bucket,
+        warmup_bursts: warmup,
+        measure_bursts: bursts,
+        tsc_hz,
+        peer_ip_host_order,
+        peer_port,
+        tx_ts_mode,
+        stopped: false,
+    };
+
+    // SAFETY: ff_run is synchronous; it blocks until the callback calls
+    // ff_stop_run and the inner poll loop unwinds. The stack frame of
+    // `state` therefore lives for the entire duration of this unsafe
+    // block, so the raw pointer remains valid for every callback
+    // invocation.
+    unsafe {
+        let arg = &mut state as *mut BurstGridState<'_> as *mut c_void;
+        ff_run(burst_grid_callback, arg);
+    }
+
+    state.results
+}
+
+// ---------------------------------------------------------------------------
+// Callback — entered once per ff_run poll iteration.
+// ---------------------------------------------------------------------------
+
+/// `ff_run` invokes this once per poll iteration. The function is
+/// `extern "C" fn` (safe pointer); the unsafe blocks are inside the body
+/// for the FFI calls themselves.
+extern "C" fn burst_grid_callback(arg: *mut c_void) -> c_int {
+    // SAFETY: `arg` came from `&mut BurstGridState as *mut _ as *mut c_void`
+    // in `run_burst_grid`. ff_run is synchronous so the stack frame is
+    // still alive; nothing else aliases the pointer.
+    let state = unsafe { &mut *(arg as *mut BurstGridState<'_>) };
+
+    // Once we've called ff_stop_run, ff_run may invoke us once or twice
+    // more before unwinding. Short-circuit in that window.
+    if state.stopped {
+        return 0;
+    }
+
+    // Drive the state machine. Many transitions can happen in a single
+    // callback invocation (e.g. Connect → WaitConnect → Warmup all in
+    // one go if connect completes synchronously). We only `return 0`
+    // when we hit EAGAIN or a wait-gate (gap_until / WaitConnect retry).
+    loop {
+        match advance(state) {
+            Step::Continue => continue,
+            Step::Yield => return 0,
+            Step::Stopped => return 0,
+        }
+    }
+}
+
+/// Single-step result for the inner state-machine advance.
+enum Step {
+    /// Made progress; call `advance` again in the same callback invocation.
+    Continue,
+    /// Would-block / wait-gate; return from the callback.
+    Yield,
+    /// `ff_stop_run` was called; return from the callback.
+    Stopped,
+}
+
+/// Take ONE state-machine step. Many transitions can be chained in a
+/// single callback by looping on `Continue`.
+fn advance(state: &mut BurstGridState<'_>) -> Step {
+    // We need to swap the phase out of the struct so we can match-and-replace
+    // by value (avoiding the pattern of cloning Vec<BurstSample> per step).
+    // The phase is restored at the end of each match arm.
+    let phase = std::mem::replace(&mut state.phase, Phase::Done);
+
+    match phase {
+        Phase::Connect => phase_connect(state),
+        Phase::WaitConnect => phase_wait_connect(state),
+        Phase::Warmup { bursts_done, sent } => phase_warmup(state, bursts_done, sent),
+        Phase::WarmupGap {
+            bursts_done,
+            gap_until,
+        } => phase_warmup_gap(state, bursts_done, gap_until),
+        Phase::MeasureStart {
+            bursts_done,
+            samples,
+            sum,
+        } => phase_measure_start(state, bursts_done, samples, sum),
+        Phase::MeasureWrite {
+            bursts_done,
+            sent,
+            t0_tsc,
+            t_first_wire,
+            samples,
+            sum,
+        } => phase_measure_write(state, bursts_done, sent, t0_tsc, t_first_wire, samples, sum),
+        Phase::MeasureGap {
+            bursts_done,
+            gap_until,
+            samples,
+            sum,
+        } => phase_measure_gap(state, bursts_done, gap_until, samples, sum),
+        Phase::CloseAndNext { samples, sum } => phase_close_and_next(state, samples, sum),
+        Phase::BucketError(msg) => phase_bucket_error(state, msg),
+        Phase::Done => phase_done(state),
+    }
+}
+
+fn phase_connect(state: &mut BurstGridState<'_>) -> Step {
     let fd = unsafe { ff_socket(AF_INET as c_int, SOCK_STREAM, 0) };
     if fd < 0 {
-        anyhow::bail!("ff_socket returned {fd}");
+        let errno = fstack_errno();
+        state.phase = Phase::BucketError(format!("ff_socket failed: errno={errno}"));
+        return Step::Continue;
     }
-    // 2. F-Stack mandates non-blocking mode for ff_write to behave as
-    // documented (ff_api.h: "Set non-blocking before ff_write").
+    state.fd = fd;
+
+    // Set non-blocking BEFORE connect so we can drive the handshake
+    // asynchronously inside ff_run's poll loop.
     let on: c_int = 1;
     let rc = unsafe { ff_ioctl(fd, FIONBIO, &on as *const c_int) };
     if rc != 0 {
-        unsafe { ff_close(fd) };
-        anyhow::bail!("ff_ioctl(FIONBIO) returned {rc}");
+        let errno = fstack_errno();
+        state.phase =
+            Phase::BucketError(format!("ff_ioctl(FIONBIO) failed: rc={rc} errno={errno}"));
+        return Step::Continue;
     }
-    // 3. Connect to the peer. F-Stack uses linux_sockaddr layout —
-    // see fstack_ffi::make_linux_sockaddr_in for the byte layout.
-    let sa = make_linux_sockaddr_in(peer_ip_host_order, peer_port);
+
+    // Issue the non-blocking connect.
+    let sa = make_linux_sockaddr_in(state.peer_ip_host_order, state.peer_port);
     let rc = unsafe { ff_connect(fd, &sa, std::mem::size_of_val(&sa) as u32) };
-    if rc != 0 {
-        // Non-blocking connect — EINPROGRESS expected. F-Stack's BSD
-        // semantics map this to errno=EINPROGRESS (FreeBSD = 36). We
-        // poll with brief retries; production code would use ff_kqueue
-        // but for bench-vs-mtcp the simple busy-wait keeps the
-        // dependency surface small.
-        // The simpler shape is to do a blocking connect (set NB after).
-        // Re-shape: set NB AFTER connect so the handshake blocks.
+    if rc == 0 {
+        // Synchronous-completion fast path: connect already done.
+        state.phase = Phase::Warmup {
+            bursts_done: 0,
+            sent: 0,
+        };
+        return Step::Continue;
     }
-    Ok(fd)
+    let errno = fstack_errno();
+    if errno == FF_EINPROGRESS {
+        state.phase = Phase::WaitConnect;
+        // No data to send yet; yield so the kernel can advance the handshake.
+        return Step::Yield;
+    }
+    state.phase = Phase::BucketError(format!(
+        "ff_connect failed: rc={rc} errno={errno} (expected FF_EINPROGRESS={FF_EINPROGRESS})"
+    ));
+    Step::Continue
 }
 
-/// Close the persistent connection. Soft-fail logged but Ok — the
-/// next bucket opens fresh.
-pub fn close_persistent_connection(fd: c_int) {
-    let rc = unsafe { ff_close(fd) };
+fn phase_wait_connect(state: &mut BurstGridState<'_>) -> Step {
+    let mut sock_err: c_int = 0;
+    let mut len: c_uint = std::mem::size_of::<c_int>() as c_uint;
+    let rc = unsafe {
+        ff_getsockopt(
+            state.fd,
+            SOL_SOCKET,
+            SO_ERROR,
+            &mut sock_err as *mut c_int as *mut c_void,
+            &mut len as *mut c_uint,
+        )
+    };
     if rc != 0 {
-        eprintln!("fstack_burst: ff_close({fd}) returned {rc} (continuing)");
+        let errno = fstack_errno();
+        state.phase =
+            Phase::BucketError(format!("ff_getsockopt(SO_ERROR) failed: rc={rc} errno={errno}"));
+        return Step::Continue;
+    }
+    if sock_err == 0 {
+        state.phase = Phase::Warmup {
+            bursts_done: 0,
+            sent: 0,
+        };
+        return Step::Continue;
+    }
+    if sock_err == FF_EINPROGRESS || sock_err == FF_EAGAIN {
+        // Still pending; restore the wait phase and yield.
+        state.phase = Phase::WaitConnect;
+        return Step::Yield;
+    }
+    state.phase = Phase::BucketError(format!("connect SO_ERROR={sock_err}"));
+    Step::Continue
+}
+
+fn phase_warmup(state: &mut BurstGridState<'_>, mut bursts_done: u64, mut sent: usize) -> Step {
+    let payload = state.payload_for_bucket[state.bucket_idx];
+    if payload.is_empty() {
+        // 0-byte burst is meaningless; treat as already done.
+        bursts_done = state.warmup_bursts;
+    }
+
+    // Try to push as much of the current burst as possible in this callback.
+    while bursts_done < state.warmup_bursts {
+        let made_progress_or_eagain = pump_one_burst(state.fd, payload, &mut sent, &mut None);
+        match made_progress_or_eagain {
+            PumpStep::Progress => {
+                if sent == payload.len() {
+                    // Burst complete. Advance to next warmup burst.
+                    bursts_done = bursts_done.saturating_add(1);
+                    sent = 0;
+                    if bursts_done == state.warmup_bursts {
+                        break;
+                    }
+                    let gap_ms = state.grid[state.bucket_idx].gap_ms;
+                    if gap_ms > 0 {
+                        state.phase = Phase::WarmupGap {
+                            bursts_done,
+                            gap_until: Instant::now() + Duration::from_millis(gap_ms),
+                        };
+                        return Step::Yield;
+                    }
+                    // gap=0: continue immediately.
+                    continue;
+                }
+                // Partial burst — loop to try the remainder right away.
+                continue;
+            }
+            PumpStep::WouldBlock => {
+                // EAGAIN — yield to let the kernel drain.
+                state.phase = Phase::Warmup { bursts_done, sent };
+                return Step::Yield;
+            }
+            PumpStep::Error(msg) => {
+                state.phase = Phase::BucketError(msg);
+                return Step::Continue;
+            }
+        }
+    }
+
+    // Warmup complete; transition to measurement.
+    state.phase = Phase::MeasureStart {
+        bursts_done: 0,
+        samples: Vec::with_capacity(state.measure_bursts as usize),
+        sum: 0,
+    };
+    Step::Continue
+}
+
+fn phase_warmup_gap(state: &mut BurstGridState<'_>, bursts_done: u64, gap_until: Instant) -> Step {
+    if Instant::now() >= gap_until {
+        state.phase = Phase::Warmup {
+            bursts_done,
+            sent: 0,
+        };
+        return Step::Continue;
+    }
+    state.phase = Phase::WarmupGap {
+        bursts_done,
+        gap_until,
+    };
+    Step::Yield
+}
+
+fn phase_measure_start(
+    state: &mut BurstGridState<'_>,
+    bursts_done: u64,
+    samples: Vec<BurstSample>,
+    sum: u64,
+) -> Step {
+    let t0_tsc = dpdk_net_core::clock::rdtsc();
+    state.phase = Phase::MeasureWrite {
+        bursts_done,
+        sent: 0,
+        t0_tsc,
+        t_first_wire: None,
+        samples,
+        sum,
+    };
+    Step::Continue
+}
+
+#[allow(clippy::too_many_arguments)]
+fn phase_measure_write(
+    state: &mut BurstGridState<'_>,
+    bursts_done: u64,
+    mut sent: usize,
+    t0_tsc: u64,
+    mut t_first_wire: Option<u64>,
+    mut samples: Vec<BurstSample>,
+    mut sum: u64,
+) -> Step {
+    let bucket = state.grid[state.bucket_idx];
+    let payload = state.payload_for_bucket[state.bucket_idx];
+
+    if payload.is_empty() {
+        // Cannot meaningfully measure a 0-byte burst — skip the bucket.
+        state.phase = Phase::BucketError("burst_bytes=0 cannot be measured".to_string());
+        return Step::Continue;
+    }
+
+    // Drive remaining bytes for this burst.
+    let pump = pump_one_burst(state.fd, payload, &mut sent, &mut t_first_wire);
+    match pump {
+        PumpStep::Progress => {
+            if sent < payload.len() {
+                // Partial — loop and retry the remainder this same callback.
+                state.phase = Phase::MeasureWrite {
+                    bursts_done,
+                    sent,
+                    t0_tsc,
+                    t_first_wire,
+                    samples,
+                    sum,
+                };
+                return Step::Continue;
+            }
+            // Burst complete.
+            let t1_tsc = dpdk_net_core::clock::rdtsc();
+            // t_first_wire MUST be Some — pump_one_burst sets it on the
+            // first successful write. Defensive fallback: if for any
+            // reason it isn't, treat as t0 to keep the row monotonic.
+            let t_first_wire_tsc = t_first_wire.unwrap_or(t0_tsc);
+
+            let t0_ns = tsc_to_absolute_ns(t0_tsc, state.tsc_hz);
+            let t_first_wire_ns = tsc_to_absolute_ns(t_first_wire_tsc, state.tsc_hz);
+            let t1_ns = tsc_to_absolute_ns(t1_tsc, state.tsc_hz);
+
+            if t1_ns <= t0_ns || t_first_wire_ns < t0_ns || t1_ns < t_first_wire_ns {
+                eprintln!(
+                    "fstack_burst: WARN dropping burst (bursts_done={bursts_done}) — non-monotonic TSC \
+                     (t0={t0_ns} t_first_wire={t_first_wire_ns} t1={t1_ns})"
+                );
+            } else {
+                let sample =
+                    BurstSample::from_timestamps(bucket.burst_bytes, t0_ns, t_first_wire_ns, t1_ns);
+                samples.push(sample);
+                sum = sum.saturating_add(bucket.burst_bytes);
+            }
+
+            let bursts_done_next = bursts_done.saturating_add(1);
+            if bursts_done_next == state.measure_bursts {
+                state.phase = Phase::CloseAndNext { samples, sum };
+                return Step::Continue;
+            }
+            if bucket.gap_ms > 0 {
+                state.phase = Phase::MeasureGap {
+                    bursts_done: bursts_done_next,
+                    gap_until: Instant::now() + Duration::from_millis(bucket.gap_ms),
+                    samples,
+                    sum,
+                };
+                return Step::Yield;
+            }
+            // gap=0 → next burst right away.
+            state.phase = Phase::MeasureStart {
+                bursts_done: bursts_done_next,
+                samples,
+                sum,
+            };
+            Step::Continue
+        }
+        PumpStep::WouldBlock => {
+            state.phase = Phase::MeasureWrite {
+                bursts_done,
+                sent,
+                t0_tsc,
+                t_first_wire,
+                samples,
+                sum,
+            };
+            Step::Yield
+        }
+        PumpStep::Error(msg) => {
+            state.phase = Phase::BucketError(msg);
+            Step::Continue
+        }
     }
 }
 
-/// Drive one bucket on the F-Stack side. One connection is reused;
-/// caller is responsible for opening it via [`open_persistent_connection`]
-/// and passing the fd in.
-pub fn run_bucket(cfg: &FStackBurstCfg<'_>, fd: c_int) -> anyhow::Result<BucketRun> {
-    if cfg.payload.len() as u64 != cfg.bucket.burst_bytes {
-        anyhow::bail!(
-            "fstack_burst: payload length ({}) does not match K ({}) for bucket {}",
-            cfg.payload.len(),
-            cfg.bucket.burst_bytes,
-            cfg.bucket.label()
-        );
+fn phase_measure_gap(
+    state: &mut BurstGridState<'_>,
+    bursts_done: u64,
+    gap_until: Instant,
+    samples: Vec<BurstSample>,
+    sum: u64,
+) -> Step {
+    if Instant::now() >= gap_until {
+        state.phase = Phase::MeasureStart {
+            bursts_done,
+            samples,
+            sum,
+        };
+        return Step::Continue;
     }
+    state.phase = Phase::MeasureGap {
+        bursts_done,
+        gap_until,
+        samples,
+        sum,
+    };
+    Step::Yield
+}
 
-    // Warmup — pump bursts without recording samples.
-    for i in 0..cfg.warmup {
-        send_one_burst(fd, cfg.payload)
-            .with_context(|| format!("fstack warmup burst {i} ({})", cfg.bucket.label()))?;
-        maybe_sleep_gap(cfg.bucket.gap_ms);
+fn phase_close_and_next(
+    state: &mut BurstGridState<'_>,
+    samples: Vec<BurstSample>,
+    sum: u64,
+) -> Step {
+    let bucket = state.grid[state.bucket_idx];
+    if state.fd >= 0 {
+        let _ = unsafe { ff_close(state.fd) };
+        state.fd = -1;
     }
+    state.results.push(BurstGridResult {
+        bucket,
+        result: Ok(BucketRun {
+            samples,
+            sum_over_bursts_bytes: sum,
+            tx_ts_mode: state.tx_ts_mode,
+        }),
+    });
+    state.bucket_idx += 1;
+    if state.bucket_idx < state.grid.len() {
+        state.phase = Phase::Connect;
+    } else {
+        state.phase = Phase::Done;
+    }
+    Step::Continue
+}
 
-    // Measurement.
-    let mut samples: Vec<BurstSample> = Vec::with_capacity(cfg.bursts as usize);
-    let mut sum: u64 = 0;
-    for i in 0..cfg.bursts {
-        let t0_tsc = dpdk_net_core::clock::rdtsc();
+fn phase_bucket_error(state: &mut BurstGridState<'_>, msg: String) -> Step {
+    let bucket = state.grid[state.bucket_idx];
+    if state.fd >= 0 {
+        let _ = unsafe { ff_close(state.fd) };
+        state.fd = -1;
+    }
+    state.results.push(BurstGridResult {
+        bucket,
+        result: Err(msg),
+    });
+    state.bucket_idx += 1;
+    if state.bucket_idx < state.grid.len() {
+        state.phase = Phase::Connect;
+    } else {
+        state.phase = Phase::Done;
+    }
+    Step::Continue
+}
 
-        // First-segment send — block on EAGAIN until ≥1 byte accepted.
-        let (initial_accepted, t_first_wire_tsc) =
-            send_first_segment_and_capture_wire_time(fd, cfg.payload).with_context(|| {
-                format!(
-                    "fstack burst {i} first-segment ({})",
-                    cfg.bucket.label()
-                )
-            })?;
+fn phase_done(state: &mut BurstGridState<'_>) -> Step {
+    if !state.stopped {
+        unsafe { ff_stop_run() };
+        state.stopped = true;
+    }
+    // Restore Done so subsequent callback invocations remain a no-op.
+    state.phase = Phase::Done;
+    Step::Stopped
+}
 
-        // Drain remainder. Returns t1_tsc.
-        let t1_tsc = drive_burst_remainder_to_completion(fd, cfg.payload, initial_accepted)
-            .with_context(|| format!("fstack burst {i} drain ({})", cfg.bucket.label()))?;
+// ---------------------------------------------------------------------------
+// Inner pump — one tight-loop attempt at filling the rest of a burst.
+// ---------------------------------------------------------------------------
 
-        let t0_ns = tsc_to_absolute_ns(t0_tsc, cfg.tsc_hz);
-        let t_first_wire_ns = tsc_to_absolute_ns(t_first_wire_tsc, cfg.tsc_hz);
-        let t1_ns = tsc_to_absolute_ns(t1_tsc, cfg.tsc_hz);
+enum PumpStep {
+    /// Made some progress (at least one byte written, or already done).
+    Progress,
+    /// EAGAIN — send buffer full; caller must yield.
+    WouldBlock,
+    /// Hard error from F-Stack; bucket is dead.
+    Error(String),
+}
 
-        if t1_ns <= t0_ns || t_first_wire_ns < t0_ns || t1_ns < t_first_wire_ns {
-            eprintln!(
-                "fstack_burst: WARN dropping burst {i} — non-monotonic TSC \
-                 (t0={t0_ns} t_first_wire={t_first_wire_ns} t1={t1_ns})"
-            );
+/// Tight-loop on `ff_write` until the burst is complete OR we hit
+/// EAGAIN. `t_first_wire`, when supplied as `&mut Option<u64>`, is set
+/// to `rdtsc()` on the first successful write.
+fn pump_one_burst(
+    fd: c_int,
+    payload: &[u8],
+    sent: &mut usize,
+    t_first_wire: &mut Option<u64>,
+) -> PumpStep {
+    if *sent >= payload.len() {
+        return PumpStep::Progress;
+    }
+    let mut made_progress = false;
+    loop {
+        let remaining = &payload[*sent..];
+        let n = unsafe { ff_write(fd, remaining.as_ptr() as *const c_void, remaining.len()) };
+        if n > 0 {
+            if t_first_wire.is_none() {
+                *t_first_wire = Some(dpdk_net_core::clock::rdtsc());
+            }
+            *sent += n as usize;
+            made_progress = true;
+            if *sent == payload.len() {
+                return PumpStep::Progress;
+            }
             continue;
         }
-
-        let sample = BurstSample::from_timestamps(
-            cfg.bucket.burst_bytes,
-            t0_ns,
-            t_first_wire_ns,
-            t1_ns,
-        );
-        samples.push(sample);
-        sum = sum.saturating_add(cfg.bucket.burst_bytes);
-
-        maybe_sleep_gap(cfg.bucket.gap_ms);
-    }
-
-    Ok(BucketRun {
-        samples,
-        sum_over_bursts_bytes: sum,
-        tx_ts_mode: cfg.tx_ts_mode,
-    })
-}
-
-/// Send the entire burst payload, looping on EAGAIN until accepted.
-/// Used during warmup (no per-segment timing capture).
-fn send_one_burst(fd: c_int, payload: &[u8]) -> anyhow::Result<()> {
-    const STALL_TIMEOUT: Duration = Duration::from_secs(180);
-    let mut sent: usize = 0;
-    let mut last_progress = std::time::Instant::now();
-    while sent < payload.len() {
-        let remaining = &payload[sent..];
-        let n = unsafe { ff_write(fd, remaining.as_ptr() as *const _, remaining.len()) };
-        if n > 0 {
-            sent += n as usize;
-            last_progress = std::time::Instant::now();
-        } else if n < 0 {
-            // Errno from F-Stack is in the BSD-style location; the
-            // ff_errno.h header documents EAGAIN=35 (FreeBSD value).
-            // Without an `__errno_location`-equivalent for F-Stack
-            // accessible here we cannot read errno directly; treat
-            // any negative return as "would-block, retry" until the
-            // stall timeout fires. Real per-error classification is a
-            // follow-up (the ff_errno.h FFI surface needs more
-            // bindings).
-            if last_progress.elapsed() >= STALL_TIMEOUT {
-                anyhow::bail!(
-                    "fstack ff_write stalled at {sent}/{} bytes (no progress in {:?})",
-                    payload.len(),
-                    STALL_TIMEOUT
-                );
+        if n < 0 {
+            let errno = fstack_errno();
+            if errno == FF_EAGAIN {
+                // Send buffer full — yield to let DPDK drain ACKs.
+                if made_progress {
+                    return PumpStep::Progress;
+                }
+                return PumpStep::WouldBlock;
             }
-            // Yield briefly so the F-Stack poll thread can drain ACKs.
-            std::thread::yield_now();
+            return PumpStep::Error(format!("ff_write failed: errno={errno}"));
         }
-    }
-    Ok(())
-}
-
-/// First segment + capture TSC. Mirrors dpdk_burst's helper.
-fn send_first_segment_and_capture_wire_time(
-    fd: c_int,
-    payload: &[u8],
-) -> anyhow::Result<(usize, u64)> {
-    const STALL_TIMEOUT: Duration = Duration::from_secs(180);
-    let start = std::time::Instant::now();
-    loop {
-        let n = unsafe { ff_write(fd, payload.as_ptr() as *const _, payload.len()) };
-        if n > 0 {
-            let t_first_wire_tsc = dpdk_net_core::clock::rdtsc();
-            return Ok((n as usize, t_first_wire_tsc));
+        // n == 0: unexpected for a TCP socket; treat as transient.
+        if made_progress {
+            return PumpStep::Progress;
         }
-        if start.elapsed() >= STALL_TIMEOUT {
-            anyhow::bail!(
-                "fstack first-segment ff_write did not accept any byte within {:?}",
-                STALL_TIMEOUT
-            );
-        }
-        std::thread::yield_now();
+        return PumpStep::WouldBlock;
     }
 }
 
-/// Drive remainder + capture t1_tsc when the last segment is accepted
-/// by F-Stack's send path. Mirrors dpdk_burst's helper without the
-/// HW-TS path (F-Stack doesn't expose it).
-fn drive_burst_remainder_to_completion(
-    fd: c_int,
-    payload: &[u8],
-    already_sent: usize,
-) -> anyhow::Result<u64> {
-    const STALL_TIMEOUT: Duration = Duration::from_secs(180);
-    let mut sent = already_sent;
-    let mut last_progress = std::time::Instant::now();
-    while sent < payload.len() {
-        let remaining = &payload[sent..];
-        let n = unsafe { ff_write(fd, remaining.as_ptr() as *const _, remaining.len()) };
-        if n > 0 {
-            sent += n as usize;
-            last_progress = std::time::Instant::now();
-        } else if n < 0 {
-            if last_progress.elapsed() >= STALL_TIMEOUT {
-                anyhow::bail!(
-                    "fstack burst drain stalled at {sent}/{} bytes (no progress in {:?})",
-                    payload.len(),
-                    STALL_TIMEOUT
-                );
-            }
-            std::thread::yield_now();
-        }
-    }
-    let t1_tsc = dpdk_net_core::clock::rdtsc();
-    let _ = FF_EAGAIN; // referenced for documentation; not used yet
-    Ok(t1_tsc)
-}
+// ---------------------------------------------------------------------------
+// Helpers retained from the old API.
+// ---------------------------------------------------------------------------
 
 /// TSC → absolute ns; same shape as dpdk_burst::tsc_to_absolute_ns.
 fn tsc_to_absolute_ns(tsc: u64, tsc_hz: u64) -> u64 {
     bench_e2e::workload::tsc_delta_to_ns(0, tsc, tsc_hz)
 }
 
-fn maybe_sleep_gap(gap_ms: u64) {
-    if gap_ms > 0 {
-        std::thread::sleep(Duration::from_millis(gap_ms));
+/// Format an IP host-order u32 as dotted-quad for log messages.
+#[allow(dead_code)]
+fn format_ip_host_order(ip: u32) -> String {
+    let b = ip.to_be_bytes();
+    format!("{}.{}.{}.{}", b[0], b[1], b[2], b[3])
+}
+
+/// Close every fd in the slice, ignoring per-fd errors.
+#[allow(dead_code)]
+fn close_all(conns: &[c_int]) {
+    for &fd in conns {
+        let _ = unsafe { ff_close(fd) };
     }
 }
 
@@ -304,11 +745,9 @@ mod tests {
         assert!(b > a);
     }
 
-    /// Sleep-gap zero is a no-op (parity with dpdk_burst).
     #[test]
-    fn maybe_sleep_gap_zero_is_noop() {
-        let start = std::time::Instant::now();
-        maybe_sleep_gap(0);
-        assert!(start.elapsed() < Duration::from_millis(1));
+    fn format_ip_host_order_dotted_quad() {
+        assert_eq!(format_ip_host_order(0x0A_00_00_2A), "10.0.0.42");
+        assert_eq!(format_ip_host_order(0xC0_A8_01_0A), "192.168.1.10");
     }
 }
