@@ -141,7 +141,7 @@ pub fn run_bucket(cfg: &DpdkBurstCfg<'_>) -> anyhow::Result<BucketRun> {
     for i in 0..cfg.warmup {
         send_one_burst_and_drain_acks(cfg.engine, cfg.conn, cfg.payload)
             .with_context(|| format!("warmup burst {i} ({}))", cfg.bucket.label()))?;
-        maybe_sleep_gap(cfg.bucket.gap_ms);
+        poll_gap(cfg.engine, cfg.conn, cfg.bucket.gap_ms)?;
     }
 
     // Measurement — record one sample per burst.
@@ -202,7 +202,7 @@ pub fn run_bucket(cfg: &DpdkBurstCfg<'_>) -> anyhow::Result<BucketRun> {
         samples.push(sample);
         sum = sum.saturating_add(cfg.bucket.burst_bytes);
 
-        maybe_sleep_gap(cfg.bucket.gap_ms);
+        poll_gap(cfg.engine, cfg.conn, cfg.bucket.gap_ms)?;
     }
 
     Ok(BucketRun {
@@ -516,10 +516,17 @@ fn tsc_to_absolute_ns(tsc: u64, tsc_hz: u64) -> u64 {
     tsc_delta_to_ns(0, tsc, tsc_hz)
 }
 
-fn maybe_sleep_gap(gap_ms: u64) {
-    if gap_ms > 0 {
-        std::thread::sleep(Duration::from_millis(gap_ms));
+fn poll_gap(engine: &Engine, conn: ConnHandle, gap_ms: u64) -> anyhow::Result<()> {
+    if gap_ms == 0 {
+        return Ok(());
     }
+    let deadline = std::time::Instant::now() + Duration::from_millis(gap_ms);
+    while std::time::Instant::now() < deadline {
+        engine.poll_once();
+        let _ = drain_and_accumulate_readable(engine, conn, &mut None)
+            .context("gap drain")?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -539,13 +546,5 @@ mod tests {
         assert!(b > a);
         // 1 billion TSC cycles at 3 GHz ≈ 333_333_333 ns.
         assert!((a as i128 - 333_333_333i128).abs() < 100);
-    }
-
-    #[test]
-    fn maybe_sleep_gap_zero_is_noop() {
-        // Should return immediately — we just verify it doesn't panic.
-        let start = std::time::Instant::now();
-        maybe_sleep_gap(0);
-        assert!(start.elapsed() < Duration::from_millis(1));
     }
 }
