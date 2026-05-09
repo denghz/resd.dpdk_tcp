@@ -23,6 +23,7 @@ fn hw_ts_mode_sums_to_rtt_exactly() {
         nic_tx_wire_to_nic_rx_ns: 10_000,
         nic_rx_to_enqueued_ns: 50,
         enqueued_to_user_return_ns: 80,
+        unsupported_buckets: 0,
     };
     let rtt_ns = 10_430;
     assert_sum_identity(buckets.total_ns(), rtt_ns, 50).unwrap();
@@ -36,6 +37,7 @@ fn hw_ts_mode_within_tolerance_passes() {
         nic_tx_wire_to_nic_rx_ns: 10_000,
         nic_rx_to_enqueued_ns: 50,
         enqueued_to_user_return_ns: 80,
+        unsupported_buckets: 0,
     };
     // 40 ns below bucket sum — within ±50 ns tolerance.
     assert_sum_identity(buckets.total_ns(), 10_390, 50).unwrap();
@@ -49,6 +51,7 @@ fn hw_ts_mode_mismatch_beyond_tolerance_errors() {
         nic_tx_wire_to_nic_rx_ns: 10_000,
         nic_rx_to_enqueued_ns: 50,
         enqueued_to_user_return_ns: 80,
+        unsupported_buckets: 0,
     };
     let rtt_ns = 11_000; // 570 ns off — well beyond ±50 ns.
     let err = assert_sum_identity(buckets.total_ns(), rtt_ns, 50).unwrap_err();
@@ -159,36 +162,27 @@ fn all_events_rx_hw_ts_ns_zero_errors_on_contamination() {
 }
 
 #[test]
-fn hw_mode_single_side_ts_collapses_to_three_effective_buckets() {
-    // THIS TEST PINS CURRENT BEHAVIOR.
-    //
-    // On a NIC that populates `rx_hw_ts_ns > 0` (mlx5 / ice / future-
-    // gen ENA), `main.rs`'s fold logic at lines 421-437 today builds
-    // the 5-bucket `HwTsBuckets` from *only* host-TSC deltas — the
-    // `rx_hw_ts_ns` pivot is not yet threaded into the math. The
-    // observable shape is:
+fn hw_mode_unsupported_flags_when_dpdk_tx_hw_ts_missing() {
+    // PHASE 9 (closes C-E3): on a NIC that populates `rx_hw_ts_ns > 0`
+    // (mlx5 / ice / future-gen ENA / c7i), the engine still doesn't
+    // expose a DPDK TX HW-TS or a NIC-RX-poll anchor, so two of the
+    // five HwTs buckets are flagged unsupported (held at 0 ns) instead
+    // of silently zeroed. The composition is:
     //
     //   - `user_send_to_tx_sched_ns`      = TSC(t_user_send -> t_tx_sched)
-    //   - `tx_sched_to_nic_tx_wire_ns`    = 0               (degraded)
+    //   - `tx_sched_to_nic_tx_wire_ns`    = 0  + UNSUPPORTED_TX_SCHED_TO_NIC_TX_WIRE
     //   - `nic_tx_wire_to_nic_rx_ns`      = TSC(t_tx_sched -> t_enqueued)
-    //   - `nic_rx_to_enqueued_ns`         = 0               (degraded)
+    //   - `nic_rx_to_enqueued_ns`         = 0  + UNSUPPORTED_NIC_RX_TO_ENQUEUED
     //   - `enqueued_to_user_return_ns`    = TSC(t_enqueued -> t_user_return)
     //
-    // Two of the five fields collapse to zero, so the HW-TS bucket
-    // vector has the same informational content as the 3-bucket TSC-
-    // fallback schema — just wearing NIC-wire-semantic field names
-    // (see `attribution.rs:19-28`).
+    // Three measurable buckets carry the real span info; the two
+    // unsupported buckets contribute 0 ns to total_ns() and the bit
+    // flag tells CSV consumers "missing data, not measured zero".
     //
-    // This is latent on ENA because `rx_hw_ts_ns` is always 0, so the
-    // HW-TS branch never fires there. It will bite mlx5 / ice the
-    // first time those NICs are targeted.
-    //
-    // A follow-up (see plan doc) will either (a) wire `rx_hw_ts_ns`
-    // into the bucket pivot so the 5 fields carry their advertised
-    // semantics, or (b) rename/redocument the degraded single-side-TS
-    // case. WHEN THAT HAPPENS, UPDATE THIS TEST: the collapse
-    // asserted below will no longer hold, and failing here is the
-    // intended early-warning.
+    // Phase 11+ will wire real DPDK TX HW-TS / engine NIC-RX-poll
+    // anchors once the engine exposes them; WHEN THAT HAPPENS, UPDATE
+    // THIS TEST: the unsupported-bit assertion below will no longer
+    // hold, and failing here is the intended early-warning.
     //
     // Timestamps below are in raw TSC ticks at 1 GHz tsc_hz, so ticks
     // == ns for arithmetic clarity.
@@ -196,18 +190,24 @@ fn hw_mode_single_side_ts_collapses_to_three_effective_buckets() {
     let host_span_ns: u64 = 10_250; // tx_sched -> enqueued span
     let enqueued_to_user_return_ns: u64 = 30;
 
-    // Reproduce the exact shape main.rs:429-435 builds today when
-    // rx_hw_ts_ns > 0 selects HW mode.
+    // Reproduce the exact shape `compose_iter_record` builds today
+    // when rx_hw_ts_ns > 0 selects HW mode.
     let buckets = HwTsBuckets {
         user_send_to_tx_sched_ns,
         tx_sched_to_nic_tx_wire_ns: 0,
         nic_tx_wire_to_nic_rx_ns: host_span_ns,
         nic_rx_to_enqueued_ns: 0,
         enqueued_to_user_return_ns,
+        unsupported_buckets: HwTsBuckets::UNSUPPORTED_TX_SCHED_TO_NIC_TX_WIRE
+            | HwTsBuckets::UNSUPPORTED_NIC_RX_TO_ENQUEUED,
     };
 
-    // Zero-fields: these are the degraded half — no TX-TS observed,
-    // no separate NIC-RX-to-engine-enqueue split.
+    // The two missing-data buckets must be flagged unsupported, not
+    // silently zero — that's the Phase 9 contract.
+    assert!(buckets.is_tx_sched_to_nic_tx_wire_unsupported());
+    assert!(buckets.is_nic_rx_to_enqueued_unsupported());
+    // Their `*_ns` field is held at zero so total_ns() still sums to
+    // the wall-clock RTT.
     assert_eq!(buckets.tx_sched_to_nic_tx_wire_ns, 0);
     assert_eq!(buckets.nic_rx_to_enqueued_ns, 0);
 
@@ -216,8 +216,8 @@ fn hw_mode_single_side_ts_collapses_to_three_effective_buckets() {
     assert_eq!(buckets.nic_tx_wire_to_nic_rx_ns, host_span_ns);
     assert_eq!(buckets.enqueued_to_user_return_ns, enqueued_to_user_return_ns);
 
-    // total_ns() equals the full wall-clock span — the two-zero
-    // collapse is an accounting no-op.
+    // total_ns() equals the full wall-clock span — unsupported
+    // buckets contribute 0 ns by construction.
     let full_span_ns = user_send_to_tx_sched_ns + host_span_ns + enqueued_to_user_return_ns;
     assert_eq!(buckets.total_ns(), full_span_ns);
     assert_eq!(buckets.total_ns(), 10_430);

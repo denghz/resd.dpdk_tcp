@@ -28,7 +28,16 @@ use dpdk_net_core::error::Error;
 use dpdk_net_core::flow_table::ConnHandle;
 use dpdk_net_core::tcp_events::InternalEvent;
 
-use crate::attribution::{AttributionMode, HwTsBuckets, TscFallbackBuckets};
+use crate::attribution::{compose_iter_record, IterInputs};
+
+// Re-export the per-iteration record + helpers from the attribution
+// module. Older callers imported `IterRecord` from
+// `bench_rtt::workload`; Phase 9 of the 2026-05-09 bench-suite overhaul
+// (closes C-E3) lifted the type into `attribution` so the pure-Rust
+// composition primitive `compose_iter_record` could be unit-tested
+// without a live DPDK engine. The re-export keeps the legacy import
+// path working without churn.
+pub use crate::attribution::IterRecord;
 
 /// Timeout for each request-response round-trip. Tens of microseconds on
 /// a healthy host; 10 s is the floor against wedge.
@@ -36,22 +45,6 @@ pub const RTT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Timeout for the initial three-way handshake. Matches RTT ceiling.
 pub const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-
-// ---------------------------------------------------------------------------
-// Per-iteration measurement product.
-// ---------------------------------------------------------------------------
-
-/// The per-iteration measurement product. `mode` selects which bucket
-/// variant is populated; the unpopulated variant is `None`. `rx_hw_ts_ns`
-/// is the raw value from the Readable event (0 on ENA).
-#[derive(Debug, Clone, Copy)]
-pub struct IterRecord {
-    pub rtt_ns: u64,
-    pub rx_hw_ts_ns: u64,
-    pub mode: AttributionMode,
-    pub hw_buckets: Option<HwTsBuckets>,
-    pub tsc_buckets: Option<TscFallbackBuckets>,
-}
 
 // ---------------------------------------------------------------------------
 // One measured round-trip with attribution buckets.
@@ -128,49 +121,21 @@ pub fn request_response_attributed(
     // --- Wall-clock exit ---
     let t_user_return = dpdk_net_core::clock::rdtsc();
 
-    let rtt_ns = tsc_delta_to_ns(t_user_send, t_user_return, tsc_hz);
+    // Compose buckets via the pure-Rust primitive in attribution.rs.
+    // Phase 9 (closes C-E3): the Hw branch flags
+    // `tx_sched_to_nic_tx_wire_ns` and `nic_rx_to_enqueued_ns` as
+    // unsupported (no DPDK TX HW-TS; no engine NIC-RX-poll anchor)
+    // instead of silently zeroing them. Live c7i validation lands in
+    // Phase 12 once nightly moves over.
     let rx_hw_ts_ns = last_rx_hw_ts_ns.unwrap_or(0);
-    let mode = AttributionMode::from_rx_hw_ts(rx_hw_ts_ns);
-
-    // Compose buckets such that `total_ns()` == rtt_ns exactly.
-    let (hw_buckets, tsc_buckets) = match mode {
-        AttributionMode::Hw => {
-            let host_span_ns = tsc_delta_to_ns(t_tx_sched, t_enqueued, tsc_hz);
-            let bucket_a = tsc_delta_to_ns(t_user_send, t_tx_sched, tsc_hz);
-            let bucket_e = tsc_delta_to_ns(t_enqueued, t_user_return, tsc_hz);
-            (
-                Some(HwTsBuckets {
-                    user_send_to_tx_sched_ns: bucket_a,
-                    tx_sched_to_nic_tx_wire_ns: 0,
-                    nic_tx_wire_to_nic_rx_ns: host_span_ns,
-                    nic_rx_to_enqueued_ns: 0,
-                    enqueued_to_user_return_ns: bucket_e,
-                }),
-                None,
-            )
-        }
-        AttributionMode::Tsc => {
-            let bucket_a = tsc_delta_to_ns(t_user_send, t_tx_sched, tsc_hz);
-            let bucket_b = tsc_delta_to_ns(t_tx_sched, t_enqueued, tsc_hz);
-            let bucket_c = tsc_delta_to_ns(t_enqueued, t_user_return, tsc_hz);
-            (
-                None,
-                Some(TscFallbackBuckets {
-                    user_send_to_tx_sched_ns: bucket_a,
-                    tx_sched_to_enqueued_ns: bucket_b,
-                    enqueued_to_user_return_ns: bucket_c,
-                }),
-            )
-        }
-    };
-
-    Ok(IterRecord {
-        rtt_ns,
+    Ok(compose_iter_record(IterInputs {
+        t_user_send,
+        t_tx_sched,
+        t_enqueued,
+        t_user_return,
         rx_hw_ts_ns,
-        mode,
-        hw_buckets,
-        tsc_buckets,
-    })
+        tsc_hz,
+    }))
 }
 
 /// Drain events from the engine, accumulating Readable-payload bytes on
