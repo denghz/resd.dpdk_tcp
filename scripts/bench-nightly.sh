@@ -337,7 +337,7 @@ PEER_BINS=(
 # DPDK 23.11 — see image-builder component 04b-install-f-stack.yaml). We
 # don't ship it via scp; the binary lives at /opt/f-stack-peer/bench-peer
 # on the peer host pre-installed by the AMI bake.
-SHARED_SCRIPTS=(scripts/check-bench-preconditions.sh scripts/bench-ab-runner-gdb.sh)
+SHARED_SCRIPTS=(scripts/check-bench-preconditions.sh scripts/bench-ab-runner-gdb.sh scripts/peer-ifb-setup.sh)
 
 for bin in "${DUT_BINS[@]}" "${PEER_BINS[@]}" "${SHARED_SCRIPTS[@]}"; do
   if [ ! -f "$bin" ]; then
@@ -378,7 +378,7 @@ retry_remote "scp DUT-bins" "$DUT_INSTANCE_ID" \
 # so bench-offload-ab / bench-obs-overhead can exec it as --runner-bin.
 retry_remote "chmod-DUT" "$DUT_INSTANCE_ID" \
   ssh "${SSH_OPTS[@]}" "ubuntu@$DUT_SSH" \
-    "chmod +x /tmp/bench-ab-runner-gdb.sh /tmp/check-bench-preconditions.sh"
+    "chmod +x /tmp/bench-ab-runner-gdb.sh /tmp/check-bench-preconditions.sh /tmp/peer-ifb-setup.sh"
 
 refresh_ec2_ic_grants
 log "  -> peer ($PEER_SSH)"
@@ -388,7 +388,7 @@ retry_remote "scp peer-bins" "$PEER_INSTANCE_ID" \
     "ubuntu@${PEER_SSH}:/tmp/"
 retry_remote "chmod-peer" "$PEER_INSTANCE_ID" \
   ssh "${SSH_OPTS[@]}" "ubuntu@$PEER_SSH" \
-    "chmod +x /tmp/check-bench-preconditions.sh"
+    "chmod +x /tmp/check-bench-preconditions.sh /tmp/peer-ifb-setup.sh"
 
 # ---------------------------------------------------------------------------
 # [6/12] Start peer services (echo-server for bench-e2e/stress/vs-mtcp;
@@ -616,44 +616,80 @@ declare -A NETEM_SPECS=(
 
 NETEM_SCENARIOS=(random_loss_01pct_10ms correlated_burst_loss_1pct reorder_depth_3 duplication_2x)
 
+# Direction axis: each netem scenario runs three times — once on peer
+# egress (current default; shapes peer→DUT, i.e. DUT-RX), once on peer
+# ingress via IFB (shapes DUT→peer, i.e. DUT-TX so DUT-TX-data-loss can
+# trigger DUT fast-retransmit), once with both for symmetric loss.
+# Closes C-C4 (no bidirectional netem).
+NETEM_DIRECTIONS=(egress ingress bidir)
+
 # Defensive cleanup: if a previous run crashed mid-scenario, the peer
-# may still have a netem qdisc installed. The next `tc qdisc add` would
-# return EEXIST and skip ALL subsequent scenarios via the apply-fail
-# branch — fail loud and silent. One pre-loop `del` puts the peer in a
-# known clean state; `|| true` covers the no-orphan case.
+# may still have a netem qdisc installed (root or ingress) and/or a
+# stale ifb0 device. The next `tc qdisc add` would return EEXIST and
+# skip ALL subsequent scenarios via the apply-fail branch — fail loud
+# and silent. One pre-loop teardown puts the peer in a known clean
+# state; `|| true` covers the no-orphan case.
 log "  [8/12] pre-loop netem cleanup (defensive)"
 ssh "${SSH_OPTS[@]}" "ubuntu@$PEER_SSH" \
-  "sudo tc qdisc del dev ens6 root || true" \
+  "sudo /tmp/peer-ifb-setup.sh down ens6 ifb0 2>/dev/null; sudo tc qdisc del dev ens6 root 2>/dev/null || true" \
   || log "    pre-loop cleanup ssh failed (peer unreachable?); continuing"
 
 bench_stress_csvs=()
 
 for scenario in "${NETEM_SCENARIOS[@]}"; do
   spec="${NETEM_SPECS[$scenario]}"
-  log "  [8/12] $scenario — applying netem ($spec)"
-  ssh "${SSH_OPTS[@]}" "ubuntu@$PEER_SSH" \
-    "sudo tc qdisc add dev ens6 root netem $spec" \
-    || { log "    apply failed; skipping scenario"; continue; }
+  for direction in "${NETEM_DIRECTIONS[@]}"; do
+    log "  [8/12] $scenario/$direction — applying netem ($spec)"
+    case "$direction" in
+      egress)
+        ssh "${SSH_OPTS[@]}" "ubuntu@$PEER_SSH" \
+          "sudo tc qdisc add dev ens6 root netem $spec" \
+          || { log "    apply failed; skipping $scenario/$direction"; continue; }
+        ;;
+      ingress)
+        ssh "${SSH_OPTS[@]}" "ubuntu@$PEER_SSH" \
+          "sudo /tmp/peer-ifb-setup.sh up ens6 ifb0 \"$spec\"" \
+          || { log "    ifb setup failed; skipping $scenario/$direction"; continue; }
+        ;;
+      bidir)
+        ssh "${SSH_OPTS[@]}" "ubuntu@$PEER_SSH" \
+          "sudo tc qdisc add dev ens6 root netem $spec && sudo /tmp/peer-ifb-setup.sh up ens6 ifb0 \"$spec\"" \
+          || { log "    bidir apply failed; skipping $scenario/$direction"; continue; }
+        ;;
+    esac
 
-  csv_name="bench-stress-$scenario"
-  if ! run_dut_bench bench-rtt "$csv_name" \
-      --stack dpdk_net \
-      --connections 1 \
-      --payload-bytes-sweep 128 \
-      "${DPDK_COMMON[@]}" \
-      --peer-port 10001 \
-      --iterations "$BENCH_ITERATIONS" \
-      --warmup "$BENCH_WARMUP" \
-      --tool bench-stress \
-      --feature-set "trading-latency-$scenario"; then
-    log "    $scenario bench-rtt exited non-zero — continuing"
-  fi
+    csv_name="bench-stress-${scenario}-${direction}"
+    if ! run_dut_bench bench-rtt "$csv_name" \
+        --stack dpdk_net \
+        --connections 1 \
+        --payload-bytes-sweep 128 \
+        "${DPDK_COMMON[@]}" \
+        --peer-port 10001 \
+        --iterations "$BENCH_ITERATIONS" \
+        --warmup "$BENCH_WARMUP" \
+        --tool bench-stress \
+        --feature-set "trading-latency-${scenario}-${direction}"; then
+      log "    $scenario/$direction bench-rtt exited non-zero — continuing"
+    fi
 
-  log "  [8/12] $scenario — removing netem"
-  ssh "${SSH_OPTS[@]}" "ubuntu@$PEER_SSH" \
-    "sudo tc qdisc del dev ens6 root || true"
+    log "  [8/12] $scenario/$direction — removing netem"
+    case "$direction" in
+      egress)
+        ssh "${SSH_OPTS[@]}" "ubuntu@$PEER_SSH" \
+          "sudo tc qdisc del dev ens6 root || true"
+        ;;
+      ingress)
+        ssh "${SSH_OPTS[@]}" "ubuntu@$PEER_SSH" \
+          "sudo /tmp/peer-ifb-setup.sh down ens6 ifb0"
+        ;;
+      bidir)
+        ssh "${SSH_OPTS[@]}" "ubuntu@$PEER_SSH" \
+          "sudo /tmp/peer-ifb-setup.sh down ens6 ifb0; sudo tc qdisc del dev ens6 root || true"
+        ;;
+    esac
 
-  bench_stress_csvs+=("$OUT_DIR/${csv_name}.csv")
+    bench_stress_csvs+=("$OUT_DIR/${csv_name}.csv")
+  done
 done
 
 # Concatenate per-scenario CSVs into a single bench-stress.csv.

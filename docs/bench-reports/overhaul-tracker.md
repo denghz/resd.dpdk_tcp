@@ -38,7 +38,20 @@ Baseline: T50 report at `docs/bench-reports/t50-bench-pair-2026-05-08.md` and T5
 - [ ] Phase 4 — Consolidate RTT benches into bench-rtt
 - [ ] Phase 5 — Split bench-vs-mtcp into bench-tx-burst + bench-tx-maxtp
 - [ ] Phase 6 — Per-segment send→ACK latency
-- [ ] Phase 7 — Bidirectional netem via peer IFB ingress
+- [x] Phase 7 — Bidirectional netem via peer IFB ingress
+  - Tasks 7.1, 7.2 done 2026-05-09
+  - Netem matrix expanded from `4 scenarios × 1 direction = 4 buckets`
+    to `4 scenarios × 3 directions {egress, ingress, bidir} = 12 buckets`
+    in `scripts/bench-nightly.sh` step [8/12]. Direction `ingress`
+    redirects peer ens6 ingress traffic to ifb0 via `peer-ifb-setup.sh`
+    so netem applies to packets DUT sent (DUT-TX-data-loss path);
+    `egress` keeps the previous peer-root qdisc (DUT-RX path); `bidir`
+    applies both simultaneously for symmetric loss. Per-scenario CSVs
+    are now keyed `bench-stress-${scenario}-${direction}` and merged
+    into `bench-stress.csv` as before.
+  - Wallclock-budget impact: nightly's [8/12] block grows by 3× on
+    the netem axis (composed multiplicatively with the Phase 10
+    iter-count expansion).
 - [ ] Phase 8 — bench-rx-burst tool
 - [ ] Phase 9 — HW-TS attribution validation on c7i
 - [ ] Phase 10 — Nightly script rewire + scenario expansion
