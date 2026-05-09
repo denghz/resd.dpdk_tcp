@@ -6,13 +6,13 @@
 
 use bench_stress::counters_snapshot::{read, Relation};
 use bench_stress::netem::NetemGuard;
-use bench_stress::scenarios::{find, is_stage2_placeholder, MATRIX};
+use bench_stress::scenarios::{find, MATRIX};
 
 use dpdk_net_core::counters::Counters;
 
 #[test]
-fn matrix_has_eight_scenarios() {
-    assert_eq!(MATRIX.len(), 8);
+fn matrix_has_seven_scenarios() {
+    assert_eq!(MATRIX.len(), 7);
 }
 
 #[test]
@@ -24,9 +24,10 @@ fn scenario_names_are_unique() {
 
 #[test]
 fn matrix_covers_every_spec_section_7_scenario() {
-    // Spec §7 table: the 7 active scenarios + the Stage-2 pmtu row.
-    // Fail loudly if someone removes or renames one — this is the
-    // authoritative binding between the spec and the code.
+    // Spec §7 table: the 7 active scenarios. The legacy Stage-2 PMTU
+    // placeholder row was removed in the 2026-05-09 bench-suite
+    // overhaul. Fail loudly if someone removes or renames one — this
+    // is the authoritative binding between the spec and the code.
     let expected: &[&str] = &[
         "random_loss_01pct_10ms",
         "correlated_burst_loss_1pct",
@@ -35,7 +36,6 @@ fn matrix_covers_every_spec_section_7_scenario() {
         "fault_injector_drop_1pct",
         "fault_injector_reorder_05pct",
         "fault_injector_dup_05pct",
-        "pmtu_blackhole_STAGE2",
     ];
     assert_eq!(MATRIX.len(), expected.len());
     for name in expected {
@@ -76,26 +76,6 @@ fn fault_injector_scenarios_have_fi_and_no_netem() {
             "{name} unexpectedly has netem spec"
         );
     }
-}
-
-/// PMTU blackhole row is Stage 2 only per parent spec §11.4. The row
-/// stays in the matrix for schema completeness, but the driver MUST
-/// skip it unconditionally and the test harness MUST flag it as a
-/// placeholder.
-///
-/// `#[ignore]` marks the test as skipped by default; `cargo test --
-/// --ignored` would run it once Stage 2 implements the PLPMTUD logic.
-#[test]
-#[ignore = "PMTU blackhole is Stage 2 (RFC 8899 PLPMTUD) per parent spec §11.4"]
-fn pmtu_blackhole_stage2_is_implemented() {
-    // Intentionally unreachable in Stage 1. Remove the ignore attribute
-    // when Stage 2 ships PLPMTUD and this scenario's pass criteria.
-    let s = find("pmtu_blackhole_STAGE2").expect("placeholder row must exist");
-    assert!(
-        !is_stage2_placeholder(s),
-        "PMTU blackhole scenario still flagged as Stage 2 placeholder — \
-         rename + wire pass criteria before un-ignoring this test"
-    );
 }
 
 #[test]

@@ -1,6 +1,6 @@
 //! Spec §7 — netem + FaultInjector scenario matrix.
 //!
-//! The 8-row matrix is the authoritative source of which conditions the
+//! The 7-row matrix is the authoritative source of which conditions the
 //! driver sweeps. Rows combine a netem spec (applied on the peer via SSH)
 //! and/or a FaultInjector spec (fed to the engine via the
 //! `DPDK_NET_FAULT_INJECTOR` env var + `fault-injector` feature).
@@ -17,13 +17,10 @@
 //!    must not change. Counter paths follow the `group.field` convention
 //!    (e.g. `tcp.tx_rto`, `obs.fault_injector_drops`).
 //!
-//! # PMTU blackhole placeholder
-//!
-//! Parent spec §11.4 lists PMTU blackhole as Stage 2 only. We keep the
-//! matrix row (preserves the 8-scenario shape per spec §7) but with all
-//! criteria blank. A Stage 2 follow-up wires the PLPMTUD logic + test
-//! implementation and re-enables ratio / counter checks. See
-//! `scenario_parse.rs` for the `#[ignore]` integration test.
+//! The legacy `pmtu_blackhole_STAGE2` placeholder row was removed in
+//! the 2026-05-09 bench-suite overhaul — bench-stress is itself slated
+//! for deletion in Phase 4 of the overhaul, and trimming the dead
+//! Stage-2 entry first keeps that consolidation diff focused.
 
 use serde::Serialize;
 
@@ -50,7 +47,7 @@ pub struct Scenario {
     pub counter_expectations: &'static [(&'static str, &'static str)],
 }
 
-/// The 8-row scenario matrix driving the benchmark sweep. Order is
+/// The 7-row scenario matrix driving the benchmark sweep. Order is
 /// significant for the `scenario_parse.rs` uniqueness check.
 pub const MATRIX: &[Scenario] = &[
     Scenario {
@@ -126,24 +123,7 @@ pub const MATRIX: &[Scenario] = &[
         p999_ceiling_ratio: Some(1.05),
         counter_expectations: &[("fault_injector.dups", ">0")],
     },
-    // PMTU blackhole is Stage 2 per parent spec §11.4; placeholder for
-    // schema completeness — driver skips the row entirely (see
-    // `scenario_parse.rs::pmtu_blackhole_placeholder_is_stage2`).
-    Scenario {
-        name: "pmtu_blackhole_STAGE2",
-        netem: None,
-        fault_injector: None,
-        p999_ceiling_ratio: None,
-        counter_expectations: &[],
-    },
 ];
-
-/// True iff the scenario is a Stage 2 placeholder that the driver must
-/// skip unconditionally. Single source of truth so the tests + the
-/// driver stay in sync without string-match ad-hoc.
-pub fn is_stage2_placeholder(s: &Scenario) -> bool {
-    s.name.ends_with("_STAGE2")
-}
 
 /// Find the scenario with `name` in `MATRIX`. Used by the CLI `--scenarios`
 /// filter so the caller can restrict the run to a subset; errors if a
@@ -157,8 +137,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn matrix_has_eight_scenarios() {
-        assert_eq!(MATRIX.len(), 8);
+    fn matrix_has_seven_scenarios() {
+        assert_eq!(MATRIX.len(), 7);
     }
 
     #[test]
@@ -173,25 +153,16 @@ mod tests {
         assert!(find("random_loss_01pct_10ms").is_some());
         assert!(find("fault_injector_drop_1pct").is_some());
         assert!(find("not_a_scenario").is_none());
+        // Legacy Stage-2 placeholder removed 2026-05-09.
+        assert!(find("pmtu_blackhole_STAGE2").is_none());
     }
 
     #[test]
-    fn pmtu_blackhole_is_flagged_stage2() {
-        let s = find("pmtu_blackhole_STAGE2").unwrap();
-        assert!(is_stage2_placeholder(s));
-        // The Stage 2 placeholder carries no pass criteria.
-        assert!(s.p999_ceiling_ratio.is_none());
-        assert!(s.counter_expectations.is_empty());
-        assert!(s.netem.is_none());
-        assert!(s.fault_injector.is_none());
-    }
-
-    #[test]
-    fn non_stage2_scenarios_have_at_least_one_signal() {
-        // Every non-placeholder scenario must exercise something — either a
-        // netem config, a FaultInjector config, or both. Guards against
-        // accidentally landing an empty row that silently passes every check.
-        for s in MATRIX.iter().filter(|s| !is_stage2_placeholder(s)) {
+    fn every_scenario_has_at_least_one_signal() {
+        // Every scenario must exercise something — either a netem config,
+        // a FaultInjector config, or both. Guards against accidentally
+        // landing an empty row that silently passes every check.
+        for s in MATRIX {
             assert!(
                 s.netem.is_some() || s.fault_injector.is_some(),
                 "scenario {} has no netem or fault_injector config",

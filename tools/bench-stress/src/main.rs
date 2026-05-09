@@ -55,7 +55,7 @@ use bench_stress::counters_snapshot::{
     assert_delta, collect_names_from_matrix, snapshot, Relation, Snapshot,
 };
 use bench_stress::netem::NetemGuard;
-use bench_stress::scenarios::{is_stage2_placeholder, Scenario, MATRIX};
+use bench_stress::scenarios::{Scenario, MATRIX};
 
 #[derive(Parser, Debug)]
 #[command(version, about = "bench-stress — netem + FaultInjector scenario matrix")]
@@ -402,22 +402,16 @@ fn run_idle_baseline(engine: &Engine, args: &Args, tsc_hz: u64) -> anyhow::Resul
 // ---------------------------------------------------------------------------
 
 /// Resolve the CLI `--scenarios` filter into a list of Scenario refs.
-/// Empty filter → all non-Stage-2 scenarios. Unknown names error.
+/// Empty filter → all scenarios in the matrix. Unknown names error.
 fn resolve_scenarios(filter: &str) -> anyhow::Result<Vec<&'static Scenario>> {
     if filter.is_empty() {
-        return Ok(MATRIX.iter().filter(|s| !is_stage2_placeholder(s)).collect());
+        return Ok(MATRIX.iter().collect());
     }
     let mut out = Vec::new();
     for name in filter.split(',').map(str::trim).filter(|s| !s.is_empty()) {
         let s = bench_stress::scenarios::find(name).ok_or_else(|| {
             anyhow::anyhow!("unknown scenario name: {name}")
         })?;
-        if is_stage2_placeholder(s) {
-            anyhow::bail!(
-                "scenario {name} is a Stage-2 placeholder; \
-                 cannot be selected in Stage 1 runs"
-            );
-        }
         out.push(s);
     }
     Ok(out)
@@ -755,11 +749,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resolve_scenarios_empty_filter_returns_non_stage2_only() {
+    fn resolve_scenarios_empty_filter_returns_all() {
+        // The Stage-2 placeholder was removed 2026-05-09; an empty
+        // filter now selects every row in the matrix.
         let selected = resolve_scenarios("").unwrap();
-        // Non-Stage-2 count = MATRIX.len() - 1 (just the pmtu placeholder).
-        assert_eq!(selected.len(), MATRIX.len() - 1);
-        assert!(selected.iter().all(|s| !is_stage2_placeholder(s)));
+        assert_eq!(selected.len(), MATRIX.len());
     }
 
     #[test]
@@ -777,9 +771,12 @@ mod tests {
     }
 
     #[test]
-    fn resolve_scenarios_rejects_stage2_placeholder() {
+    fn resolve_scenarios_rejects_legacy_stage2_placeholder() {
+        // The Stage-2 placeholder row was removed 2026-05-09; the name
+        // now resolves to "unknown scenario" rather than a special-case
+        // Stage-2 rejection.
         let err = resolve_scenarios("pmtu_blackhole_STAGE2").unwrap_err();
-        assert!(err.to_string().contains("Stage-2 placeholder"));
+        assert!(err.to_string().contains("unknown scenario"));
     }
 
     #[test]
@@ -793,7 +790,7 @@ mod tests {
     fn enforce_single_fi_spec_accepts_all_netem_only() {
         let selected: Vec<_> = MATRIX
             .iter()
-            .filter(|s| s.fault_injector.is_none() && !is_stage2_placeholder(s))
+            .filter(|s| s.fault_injector.is_none())
             .collect();
         assert!(enforce_single_fi_spec(&selected).is_ok());
     }
