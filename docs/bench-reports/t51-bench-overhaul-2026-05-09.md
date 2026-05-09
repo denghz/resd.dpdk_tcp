@@ -132,9 +132,14 @@ no measurable wallclock.
    added high-loss scenarios (3%, 5%) to exercise RTO; if those scenarios still don't
    produce non-zero `tcp.tx_retrans_rto` deltas after a real run, the assumption
    needs revisiting.
-4. The CSV column for `unsupported_buckets` (Phase 9) is currently NOT emitted by
-   bench-rtt — only the bucket-ns values flow through `BucketResult.samples`. Wire it
-   into the CSV when bench-rtt's per-bucket columns get added.
+4. **CLOSED** (2026-05-09, commit `f05b114`): bench-rtt's
+   `--attribution-csv` sidecar now emits one row per measurement iteration with
+   the 14-column schema (`bucket_id, iter, mode, rtt_ns, rx_hw_ts_ns,` 5 Hw-bucket
+   ns columns, 3 Tsc-bucket ns columns, `unsupported_mask`) — the trailing
+   `unsupported_mask` carries Phase 9's `HwTsBuckets::unsupported_buckets` u32
+   bitfield verbatim. Nightly script wires the flag at every bench-rtt invocation;
+   `run_dut_bench` pulls the sidecar back via the generic `--*-csv` arg-scan so
+   future per-iter CSV emits plug in without further changes.
 
 ## Operator runbook delta
 
