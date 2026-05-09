@@ -13,6 +13,7 @@ members = [
     "tools/bench-report",
     "tools/bench-fstack-ffi",
     "tools/bench-rtt",
+    "tools/bench-rx-burst",
     "tools/bench-tx-burst",
     "tools/bench-tx-maxtp",
     "tools/bench-vs-linux",
