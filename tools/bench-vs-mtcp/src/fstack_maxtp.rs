@@ -24,14 +24,14 @@
 //!
 //! # Measurement contract
 //!
-//! Goodput = `bytes_sent_in_window / window_duration_ns`, in bps.
-//! `bytes_sent_in_window` is the running sum of successful
-//! `ff_write` return values during the 60s measurement window after
-//! a 10s warmup. F-Stack does not expose a per-conn `snd_una` or
-//! ACKed-bytes counter through its BSD-shaped API, so we use bytes-
-//! sent as the goodput proxy — under TCP semantics the two converge
-//! across a 60s window because the in-flight cap is small relative
-//! to the window.
+//! Wire goodput = `bytes_echoed_in_window / window_duration_ns`, in bps.
+//! `bytes_echoed_in_window` is the running sum of bytes received back
+//! from the echo peer during the measurement window — bytes the peer
+//! received on the wire and sent back, analogous to dpdk_net's snd_una
+//! delta. This is wire-rate comparable across stacks.
+//! `bytes_written_in_window` (ff_write bytes) is also recorded for
+//! reference; above ~2.5 Gbps it exceeds ENA link capacity and is a
+//! buffer-fill artifact, not wire delivery.
 //!
 //! `pps` is left at 0 — same rationale as `linux_maxtp.rs` (no
 //! socket-level segments-out probe). Bench-report can filter F-Stack
@@ -58,9 +58,14 @@ use crate::maxtp::{Bucket, MaxtpSample};
 /// One bucket's raw measurement product. Mirrors `linux_maxtp::BucketRun`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BucketRun {
+    /// `sustained_goodput_bps` is computed from `bytes_echoed_in_window`
+    /// (bytes the peer sent back = bytes it received on the wire).
+    /// This is wire-rate comparable to dpdk_net's snd_una delta.
     pub sample: MaxtpSample,
-    /// Bytes the F-Stack send path accepted across the measurement window.
-    pub bytes_sent_in_window: u64,
+    /// Bytes accepted by `ff_write` (buffer-fill rate — may exceed wire rate).
+    pub bytes_written_in_window: u64,
+    /// Bytes received back from the echo peer (wire-confirmed delivery).
+    pub bytes_echoed_in_window: u64,
     pub tx_ts_mode: TxTsMode,
 }
 
@@ -83,12 +88,13 @@ enum Phase {
     WaitConnectAll { checked: usize, deadline: Instant },
     /// Pump writes round-robin during the warmup window.
     Warmup { warmup_deadline: Instant },
-    /// Pump writes round-robin during the measurement window. `bytes`
-    /// accumulates across callback invocations.
+    /// Pump writes round-robin during the measurement window.
+    /// `bytes_written` and `bytes_echoed` accumulate across callback invocations.
     Measure {
         t_start: Instant,
         measure_deadline: Instant,
-        bytes: u64,
+        bytes_written: u64,
+        bytes_echoed: u64,
     },
     /// Close every fd; advance to next bucket when done.
     CloseAll {
@@ -202,8 +208,9 @@ fn advance(state: &mut MaxtpGridState<'_>) -> Step {
         Phase::Measure {
             t_start,
             measure_deadline,
-            bytes,
-        } => phase_measure(state, t_start, measure_deadline, bytes),
+            bytes_written,
+            bytes_echoed,
+        } => phase_measure(state, t_start, measure_deadline, bytes_written, bytes_echoed),
         Phase::CloseAll { idx, result } => phase_close_all(state, idx, result),
         Phase::BucketError(msg) => phase_bucket_error(state, msg),
         Phase::Done => phase_done(state),
@@ -342,7 +349,8 @@ fn phase_warmup(state: &mut MaxtpGridState<'_>, warmup_deadline: Instant) -> Ste
         state.phase = Phase::Measure {
             t_start: now,
             measure_deadline: now + state.duration,
-            bytes: 0,
+            bytes_written: 0,
+            bytes_echoed: 0,
         };
         return Step::Continue;
     }
@@ -355,19 +363,24 @@ fn phase_measure(
     state: &mut MaxtpGridState<'_>,
     t_start: Instant,
     measure_deadline: Instant,
-    mut bytes: u64,
+    mut bytes_written: u64,
+    mut bytes_echoed: u64,
 ) -> Step {
-    let written = pump_round_robin_once(&state.fds, &state.payload, &mut state.discard);
-    bytes = bytes.saturating_add(written);
+    let (written, echoed) = pump_round_robin_once(&state.fds, &state.payload, &mut state.discard);
+    bytes_written = bytes_written.saturating_add(written);
+    bytes_echoed = bytes_echoed.saturating_add(echoed);
     if Instant::now() >= measure_deadline {
         let elapsed_ns = Instant::now()
             .saturating_duration_since(t_start)
             .as_nanos() as u64;
-        let elapsed_ns = elapsed_ns.max(1); // MaxtpSample::from_window asserts >0.
-        let sample = MaxtpSample::from_window(bytes, 0, elapsed_ns);
+        let elapsed_ns = elapsed_ns.max(1);
+        // Wire-rate goodput: bytes the peer echoed back = bytes it received on wire.
+        // Comparable to dpdk_net's snd_una delta over the same window.
+        let sample = MaxtpSample::from_window(bytes_echoed, 0, elapsed_ns);
         let run = BucketRun {
             sample,
-            bytes_sent_in_window: bytes,
+            bytes_written_in_window: bytes_written,
+            bytes_echoed_in_window: bytes_echoed,
             tx_ts_mode: state.tx_ts_mode,
         };
         state.phase = Phase::CloseAll {
@@ -379,7 +392,8 @@ fn phase_measure(
     state.phase = Phase::Measure {
         t_start,
         measure_deadline,
-        bytes,
+        bytes_written,
+        bytes_echoed,
     };
     Step::Yield
 }
@@ -437,13 +451,16 @@ fn phase_done(state: &mut MaxtpGridState<'_>) -> Step {
 }
 
 /// One round-robin sweep across every connection: drain inbound first,
-/// then issue a single non-blocking write attempt. Returns the total
-/// bytes written across this sweep.
-fn pump_round_robin_once(fds: &[c_int], payload: &[u8], discard: &mut [u8]) -> u64 {
+/// then issue a single non-blocking write attempt. Returns
+/// `(bytes_written, bytes_echoed)` where `bytes_echoed` is the count
+/// of echo bytes received from the peer — wire-confirmed delivery,
+/// comparable to dpdk_net's snd_una delta.
+fn pump_round_robin_once(fds: &[c_int], payload: &[u8], discard: &mut [u8]) -> (u64, u64) {
     if fds.is_empty() || payload.is_empty() {
-        return 0;
+        return (0, 0);
     }
-    let mut total: u64 = 0;
+    let mut total_written: u64 = 0;
+    let mut total_echoed: u64 = 0;
     for &fd in fds {
         // Drain inbound (non-blocking). Cap at 8 reads per conn per
         // sweep so a fast peer cannot starve other conns this callback.
@@ -454,15 +471,16 @@ fn pump_round_robin_once(fds: &[c_int], payload: &[u8], discard: &mut [u8]) -> u
             if n <= 0 {
                 break; // EAGAIN or EOF
             }
+            total_echoed = total_echoed.saturating_add(n as u64);
         }
         // Single non-blocking write attempt.
         let n = unsafe { ff_write(fd, payload.as_ptr() as *const c_void, payload.len()) };
         if n > 0 {
-            total = total.saturating_add(n as u64);
+            total_written = total_written.saturating_add(n as u64);
         }
         // n <= 0 → EAGAIN or per-conn error; round-robin continues.
     }
-    total
+    (total_written, total_echoed)
 }
 
 // ---------------------------------------------------------------------------
