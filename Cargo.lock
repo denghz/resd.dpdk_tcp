@@ -106,22 +106,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
-name = "bench-ab-runner"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bench-common",
- "chrono",
- "clap 4.6.1",
- "csv",
- "dpdk-net-core",
- "dpdk-net-sys",
- "hostname",
- "serde_json",
- "uuid",
-]
-
-[[package]]
 name = "bench-common"
 version = "0.1.0"
 dependencies = [

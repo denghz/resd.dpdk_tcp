@@ -42,7 +42,7 @@ serde_json = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 uuid = { version = "1", features = ["v4"] }
 # Inherited from bench-offload-ab's subprocess handling — gives us a
-# portable `Child::wait_timeout(Duration)` so a stalled bench-ab-runner
+# portable `Child::wait_timeout(Duration)` so a stalled bench-rtt
 # doesn't wedge the sweep. See bench-offload-ab/Cargo.toml for the
 # rationale.
 wait-timeout = "0.2"

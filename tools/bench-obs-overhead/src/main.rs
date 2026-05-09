@@ -2,9 +2,13 @@
 //!
 //! Spec §10. For each `ObsRow` in [`matrix::OBS_MATRIX`]:
 //!
-//! 1. Rebuild `bench-ab-runner` with the row's feature set.
+//! 1. Rebuild `bench-rtt` with the row's feature set.
 //! 2. Spawn the runner; capture its CSV stdout.
 //! 3. Append the CSV rows to `$output_dir/<run_id>.csv`.
+//!
+//! Phase 4 of the 2026-05-09 bench-suite overhaul retired
+//! `bench-ab-runner` as the obs-overhead subprocess target; bench-rtt's
+//! `--stack dpdk_net` arm subsumes the equivalent measurement loop.
 //!
 //! After the matrix runs, two extra back-to-back `obs-none` rebuilds +
 //! runs compute the noise floor (spec §9 convention, spec §10 inherits
@@ -64,14 +68,14 @@ use bench_obs_overhead::report::{
 // Signal.
 const MIN_NOISE_FLOOR_NS: f64 = 5.0;
 
-/// Number of rows the `bench-ab-runner` emits per invocation — one per
+/// Number of rows the `bench-rtt` runner emits per invocation — one per
 /// `MetricAggregation` variant (p50 / p99 / p999 / mean / stddev /
 /// ci95_lo / ci95_hi). Identical to the T10 constant; kept local so
 /// this binary stays self-contained even if T10's is ever lifted to
 /// the library.
 const EXPECTED_DATA_ROWS: usize = 7;
 
-/// Absolute wall-clock budget for one bench-ab-runner invocation —
+/// Absolute wall-clock budget for one bench-rtt invocation —
 /// same rationale as T10.
 const SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -306,8 +310,8 @@ fn run_row(
     }
 
     // bench-rtt writes its summary CSV to a file (`--output-csv`)
-    // rather than stdout (the bench-ab-runner shape). Pipe the file
-    // through after the subprocess completes so the rest of the
+    // rather than stdout (the legacy bench-ab-runner shape). Pipe the
+    // file through after the subprocess completes so the rest of the
     // streaming-append logic below stays unchanged.
     let tmp_csv = std::env::temp_dir().join(format!(
         "bench-obs-overhead-{}-{}.csv",
@@ -372,7 +376,7 @@ fn run_row(
             let _ = child.kill();
             let _ = child.wait();
             anyhow::bail!(
-                "bench-ab-runner exceeded {}s timeout for config '{}' (killed)",
+                "bench-rtt exceeded {}s timeout for config '{}' (killed)",
                 SUBPROCESS_TIMEOUT.as_secs(),
                 row.config.name
             );
@@ -400,7 +404,7 @@ fn run_row(
     Ok(())
 }
 
-/// `cargo build [--no-default-features] --features <…> -p bench-ab-runner --release`.
+/// `cargo build [--no-default-features] --features <…> -p bench-rtt --release`.
 ///
 /// Unlike bench-offload-ab (which ALWAYS passes `--no-default-features`),
 /// the `default` row in [`OBS_MATRIX`] is supposed to build WITH defaults
@@ -464,7 +468,7 @@ fn append_runner_output(
     }
     if data_lines != EXPECTED_DATA_ROWS {
         anyhow::bail!(
-            "bench-ab-runner for config '{config_name}' emitted {data_lines} data rows \
+            "bench-rtt for config '{config_name}' emitted {data_lines} data rows \
              (expected {EXPECTED_DATA_ROWS} — one per MetricAggregation variant: \
              p50 / p99 / p999 / mean / stddev / ci95_lo / ci95_hi); \
              subprocess likely crashed mid-emit or stdout was truncated"
@@ -534,7 +538,7 @@ mod tests {
         assert_eq!(clamp_noise_floor(MIN_NOISE_FLOOR_NS), MIN_NOISE_FLOOR_NS);
     }
 
-    /// Per config name → `data_row_count` CSV bytes in bench-ab-runner's
+    /// Per config name → `data_row_count` CSV bytes in bench-rtt's
     /// shape (same fixture helper as T10, scoped down).
     fn fake_runner_csv(feature_set: &str, data_row_count: usize) -> Vec<u8> {
         let header = COLUMNS.join(",");

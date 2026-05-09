@@ -2,9 +2,13 @@
 //!
 //! Spec §9. For each `Config` in the [`matrix::HW_OFFLOAD_MATRIX`]:
 //!
-//! 1. Rebuild `bench-ab-runner` with the matching feature set.
+//! 1. Rebuild `bench-rtt` with the matching feature set.
 //! 2. Spawn the runner; capture its CSV stdout.
 //! 3. Append the CSV rows to `$output_dir/<run_id>.csv`.
+//!
+//! Phase 4 of the 2026-05-09 bench-suite overhaul retired
+//! `bench-ab-runner` as the offload-ab subprocess target; bench-rtt's
+//! `--stack dpdk_net` arm subsumes the equivalent measurement loop.
 //!
 //! After the matrix runs, the driver runs two extra back-to-back
 //! baseline rebuilds + runs to compute the noise floor (spec §9:
@@ -17,7 +21,7 @@
 //!
 //! This binary never opens a DPDK port, never calls `rte_eal_init`,
 //! never touches a NIC. The rebuild + subprocess plumbing is the
-//! whole surface; `bench-ab-runner` owns the live engine. That means
+//! whole surface; `bench-rtt` owns the live engine. That means
 //! the driver build must NOT depend on `dpdk-net-core` or
 //! `dpdk-net-sys` — it's a pure orchestrator.
 //!
@@ -54,14 +58,14 @@ use bench_offload_ab::report::{
 // x86_64 (~2 TSC ticks @ 2.5 GHz). Adjust if platform TSC resolution changes.
 const MIN_NOISE_FLOOR_NS: f64 = 5.0;
 
-/// Number of rows the `bench-ab-runner` emits per invocation — one per
+/// Number of rows the `bench-rtt` runner emits per invocation — one per
 /// `MetricAggregation` variant (p50, p99, p999, mean, stddev, ci95_lo,
 /// ci95_hi). Anything other than 7 means the subprocess crashed mid-
 /// emit or stdout was truncated; [`append_runner_output`] bails rather
 /// than silently accepting a partial payload.
 const EXPECTED_DATA_ROWS: usize = 7;
 
-/// Absolute wall-clock budget for one bench-ab-runner invocation. The
+/// Absolute wall-clock budget for one bench-rtt invocation. The
 /// runner in a healthy state completes well under this (default N=10k
 /// @ ~microsecond iterations + ~5s warmup), so 5 minutes is a generous
 /// ceiling that still catches DPDK stalls, missing-NIC hangs, and
@@ -294,8 +298,8 @@ fn run_config(
     }
 
     // bench-rtt writes its summary CSV to a file (`--output-csv`)
-    // rather than stdout (the bench-ab-runner shape). Pipe the file
-    // through after the subprocess completes so the rest of the
+    // rather than stdout (the legacy bench-ab-runner shape). Pipe the
+    // file through after the subprocess completes so the rest of the
     // streaming-append logic below stays unchanged.
     let tmp_csv = std::env::temp_dir().join(format!(
         "bench-offload-ab-{}-{}.csv",
@@ -340,7 +344,7 @@ fn run_config(
 
     // Drain stdout on a helper thread so a runaway runner producing
     // heaps of stdout doesn't wedge the pipe buffer while wait_timeout
-    // polls. Kernel pipes are typically 64 KiB; bench-ab-runner's CSV
+    // polls. Kernel pipes are typically 64 KiB; bench-rtt's CSV
     // payload (8 rows * ~400 bytes) fits, but draining off-thread is the
     // robust shape and costs one extra thread per sub-process lifetime.
     let mut stdout = child
@@ -365,7 +369,7 @@ fn run_config(
             let _ = child.kill();
             let _ = child.wait();
             anyhow::bail!(
-                "bench-ab-runner exceeded {}s timeout for config '{}' (killed)",
+                "bench-rtt exceeded {}s timeout for config '{}' (killed)",
                 SUBPROCESS_TIMEOUT.as_secs(),
                 cfg.name
             );
@@ -395,7 +399,7 @@ fn run_config(
     Ok(())
 }
 
-/// `cargo build --no-default-features --features <…> -p bench-ab-runner --release`.
+/// `cargo build --no-default-features --features <…> -p bench-rtt --release`.
 ///
 /// Empty-feature case (baseline): omit the `--features` flag entirely
 /// (cargo rejects `--features ""`).
@@ -473,7 +477,7 @@ fn append_runner_output(
     }
     if data_lines != EXPECTED_DATA_ROWS {
         anyhow::bail!(
-            "bench-ab-runner for config '{config_name}' emitted {data_lines} data rows \
+            "bench-rtt for config '{config_name}' emitted {data_lines} data rows \
              (expected {EXPECTED_DATA_ROWS} — one per MetricAggregation variant: \
              p50 / p99 / p999 / mean / stddev / ci95_lo / ci95_hi); \
              subprocess likely crashed mid-emit or stdout was truncated"
@@ -553,7 +557,7 @@ mod tests {
         assert_eq!(clamp_noise_floor(MIN_NOISE_FLOOR_NS), MIN_NOISE_FLOOR_NS);
     }
 
-    /// Build a fake bench-ab-runner CSV with `data_row_count` data lines
+    /// Build a fake bench-rtt CSV with `data_row_count` data lines
     /// after the header. Each data row uses the same feature_set label
     /// and a P99 aggregation (content doesn't matter for the row-count
     /// check — we only care that append_runner_output sees N non-empty

@@ -6,8 +6,10 @@
 //!   used as the human-readable key in the report table.
 //! - `features` — the cargo feature list passed to `cargo build
 //!   --no-default-features --features <…>` when rebuilding
-//!   `bench-ab-runner` for this slot. Empty → pure baseline
-//!   (`--no-default-features` only).
+//!   `bench-rtt` for this slot. Empty → pure baseline
+//!   (`--no-default-features` only). Phase 4 of the 2026-05-09
+//!   bench-suite overhaul retired bench-ab-runner; bench-rtt's
+//!   `--stack dpdk_net` arm subsumes the equivalent measurement loop.
 //! - `is_baseline` — true only for the `baseline` row. Used by the
 //!   report writer to pick the reference p99 for delta computation.
 //! - `is_full` — true only for the `full` row. Used by the sanity
@@ -28,7 +30,7 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     /// Config label (e.g. `"baseline"`, `"tx-cksum-only"`, `"full"`).
-    /// Emitted as the `feature_set` CSV column by `bench-ab-runner`.
+    /// Emitted as the `feature_set` CSV column by `bench-rtt`.
     pub name: &'static str,
     /// Cargo feature flag names to pass verbatim to `--features`. Empty
     /// for the `baseline` row (which uses `--no-default-features` and
