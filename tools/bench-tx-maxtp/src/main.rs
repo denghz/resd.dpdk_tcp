@@ -19,9 +19,9 @@ use bench_common::preconditions::{PreconditionMode, PreconditionValue, Precondit
 use bench_common::raw_samples::RawSamplesWriter;
 use bench_common::run_metadata::RunMetadata;
 
+use bench_common::preflight::{check_nic_saturation_bps, check_peer_window, BucketVerdict};
 use bench_tx_maxtp::dpdk::{self, DpdkMaxtpCfg};
 use bench_tx_maxtp::maxtp;
-use bench_tx_maxtp::preflight::{check_nic_saturation_bps, check_peer_window, BucketVerdict};
 use bench_tx_maxtp::Stack;
 
 use dpdk_net_core::engine::Engine;
@@ -360,7 +360,7 @@ fn resolve_peer_rwnd_bytes(
         );
         return placebo_rwnd;
     };
-    match bench_tx_maxtp::peer_introspect::fetch_peer_rwnd_bytes(ssh, dut_ip, peer_port) {
+    match bench_common::peer_introspect::fetch_peer_rwnd_bytes(ssh, dut_ip, peer_port) {
         Ok(v) => v as u64,
         Err(e) => {
             eprintln!(

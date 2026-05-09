@@ -8,12 +8,12 @@
 //! workload out of bench-vs-mtcp into this `bench-tx-maxtp` crate;
 //! the test file moved with it.
 
+use bench_common::preflight::BucketVerdict;
 use bench_tx_maxtp::dpdk::TxTsMode;
 use bench_tx_maxtp::maxtp::{
     self, check_sanity_invariant, enumerate_filtered_grid, enumerate_grid, Bucket,
     BucketAggregate, MaxtpSample, BUCKET_COUNT, C_CONNS, DURATION_SECS, WARMUP_SECS, W_BYTES,
 };
-use bench_tx_maxtp::preflight::BucketVerdict;
 use bench_tx_maxtp::Stack;
 
 // ---------------------------------------------------------------------------

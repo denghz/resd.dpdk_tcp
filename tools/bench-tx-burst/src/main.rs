@@ -18,14 +18,14 @@ use clap::Parser;
 use bench_common::preconditions::{PreconditionMode, PreconditionValue, Preconditions};
 use bench_common::run_metadata::RunMetadata;
 
+use bench_common::preflight::{
+    check_mss_and_burst_agreement, check_nic_saturation_bps, check_peer_window,
+    check_sanity_invariant, BucketVerdict,
+};
 use bench_tx_burst::burst::{
     emit_bucket_rows, enumerate_filtered_grid, BucketAggregate,
 };
 use bench_tx_burst::dpdk::{self, DpdkBurstCfg, TxTsMode};
-use bench_tx_burst::preflight::{
-    check_mss_and_burst_agreement, check_nic_saturation_bps, check_peer_window,
-    check_sanity_invariant, BucketVerdict,
-};
 use bench_tx_burst::Stack;
 
 use dpdk_net_core::engine::Engine;
@@ -272,7 +272,7 @@ fn resolve_peer_rwnd_bytes(
         );
         return placebo_rwnd;
     };
-    match bench_tx_burst::peer_introspect::fetch_peer_rwnd_bytes(ssh, dut_ip, peer_port) {
+    match bench_common::peer_introspect::fetch_peer_rwnd_bytes(ssh, dut_ip, peer_port) {
         Ok(v) => v as u64,
         Err(e) => {
             eprintln!(

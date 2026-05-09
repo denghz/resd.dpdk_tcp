@@ -24,8 +24,6 @@ pub mod dpdk;
 pub mod fstack;
 pub mod linux;
 pub mod maxtp;
-pub mod peer_introspect;
-pub mod preflight;
 
 /// Phase 6 follow-up: shared helper that writes one `fstack_unsupported`
 /// marker row into the unified 11-column send-ack CSV. Lives at the

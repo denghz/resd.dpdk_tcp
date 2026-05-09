@@ -8,15 +8,15 @@
 //! workload out of bench-vs-mtcp into this `bench-tx-burst` crate;
 //! the test file moved with it.
 
+use bench_common::preflight::{
+    check_mss_and_burst_agreement, check_nic_saturation_bps, check_peer_window,
+    check_sanity_invariant, BucketVerdict,
+};
 use bench_tx_burst::burst::{
     enumerate_filtered_grid, enumerate_grid, Bucket, BucketAggregate, BurstSample, BUCKET_COUNT,
     G_MS, K_BYTES,
 };
 use bench_tx_burst::dpdk::TxTsMode;
-use bench_tx_burst::preflight::{
-    check_mss_and_burst_agreement, check_nic_saturation_bps, check_peer_window,
-    check_sanity_invariant, BucketVerdict,
-};
 use bench_tx_burst::Stack;
 
 // ---------------------------------------------------------------------------

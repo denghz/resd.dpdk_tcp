@@ -123,8 +123,22 @@ no measurable wallclock.
 
 ## Deferred work (operator follow-ups, non-blocking)
 
-1. preflight + peer_introspect duplicated between bench-tx-burst and bench-tx-maxtp
-   (Phase 5). Extract to bench-common when a third consumer lands.
+1. **CLOSED** (2026-05-09): preflight + peer_introspect were duplicated between
+   bench-tx-burst and bench-tx-maxtp at Phase 5 (byte-identical inline copies,
+   ~270 + ~280 LoC each). Extracted to `bench-common`:
+   - `tools/bench-common/src/preflight.rs` (moved via `git mv` from bench-tx-burst,
+     history preserved).
+   - `tools/bench-common/src/peer_introspect.rs` (moved via `git mv` from
+     bench-tx-burst, history preserved).
+   Both consumer crates now `use bench_common::{preflight, peer_introspect}::*`
+   instead of crate-local imports. The duplicate copies under bench-tx-maxtp/src
+   were `git rm`'d; net workspace LoC delta is approximately -554. The trigger
+   was drift risk (independent evolution of the two copies), not a third consumer
+   — the extraction is mechanical because the copies were verified byte-identical
+   pre-move. bench-common already had `anyhow` as a dependency so no Cargo.toml
+   churn was needed; the helpers are pure-data + `std::process::Command` so they
+   slot in alongside `csv_row` / `percentile` / `raw_samples` / `run_metadata` /
+   `preconditions` without expanding the crate's dep closure.
 2. build.rs duplication across bench-rtt + bench-tx-burst + bench-tx-maxtp + bench-rx-burst.
    The link-arg-order constraint limits Cargo's expressiveness; a build-helpers crate
    could push the pragmas into one place.

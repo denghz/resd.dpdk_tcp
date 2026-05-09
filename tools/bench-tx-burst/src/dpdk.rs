@@ -38,7 +38,7 @@
 //! `warmup` bursts are pumped without recording samples. After the
 //! measurement bursts, the runner snapshots
 //! `counters.tcp.tx_payload_bytes` and calls
-//! [`crate::preflight::check_sanity_invariant`] against
+//! [`bench_common::preflight::check_sanity_invariant`] against
 //! `sum_over_bursts(K)`. Any divergence surfaces as `Err` — harness
 //! is lying about what it sent.
 //!

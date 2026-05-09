@@ -39,8 +39,9 @@ use bench_common::csv_row::{CsvRow, MetricAggregation};
 use bench_common::percentile::{summarize, Summary};
 use bench_common::run_metadata::RunMetadata;
 
+use bench_common::preflight::BucketVerdict;
+
 use crate::dpdk::TxTsMode;
-use crate::preflight::BucketVerdict;
 use crate::Stack;
 
 /// Per spec §11.1: burst sizes K in bytes.

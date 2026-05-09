@@ -26,8 +26,6 @@ pub mod dpdk;
 #[cfg(feature = "fstack")]
 pub mod fstack;
 pub mod linux;
-pub mod peer_introspect;
-pub mod preflight;
 
 // Phase 5 Task 5.4 of the 2026-05-09 bench-suite overhaul lifted the
 // `fstack_ffi` module into the shared `bench-fstack-ffi` crate. Re-
