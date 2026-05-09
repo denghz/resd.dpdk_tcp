@@ -211,15 +211,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bench-rx-zero-copy"
-version = "0.1.0"
-dependencies = [
- "criterion",
- "dpdk-net-core",
- "dpdk-net-sys",
-]
-
-[[package]]
 name = "bench-stress"
 version = "0.1.0"
 dependencies = [
