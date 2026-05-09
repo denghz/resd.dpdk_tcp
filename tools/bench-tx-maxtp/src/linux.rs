@@ -122,6 +122,31 @@ pub fn open_persistent_connections(
 
 /// Drive one bucket on the Linux side.
 ///
+/// Phase 5 Task 5.5 contract: bench-tx-maxtp's linux_kernel arm
+/// requires the peer to be `linux-tcp-sink` (which DISCARDS bytes).
+/// The historical `echo-server` peer at port 10001 echoes back what
+/// it receives — under kernel TCP that fills the recv buffer +
+/// back-pressures the sender to ~0 Gbps for any non-trivial W
+/// (T50 report observation).
+///
+/// `linux-tcp-sink` is started on port 10002 in
+/// `scripts/bench-nightly.sh` step [6/12]. This function bails if
+/// the operator passed any other port; matches the spec §11.2
+/// kernel-TCP measurement assumption that bytes are dropped on the
+/// peer side. Closes C-F2.
+pub fn assert_peer_is_sink(peer_port: u16) -> anyhow::Result<()> {
+    if peer_port != 10002 {
+        anyhow::bail!(
+            "bench-tx-maxtp linux_kernel arm requires peer_port=10002 (linux-tcp-sink); \
+             got {peer_port}. The historical echo-server peer at port 10001 echoes \
+             bytes back to the sender, which back-pressures the kernel TCP recv \
+             buffer to ~0 Gbps for any non-trivial write size — see T50 report. \
+             Use --peer-port 10002 (linux-tcp-sink) instead."
+        );
+    }
+    Ok(())
+}
+
 /// Sequence (parity with `dpdk_maxtp::run_bucket`):
 /// 1. Pump writes for `warmup`, no sampling.
 /// 2. Pump writes for `duration`, accumulating bytes-sent.
@@ -251,6 +276,28 @@ fn pump_round_robin(
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, TcpListener};
+
+    /// Phase 5 Task 5.5 contract: bench-tx-maxtp's linux_kernel arm
+    /// requires the peer to be `linux-tcp-sink` (port 10002, DISCARDS
+    /// bytes). Pointing at any other port fails the assertion.
+    #[test]
+    fn assert_peer_is_sink_accepts_10002() {
+        assert_peer_is_sink(10_002).expect("port 10002 is the sink contract");
+    }
+
+    #[test]
+    fn assert_peer_is_sink_rejects_other_ports() {
+        // 10001 is the dpdk echo-server port; pointing there back-
+        // pressures kernel TCP to ~0 Gbps (T50 report).
+        let err = assert_peer_is_sink(10_001).unwrap_err();
+        assert!(
+            err.to_string().contains("requires peer_port=10002"),
+            "expected sink-port error, got: {err}"
+        );
+        // Arbitrary other port also fails.
+        let err = assert_peer_is_sink(54321).unwrap_err();
+        assert!(err.to_string().contains("got 54321"));
+    }
 
     /// `open_persistent_connections` rejects `conn_count == 0` without
     /// hitting the network.

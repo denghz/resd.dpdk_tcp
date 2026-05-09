@@ -513,6 +513,15 @@ fn run_maxtp_grid_linux<W: std::io::Write>(
 ) -> anyhow::Result<()> {
     use bench_tx_maxtp::linux::{self, LinuxMaxtpCfg};
 
+    // Phase 5 Task 5.5: pin the peer-port contract before any bucket
+    // opens connections. T50 reported the linux maxtp pass was
+    // accidentally pointed at echo-server (port 10001) instead of
+    // linux-tcp-sink (port 10002), back-pressuring goodput to ~0 Gbps.
+    // The assertion makes the operator-visible contract explicit so
+    // misconfiguration fails fast at start-of-bench rather than
+    // surfacing as bogus low-throughput rows in the CSV.
+    linux::assert_peer_is_sink(peer_port)?;
+
     for bucket in grid {
         eprintln!(
             "bench-tx-maxtp: running linux_kernel maxtp bucket {}",
