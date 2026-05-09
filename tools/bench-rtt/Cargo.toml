@@ -14,6 +14,15 @@ publish = false
 
 [features]
 default = []
+# Enables the F-Stack RTT inner loop. Requires libfstack.a + DPDK 23.11
+# at /opt/f-stack/lib (image-builder component
+# 04b-install-f-stack.yaml). Default builds skip the F-Stack arm so
+# the workspace compiles on dev hosts without F-Stack. The FFI
+# bindings live inline in `src/fstack_ffi.rs` — duplicated from
+# bench-vs-mtcp to avoid a circular dep (bench-vs-mtcp already depends
+# on bench-rtt for the workload helpers, so bench-rtt cannot depend
+# back on bench-vs-mtcp). Phase 5 of the bench-suite overhaul lifts
+# the FFI bindings into a shared crate.
 fstack = ["dep:libc"]
 
 [lib]

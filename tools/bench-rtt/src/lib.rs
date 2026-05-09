@@ -12,6 +12,9 @@
 //! `use bench_rtt::*`.
 
 pub mod attribution;
+pub mod fstack;
+#[cfg(feature = "fstack")]
+pub mod fstack_ffi;
 pub mod hw_task_18;
 pub mod linux_kernel;
 pub mod stack;

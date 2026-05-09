@@ -832,7 +832,7 @@ fn pump_drain(fd: c_int, expected: usize, recvd: &mut usize) -> DrainStep {
 
 /// TSC → absolute ns; same shape as dpdk_burst::tsc_to_absolute_ns.
 fn tsc_to_absolute_ns(tsc: u64, tsc_hz: u64) -> u64 {
-    bench_e2e::workload::tsc_delta_to_ns(0, tsc, tsc_hz)
+    bench_rtt::workload::tsc_delta_to_ns(0, tsc, tsc_hz)
 }
 
 /// Format an IP host-order u32 as dotted-quad for log messages.

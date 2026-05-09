@@ -21,6 +21,7 @@ use bench_rtt::attribution::AttributionMode;
 use bench_rtt::hw_task_18::{
     assert_all_events_rx_hw_ts_ns_zero, assert_hw_task_18_post_run, HwTask18Expectations,
 };
+use bench_rtt::fstack;
 use bench_rtt::linux_kernel;
 use bench_rtt::stack::Stack;
 use bench_rtt::sum_identity::assert_sum_identity;
@@ -265,14 +266,27 @@ fn run_linux_kernel(args: &Args, metadata: &RunMetadata) -> anyhow::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// fstack stack — placeholder until Task 4.4 lands the inner loop.
+// fstack stack — F-Stack on DPDK. Feature-gated; default builds bail
+// at the imp::run_rtt_workload entry point.
 // ---------------------------------------------------------------------------
 
-fn run_fstack(_args: &Args, _metadata: &RunMetadata) -> anyhow::Result<()> {
-    anyhow::bail!(
-        "fstack stack dispatch landed in Task 4.3 but the inner loop is wired \
-         in Task 4.4. Re-run after Task 4.4 commits."
-    )
+fn run_fstack(args: &Args, metadata: &RunMetadata) -> anyhow::Result<()> {
+    let peer_ip = parse_ip_host_order(&args.peer_ip)?;
+    // F-Stack init (one ff_init per process) is the caller's
+    // responsibility — Phase 4 leaves it to Task 4.5/4.7's payload
+    // sweep + nightly wiring; for the standalone --stack fstack path
+    // we error out if `ff_init` hasn't been called yet (run_rtt_workload
+    // detects this via ff_run failing to make wire progress).
+    let samples = fstack::imp::run_rtt_workload(
+        peer_ip,
+        args.peer_port,
+        args.request_bytes,
+        args.response_bytes,
+        args.warmup,
+        args.iterations,
+    )?;
+    emit_csv(args, metadata, &samples)?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
