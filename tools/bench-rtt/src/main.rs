@@ -6,8 +6,9 @@
 //! payload size, connection count, and (in nightly) netem-spec axes.
 //!
 //! Tasks 4.2-4.4 land the dpdk_net + linux_kernel + fstack inner
-//! loops behind `--stack`. Tasks 4.5-4.6 wire the payload-axis
-//! sweep + per-iter-failure capture.
+//! loops behind `--stack`. Task 4.5 adds the payload-axis sweep +
+//! raw-sample CSV sidecar. Task 4.6 captures per-iter failure counts
+//! into the `failed_iter_count` column instead of bailing.
 
 use anyhow::Context;
 use clap::Parser;
@@ -15,13 +16,14 @@ use clap::Parser;
 use bench_common::csv_row::{CsvRow, MetricAggregation};
 use bench_common::percentile::{summarize, Summary};
 use bench_common::preconditions::{PreconditionMode, PreconditionValue, Preconditions};
+use bench_common::raw_samples::RawSamplesWriter;
 use bench_common::run_metadata::RunMetadata;
 
 use bench_rtt::attribution::AttributionMode;
+use bench_rtt::fstack;
 use bench_rtt::hw_task_18::{
     assert_all_events_rx_hw_ts_ns_zero, assert_hw_task_18_post_run, HwTask18Expectations,
 };
-use bench_rtt::fstack;
 use bench_rtt::linux_kernel;
 use bench_rtt::stack::Stack;
 use bench_rtt::sum_identity::assert_sum_identity;
@@ -31,8 +33,8 @@ use dpdk_net_core::engine::Engine;
 use dpdk_net_core::flow_table::ConnHandle;
 
 /// Command-line args. Mirrors bench-ab-runner's shape (see spec §6.1
-/// for the full list); adds `sum-identity-tol-ns` and
-/// `assert-hw-task-18`.
+/// for the full list); adds `sum-identity-tol-ns`, `assert-hw-task-18`,
+/// `payload-bytes-sweep`, `connections`, and `raw-samples-csv`.
 #[derive(Parser, Debug)]
 #[command(version, about = "bench-rtt — request/response RTT + attribution")]
 struct Args {
@@ -50,24 +52,34 @@ struct Args {
     #[arg(long, default_value_t = 10_001)]
     peer_port: u16,
 
-    /// Request payload size in bytes.
-    #[arg(long, default_value_t = 128)]
-    request_bytes: usize,
+    /// Comma-separated list of payload sizes (bytes) to sweep over.
+    /// Each value is used as both request and response size for the
+    /// bucket. Default `128` matches the legacy bench-e2e workload.
+    #[arg(long, value_delimiter = ',', default_value = "128")]
+    payload_bytes_sweep: Vec<usize>,
 
-    /// Response payload size in bytes.
-    #[arg(long, default_value_t = 128)]
-    response_bytes: usize,
+    /// Number of concurrent connections per payload bucket. Default 1
+    /// matches the legacy single-connection RTT workload; multi-conn
+    /// runs round-robin per iteration.
+    #[arg(long, default_value_t = 1)]
+    connections: u32,
 
-    /// Measurement iteration count (spec §6: ≥100k post-warmup).
+    /// Measurement iteration count per (payload, connection) bucket.
     #[arg(long, default_value_t = 100_000)]
     iterations: u64,
 
-    /// Warmup iteration count (discarded).
+    /// Warmup iteration count per (payload, connection) bucket.
     #[arg(long, default_value_t = 1_000)]
     warmup: u64,
 
-    /// Output CSV path. One row per aggregation (p50, p99, p999,
-    /// mean, stddev, ci95_lower, ci95_upper).
+    /// Optional sidecar CSV for raw per-iter samples. One row per
+    /// iteration with columns (bucket_id, iter_idx, rtt_ns).
+    #[arg(long)]
+    raw_samples_csv: Option<std::path::PathBuf>,
+
+    /// Output CSV path. One row per (payload, aggregation) tuple — 7
+    /// aggregations per payload bucket (p50, p99, p999, mean, stddev,
+    /// ci95_lower, ci95_upper).
     #[arg(long)]
     output_csv: std::path::PathBuf,
 
@@ -115,8 +127,35 @@ struct Args {
     feature_set: String,
 }
 
+/// One bucket's measurement product: aggregated samples + counters
+/// for raw-sample emission and the failed-iter column.
+struct BucketResult {
+    /// `payload_<W>` (e.g. `payload_128`) — keys raw-sample rows back
+    /// to the summary row's `dimensions_json` slot.
+    bucket_id: String,
+    /// Payload size for this bucket — both request and response.
+    payload_bytes: usize,
+    /// All collected RTT samples in ns (warmup excluded).
+    samples: Vec<f64>,
+    /// Failed iteration count — populated by Task 4.6.
+    failed_iter_count: u64,
+    /// `rx_hw_ts_ns` per measurement iter (dpdk_net only); empty for
+    /// other stacks. Used by the optional A-HW Task 18 assertion at
+    /// the call site that captures it (`run_dpdk_net`); the field is
+    /// kept on the struct for downstream visibility but other stacks
+    /// leave it empty.
+    #[allow(dead_code)]
+    rx_hw_ts_ns: Vec<u64>,
+}
+
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    if args.payload_bytes_sweep.is_empty() {
+        anyhow::bail!("--payload-bytes-sweep resolved to an empty list");
+    }
+    if args.connections == 0 {
+        anyhow::bail!("--connections must be at least 1");
+    }
     let mode = parse_mode(&args.precondition_mode)?;
 
     // 1. Precondition check.
@@ -131,18 +170,48 @@ fn main() -> anyhow::Result<()> {
         std::process::exit(1);
     }
 
-    // 2. Dispatch to the per-stack runner. The dpdk_net path is the
-    // gold-standard implementation (one EAL init, one engine, one
-    // connection, sum-identity per iter, optional A-HW Task 18
-    // post-run assertions); the linux_kernel path is the kernel-TCP
-    // baseline; the fstack path is feature-gated.
     let metadata = build_run_metadata(mode, preconditions)?;
 
-    match args.stack {
-        Stack::DpdkNet => run_dpdk_net(&args, &metadata)?,
-        Stack::LinuxKernel => run_linux_kernel(&args, &metadata)?,
-        Stack::Fstack => run_fstack(&args, &metadata)?,
+    // 2. Optional raw-sample sidecar — open before the workload so
+    // any header-write error surfaces fast.
+    let mut raw_writer = match args.raw_samples_csv.as_ref() {
+        Some(path) => Some(
+            RawSamplesWriter::create(path, &["bucket_id", "iter_idx", "rtt_ns"])
+                .with_context(|| format!("creating raw-samples CSV {path:?}"))?,
+        ),
+        None => None,
+    };
+
+    // 3. Dispatch to the per-stack runner. Each runner returns one
+    // `BucketResult` per payload bucket; the outer loop emits the
+    // summary CSV + raw-sample sidecar.
+    let buckets = match args.stack {
+        Stack::DpdkNet => run_dpdk_net(&args)?,
+        Stack::LinuxKernel => run_linux_kernel(&args)?,
+        Stack::Fstack => run_fstack(&args)?,
+    };
+
+    // 4. Emit raw samples (one row per iteration) before summary —
+    // raw is the source of truth, summary derives from it.
+    if let Some(writer) = raw_writer.as_mut() {
+        for bucket in &buckets {
+            for (i, rtt) in bucket.samples.iter().enumerate() {
+                writer
+                    .row(&[
+                        &bucket.bucket_id,
+                        &i.to_string(),
+                        &(*rtt as u64).to_string(),
+                    ])
+                    .with_context(|| {
+                        format!("writing raw-sample row bucket={} iter={i}", bucket.bucket_id)
+                    })?;
+            }
+        }
+        writer.flush().context("flushing raw-samples CSV")?;
     }
+
+    // 5. Emit the summary CSV.
+    emit_csv(&args, &metadata, &buckets)?;
     Ok(())
 }
 
@@ -150,86 +219,117 @@ fn main() -> anyhow::Result<()> {
 // dpdk_net stack — preserved verbatim from bench-e2e (the gold standard).
 // ---------------------------------------------------------------------------
 
-fn run_dpdk_net(args: &Args, metadata: &RunMetadata) -> anyhow::Result<()> {
+fn run_dpdk_net(args: &Args) -> anyhow::Result<Vec<BucketResult>> {
     validate_dpdk_args(args)?;
 
-    // EAL init — routed through `dpdk_net_core::engine::eal_init`.
     eal_init(args)?;
     let _eal_guard = EalGuard;
 
-    // Engine::new.
     let engine = build_engine(args)?;
-
-    // Cache tsc_hz once.
     let tsc_hz = unsafe { dpdk_net_sys::rte_get_tsc_hz() };
     if tsc_hz == 0 {
         anyhow::bail!("rte_get_tsc_hz() returned 0 — EAL not initialised?");
     }
 
-    // Open the TCP connection.
     let peer_ip = parse_ip_host_order(&args.peer_ip)?;
-    let conn = open_connection(&engine, peer_ip, args.peer_port)?;
 
-    // Warmup + measurement loops.
-    let (samples_rtt, samples_rx_hw_ts_ns) = run_dpdk_workload(&engine, conn, args, tsc_hz)?;
+    let mut buckets: Vec<BucketResult> = Vec::with_capacity(args.payload_bytes_sweep.len());
+    for &payload_bytes in &args.payload_bytes_sweep {
+        // Open `connections` connections per bucket. Iterate them
+        // round-robin so every connection contributes roughly the
+        // same number of iterations. Each connection runs warmup +
+        // its share of the iteration count.
+        let conn_count = args.connections as usize;
+        let mut conns: Vec<ConnHandle> = Vec::with_capacity(conn_count);
+        for _ in 0..conn_count {
+            conns.push(
+                open_connection(&engine, peer_ip, args.peer_port)
+                    .context("dpdk_net open_connection")?,
+            );
+        }
 
-    // Optional A-HW Task 18 post-run assertions.
-    if args.assert_hw_task_18 {
-        assert_hw_task_18_post_run(engine.counters(), &HwTask18Expectations::default())
-            .map_err(anyhow::Error::msg)
-            .context("A-HW Task 18 offload-counter post-run assertion failed")?;
-        assert_all_events_rx_hw_ts_ns_zero(&samples_rx_hw_ts_ns)
-            .map_err(anyhow::Error::msg)
-            .context("A-HW Task 18 rx_hw_ts_ns-per-event assertion failed")?;
+        // Run warmup + measurement on each connection.
+        let mut samples_rtt: Vec<f64> = Vec::with_capacity(args.iterations as usize);
+        let mut samples_rx_hw_ts: Vec<u64> = Vec::with_capacity(args.iterations as usize);
+        let per_conn_iters = args.iterations / conn_count as u64;
+        for conn in &conns {
+            let (rtt, rx_hw_ts) = run_dpdk_workload_one(
+                &engine,
+                *conn,
+                payload_bytes,
+                args.warmup,
+                per_conn_iters,
+                tsc_hz,
+                args.sum_identity_tol_ns,
+            )?;
+            samples_rtt.extend(rtt);
+            samples_rx_hw_ts.extend(rx_hw_ts);
+        }
+
+        if args.assert_hw_task_18 {
+            assert_hw_task_18_post_run(engine.counters(), &HwTask18Expectations::default())
+                .map_err(anyhow::Error::msg)
+                .context("A-HW Task 18 offload-counter post-run assertion failed")?;
+            assert_all_events_rx_hw_ts_ns_zero(&samples_rx_hw_ts)
+                .map_err(anyhow::Error::msg)
+                .context("A-HW Task 18 rx_hw_ts_ns-per-event assertion failed")?;
+        }
+
+        buckets.push(BucketResult {
+            bucket_id: format!("payload_{payload_bytes}"),
+            payload_bytes,
+            samples: samples_rtt,
+            failed_iter_count: 0,
+            rx_hw_ts_ns: samples_rx_hw_ts,
+        });
     }
-
-    emit_csv(args, metadata, &samples_rtt)?;
-    Ok(())
+    Ok(buckets)
 }
 
-/// Drive warmup + measurement iterations with sum-identity enforcement.
-fn run_dpdk_workload(
+/// Drive warmup + measurement iterations on a single connection,
+/// enforcing sum-identity per iter.
+fn run_dpdk_workload_one(
     engine: &Engine,
     conn: ConnHandle,
-    args: &Args,
+    payload_bytes: usize,
+    warmup: u64,
+    iterations: u64,
     tsc_hz: u64,
+    sum_identity_tol_ns: u64,
 ) -> anyhow::Result<(Vec<f64>, Vec<u64>)> {
-    let request = vec![0u8; args.request_bytes];
+    let request = vec![0u8; payload_bytes];
     let mut carry_forward: usize = 0;
 
-    // Warmup discards buckets + RTT.
-    for i in 0..args.warmup {
+    for i in 0..warmup {
         request_response_attributed(
             engine,
             conn,
             &request,
-            args.response_bytes,
+            payload_bytes,
             tsc_hz,
             &mut carry_forward,
         )
         .with_context(|| format!("warmup iteration {i}"))?;
     }
 
-    // Measurement.
-    let mut rtt_ns: Vec<f64> = Vec::with_capacity(args.iterations as usize);
-    let mut rx_hw_ts_ns: Vec<u64> = Vec::with_capacity(args.iterations as usize);
-    for i in 0..args.iterations {
+    let mut rtt_ns: Vec<f64> = Vec::with_capacity(iterations as usize);
+    let mut rx_hw_ts_ns: Vec<u64> = Vec::with_capacity(iterations as usize);
+    for i in 0..iterations {
         let rec: IterRecord = request_response_attributed(
             engine,
             conn,
             &request,
-            args.response_bytes,
+            payload_bytes,
             tsc_hz,
             &mut carry_forward,
         )
         .with_context(|| format!("measurement iteration {i}"))?;
 
-        // Sum-identity — abort the run on any drift beyond tolerance.
         let sum = match rec.mode {
             AttributionMode::Hw => rec.hw_buckets.unwrap_or_default().total_ns(),
             AttributionMode::Tsc => rec.tsc_buckets.unwrap_or_default().total_ns(),
         };
-        assert_sum_identity(sum, rec.rtt_ns, args.sum_identity_tol_ns)
+        assert_sum_identity(sum, rec.rtt_ns, sum_identity_tol_ns)
             .map_err(anyhow::Error::msg)
             .with_context(|| {
                 format!(
@@ -241,7 +341,6 @@ fn run_dpdk_workload(
         rtt_ns.push(rec.rtt_ns as f64);
         rx_hw_ts_ns.push(rec.rx_hw_ts_ns);
     }
-
     Ok((rtt_ns, rx_hw_ts_ns))
 }
 
@@ -249,20 +348,36 @@ fn run_dpdk_workload(
 // linux_kernel stack — `std::net::TcpStream` over the host's kernel TCP.
 // ---------------------------------------------------------------------------
 
-fn run_linux_kernel(args: &Args, metadata: &RunMetadata) -> anyhow::Result<()> {
+fn run_linux_kernel(args: &Args) -> anyhow::Result<Vec<BucketResult>> {
     let peer_ip = parse_ip_host_order(&args.peer_ip)?;
-    let mut stream = linux_kernel::connect(peer_ip, args.peer_port)
-        .context("linux_kernel connect")?;
-    let samples = linux_kernel::run_rtt_workload(
-        &mut stream,
-        args.request_bytes,
-        args.response_bytes,
-        args.warmup,
-        args.iterations,
-    )
-    .context("linux_kernel run_rtt_workload")?;
-    emit_csv(args, metadata, &samples)?;
-    Ok(())
+    let conn_count = args.connections as usize;
+
+    let mut buckets: Vec<BucketResult> = Vec::with_capacity(args.payload_bytes_sweep.len());
+    for &payload_bytes in &args.payload_bytes_sweep {
+        let mut samples: Vec<f64> = Vec::with_capacity(args.iterations as usize);
+        let per_conn_iters = args.iterations / conn_count as u64;
+        for _ in 0..conn_count {
+            let mut stream = linux_kernel::connect(peer_ip, args.peer_port)
+                .context("linux_kernel connect")?;
+            let chunk = linux_kernel::run_rtt_workload(
+                &mut stream,
+                payload_bytes,
+                payload_bytes,
+                args.warmup,
+                per_conn_iters,
+            )
+            .context("linux_kernel run_rtt_workload")?;
+            samples.extend(chunk);
+        }
+        buckets.push(BucketResult {
+            bucket_id: format!("payload_{payload_bytes}"),
+            payload_bytes,
+            samples,
+            failed_iter_count: 0,
+            rx_hw_ts_ns: Vec::new(),
+        });
+    }
+    Ok(buckets)
 }
 
 // ---------------------------------------------------------------------------
@@ -270,23 +385,38 @@ fn run_linux_kernel(args: &Args, metadata: &RunMetadata) -> anyhow::Result<()> {
 // at the imp::run_rtt_workload entry point.
 // ---------------------------------------------------------------------------
 
-fn run_fstack(args: &Args, metadata: &RunMetadata) -> anyhow::Result<()> {
+fn run_fstack(args: &Args) -> anyhow::Result<Vec<BucketResult>> {
     let peer_ip = parse_ip_host_order(&args.peer_ip)?;
-    // F-Stack init (one ff_init per process) is the caller's
-    // responsibility — Phase 4 leaves it to Task 4.5/4.7's payload
-    // sweep + nightly wiring; for the standalone --stack fstack path
-    // we error out if `ff_init` hasn't been called yet (run_rtt_workload
-    // detects this via ff_run failing to make wire progress).
-    let samples = fstack::imp::run_rtt_workload(
-        peer_ip,
-        args.peer_port,
-        args.request_bytes,
-        args.response_bytes,
-        args.warmup,
-        args.iterations,
-    )?;
-    emit_csv(args, metadata, &samples)?;
-    Ok(())
+    let mut buckets: Vec<BucketResult> = Vec::with_capacity(args.payload_bytes_sweep.len());
+    for &payload_bytes in &args.payload_bytes_sweep {
+        // fstack's run_rtt_workload uses one ff_run invocation; we drive
+        // a single connection per bucket. Multi-conn fstack RTT lands
+        // alongside the bench-tx-maxtp work in Phase 5 (the F-Stack
+        // ff_run model needs a unified state machine across buckets).
+        if args.connections > 1 {
+            anyhow::bail!(
+                "--connections > 1 is not yet supported on the fstack arm \
+                 (single ff_run invocation per process; multi-conn lands \
+                 in Phase 5). Use --connections 1 or pick another stack."
+            );
+        }
+        let samples = fstack::imp::run_rtt_workload(
+            peer_ip,
+            args.peer_port,
+            payload_bytes,
+            payload_bytes,
+            args.warmup,
+            args.iterations,
+        )?;
+        buckets.push(BucketResult {
+            bucket_id: format!("payload_{payload_bytes}"),
+            payload_bytes,
+            samples,
+            failed_iter_count: 0,
+            rx_hw_ts_ns: Vec::new(),
+        });
+    }
+    Ok(buckets)
 }
 
 // ---------------------------------------------------------------------------
@@ -547,57 +677,69 @@ fn run_capture(argv: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// Emit the 7-row CSV (one per aggregation) to `args.output_csv`. The
-/// schema is the unified bench-common CSV (spec §14); `test_case` is
-/// the fixed string "request_response_rtt", `dimensions_json` captures
-/// request/response byte sizes + the stack dimension.
-fn emit_csv(args: &Args, meta: &RunMetadata, samples: &[f64]) -> anyhow::Result<()> {
-    if samples.is_empty() {
-        anyhow::bail!("emit_csv: no samples to summarise (iterations=0?)");
+/// Emit the summary CSV — one set of 7 aggregation rows per payload
+/// bucket. `dimensions_json` carries `{stack, payload_bytes, connections}`
+/// so bench-report can group by any axis.
+fn emit_csv(args: &Args, meta: &RunMetadata, buckets: &[BucketResult]) -> anyhow::Result<()> {
+    if buckets.is_empty() {
+        anyhow::bail!("emit_csv: no buckets to summarise");
     }
-    let summary: Summary = summarize(samples);
-
     let file = std::fs::File::create(&args.output_csv)
         .with_context(|| format!("creating output CSV {:?}", args.output_csv))?;
     let mut wtr = csv::Writer::from_writer(file);
 
-    let dims = serde_json::json!({
-        "stack": args.stack.as_dimension(),
-        "request_bytes": args.request_bytes,
-        "response_bytes": args.response_bytes,
-    })
-    .to_string();
+    let raw_samples_path: Option<String> = args
+        .raw_samples_csv
+        .as_ref()
+        .map(|p| p.display().to_string());
 
-    let rows: [(MetricAggregation, f64); 7] = [
-        (MetricAggregation::P50, summary.p50),
-        (MetricAggregation::P99, summary.p99),
-        (MetricAggregation::P999, summary.p999),
-        (MetricAggregation::Mean, summary.mean),
-        (MetricAggregation::Stddev, summary.stddev),
-        (MetricAggregation::Ci95Lower, summary.ci95_lower),
-        (MetricAggregation::Ci95Upper, summary.ci95_upper),
-    ];
+    for bucket in buckets {
+        if bucket.samples.is_empty() {
+            anyhow::bail!(
+                "bucket {} produced no samples (iterations=0?)",
+                bucket.bucket_id
+            );
+        }
+        let summary: Summary = summarize(&bucket.samples);
 
-    for (agg, value) in rows {
-        let row = CsvRow {
-            run_metadata: meta.clone(),
-            tool: args.tool.clone(),
-            test_case: "request_response_rtt".to_string(),
-            feature_set: args.feature_set.clone(),
-            dimensions_json: dims.clone(),
-            metric_name: "rtt_ns".to_string(),
-            metric_unit: "ns".to_string(),
-            metric_value: value,
-            metric_aggregation: agg,
-            cpu_family: None,
-            cpu_model_name: None,
-            dpdk_version_pkgconfig: None,
-            worktree_branch: None,
-            uprof_session_id: None,
-            raw_samples_path: None,
-            failed_iter_count: 0,
-        };
-        wtr.serialize(&row)?;
+        let dims = serde_json::json!({
+            "stack": args.stack.as_dimension(),
+            "payload_bytes": bucket.payload_bytes,
+            "connections": args.connections,
+        })
+        .to_string();
+
+        let rows: [(MetricAggregation, f64); 7] = [
+            (MetricAggregation::P50, summary.p50),
+            (MetricAggregation::P99, summary.p99),
+            (MetricAggregation::P999, summary.p999),
+            (MetricAggregation::Mean, summary.mean),
+            (MetricAggregation::Stddev, summary.stddev),
+            (MetricAggregation::Ci95Lower, summary.ci95_lower),
+            (MetricAggregation::Ci95Upper, summary.ci95_upper),
+        ];
+
+        for (agg, value) in rows {
+            let row = CsvRow {
+                run_metadata: meta.clone(),
+                tool: args.tool.clone(),
+                test_case: "request_response_rtt".to_string(),
+                feature_set: args.feature_set.clone(),
+                dimensions_json: dims.clone(),
+                metric_name: "rtt_ns".to_string(),
+                metric_unit: "ns".to_string(),
+                metric_value: value,
+                metric_aggregation: agg,
+                cpu_family: None,
+                cpu_model_name: None,
+                dpdk_version_pkgconfig: None,
+                worktree_branch: None,
+                uprof_session_id: None,
+                raw_samples_path: raw_samples_path.clone(),
+                failed_iter_count: bucket.failed_iter_count,
+            };
+            wtr.serialize(&row)?;
+        }
     }
     wtr.flush()?;
     Ok(())
