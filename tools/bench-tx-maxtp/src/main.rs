@@ -16,6 +16,7 @@ use anyhow::Context;
 use clap::Parser;
 
 use bench_common::preconditions::{PreconditionMode, PreconditionValue, Preconditions};
+use bench_common::raw_samples::RawSamplesWriter;
 use bench_common::run_metadata::RunMetadata;
 
 use bench_tx_maxtp::dpdk::{self, DpdkMaxtpCfg};
@@ -53,6 +54,16 @@ struct Args {
     /// Output CSV path.
     #[arg(long)]
     output_csv: std::path::PathBuf,
+
+    /// Optional sidecar CSV for per-conn raw maxtp samples (Phase 5
+    /// Task 5.3). When set, the dpdk_net arm emits one row per conn
+    /// per SAMPLE_INTERVAL during the measurement window with columns
+    /// `bucket_id, conn_id, sample_idx, t_ns, goodput_bps_window,
+    /// snd_nxt_minus_una`. Only the dpdk arm currently emits raw
+    /// samples — linux + fstack arms ignore this flag (they have no
+    /// equivalent per-conn snd_una hook).
+    #[arg(long)]
+    raw_samples_csv: Option<std::path::PathBuf>,
 
     /// Precondition mode: `strict` aborts on precondition failure;
     /// `lenient` warns and continues.
@@ -175,6 +186,26 @@ fn main() -> anyhow::Result<()> {
     let mut writer = csv::Writer::from_path(&args.output_csv)
         .with_context(|| format!("creating output CSV {:?}", args.output_csv))?;
 
+    // Phase 5 Task 5.3: optional sidecar raw-sample CSV. Header order is
+    // co-located with `dpdk::emit_per_conn_raw_sample`'s row layout.
+    let mut raw_samples_writer: Option<RawSamplesWriter> = match args.raw_samples_csv.as_ref() {
+        Some(path) => {
+            let header = [
+                "bucket_id",
+                "conn_id",
+                "sample_idx",
+                "t_ns",
+                "goodput_bps_window",
+                "snd_nxt_minus_una",
+            ];
+            Some(
+                RawSamplesWriter::create(path, &header)
+                    .with_context(|| format!("creating raw-samples CSV {path:?}"))?,
+            )
+        }
+        None => None,
+    };
+
     let peer_ip = parse_ip_host_order(&args.peer_ip)?;
     let nic_max_bps = resolve_nic_max_bps(args.nic_max_bps);
     if nic_max_bps.is_none() {
@@ -205,6 +236,7 @@ fn main() -> anyhow::Result<()> {
                 &metadata,
                 nic_max_bps,
                 &mut writer,
+                raw_samples_writer.as_mut(),
             )?;
         }
         Stack::LinuxKernel => {
@@ -232,6 +264,9 @@ fn main() -> anyhow::Result<()> {
     }
 
     writer.flush()?;
+    if let Some(rsw) = raw_samples_writer.as_mut() {
+        rsw.flush().context("flushing raw-samples CSV")?;
+    }
     Ok(())
 }
 
@@ -285,6 +320,7 @@ fn run_maxtp_grid_dpdk<W: std::io::Write>(
     metadata: &RunMetadata,
     nic_max_bps: Option<u64>,
     writer: &mut csv::Writer<W>,
+    mut raw_samples_writer: Option<&mut RawSamplesWriter>,
 ) -> anyhow::Result<()> {
     let mut payload_cache: std::collections::HashMap<u64, Vec<u8>> = std::collections::HashMap::new();
 
@@ -292,6 +328,11 @@ fn run_maxtp_grid_dpdk<W: std::io::Write>(
         .local_ip
         .parse()
         .with_context(|| format!("parsing --local-ip `{}` for peer rwnd probe", args.local_ip))?;
+
+    let raw_samples_path_str: Option<String> = args
+        .raw_samples_csv
+        .as_ref()
+        .map(|p| p.display().to_string());
 
     for bucket in grid {
         eprintln!("bench-tx-maxtp: running dpdk_net bucket {}", bucket.label());
@@ -348,7 +389,11 @@ fn run_maxtp_grid_dpdk<W: std::io::Write>(
             }
         };
 
-        let cfg = DpdkMaxtpCfg {
+        let bucket_id = format!(
+            "W={}B,C={}",
+            bucket.write_bytes, bucket.conn_count
+        );
+        let mut cfg = DpdkMaxtpCfg {
             engine,
             conns: &conns,
             bucket: *bucket,
@@ -356,9 +401,11 @@ fn run_maxtp_grid_dpdk<W: std::io::Write>(
             duration: std::time::Duration::from_secs(args.duration_secs),
             payload,
             tx_ts_mode,
+            bucket_id: &bucket_id,
+            raw_samples: raw_samples_writer.as_deref_mut(),
         };
         let bucket_outcome = (|| -> anyhow::Result<()> {
-            let run = match dpdk::run_bucket(&cfg).with_context(|| {
+            let run = match dpdk::run_bucket(&mut cfg).with_context(|| {
                 format!("dpdk::run_bucket for {}", bucket.label())
             }) {
                 Ok(r) => r,
@@ -413,8 +460,28 @@ fn run_maxtp_grid_dpdk<W: std::io::Write>(
                     agg.override_verdict(sat_verdict);
                 }
             }
-            maxtp::emit_bucket_rows(writer, metadata, &args.tool, &args.feature_set, &agg)
-                .context("emit maxtp bucket rows")
+            // Phase 5 Task 5.3: fold the per-conn-per-interval goodput
+            // samples across every conn (and every interval) for the
+            // bucket-level percentile aggregate. Each MaxtpRawPoint
+            // carries the goodput over its just-closed
+            // SAMPLE_INTERVAL window — the aggregate distribution is
+            // the natural per-bucket "percentile of per-second
+            // goodput" view.
+            let raw_window_samples: Vec<f64> = run
+                .raw_points
+                .iter()
+                .map(|p| p.goodput_bps_window)
+                .collect();
+            maxtp::emit_bucket_rows_with_percentiles(
+                writer,
+                metadata,
+                &args.tool,
+                &args.feature_set,
+                &agg,
+                &raw_window_samples,
+                raw_samples_path_str.as_deref(),
+            )
+            .context("emit maxtp bucket rows")
         })();
 
         if let Err(e) = dpdk::close_persistent_connections(engine, &conns) {

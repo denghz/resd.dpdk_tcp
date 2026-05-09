@@ -58,6 +58,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 
+use bench_common::raw_samples::RawSamplesWriter;
 use bench_rtt::workload::{drain_and_accumulate_readable, open_connection};
 
 use dpdk_net_core::engine::{Engine, CLOSE_FLAG_FORCE_TW_SKIP};
@@ -105,6 +106,63 @@ pub struct DpdkMaxtpCfg<'a> {
     pub payload: &'a [u8],
     /// The TX-TS mode the harness will report into CSV.
     pub tx_ts_mode: TxTsMode,
+    /// Bucket identifier emitted into the raw-sample CSV's bucket_id
+    /// column. Phase 5 Task 5.3 — usually constructed as
+    /// `format!("W={},C={}", bucket.write_bytes, bucket.conn_count)`.
+    pub bucket_id: &'a str,
+    /// Optional sidecar writer that receives one
+    /// [`MaxtpRawPoint`] per conn per SAMPLE_INTERVAL during the
+    /// measurement window (Phase 5 Task 5.3 — closes C-B1, C-B5, C-E1).
+    /// `None` skips raw-sample emission entirely; the bucket-level
+    /// percentile aggregate is still computed.
+    pub raw_samples: Option<&'a mut RawSamplesWriter>,
+}
+
+/// One raw-sample row emitted at SAMPLE_INTERVAL granularity per
+/// connection during the maxtp measurement window. Phase 5 Task 5.3:
+/// closes C-B1 (no percentiles), C-B5 (multi-conn visibility), and
+/// C-E1 (queue-depth time series via `snd_nxt_minus_una`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MaxtpRawPoint {
+    /// Index of the connection inside the bucket's `conns` slice
+    /// (stable per bucket; not the engine's `ConnHandle`).
+    pub conn_id: u32,
+    /// Sample sequence number — 0..=N where N = duration / SAMPLE_INTERVAL.
+    pub sample_idx: u32,
+    /// Wall-clock ns relative to `t_measure_start`. Same anchor across
+    /// every conn in the bucket so downstream tooling can align rows.
+    pub t_ns: u64,
+    /// Per-conn instantaneous goodput over the most recent
+    /// SAMPLE_INTERVAL window (bits/sec). Computed from the per-conn
+    /// `snd_una` delta over the interval — not aggregate goodput.
+    pub goodput_bps_window: f64,
+    /// Per-conn `snd_nxt - snd_una` at sample time — bytes the stack
+    /// has handed to the wire that the peer hasn't ACKed yet. Direct
+    /// queue-depth proxy.
+    pub snd_nxt_minus_una: u32,
+}
+
+/// Emit one raw-sample row to the sidecar CSV. Splitting this out
+/// keeps the `RawSamplesWriter` schema (column order + header) co-
+/// located with the column definitions — every emit site uses the same
+/// formatting rules.
+///
+/// Header (same order):
+/// `bucket_id, conn_id, sample_idx, t_ns, goodput_bps_window, snd_nxt_minus_una`
+pub fn emit_per_conn_raw_sample(
+    writer: &mut RawSamplesWriter,
+    bucket_id: &str,
+    point: &MaxtpRawPoint,
+) -> anyhow::Result<()> {
+    writer.row(&[
+        bucket_id,
+        &point.conn_id.to_string(),
+        &point.sample_idx.to_string(),
+        &point.t_ns.to_string(),
+        &point.goodput_bps_window.to_string(),
+        &point.snd_nxt_minus_una.to_string(),
+    ])?;
+    Ok(())
 }
 
 /// One bucket's raw measurement product.
@@ -133,6 +191,13 @@ pub struct BucketRun {
     /// sanity-invariant check to bound ε (spec §11.2 "minus any
     /// bytes still in-flight at `t_end`, bounded by cwnd + rwnd").
     pub inflight_bytes_at_end: u64,
+    /// Phase 5 Task 5.3: per-conn-per-sample-interval raw points
+    /// captured during the measurement window. Empty unless the
+    /// pump was driven with sampling enabled (the default for the
+    /// dpdk arm). Caller writes these into the sidecar CSV +
+    /// folds the goodput column into `bench_common::percentile`
+    /// for the bucket-level distribution rows.
+    pub raw_points: Vec<MaxtpRawPoint>,
 }
 
 /// Open `C` persistent connections to the peer. Connections are
@@ -329,7 +394,7 @@ pub fn close_persistent_connections(
 /// 4. Close with a final per-conn snapshot and fold it into the
 ///    accumulator so the tail sub-window is counted. Snapshot counters.
 /// 5. Return `MaxtpSample::from_window(acked_bytes, tx_pkts, elapsed_ns)`.
-pub fn run_bucket(cfg: &DpdkMaxtpCfg<'_>) -> anyhow::Result<BucketRun> {
+pub fn run_bucket(cfg: &mut DpdkMaxtpCfg<'_>) -> anyhow::Result<BucketRun> {
     if cfg.conns.len() as u64 != cfg.bucket.conn_count {
         anyhow::bail!(
             "dpdk_maxtp: conns.len() = {} does not match bucket.conn_count = {}",
@@ -395,6 +460,7 @@ pub fn run_bucket(cfg: &DpdkMaxtpCfg<'_>) -> anyhow::Result<BucketRun> {
     // ACKed bytes).
     let mut accumulator = SndUnaAccumulator::new(pre_snd_una);
     let t_measure_start = Instant::now();
+    accumulator.anchor_measure_start(t_measure_start);
     let measure_deadline = t_measure_start + cfg.duration;
     pump_round_robin(
         cfg.engine,
@@ -522,6 +588,25 @@ pub fn run_bucket(cfg: &DpdkMaxtpCfg<'_>) -> anyhow::Result<BucketRun> {
         }
     }
 
+    // Phase 5 Task 5.3: stream the per-conn raw points to the sidecar
+    // CSV (if a writer was configured) before we move them into the
+    // BucketRun. The reverse direction (writer → BucketRun) keeps the
+    // run_bucket return shape stable regardless of whether the caller
+    // wired a sidecar; the caller can re-emit from BucketRun.raw_points
+    // even if the sidecar wasn't given.
+    let raw_points = std::mem::take(&mut accumulator.raw_points);
+    if let Some(writer) = cfg.raw_samples.as_deref_mut() {
+        for point in &raw_points {
+            emit_per_conn_raw_sample(writer, cfg.bucket_id, point)
+                .with_context(|| {
+                    format!(
+                        "writing raw-sample row for bucket={} conn_id={} sample_idx={}",
+                        cfg.bucket_id, point.conn_id, point.sample_idx
+                    )
+                })?;
+        }
+    }
+
     Ok(BucketRun {
         sample,
         acked_bytes_in_window,
@@ -529,6 +614,7 @@ pub fn run_bucket(cfg: &DpdkMaxtpCfg<'_>) -> anyhow::Result<BucketRun> {
         tx_pkts_delta,
         tx_ts_mode: cfg.tx_ts_mode,
         inflight_bytes_at_end,
+        raw_points,
     })
 }
 
@@ -545,6 +631,12 @@ const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 /// even multi-GB/s sustained traffic cannot overflow the u32 sequence
 /// space silently. Used by `run_bucket`; exposed at module scope so
 /// unit tests can drive it with synthetic sample sequences.
+///
+/// Phase 5 Task 5.3: also retains per-conn-per-sample-interval raw
+/// points in memory (`raw_points`) so the bucket-level emit path can
+/// stream them to a sidecar CSV + compute percentiles over the goodput
+/// distribution. The window math (`accumulate` + `total`) is unchanged;
+/// raw-point emission piggybacks on the existing sample tick.
 pub(crate) struct SndUnaAccumulator {
     /// Last `snd_una` snapshot observed. One entry per conn.
     last_sample: Vec<u32>,
@@ -555,6 +647,17 @@ pub(crate) struct SndUnaAccumulator {
     /// pump loop. Initialised to `None` so the first `maybe_sample`
     /// call computes an absolute deadline from the caller's `now`.
     next_sample_at: Option<Instant>,
+    /// Phase 5 Task 5.3: per-conn-per-sample-interval raw points
+    /// captured during the measurement window. One entry per
+    /// `(sample_idx, conn_id)`. Drained by `run_bucket` after the
+    /// pump loop closes.
+    pub(crate) raw_points: Vec<MaxtpRawPoint>,
+    /// Wall-clock anchor for `t_ns` in raw points — `t_measure_start`
+    /// from the pump loop. Set to `None` until first sample fires.
+    measure_start: Option<Instant>,
+    /// Sample index counter — increments each time `accumulate` runs.
+    /// `0` after construction; first emitted point sets it to `1`.
+    pub(crate) sample_idx: u32,
 }
 
 impl SndUnaAccumulator {
@@ -564,6 +667,9 @@ impl SndUnaAccumulator {
             last_sample: initial_sample,
             accumulated_bytes: vec![0u64; n],
             next_sample_at: None,
+            raw_points: Vec::new(),
+            measure_start: None,
+            sample_idx: 0,
         }
     }
 
@@ -587,10 +693,22 @@ impl SndUnaAccumulator {
         self.accumulated_bytes.iter().sum()
     }
 
+    /// Phase 5 Task 5.3: anchor `t_ns` calculations for raw points to
+    /// `t_measure_start`. Called by `run_bucket` immediately after the
+    /// warmup window closes — before any raw points are recorded.
+    pub(crate) fn anchor_measure_start(&mut self, t: Instant) {
+        self.measure_start = Some(t);
+    }
+
     /// If `now` is past the next-sample deadline, fold a fresh sample
     /// from the engine and reschedule. The first call schedules the
     /// first sample `SAMPLE_INTERVAL` into the future so pump-loop
     /// callers don't pay for a snapshot on every iteration.
+    ///
+    /// Phase 5 Task 5.3: when emitting a sample, also capture per-conn
+    /// raw points (goodput over the just-closed interval +
+    /// `snd_nxt - snd_una` queue depth) into `self.raw_points`. The
+    /// per-conn-state read goes via `engine.diag_conn_stats`.
     fn maybe_sample(&mut self, now: Instant, engine: &Engine, conns: &[ConnHandle]) {
         let due = match self.next_sample_at {
             None => {
@@ -599,12 +717,154 @@ impl SndUnaAccumulator {
             }
             Some(t) => t,
         };
-        if now >= due {
-            let current =
-                snapshot_snd_una_per_conn(engine, conns, Some(&self.last_sample));
-            self.accumulate(&current);
-            self.next_sample_at = Some(now + SAMPLE_INTERVAL);
+        if now < due {
+            return;
         }
+        // Snapshot per-conn snd_una for goodput delta.
+        let current =
+            snapshot_snd_una_per_conn(engine, conns, Some(&self.last_sample));
+        // Per-conn snd_nxt - snd_una for queue-depth column.
+        let snd_nxt_minus_una: Vec<u32> = conns
+            .iter()
+            .map(|&conn| {
+                engine
+                    .diag_conn_stats(conn)
+                    .map(|s| s.snd_nxt.wrapping_sub(s.snd_una))
+                    .unwrap_or(0)
+            })
+            .collect();
+        self.record_sample(now, &current, &snd_nxt_minus_una);
+        self.next_sample_at = Some(now + SAMPLE_INTERVAL);
+    }
+
+    /// Phase 5 Task 5.3: pure-data variant of `maybe_sample`'s body.
+    /// Records one (sample_idx, conn_id) row per connection, computing
+    /// goodput from the per-conn `snd_una` deltas and stamping
+    /// `t_ns` relative to `measure_start`.
+    ///
+    /// Split out from `maybe_sample` so unit tests can drive the
+    /// SAMPLE_INTERVAL emission without standing up a live Engine —
+    /// the engine reads stay in `maybe_sample`. This function is
+    /// pure: same `(now, current, snd_nxt_minus_una)` inputs always
+    /// produce the same `raw_points` push.
+    pub(crate) fn record_sample(
+        &mut self,
+        now: Instant,
+        current: &[u32],
+        snd_nxt_minus_una: &[u32],
+    ) {
+        debug_assert_eq!(current.len(), self.last_sample.len());
+        debug_assert_eq!(snd_nxt_minus_una.len(), self.last_sample.len());
+        let prior_totals: Vec<u64> = self.accumulated_bytes.clone();
+        self.accumulate(current);
+        self.sample_idx = self.sample_idx.saturating_add(1);
+        let interval_ns = SAMPLE_INTERVAL.as_nanos() as u64;
+        let t_ns = self
+            .measure_start
+            .map(|s| now.saturating_duration_since(s).as_nanos() as u64)
+            .unwrap_or(0);
+        for (i, &queue_depth) in snd_nxt_minus_una.iter().enumerate() {
+            let bytes_this_interval = self
+                .accumulated_bytes
+                .get(i)
+                .copied()
+                .unwrap_or(0)
+                .saturating_sub(prior_totals.get(i).copied().unwrap_or(0));
+            let goodput_bps_window = if interval_ns > 0 {
+                (bytes_this_interval as f64) * 8.0
+                    / ((interval_ns as f64) / 1_000_000_000.0)
+            } else {
+                0.0
+            };
+            self.raw_points.push(MaxtpRawPoint {
+                conn_id: i as u32,
+                sample_idx: self.sample_idx,
+                t_ns,
+                goodput_bps_window,
+                snd_nxt_minus_una: queue_depth,
+            });
+        }
+    }
+}
+
+#[cfg(test)]
+mod accumulator_tests {
+    use super::*;
+
+    /// Phase 5 Task 5.3: SAMPLE_INTERVAL boundary — exercising the
+    /// pure record_sample path without a live engine.
+    /// One call → one (idx=1) row per conn.
+    #[test]
+    fn record_sample_emits_one_row_per_conn_per_call() {
+        let mut acc = SndUnaAccumulator::new(vec![0, 0, 0, 0]);
+        let now = Instant::now();
+        acc.anchor_measure_start(now);
+        // First call after the warmup → all four conns have made
+        // some progress.
+        acc.record_sample(
+            now + SAMPLE_INTERVAL,
+            &[1_000_000, 2_000_000, 3_000_000, 4_000_000],
+            &[16_384, 16_384, 16_384, 16_384],
+        );
+        assert_eq!(acc.raw_points.len(), 4);
+        assert_eq!(acc.sample_idx, 1);
+        for (i, p) in acc.raw_points.iter().enumerate() {
+            assert_eq!(p.conn_id as usize, i);
+            assert_eq!(p.sample_idx, 1);
+            assert_eq!(p.snd_nxt_minus_una, 16_384);
+        }
+    }
+
+    /// Five intervals × four conns = twenty rows; sample_idx ticks 1..=5.
+    #[test]
+    fn record_sample_increments_idx_per_call() {
+        let mut acc = SndUnaAccumulator::new(vec![0, 0, 0, 0]);
+        let start = Instant::now();
+        acc.anchor_measure_start(start);
+        for k in 1u32..=5 {
+            let snd_una_per_conn: Vec<u32> = (0..4)
+                .map(|c| (c as u32 + 1).wrapping_mul(k))
+                .collect();
+            acc.record_sample(
+                start + SAMPLE_INTERVAL * k,
+                &snd_una_per_conn,
+                &[1024, 1024, 1024, 1024],
+            );
+        }
+        assert_eq!(acc.raw_points.len(), 20);
+        assert_eq!(acc.sample_idx, 5);
+        // Last interval row's sample_idx is 5; first is 1.
+        assert_eq!(acc.raw_points.first().unwrap().sample_idx, 1);
+        assert_eq!(acc.raw_points.last().unwrap().sample_idx, 5);
+    }
+
+    /// `goodput_bps_window` is computed from per-conn deltas in this
+    /// interval, not cumulative totals — proves we strip the prior
+    /// cumulative state correctly before computing.
+    #[test]
+    fn record_sample_goodput_is_per_interval_not_cumulative() {
+        let mut acc = SndUnaAccumulator::new(vec![0]);
+        let start = Instant::now();
+        acc.anchor_measure_start(start);
+        // Interval 1: 1 GiB ACKed at conn 0 over 1 s → 8 Gbit/s = 8e9.
+        acc.record_sample(
+            start + SAMPLE_INTERVAL,
+            &[1 << 30],
+            &[0],
+        );
+        // Interval 2: another 1 GiB ACKed, cumulative now 2 GiB.
+        // The per-interval goodput should still be 8e9, not 16e9.
+        acc.record_sample(
+            start + SAMPLE_INTERVAL * 2,
+            &[2 << 30],
+            &[0],
+        );
+        assert_eq!(acc.raw_points.len(), 2);
+        let g1 = acc.raw_points[0].goodput_bps_window;
+        let g2 = acc.raw_points[1].goodput_bps_window;
+        let expected = (1u64 << 30) as f64 * 8.0;
+        assert!((g1 - expected).abs() / expected < 1e-9, "g1={g1}");
+        assert!((g2 - expected).abs() / expected < 1e-9, "g2={g2}");
     }
 }
 

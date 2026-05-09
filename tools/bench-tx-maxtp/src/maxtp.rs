@@ -363,6 +363,137 @@ pub fn emit_bucket_rows<W: std::io::Write>(
     Ok(())
 }
 
+/// Phase 5 Task 5.3 emit path: writes the standard 2-row maxtp output
+/// PLUS percentile rows over the per-conn time-series goodput samples,
+/// and stamps every output row's `raw_samples_path` column with the
+/// sidecar CSV path (if one was provided to the tool).
+///
+/// Closes C-B1 (no percentiles), C-B5 (multi-conn visibility), and
+/// surfaces queue-depth via the `snd_nxt_minus_una` column the dpdk
+/// arm now writes into the sidecar.
+///
+/// `raw_window_samples` are the per-conn-per-sample-interval
+/// `goodput_bps_window` values (bps, one per `MaxtpRawPoint` emitted
+/// during the bucket's window). `raw_samples_path` is the operator's
+/// `--raw-samples-csv` string; when `None`, the standard 2-row Mean
+/// output is emitted unchanged. When `Some`, the same 2 rows are
+/// written with `raw_samples_path` populated, plus 6 additional rows
+/// (`sustained_goodput_bps`, p50/p99/p999/stddev/ci95_lower/ci95_upper)
+/// for cross-stack distribution analysis.
+pub fn emit_bucket_rows_with_percentiles<W: std::io::Write>(
+    writer: &mut csv::Writer<W>,
+    metadata: &RunMetadata,
+    tool: &str,
+    feature_set: &str,
+    aggregate: &BucketAggregate,
+    raw_window_samples: &[f64],
+    raw_samples_path: Option<&str>,
+) -> Result<(), csv::Error> {
+    use bench_common::percentile::summarize;
+
+    let dims = build_dimensions_json(
+        aggregate.bucket,
+        aggregate.stack,
+        aggregate.verdict.reason(),
+        aggregate.tx_ts_mode.map(|m| m.as_str()),
+    );
+    let raw_path_string = raw_samples_path.map(str::to_string);
+
+    let make_row = |metric_name: &str,
+                    metric_unit: &str,
+                    metric_value: f64,
+                    metric_aggregation: MetricAggregation| CsvRow {
+        run_metadata: metadata.clone(),
+        tool: tool.to_string(),
+        test_case: "maxtp".to_string(),
+        feature_set: feature_set.to_string(),
+        dimensions_json: dims.clone(),
+        metric_name: metric_name.to_string(),
+        metric_unit: metric_unit.to_string(),
+        metric_value,
+        metric_aggregation,
+        cpu_family: None,
+        cpu_model_name: None,
+        dpdk_version_pkgconfig: None,
+        worktree_branch: None,
+        uprof_session_id: None,
+        raw_samples_path: raw_path_string.clone(),
+        // Maxtp does not have per-iter timeouts; the wedge-detect path
+        // bails the bucket entirely. Keep this at 0 for schema parity
+        // with bench-rtt rows.
+        failed_iter_count: 0,
+    };
+
+    match &aggregate.sample {
+        Some(sample) => {
+            writer.serialize(make_row(
+                "sustained_goodput_bps",
+                "bits_per_sec",
+                sample.goodput_bps,
+                MetricAggregation::Mean,
+            ))?;
+            writer.serialize(make_row(
+                "tx_pps",
+                "pps",
+                sample.pps,
+                MetricAggregation::Mean,
+            ))?;
+            // Phase 5 Task 5.3: percentile rows over the per-sample-
+            // interval per-conn goodput time series. Folded across
+            // every conn × every interval — bench-report can split per
+            // conn by joining against the sidecar CSV's conn_id col.
+            if !raw_window_samples.is_empty() {
+                let summary = summarize(raw_window_samples);
+                writer.serialize(make_row(
+                    "sustained_goodput_bps",
+                    "bits_per_sec",
+                    summary.p50,
+                    MetricAggregation::P50,
+                ))?;
+                writer.serialize(make_row(
+                    "sustained_goodput_bps",
+                    "bits_per_sec",
+                    summary.p99,
+                    MetricAggregation::P99,
+                ))?;
+                writer.serialize(make_row(
+                    "sustained_goodput_bps",
+                    "bits_per_sec",
+                    summary.p999,
+                    MetricAggregation::P999,
+                ))?;
+                writer.serialize(make_row(
+                    "sustained_goodput_bps",
+                    "bits_per_sec",
+                    summary.stddev,
+                    MetricAggregation::Stddev,
+                ))?;
+                writer.serialize(make_row(
+                    "sustained_goodput_bps",
+                    "bits_per_sec",
+                    summary.ci95_lower,
+                    MetricAggregation::Ci95Lower,
+                ))?;
+                writer.serialize(make_row(
+                    "sustained_goodput_bps",
+                    "bits_per_sec",
+                    summary.ci95_upper,
+                    MetricAggregation::Ci95Upper,
+                ))?;
+            }
+        }
+        None => {
+            writer.serialize(make_row(
+                "sustained_goodput_bps",
+                "bits_per_sec",
+                0.0,
+                MetricAggregation::Mean,
+            ))?;
+        }
+    }
+    Ok(())
+}
+
 /// Check the §11.2 sanity invariant: ACKed bytes during the window
 /// equal the `stack_tx_bytes_counter_delta` during the window, **minus
 /// any bytes still in-flight at `t_end`** (bounded by cwnd + rwnd).
