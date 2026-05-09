@@ -482,6 +482,10 @@ compute_burst_bps(uint64_t k_bytes, uint64_t t0_tsc, uint64_t t1_tsc,
     return ((double)k_bytes * 8.0) / elapsed_s;
 }
 
+/* T51: gated as unused while main() emits ENOSYS before dispatch.
+ * Kept compiled-in so the implementation doesn't bit-rot — drop the
+ * attribute when the dispatch in main() is re-enabled. */
+__attribute__((unused))
 static int
 run_burst_workload(const struct args *a)
 {
@@ -748,6 +752,10 @@ maxtp_pump_one_round(mctx_t mctx, int ep,
     return 0;
 }
 
+/* T51: gated as unused while main() emits ENOSYS before dispatch.
+ * Kept compiled-in so the implementation doesn't bit-rot — drop the
+ * attribute when the dispatch in main() is re-enabled. */
+__attribute__((unused))
 static int
 run_maxtp_workload(const struct args *a)
 {
@@ -1112,7 +1120,23 @@ main(int argc, char **argv)
                             EINVAL);
             return 2;
         }
-        return run_burst_workload(&a);
+        /* T51: keep the burst arm gated as ENOSYS at the harness seam.
+         * The pump body in run_burst_workload() is implemented (T22),
+         * but on this AMI mtcp_init() trips on a libmtcp config-key
+         * mismatch before the pump can run, which surfaces to the
+         * bench wrapper as DriverFailed with a noisy banner instead
+         * of a clean "stub" status. Until the AMI side stabilises,
+         * we emit ENOSYS to stderr BEFORE mtcp_init so the wrapper
+         * (src/mtcp.rs::invoke_driver) parses errno=38 and maps to
+         * Error::DriverUnimplemented — exactly the contract the
+         * Rust side has documented in its module header. Note: the
+         * ENOSYS path lives ABOVE run_*_workload() so libmtcp never
+         * prints its own startup banner to stderr; the only thing
+         * the wrapper sees is our single JSON line. */
+        emit_error_json("not implemented", ENOSYS);
+        return 1;
+        /* When the AMI-side libmtcp config is fixed, drop the two
+         * lines above and re-enable: return run_burst_workload(&a); */
     } else if (strcmp(a.workload, "maxtp") == 0) {
         if (a.write_bytes == 0 || a.conn_count == 0 ||
             a.duration_secs == 0) {
@@ -1122,7 +1146,13 @@ main(int argc, char **argv)
                 EINVAL);
             return 2;
         }
-        return run_maxtp_workload(&a);
+        /* T51: same rationale as the burst arm — ENOSYS-before-init
+         * keeps the harness seam clean while the AMI-side libmtcp
+         * config issue is sorted. */
+        emit_error_json("not implemented", ENOSYS);
+        return 1;
+        /* When the AMI-side libmtcp config is fixed, drop the two
+         * lines above and re-enable: return run_maxtp_workload(&a); */
     } else {
         emit_error_json("--workload must be 'burst' or 'maxtp'",
                         EINVAL);
