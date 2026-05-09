@@ -311,10 +311,11 @@ wait_for_ssh "$PEER_SSH" "$PEER_INSTANCE_ID"
 # `--in-memory` keeps DPDK metadata out of /var/run/dpdk/rte/, and
 # `--huge-unlink` removes /dev/hugepages/rtemap_* backing files at mmap
 # time so they don't survive a half-completed rte_eal_cleanup. Without
-# these flags, residual hugepage state from a prior bench-ab-runner
+# these flags, residual hugepage state from a prior bench-rtt
 # leaks into the next process and rte_eal_cleanup walks a corrupted
 # memzone (observed: bench-obs-overhead obs-none SIGSEGV in run
-# bl16x36lb). Same flags as tests/ffi-test/tests/ffi_smoke.rs:48 uses
+# bl16x36lb against the predecessor bench-ab-runner binary).
+# Same flags as tests/ffi-test/tests/ffi_smoke.rs:48 uses
 # for the same reason.
 EAL_ARGS="${EAL_ARGS:--l 2-3 -n 4 --in-memory --huge-unlink -a 0000:00:06.0,large_llq_hdr=1,miss_txc_to=3}"
 
@@ -341,7 +342,7 @@ PEER_BINS=(
 # DPDK 23.11 — see image-builder component 04b-install-f-stack.yaml). We
 # don't ship it via scp; the binary lives at /opt/f-stack-peer/bench-peer
 # on the peer host pre-installed by the AMI bake.
-SHARED_SCRIPTS=(scripts/check-bench-preconditions.sh scripts/bench-ab-runner-gdb.sh scripts/peer-ifb-setup.sh)
+SHARED_SCRIPTS=(scripts/check-bench-preconditions.sh scripts/bench-rtt-gdb.sh scripts/peer-ifb-setup.sh)
 
 for bin in "${DUT_BINS[@]}" "${PEER_BINS[@]}" "${SHARED_SCRIPTS[@]}"; do
   if [ ! -f "$bin" ]; then
@@ -382,7 +383,7 @@ retry_remote "scp DUT-bins" "$DUT_INSTANCE_ID" \
 # so bench-offload-ab / bench-obs-overhead can exec it as --runner-bin.
 retry_remote "chmod-DUT" "$DUT_INSTANCE_ID" \
   ssh "${SSH_OPTS[@]}" "ubuntu@$DUT_SSH" \
-    "chmod +x /tmp/bench-ab-runner-gdb.sh /tmp/check-bench-preconditions.sh /tmp/peer-ifb-setup.sh"
+    "chmod +x /tmp/bench-rtt-gdb.sh /tmp/check-bench-preconditions.sh /tmp/peer-ifb-setup.sh"
 
 refresh_ec2_ic_grants
 log "  -> peer ($PEER_SSH)"
@@ -586,8 +587,9 @@ run_dut_bench() {
 
 # Common args shared across bench-rtt / bench-vs-linux / bench-tx-burst /
 # bench-tx-maxtp (DPDK stacks). bench-offload-ab / bench-obs-overhead are
-# A/B drivers that shell out to bench-ab-runner internally, so they take
-# a narrower arg set.
+# A/B drivers that shell out to bench-rtt internally (Phase 4 / Phase 12
+# of the 2026-05-09 overhaul retired the bench-ab-runner intermediary),
+# so they take a narrower arg set.
 #
 # BENCH_ITERATIONS / BENCH_WARMUP: lowered from the spec's 100k/1k
 # defaults because run b5scpbl90 observed a deterministic TCP
@@ -1013,7 +1015,7 @@ fi
 # ---------------------------------------------------------------------------
 # [10/12] bench-offload-ab + bench-obs-overhead — A/B drivers. These
 # rebuild the workspace per config, so they cannot run in parallel with
-# each other. They run on the DUT because they invoke bench-ab-runner
+# each other. They run on the DUT because they invoke bench-rtt
 # which opens an EAL. Output goes into the driver's output-dir plus a
 # Markdown report; we pull both into $OUT_DIR.
 # ---------------------------------------------------------------------------
@@ -1067,12 +1069,12 @@ scp -r "${SCP_OPTS[@]}" \
     || log "  [10b/12] scp of bench-obs-overhead failed — continuing"
 
 # Pull the gdb wrapper's diagnostic log back for offline analysis. The
-# wrapper writes stack traces from any SIGSEGV that hit bench-ab-runner
+# wrapper writes stack traces from any SIGSEGV that hit bench-rtt
 # during [10/12]+[10b/12], plus the gdb-version banner and any apt-install
 # output if gdb was bootstrapped at first invocation.
 refresh_ec2_ic_grants
 scp "${SCP_OPTS[@]}" \
-    "ubuntu@$DUT_SSH:/tmp/bench-ab-runner-gdb.log" "$OUT_DIR/" \
+    "ubuntu@$DUT_SSH:/tmp/bench-rtt-gdb.log" "$OUT_DIR/" \
     || log "  gdb log scp failed — continuing"
 
 # ---------------------------------------------------------------------------

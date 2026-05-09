@@ -140,6 +140,15 @@ no measurable wallclock.
    bitfield verbatim. Nightly script wires the flag at every bench-rtt invocation;
    `run_dut_bench` pulls the sidecar back via the generic `--*-csv` arg-scan so
    future per-iter CSV emits plug in without further changes.
+5. **CLOSED** (2026-05-09): the gdb stack-trace wrapper survived Phase 12's
+   bench-ab-runner crate deletion with an orphaned `exec /tmp/bench-ab-runner`
+   target. Decommissioned by repointing it at `/tmp/bench-rtt` (the binary
+   bench-offload-ab / bench-obs-overhead now subprocess via `--runner-bin`)
+   and renaming `scripts/bench-ab-runner-gdb.sh` →
+   `scripts/bench-rtt-gdb.sh` with `git mv` to preserve history. The
+   SIGSEGV trace-capture workflow is preserved; `bench-nightly.sh`
+   updated to scp the renamed script and pull `/tmp/bench-rtt-gdb.log`
+   back at the end of the [10/12]+[10b/12] block.
 
 ## Operator runbook delta
 

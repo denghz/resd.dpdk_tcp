@@ -1,17 +1,23 @@
 #!/bin/bash
-# bench-ab-runner-gdb.sh — wrapper that runs /tmp/bench-ab-runner under
-# gdb-batch and captures a stack trace on SIGSEGV. Used to diagnose the
-# silent exit-139 crash observed on the Nth DPDK process invocation in a
-# bench-nightly session (see docs/superpowers/reports/a10-ab-driver-debug-v2.md).
+# bench-rtt-gdb.sh — wrapper that runs /tmp/bench-rtt under gdb-batch and
+# captures a stack trace on SIGSEGV. Used to diagnose silent exit-139
+# crashes observed in repeated DPDK process invocations during a
+# bench-nightly session (see docs/superpowers/reports/a10-ab-driver-debug-v2.md
+# for the original investigation against the predecessor binary).
+#
+# Phase 12 of the 2026-05-09 bench-suite overhaul deleted the
+# bench-ab-runner crate; this wrapper was repointed at /tmp/bench-rtt
+# (the binary that bench-offload-ab / bench-obs-overhead now subprocess
+# via --runner-bin) and renamed accordingly.
 #
 # stdout/stderr pass through to the parent (bench-offload-ab /
 # bench-obs-overhead) so the runner's CSV harvest stays intact. gdb's
 # own diagnostic + the post-crash backtrace land in
-# /tmp/bench-ab-runner-gdb.log so they don't pollute the CSV stream.
+# /tmp/bench-rtt-gdb.log so they don't pollute the CSV stream.
 
 set -u
 
-GDB_LOG="/tmp/bench-ab-runner-gdb.log"
+GDB_LOG="/tmp/bench-rtt-gdb.log"
 
 {
     echo
@@ -31,7 +37,7 @@ fi
 
 if ! command -v gdb >/dev/null 2>&1; then
     echo "ERROR: gdb still not on PATH; running binary directly without trace" >&2
-    exec /tmp/bench-ab-runner "$@"
+    exec /tmp/bench-rtt "$@"
 fi
 
 # `--batch --quiet` — no interactive prompt, no banner.
@@ -61,4 +67,4 @@ exec gdb \
     -ex 'printf "\n=== PROC MAPPINGS (head) ===\n"' \
     -ex 'info proc mappings' \
     -ex 'quit' \
-    --args /tmp/bench-ab-runner "$@"
+    --args /tmp/bench-rtt "$@"
