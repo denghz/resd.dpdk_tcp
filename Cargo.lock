@@ -134,10 +134,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bench-e2e"
-version = "0.1.0"
-
-[[package]]
 name = "bench-micro"
 version = "0.1.0"
 dependencies = [
@@ -213,25 +209,6 @@ dependencies = [
  "dpdk-net-sys",
  "hostname",
  "libc",
- "serde_json",
- "tempfile",
- "uuid",
-]
-
-[[package]]
-name = "bench-stress"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bench-common",
- "bench-rtt",
- "chrono",
- "clap 4.6.1",
- "csv",
- "dpdk-net-core",
- "dpdk-net-sys",
- "hostname",
- "serde",
  "serde_json",
  "tempfile",
  "uuid",
@@ -928,7 +905,6 @@ dependencies = [
  "anyhow",
  "bench-common",
  "bench-rtt",
- "bench-stress",
  "chrono",
  "clap 4.6.1",
  "dpdk-net-core",

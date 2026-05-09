@@ -317,13 +317,11 @@ EAL_ARGS="${EAL_ARGS:--l 2-3 -n 4 --in-memory --huge-unlink -a 0000:00:06.0,larg
 log "[5/12] deploying binaries to DUT + peer"
 
 DUT_BINS=(
-  target/release/bench-e2e
-  target/release/bench-stress
+  target/release/bench-rtt
   target/release/bench-vs-linux
   target/release/bench-offload-ab
   target/release/bench-obs-overhead
   target/release/bench-vs-mtcp
-  target/release/bench-ab-runner
 )
 PEER_BINS=(
   tools/bench-e2e/peer/echo-server
@@ -563,32 +561,46 @@ DPDK_COMMON=(
 )
 
 # ---------------------------------------------------------------------------
-# [7/12] bench-e2e — request/response RTT + A-HW Task 18 assertions.
+# [7/12] bench-rtt — request/response RTT + A-HW Task 18 assertions.
 # ---------------------------------------------------------------------------
-log "[7/12] bench-e2e (with --assert-hw-task-18)"
-run_dut_bench bench-e2e bench-e2e \
+# Phase 4 of the 2026-05-09 bench-suite overhaul retired bench-e2e; the
+# dpdk_net RTT inner loop migrated into bench-rtt, which sweeps over a
+# `--payload-bytes-sweep` axis. For this slot we keep the legacy
+# 128/128 default (bench-rtt's default for `--payload-bytes-sweep` is
+# `128`); Phase 10 expands the sweep to 64/128/256.
+log "[7/12] bench-rtt (with --assert-hw-task-18)"
+run_dut_bench bench-rtt bench-rtt \
+    --stack dpdk_net \
+    --connections 1 \
+    --payload-bytes-sweep 128 \
     "${DPDK_COMMON[@]}" \
     --peer-port 10001 \
     --iterations "$BENCH_ITERATIONS" \
     --warmup "$BENCH_WARMUP" \
     --assert-hw-task-18 \
-    --tool bench-e2e \
+    --tool bench-rtt \
     --feature-set trading-latency \
-    || log "  [7/12] bench-e2e exited non-zero — continuing"
+    || log "  [7/12] bench-rtt exited non-zero — continuing"
 
 # ---------------------------------------------------------------------------
-# [8/12] bench-stress — operator-side netem orchestration.
+# [8/12] bench-rtt under netem — operator-side qdisc lifecycle.
 # DUT cannot SSH from the data ENI to the peer's mgmt IP (different SG /
-# no route), so the previous in-process NetemGuard apply hangs on
-# OpenSSH's connect timeout. Operator workstation has working SSH to
-# the peer's mgmt IP; orchestrate netem here, run bench-stress with
-# --external-netem on the DUT.
+# no route), so the operator workstation drives the netem qdisc apply +
+# revert. The bench-stress crate that previously orchestrated this loop
+# was retired in Phase 4 of the 2026-05-09 bench-suite overhaul; the
+# scenario matrix moves into the nightly script and per-scenario rows
+# come out of bench-rtt with `dimensions_json.netem_scenario` carried
+# through `--feature-set` (downstream report keys on tool+feature_set).
+#
+# TODO(Phase 10): the bench-stress p999-vs-idle-baseline ratio assertion
+# previously fired in-process. Until Phase 10 lands a post-process
+# helper script (`scripts/bench-stress-ratio-check.py` per the plan)
+# the assertion is intentionally absent — per-scenario p999 cells in
+# the merged CSV are visible to a human reader but no automated gate
+# fires. Document this in the bench-overhaul tracker.
 # ---------------------------------------------------------------------------
-log "[8/12] bench-stress (operator-side netem orchestration)"
+log "[8/12] bench-rtt under netem (operator-side qdisc lifecycle)"
 
-# Spec→string map mirrors the literals in
-# `tools/bench-stress/src/scenarios.rs::MATRIX`. Adding a new netem
-# scenario requires a new entry here AND a row in scenarios.rs.
 declare -A NETEM_SPECS=(
   [random_loss_01pct_10ms]="loss 0.1% delay 10ms"
   [correlated_burst_loss_1pct]="loss 1% 25%"
@@ -618,18 +630,17 @@ for scenario in "${NETEM_SCENARIOS[@]}"; do
     || { log "    apply failed; skipping scenario"; continue; }
 
   csv_name="bench-stress-$scenario"
-  if ! run_dut_bench bench-stress "$csv_name" \
+  if ! run_dut_bench bench-rtt "$csv_name" \
+      --stack dpdk_net \
+      --connections 1 \
+      --payload-bytes-sweep 128 \
       "${DPDK_COMMON[@]}" \
       --peer-port 10001 \
-      --peer-ssh "ubuntu@$PEER_SSH" \
-      --peer-iface ens6 \
-      --scenarios "$scenario" \
-      --external-netem \
       --iterations "$BENCH_ITERATIONS" \
       --warmup "$BENCH_WARMUP" \
       --tool bench-stress \
-      --feature-set trading-latency; then
-    log "    $scenario bench-stress exited non-zero — continuing"
+      --feature-set "trading-latency-$scenario"; then
+    log "    $scenario bench-rtt exited non-zero — continuing"
   fi
 
   log "  [8/12] $scenario — removing netem"
@@ -655,31 +666,67 @@ log "[8/12] merging per-scenario CSVs into bench-stress.csv"
 } > "$OUT_DIR/bench-stress.csv"
 
 # ---------------------------------------------------------------------------
-# [9/12] bench-vs-linux — mode A (RTT) + mode B (wire-diff).
-# Mode A: dpdk + linux stacks (afpacket is a T8 stub → dropped in
-#   lenient mode; we keep strict + drop afpacket from --stacks).
-# Mode B: wire-diff consumes pcaps. The live tcpdump orchestration is a
-#   T15-B follow-up; for the MVP we skip mode B if no pcaps are staged.
+# [9/12] bench-rtt cross-stack RTT comparison (replaces bench-vs-linux
+# mode A). Phase 4 of the 2026-05-09 bench-suite overhaul moved the
+# dpdk_net + linux_kernel + fstack RTT triplet into bench-rtt. We
+# invoke bench-rtt three times — once per stack — and let the
+# downstream bench-report group rows by `dimensions_json.stack`.
+# bench-vs-linux retains only mode B (wire-diff), handled below at
+# [9b/12].
 # ---------------------------------------------------------------------------
-log "[9/12] bench-vs-linux mode A (RTT comparison) — dpdk,linux,fstack"
-# F-Stack arm requires the binary built with `--features fstack`; the
-# default release build (step [3/12]) skips F-Stack so the F-Stack
-# stack is selected here in lenient mode (drops it if feature-off).
-# When the AMI build sets cargo build with --features fstack the arm
-# becomes live. The 2026-04-29 follow-up landed the F-Stack rust arm
-# in mode A.
-run_dut_bench bench-vs-linux bench-vs-linux-rtt \
+log "[9/12] bench-rtt cross-stack RTT (dpdk_net + linux_kernel + fstack)"
+run_dut_bench bench-rtt bench-rtt-dpdk_net \
+    --stack dpdk_net \
+    --connections 1 \
+    --payload-bytes-sweep 128 \
     "${DPDK_COMMON[@]}" \
-    --mode rtt \
-    --peer-port 10002 \
-    --peer-iface ens6 \
-    --stacks dpdk,linux,fstack \
-    --fstack-peer-port 10001 \
+    --peer-port 10001 \
     --iterations "$BENCH_ITERATIONS" \
     --warmup "$BENCH_WARMUP" \
     --tool bench-vs-linux \
     --feature-set trading-latency \
-    || log "  [9/12] bench-vs-linux mode A exited non-zero — continuing"
+    || log "  [9/12] bench-rtt --stack dpdk_net exited non-zero — continuing"
+
+# linux_kernel arm needs no DPDK args — connect to the linux-tcp-sink
+# peer on port 10002. Pass through the EAL flags anyway so the
+# common-arg array stays uniform; bench-rtt's linux_kernel path
+# ignores them.
+run_dut_bench bench-rtt bench-rtt-linux_kernel \
+    --stack linux_kernel \
+    --connections 1 \
+    --payload-bytes-sweep 128 \
+    --peer-ip "$PEER_IP" \
+    --peer-port 10002 \
+    --local-ip "$DUT_IP" \
+    --gateway-ip "$GATEWAY_IP" \
+    --eal-args "$EAL_ARGS" \
+    --lcore 2 \
+    --precondition-mode strict \
+    --iterations "$BENCH_ITERATIONS" \
+    --warmup "$BENCH_WARMUP" \
+    --tool bench-vs-linux \
+    --feature-set trading-latency \
+    || log "  [9/12] bench-rtt --stack linux_kernel exited non-zero — continuing"
+
+# fstack arm: requires the binary built with `--features fstack`; the
+# default release build (step [3/12]) skips F-Stack so this is a no-op
+# until the AMI build flips the feature on.
+run_dut_bench bench-rtt bench-rtt-fstack \
+    --stack fstack \
+    --connections 1 \
+    --payload-bytes-sweep 128 \
+    --peer-ip "$PEER_IP" \
+    --peer-port 10003 \
+    --local-ip "$DUT_IP" \
+    --gateway-ip "$GATEWAY_IP" \
+    --eal-args "$EAL_ARGS" \
+    --lcore 2 \
+    --precondition-mode lenient \
+    --iterations "$BENCH_ITERATIONS" \
+    --warmup "$BENCH_WARMUP" \
+    --tool bench-vs-linux \
+    --feature-set trading-latency \
+    || log "  [9/12] bench-rtt --stack fstack exited non-zero — continuing"
 
 # Mode B: wire-diff — consume pcaps captured around a short live
 # workload. A10 Plan B T15-B wires tcpdump orchestration: start tcpdump
@@ -726,13 +773,17 @@ else
   # which is exactly what the canonicaliser keys on.
   sleep 2
 
-  # Short synthetic workload: reuse bench-e2e for 10 request/response
+  # Short synthetic workload: reuse bench-rtt for 10 request/response
   # exchanges against the echo-server on port 10001. No HW-task-18
   # assertions — those add TX-TS preconditions that are orthogonal to
-  # the pcap content we care about for wire-diff.
-  log "        running bench-e2e live capture workload"
+  # the pcap content we care about for wire-diff. (Phase 4 of the
+  # 2026-05-09 bench-suite overhaul retired bench-e2e; bench-rtt
+  # subsumes the same workload behind --stack dpdk_net.)
+  log "        running bench-rtt live capture workload"
   ssh "${SSH_OPTS[@]}" "ubuntu@$DUT_SSH" \
-      "sudo /tmp/bench-e2e \
+      "sudo /tmp/bench-rtt \
+          --stack dpdk_net \
+          --connections 1 \
           --peer-ip $PEER_IP \
           --local-ip $DUT_IP \
           --gateway-ip $GATEWAY_IP \
@@ -741,10 +792,10 @@ else
           --precondition-mode lenient \
           --peer-port 10001 \
           --iterations 10 \
-          --output-csv /tmp/bench-e2e-mode-b-capture.csv \
+          --output-csv /tmp/bench-rtt-mode-b-capture.csv \
           --tool bench-vs-linux-mode-b \
           --feature-set rfc-compliance" \
-      || log "        WARN bench-e2e capture workload returned non-zero; \
+      || log "        WARN bench-rtt capture workload returned non-zero; \
 diff may still be meaningful"
 
   # Stop tcpdump and flush buffers. SIGINT (the default on killall
@@ -821,7 +872,7 @@ ssh "${SSH_OPTS[@]}" "ubuntu@$DUT_SSH" \
         --warmup $BENCH_WARMUP \
         --output-dir /tmp/bench-offload-ab-out \
         --report-path /tmp/bench-offload-ab-out/offload-ab.md \
-        --runner-bin /tmp/bench-ab-runner \
+        --runner-bin /tmp/bench-rtt \
         --skip-rebuild" \
     || log "  [10/12] bench-offload-ab exited non-zero — continuing"
 refresh_ec2_ic_grants
@@ -845,7 +896,7 @@ ssh "${SSH_OPTS[@]}" "ubuntu@$DUT_SSH" \
         --warmup $BENCH_WARMUP \
         --output-dir /tmp/bench-obs-overhead-out \
         --report-path /tmp/bench-obs-overhead-out/obs-overhead.md \
-        --runner-bin /tmp/bench-ab-runner \
+        --runner-bin /tmp/bench-rtt \
         --skip-rebuild" \
     || log "  [10b/12] bench-obs-overhead exited non-zero — continuing"
 refresh_ec2_ic_grants

@@ -9,7 +9,7 @@ use clap::Parser;
 use uuid::Uuid;
 
 use bench_common::preconditions::PreconditionMode;
-use bench_stress::netem::NetemGuard;
+use layer_h_correctness::netem::NetemGuard;
 
 use dpdk_net_core::engine::{Engine, EngineConfig};
 

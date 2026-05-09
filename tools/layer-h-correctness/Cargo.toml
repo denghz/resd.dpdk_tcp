@@ -26,11 +26,12 @@ test-server = ["dpdk-net-core/test-server"]
 
 [dependencies]
 bench-common = { path = "../bench-common" }
-# Phase 4 bench-suite overhaul (2026-05-09): the RTT inner loop is now
-# in bench-rtt (formerly in bench-e2e). bench-stress is still wired in
-# until Task 4.7 retires it.
+# Phase 4 bench-suite overhaul (2026-05-09): RTT inner loop now lives
+# in bench-rtt; bench-stress was retired in Task 4.7. The
+# `bench_stress::netem::NetemGuard` formerly imported here moved into
+# `layer_h_correctness::netem` (verbatim copy of the module — same
+# tc/SSH shape).
 bench-rtt = { path = "../bench-rtt" }
-bench-stress = { path = "../bench-stress" }
 dpdk-net-core = { path = "../../crates/dpdk-net-core", default-features = true }
 dpdk-net-sys = { path = "../../crates/dpdk-net-sys" }
 clap = { version = "4", features = ["derive"] }

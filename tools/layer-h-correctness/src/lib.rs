@@ -9,6 +9,7 @@
 
 pub mod assertions;
 pub mod counters_snapshot;
+pub mod netem;
 pub mod observation;
 pub mod report;
 pub mod scenarios;

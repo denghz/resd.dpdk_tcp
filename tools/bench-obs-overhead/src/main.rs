@@ -132,10 +132,12 @@ struct Args {
     #[arg(long, default_value_t = false)]
     skip_rebuild: bool,
 
-    /// Path to the `bench-ab-runner` binary (post-build). Defaults to
-    /// `target/release/bench-ab-runner`, which is where a release
-    /// build under the workspace `target/` lands.
-    #[arg(long, default_value = "target/release/bench-ab-runner")]
+    /// Path to the `bench-rtt` binary (post-build). Defaults to
+    /// `target/release/bench-rtt`. Phase 4 of the 2026-05-09 bench-suite
+    /// overhaul retired bench-ab-runner as the obs-overhead subprocess
+    /// target; bench-rtt's `--stack dpdk_net` arm subsumes the
+    /// equivalent measurement loop.
+    #[arg(long, default_value = "target/release/bench-rtt")]
     runner_bin: PathBuf,
 }
 
@@ -303,8 +305,21 @@ fn run_row(
         );
     }
 
+    // bench-rtt writes its summary CSV to a file (`--output-csv`)
+    // rather than stdout (the bench-ab-runner shape). Pipe the file
+    // through after the subprocess completes so the rest of the
+    // streaming-append logic below stays unchanged.
+    let tmp_csv = std::env::temp_dir().join(format!(
+        "bench-obs-overhead-{}-{}.csv",
+        row.config.name,
+        std::process::id()
+    ));
     let mut child = Command::new(&runner_path)
         .args([
+            "--stack",
+            "dpdk_net",
+            "--connections",
+            "1",
             "--peer-ip",
             &args.peer_ip,
             "--peer-port",
@@ -327,6 +342,8 @@ fn run_row(
             &args.gateway_ip,
             "--eal-args",
             &args.eal_args,
+            "--output-csv",
+            tmp_csv.to_str().expect("temp path utf8"),
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -363,18 +380,23 @@ fn run_row(
     };
     if !status.success() {
         anyhow::bail!(
-            "bench-ab-runner config {} exited with status {:?}",
+            "bench-rtt config {} exited with status {:?}",
             row.config.name,
             status
         );
     }
 
-    let stdout_bytes = rx
-        .recv()
-        .context("runner stdout-drain thread dropped its sender")?
-        .with_context(|| format!("reading stdout from runner for {}", row.config.name))?;
+    let _ = rx.recv();
 
-    append_runner_output(csv_file, &stdout_bytes, row.config.name)?;
+    let csv_bytes = std::fs::read(&tmp_csv).with_context(|| {
+        format!(
+            "reading bench-rtt CSV {} for config {}",
+            tmp_csv.display(),
+            row.config.name
+        )
+    })?;
+    let _ = std::fs::remove_file(&tmp_csv);
+    append_runner_output(csv_file, &csv_bytes, row.config.name)?;
     Ok(())
 }
 
@@ -396,7 +418,7 @@ fn run_row(
 fn rebuild_runner(row: &ObsRow) -> anyhow::Result<()> {
     let features = row.config.features_as_cli_string();
     let mut cmd = Command::new("cargo");
-    cmd.args(["build", "-p", "bench-ab-runner", "--release"]);
+    cmd.args(["build", "-p", "bench-rtt", "--release"]);
     if !row.is_default {
         cmd.arg("--no-default-features");
     }

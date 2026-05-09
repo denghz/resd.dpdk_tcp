@@ -125,10 +125,12 @@ struct Args {
     #[arg(long, default_value_t = false)]
     skip_rebuild: bool,
 
-    /// Path to the `bench-ab-runner` binary (post-build). Defaults to
-    /// `target/release/bench-ab-runner`, which is where a release
-    /// build under the workspace `target/` lands.
-    #[arg(long, default_value = "target/release/bench-ab-runner")]
+    /// Path to the `bench-rtt` binary (post-build). Defaults to
+    /// `target/release/bench-rtt`. Phase 4 of the 2026-05-09 bench-suite
+    /// overhaul retired bench-ab-runner as the offload-ab subprocess
+    /// target; bench-rtt's `--stack dpdk_net` arm subsumes the
+    /// equivalent measurement loop.
+    #[arg(long, default_value = "target/release/bench-rtt")]
     runner_bin: PathBuf,
 }
 
@@ -291,8 +293,21 @@ fn run_config(
         );
     }
 
+    // bench-rtt writes its summary CSV to a file (`--output-csv`)
+    // rather than stdout (the bench-ab-runner shape). Pipe the file
+    // through after the subprocess completes so the rest of the
+    // streaming-append logic below stays unchanged.
+    let tmp_csv = std::env::temp_dir().join(format!(
+        "bench-offload-ab-{}-{}.csv",
+        cfg.name,
+        std::process::id()
+    ));
     let mut child = Command::new(&runner_path)
         .args([
+            "--stack",
+            "dpdk_net",
+            "--connections",
+            "1",
             "--peer-ip",
             &args.peer_ip,
             "--peer-port",
@@ -315,6 +330,8 @@ fn run_config(
             &args.gateway_ip,
             "--eal-args",
             &args.eal_args,
+            "--output-csv",
+            tmp_csv.to_str().expect("temp path utf8"),
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -356,20 +373,25 @@ fn run_config(
     };
     if !status.success() {
         anyhow::bail!(
-            "bench-ab-runner config {} exited with status {:?}",
+            "bench-rtt config {} exited with status {:?}",
             cfg.name,
             status
         );
     }
 
-    // wait_timeout returned Some — process is reaped; recv on the
-    // drain-thread is immediate because EOF closed its read loop.
-    let stdout_bytes = rx
-        .recv()
-        .context("runner stdout-drain thread dropped its sender")?
-        .with_context(|| format!("reading stdout from runner for {}", cfg.name))?;
+    // wait_timeout returned Some — process is reaped; the drain
+    // thread sees EOF on stdout (we don't actually consume it, but
+    // we still join it so threads don't leak).
+    let _ = rx.recv();
 
-    append_runner_output(csv_file, &stdout_bytes, cfg.name)?;
+    // bench-rtt's CSV lives in the temp file we passed via
+    // --output-csv. Read it, then unlink. The append helper already
+    // strips the leading header so existing aggregation downstream
+    // works unchanged.
+    let csv_bytes = std::fs::read(&tmp_csv)
+        .with_context(|| format!("reading bench-rtt CSV {} for config {}", tmp_csv.display(), cfg.name))?;
+    let _ = std::fs::remove_file(&tmp_csv);
+    append_runner_output(csv_file, &csv_bytes, cfg.name)?;
     Ok(())
 }
 
@@ -398,7 +420,7 @@ fn rebuild_runner(cfg: &Config) -> anyhow::Result<()> {
         "build",
         "--no-default-features",
         "-p",
-        "bench-ab-runner",
+        "bench-rtt",
         "--release",
     ]);
     if !features.is_empty() {
