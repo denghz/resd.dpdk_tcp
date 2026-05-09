@@ -13,6 +13,7 @@ members = [
     "tools/bench-report",
     "tools/bench-rtt",
     "tools/bench-tx-burst",
+    "tools/bench-tx-maxtp",
     "tools/bench-vs-linux",
     "tools/bench-vs-mtcp",
     "tools/layer-h-correctness",

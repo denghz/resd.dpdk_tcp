@@ -233,6 +233,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "bench-tx-maxtp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bench-common",
+ "bench-rtt",
+ "chrono",
+ "clap 4.6.1",
+ "csv",
+ "dpdk-net-core",
+ "dpdk-net-sys",
+ "hostname",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
 name = "bench-vs-linux"
 version = "0.1.0"
 dependencies = [

@@ -7,9 +7,8 @@
 //!
 //! Grid enumeration + CSV row emission for the max-sustained-throughput
 //! workload. The per-stack implementation lives in
-//! [`crate::dpdk_maxtp`] (dpdk_net side), [`crate::linux_maxtp`]
-//! (Linux kernel TCP), and [`crate::fstack_maxtp`] (F-Stack,
-//! feature-gated).
+//! [`crate::dpdk`] (dpdk_net side), [`crate::linux`] (Linux kernel TCP),
+//! and [`crate::fstack`] (F-Stack, feature-gated).
 //!
 //! # Measurement contract (spec §11.2)
 //!
@@ -47,7 +46,7 @@
 use bench_common::csv_row::{CsvRow, MetricAggregation};
 use bench_common::run_metadata::RunMetadata;
 
-use crate::dpdk_maxtp::TxTsMode;
+use crate::dpdk::TxTsMode;
 use crate::preflight::BucketVerdict;
 use crate::Stack;
 
@@ -596,12 +595,12 @@ mod tests {
     fn dimensions_json_carries_invalid_reason_when_present() {
         let dims = build_dimensions_json(
             Bucket::new(262_144, 64),
-            Stack::Linux,
+            Stack::LinuxKernel,
             Some("NIC-bound"),
             None,
         );
         let parsed: serde_json::Value = serde_json::from_str(&dims).unwrap();
-        assert_eq!(parsed["stack"], "linux");
+        assert_eq!(parsed["stack"], "linux_kernel");
         assert_eq!(parsed["bucket_invalid"], "NIC-bound");
     }
 
@@ -629,8 +628,8 @@ mod tests {
     fn dimensions_json_is_stable_across_calls() {
         // bench-report groups rows by the verbatim string; serialisation
         // must be deterministic.
-        let a = build_dimensions_json(Bucket::new(1024, 4), Stack::Linux, None, None);
-        let b = build_dimensions_json(Bucket::new(1024, 4), Stack::Linux, None, None);
+        let a = build_dimensions_json(Bucket::new(1024, 4), Stack::LinuxKernel, None, None);
+        let b = build_dimensions_json(Bucket::new(1024, 4), Stack::LinuxKernel, None, None);
         assert_eq!(a, b);
     }
 
@@ -790,7 +789,7 @@ mod tests {
         let bucket = Bucket::new(64, 1);
         let agg = BucketAggregate::from_sample(
             bucket,
-            Stack::Linux,
+            Stack::LinuxKernel,
             None,
             BucketVerdict::Invalid("rwnd low".to_string()),
             None,

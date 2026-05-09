@@ -1,17 +1,20 @@
-//! Integration tests for the `maxtp` sub-workload (spec §11.2).
+//! Integration tests for the `maxtp` workload (spec §11.2).
 //!
 //! These tests don't touch DPDK / a live peer. They cover the
 //! pure-Rust primitives: grid enumeration, per-window sample
 //! construction, preflight check helpers, and sanity-invariant math.
-//! The mTCP arm was removed in the 2026-05-09 bench-suite overhaul.
+//!
+//! Phase 5 of the 2026-05-09 bench-suite overhaul moved the maxtp
+//! workload out of bench-vs-mtcp into this `bench-tx-maxtp` crate;
+//! the test file moved with it.
 
-use bench_vs_mtcp::dpdk_maxtp::TxTsMode;
-use bench_vs_mtcp::maxtp::{
+use bench_tx_maxtp::dpdk::TxTsMode;
+use bench_tx_maxtp::maxtp::{
     self, check_sanity_invariant, enumerate_filtered_grid, enumerate_grid, Bucket,
     BucketAggregate, MaxtpSample, BUCKET_COUNT, C_CONNS, DURATION_SECS, WARMUP_SECS, W_BYTES,
 };
-use bench_vs_mtcp::preflight::BucketVerdict;
-use bench_vs_mtcp::Stack;
+use bench_tx_maxtp::preflight::BucketVerdict;
+use bench_tx_maxtp::Stack;
 
 // ---------------------------------------------------------------------------
 // Grid enumeration — spec §11.2 W × C = 28 buckets.
@@ -247,7 +250,7 @@ fn emit_bucket_rows_dimensions_json_matches_spec_11_3_shape() {
     let mut buf = Vec::new();
     {
         let mut w = csv::Writer::from_writer(&mut buf);
-        maxtp::emit_bucket_rows(&mut w, &metadata, "bench-vs-mtcp", "trading-latency", &agg)
+        maxtp::emit_bucket_rows(&mut w, &metadata, "bench-tx-maxtp", "trading-latency", &agg)
             .unwrap();
         w.flush().unwrap();
     }
@@ -316,7 +319,7 @@ fn emit_bucket_rows_invalid_bucket_emits_single_marker() {
     let mut buf = Vec::new();
     {
         let mut w = csv::Writer::from_writer(&mut buf);
-        maxtp::emit_bucket_rows(&mut w, &metadata, "bench-vs-mtcp", "trading-latency", &agg)
+        maxtp::emit_bucket_rows(&mut w, &metadata, "bench-tx-maxtp", "trading-latency", &agg)
             .unwrap();
         w.flush().unwrap();
     }
