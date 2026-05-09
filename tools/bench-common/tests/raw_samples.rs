@@ -25,3 +25,42 @@ fn rejects_row_with_wrong_column_count() {
     let err = w.row(&["only_one"]).unwrap_err();
     assert!(err.to_string().contains("column count"));
 }
+
+#[test]
+fn quotes_values_containing_commas() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("raw.csv");
+    let mut w = RawSamplesWriter::create(&path, &["bucket_id", "rtt_ns"]).unwrap();
+    w.row(&["K=262144B,G=10ms", "1234"]).unwrap();
+    w.flush().unwrap();
+    drop(w);
+
+    // Re-read with csv::Reader to confirm the comma-bearing bucket_id
+    // round-trips as a single field, not two.
+    let mut rdr = csv::ReaderBuilder::new()
+        .has_headers(true)
+        .from_path(&path)
+        .unwrap();
+    let headers = rdr.headers().unwrap().clone();
+    assert_eq!(&headers[0], "bucket_id");
+    assert_eq!(&headers[1], "rtt_ns");
+
+    let row = rdr.records().next().unwrap().unwrap();
+    assert_eq!(&row[0], "K=262144B,G=10ms");
+    assert_eq!(&row[1], "1234");
+}
+
+#[test]
+fn quotes_values_containing_newlines_and_doublequotes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("raw.csv");
+    let mut w = RawSamplesWriter::create(&path, &["a", "b"]).unwrap();
+    w.row(&["line1\nline2", r#"has "quotes""#]).unwrap();
+    w.flush().unwrap();
+    drop(w);
+
+    let mut rdr = csv::ReaderBuilder::new().has_headers(true).from_path(&path).unwrap();
+    let row = rdr.records().next().unwrap().unwrap();
+    assert_eq!(&row[0], "line1\nline2");
+    assert_eq!(&row[1], r#"has "quotes""#);
+}

@@ -5,14 +5,17 @@
 //! (additional percentiles, histograms, bimodality detection) does not
 //! require re-running the bench. Writers are streaming — they flush
 //! per-row to bound peak memory at iteration counts up to 10^7.
+//!
+//! Cell values may contain commas, newlines, or double quotes — the
+//! `csv` crate handles RFC 4180 quoting so callers do not have to
+//! sanitise their inputs.
 
 use anyhow::{anyhow, Context, Result};
 use std::fs::File;
-use std::io::{BufWriter, Write};
 use std::path::Path;
 
 pub struct RawSamplesWriter {
-    inner: BufWriter<File>,
+    inner: csv::Writer<File>,
     expected_cols: usize,
 }
 
@@ -20,9 +23,10 @@ impl RawSamplesWriter {
     pub fn create(path: &Path, header: &[&str]) -> Result<Self> {
         let f = File::create(path)
             .with_context(|| format!("create {}", path.display()))?;
-        let mut inner = BufWriter::new(f);
-        inner.write_all(header.join(",").as_bytes())?;
-        inner.write_all(b"\n")?;
+        let mut inner = csv::WriterBuilder::new()
+            .buffer_capacity(64 * 1024)
+            .from_writer(f);
+        inner.write_record(header).context("write header")?;
         Ok(Self { inner, expected_cols: header.len() })
     }
 
@@ -34,8 +38,7 @@ impl RawSamplesWriter {
                 self.expected_cols,
             ));
         }
-        self.inner.write_all(cols.join(",").as_bytes())?;
-        self.inner.write_all(b"\n")?;
+        self.inner.write_record(cols).context("write row")?;
         Ok(())
     }
 

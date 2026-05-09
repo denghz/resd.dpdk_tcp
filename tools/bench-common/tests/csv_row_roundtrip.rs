@@ -261,6 +261,104 @@ fn csv_row_deserialize_tolerates_missing_task_2_8_columns() {
     assert!(parsed.uprof_session_id.is_none());
 }
 
+/// Phase 3 backwards-compat guard. An older 40-column CSV that was written
+/// before the Phase 3 schema additions (`raw_samples_path`,
+/// `failed_iter_count`) must still deserialise — the new fields default to
+/// `None` and `0` respectively. Mirrors the Task 2.8 backward-compat test
+/// above, but strips the trailing two Phase 3 columns instead of the five
+/// Task 2.8 identification columns.
+#[test]
+fn csv_row_deserialize_tolerates_missing_phase3_columns() {
+    let mut row = sample_row();
+    // Force the Phase 3 fields to their default-on-absence values so the
+    // round-trip equality check below verifies the visitor's defaulting,
+    // not residual state from `sample_row()` (which already sets these to
+    // `None`/`0`, but we want this test to be self-documenting).
+    row.raw_samples_path = None;
+    row.failed_iter_count = 0;
+
+    // Serialise the live 42-column row, then strip the two Phase 3 columns
+    // from header and data to produce a legacy 40-column shape ending at
+    // `uprof_session_id`.
+    let mut buf = Vec::new();
+    {
+        let mut wtr = csv::Writer::from_writer(&mut buf);
+        row.write_with_header(&mut wtr).unwrap();
+    }
+
+    let phase3_columns = ["raw_samples_path", "failed_iter_count"];
+
+    let mut rdr = csv::ReaderBuilder::new()
+        .has_headers(false)
+        .from_reader(&buf[..]);
+    let mut records = rdr.records();
+    let header_record = records.next().unwrap().unwrap();
+    let data_record = records.next().unwrap().unwrap();
+    let mut header_fields: Vec<String> = header_record.iter().map(String::from).collect();
+    let mut data_fields: Vec<String> = data_record.iter().map(String::from).collect();
+    assert_eq!(header_fields.len(), COLUMNS.len());
+    assert_eq!(data_fields.len(), COLUMNS.len());
+    for col in phase3_columns {
+        let idx = header_fields
+            .iter()
+            .position(|c| c == col)
+            .unwrap_or_else(|| panic!("column {col} missing from live header"));
+        header_fields.remove(idx);
+        data_fields.remove(idx);
+    }
+    assert_eq!(header_fields.len(), COLUMNS.len() - 2);
+    // Sanity: legacy header now ends at `uprof_session_id`, the last
+    // pre-Phase 3 column.
+    assert_eq!(header_fields.last().unwrap(), "uprof_session_id");
+
+    let mut drifted_buf = Vec::new();
+    {
+        let mut wtr = csv::Writer::from_writer(&mut drifted_buf);
+        wtr.write_record(&header_fields).unwrap();
+        wtr.write_record(&data_fields).unwrap();
+        wtr.flush().unwrap();
+    }
+
+    let mut rdr = csv::Reader::from_reader(&drifted_buf[..]);
+    let parsed: CsvRow = rdr
+        .deserialize()
+        .next()
+        .unwrap()
+        .expect("older 40-column CSV without Phase 3 columns must still parse");
+
+    // Phase 3 fields default to None / 0 when absent.
+    assert!(parsed.raw_samples_path.is_none());
+    assert_eq!(parsed.failed_iter_count, 0);
+
+    // Representative subset of the surviving 40 columns survives the
+    // round-trip — this guards that the visitor's missing-field defaulting
+    // for Phase 3 didn't accidentally clobber other column wiring.
+    assert_eq!(parsed.tool, row.tool);
+    assert_eq!(parsed.test_case, row.test_case);
+    assert_eq!(parsed.feature_set, row.feature_set);
+    assert_eq!(parsed.dimensions_json, row.dimensions_json);
+    assert_eq!(parsed.metric_name, row.metric_name);
+    assert_eq!(parsed.metric_unit, row.metric_unit);
+    assert_eq!(parsed.metric_value, row.metric_value);
+    assert_eq!(parsed.metric_aggregation, row.metric_aggregation);
+    assert_eq!(parsed.cpu_family, row.cpu_family);
+    assert_eq!(parsed.cpu_model_name, row.cpu_model_name);
+    assert_eq!(parsed.dpdk_version_pkgconfig, row.dpdk_version_pkgconfig);
+    assert_eq!(parsed.worktree_branch, row.worktree_branch);
+    assert_eq!(parsed.uprof_session_id, row.uprof_session_id);
+    assert_eq!(parsed.run_metadata.run_id, row.run_metadata.run_id);
+    assert_eq!(parsed.run_metadata.commit_sha, row.run_metadata.commit_sha);
+    assert_eq!(parsed.run_metadata.host, row.run_metadata.host);
+    assert_eq!(
+        parsed.run_metadata.preconditions,
+        row.run_metadata.preconditions
+    );
+
+    // Strongest guarantee: the parsed row equals the source row, since
+    // every Phase 3 default exactly matches the values we forced above.
+    assert_eq!(parsed, row);
+}
+
 /// Task 2.8 round-trip guard: populated identification columns survive
 /// write-then-read through the CSV reader, including the numeric
 /// `cpu_family` (u32) and the mixed-populated `uprof_session_id` case
