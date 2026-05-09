@@ -1546,6 +1546,11 @@ fn handle_close_path(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
     }
 
     // Advance snd_una if ack covers more of our stream.
+    // Phase 11+ TODO: this snd_una advance does not call
+    // observe_cumulative_ack on send_ack_log; the bench-tx-maxtp
+    // measurement window runs in ESTABLISHED only, so close-path
+    // (FIN-WAIT/Closing/LastAck/CloseWait) ACK coverage is out of
+    // scope. See docs/superpowers/plans/2026-05-09-bench-suite-overhaul.md.
     let fin_acked = conn.fin_has_been_acked(seg.ack);
     if seq_lt(conn.snd_una, seg.ack) && seq_le(seg.ack, conn.snd_nxt) {
         conn.snd_una = seg.ack;

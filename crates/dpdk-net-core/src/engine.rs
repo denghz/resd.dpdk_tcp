@@ -3299,6 +3299,10 @@ impl Engine {
         if sent {
             crate::counters::inc(&self.counters.tcp.tx_persist);
             // Advance snd_nxt past the probe byte.
+            // Phase 11+ TODO: persist-probe segments are not recorded in
+            // send_ack_log; out-of-scope for the bench-tx-maxtp
+            // measurement window which runs in ESTABLISHED only. See
+            // docs/superpowers/plans/2026-05-09-bench-suite-overhaul.md.
             let mut ft = self.flow_table.borrow_mut();
             if let Some(c) = ft.get_mut(handle) {
                 c.snd_nxt = c.snd_nxt.wrapping_add(1);
@@ -6622,9 +6626,14 @@ impl Engine {
         {
             let mut ft = self.flow_table.borrow_mut();
             if let Some(conn) = ft.get_mut(conn_handle) {
+                // Phase 6 follow-up: take ONE TSC read for both
+                // `entry.xmit_ts_ns` and `send_ack_log.record_send` —
+                // they describe the same emission instant, and TSC
+                // reads in the retransmit hot path add up. Hoisted out
+                // of the inner `if let` so both consumers see it.
+                let now_ns_xmit = crate::clock::now_ns();
                 if let Some(entry) = conn.snd_retrans.entries.get_mut(entry_index) {
                     entry.xmit_count = entry.xmit_count.saturating_add(1);
-                    let now_ns_xmit = crate::clock::now_ns();
                     entry.xmit_ts_ns = now_ns_xmit;
                     entry.lost = false;
                     let _ = did_adj;
@@ -6640,7 +6649,7 @@ impl Engine {
                         begin: seg_seq,
                         end: seg_seq.wrapping_add(entry_len as u32),
                     },
-                    crate::clock::now_ns(),
+                    now_ns_xmit,
                 );
             }
         }

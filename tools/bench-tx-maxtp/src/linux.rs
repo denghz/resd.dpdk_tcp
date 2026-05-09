@@ -365,20 +365,43 @@ fn emit_tcp_info_rows(
             // closed mid-window. Other conns still produce rows.
             None => continue,
         };
-        sink.writer.row(&[
+        write_linux_tcp_info_row(
+            sink.writer,
             sink.bucket_id,
-            &(conn_idx as u32).to_string(),
-            "linux_tcp_info",
-            &sink.sample_idx.to_string(),
-            &t_ns.to_string(),
-            "",
-            "",
-            "",
-            &info.tcpi_rtt.to_string(),
-            &info.tcpi_total_retrans.to_string(),
-            &info.tcpi_unacked.to_string(),
-        ])?;
+            conn_idx as u32,
+            sink.sample_idx,
+            t_ns,
+            &info,
+        )?;
     }
+    Ok(())
+}
+
+/// Phase 6 follow-up: testable inner helper that writes one
+/// `linux_tcp_info` scope row into the unified 11-column send-ack CSV.
+/// Extracted so unit tests can drive a synthetic `LinuxTcpInfoMinimal`
+/// without needing a live socket / `getsockopt` syscall.
+fn write_linux_tcp_info_row(
+    w: &mut RawSamplesWriter,
+    bucket_id: &str,
+    conn_id: u32,
+    sample_idx: u32,
+    t_ns: u64,
+    info: &LinuxTcpInfoMinimal,
+) -> anyhow::Result<()> {
+    w.row(&[
+        bucket_id,
+        &conn_id.to_string(),
+        "linux_tcp_info",
+        &sample_idx.to_string(),
+        &t_ns.to_string(),
+        "",
+        "",
+        "",
+        &info.tcpi_rtt.to_string(),
+        &info.tcpi_total_retrans.to_string(),
+        &info.tcpi_unacked.to_string(),
+    ])?;
     Ok(())
 }
 
@@ -580,6 +603,60 @@ mod tests {
             err.to_string().contains("measurement duration must be > 0"),
             "expected zero-duration error, got: {err}"
         );
+    }
+
+    /// Phase 6 follow-up: the linux arm's `write_linux_tcp_info_row` helper
+    /// must produce the unified 11-column row shape with the three
+    /// TCP_INFO fields populated and `begin_seq`/`end_seq`/`latency_ns`
+    /// blank. Drives a synthetic `LinuxTcpInfoMinimal` so the test is
+    /// self-contained — no live socket, no `getsockopt` syscall.
+    #[test]
+    fn linux_tcp_info_emits_correct_row_shape() {
+        let header = [
+            "bucket_id",
+            "conn_id",
+            "scope",
+            "sample_idx",
+            "t_ns",
+            "begin_seq",
+            "end_seq",
+            "latency_ns",
+            "tcpi_rtt_us",
+            "tcpi_total_retrans",
+            "tcpi_unacked",
+        ];
+        let info = LinuxTcpInfoMinimal {
+            tcpi_rtt: 1234,
+            tcpi_total_retrans: 7,
+            tcpi_unacked: 42,
+            ..LinuxTcpInfoMinimal::default()
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("send-ack.csv");
+        {
+            let mut w = RawSamplesWriter::create(&path, &header).expect("create");
+            write_linux_tcp_info_row(&mut w, "bucket1", 5, 3, 1_500_000_000, &info)
+                .expect("write row");
+            w.flush().expect("flush");
+        }
+        let csv = std::fs::read_to_string(&path).expect("read");
+        let row = csv.lines().nth(1).expect("data row");
+        let cols: Vec<&str> = row.split(',').collect();
+        // Verify the unified 11-column layout: bucket_id, conn_id, scope,
+        // sample_idx, t_ns, begin_seq, end_seq, latency_ns, tcpi_rtt_us,
+        // tcpi_total_retrans, tcpi_unacked.
+        assert_eq!(cols.len(), 11, "row has 11 cols, got {}: {row}", cols.len());
+        assert_eq!(cols[0], "bucket1");
+        assert_eq!(cols[1], "5");
+        assert_eq!(cols[2], "linux_tcp_info");
+        assert_eq!(cols[3], "3");
+        assert_eq!(cols[4], "1500000000");
+        assert_eq!(cols[5], ""); // begin_seq blank
+        assert_eq!(cols[6], ""); // end_seq blank
+        assert_eq!(cols[7], ""); // latency_ns blank
+        assert_eq!(cols[8], "1234");
+        assert_eq!(cols[9], "7");
+        assert_eq!(cols[10], "42");
     }
 
     /// End-to-end sanity check on a loopback peer: open two connections

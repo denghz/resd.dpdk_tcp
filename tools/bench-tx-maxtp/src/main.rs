@@ -855,20 +855,8 @@ fn run_maxtp_grid_fstack<W: std::io::Write>(
                 "W={}B,C={}",
                 bucket.write_bytes, bucket.conn_count
             );
-            saw.row(&[
-                &bucket_id,
-                "0",
-                "fstack_unsupported",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-            ])
-            .context("emit fstack_unsupported marker row")?;
+            bench_tx_maxtp::emit_fstack_unsupported_marker(saw, &bucket_id)
+                .context("emit fstack_unsupported marker row")?;
         }
         match gr.result {
             Err(e) => {
@@ -939,20 +927,8 @@ fn run_maxtp_grid_fstack<W: std::io::Write>(
                 "W={}B,C={}",
                 bucket.write_bytes, bucket.conn_count
             );
-            saw.row(&[
-                &bucket_id,
-                "0",
-                "fstack_unsupported",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-            ])
-            .context("emit fstack_unsupported marker row (stub)")?;
+            bench_tx_maxtp::emit_fstack_unsupported_marker(saw, &bucket_id)
+                .context("emit fstack_unsupported marker row (stub)")?;
         }
         let agg = maxtp::BucketAggregate::from_sample(
             *bucket,
