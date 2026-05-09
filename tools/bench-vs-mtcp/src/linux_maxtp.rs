@@ -214,9 +214,8 @@ fn pump_round_robin(
                     Ok(0) => break, // EOF — peer closed
                     Ok(n) => {
                         drained += n;
-                        if n < discard.len() {
-                            break;
-                        }
+                        // Partial read is normal on TCP — keep draining
+                        // until WouldBlock or the per-round cap fires.
                     }
                     Err(e) if e.kind() == ErrorKind::WouldBlock => break,
                     Err(e) if e.kind() == ErrorKind::Interrupted => continue,
