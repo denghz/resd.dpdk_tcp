@@ -7,4 +7,5 @@
 pub mod csv_row;
 pub mod percentile;
 pub mod preconditions;
+pub mod raw_samples;
 pub mod run_metadata;
