@@ -632,9 +632,24 @@ declare -A NETEM_SPECS=(
   [correlated_burst_loss_1pct]="loss 1% 25%"
   [reorder_depth_3]="delay 5ms reorder 50% gap 3"
   [duplication_2x]="duplicate 100%"
+  # Phase 10 Task 10.2: scenarios that actually fire the RTO recovery
+  # path. Per Phase 4 scenarios.rs:67-83 comment, RTO requires a
+  # burst-tail past the 200ms RTO floor; ≥3% loss with correlation
+  # gets us there. Closes C-D2.
+  [high_loss_3pct]="loss 3% delay 5ms"
+  [high_loss_5pct]="loss 5% 25%"
+  [symmetric_3pct]="loss 3%"
 )
 
-NETEM_SCENARIOS=(random_loss_01pct_10ms correlated_burst_loss_1pct reorder_depth_3 duplication_2x)
+NETEM_SCENARIOS=(
+  random_loss_01pct_10ms
+  correlated_burst_loss_1pct
+  reorder_depth_3
+  duplication_2x
+  high_loss_3pct
+  high_loss_5pct
+  symmetric_3pct
+)
 
 # Direction axis: each netem scenario runs three times — once on peer
 # egress (current default; shapes peer→DUT, i.e. DUT-RX), once on peer
@@ -690,6 +705,35 @@ for scenario in "${NETEM_SCENARIOS[@]}"; do
         --tool bench-stress \
         --feature-set "trading-latency-${scenario}-${direction}"; then
       log "    $scenario/$direction bench-rtt exited non-zero — continuing"
+    fi
+
+    # Phase 10 Task 10.2: burst×netem cells. dpdk_net only — Phase 10
+    # keeps the cross-stack comparison on clean wire (steps [9/12],
+    # [11a..h/12]); under netem we only characterise the dpdk_net stack
+    # so the matrix doesn't explode further. Smaller measure_bursts
+    # (1000 not 10000) and trimmed burst_counts (drop 1024) keep the
+    # matrix wallclock manageable. Closes C-C3.
+    if ! run_dut_bench bench-tx-burst "bench-tx-burst-${scenario}-${direction}" \
+        "${DPDK_COMMON[@]}" \
+        --stack dpdk_net \
+        --peer-port 10001 \
+        --tool bench-tx-burst \
+        --feature-set "trading-latency-${scenario}-${direction}" \
+        --nic-max-bps "$NIC_MAX_BPS"; then
+      log "    $scenario/$direction bench-tx-burst exited non-zero — continuing"
+    fi
+
+    if ! run_dut_bench bench-rx-burst "bench-rx-burst-${scenario}-${direction}" \
+        "${DPDK_COMMON[@]}" \
+        --stack dpdk_net \
+        --peer-control-port 10003 \
+        --segment-sizes 64,128,256 \
+        --burst-counts 16,64,256 \
+        --warmup-bursts 50 \
+        --measure-bursts 1000 \
+        --tool bench-rx-burst \
+        --feature-set "trading-latency-${scenario}-${direction}"; then
+      log "    $scenario/$direction bench-rx-burst exited non-zero — continuing"
     fi
 
     log "  [8/12] $scenario/$direction — removing netem"

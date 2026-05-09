@@ -54,7 +54,19 @@ Baseline: T50 report at `docs/bench-reports/t50-bench-pair-2026-05-08.md` and T5
     iter-count expansion).
 - [ ] Phase 8 — bench-rx-burst tool
 - [ ] Phase 9 — HW-TS attribution validation on c7i
-- [ ] Phase 10 — Nightly script rewire + scenario expansion
+- [/] Phase 10 — Nightly script rewire + scenario expansion
+  - Task 10.1 done 2026-05-09: bench-rtt invocations now sweep
+    `$BENCH_RTT_PAYLOADS` (default `64,128,256,1024`) instead of the
+    legacy hard-coded `--payload-bytes-sweep 128`. Closes C-C1.
+  - Task 10.2 done 2026-05-09: netem matrix grows from
+    `4 scenarios × 3 directions = 12 buckets` (post-Phase-7) to
+    `7 scenarios × 3 directions = 21 buckets`. Three new scenarios
+    (`high_loss_3pct`, `high_loss_5pct`, `symmetric_3pct`) push the
+    burst-tail past the 200ms RTO floor — first time in this
+    bench suite the RTO recovery path is exercised. Closes C-D2.
+    `bench-tx-burst` and `bench-rx-burst` now run under the netem
+    matrix (dpdk_net only) in addition to bench-rtt: 21 cells × 3
+    tools = 63 sub-runs per nightly. Closes C-C3.
 - [ ] Phase 11 — Counters + observability
 - [ ] Phase 12 — Cleanup, c7i validation, t51 report
 
