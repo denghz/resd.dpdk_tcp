@@ -39,6 +39,7 @@ use bench_common::raw_samples::RawSamplesWriter;
 use bench_common::run_metadata::RunMetadata;
 
 use bench_rx_burst::dpdk;
+use bench_rx_burst::linux as linux_arm;
 use bench_rx_burst::segment::SegmentRecord;
 use bench_rx_burst::stack::Stack;
 
@@ -275,26 +276,138 @@ fn run_dpdk_net(args: &Args) -> anyhow::Result<Vec<BucketResult>> {
 }
 
 // ---------------------------------------------------------------------------
-// linux_kernel — Task 8.3 wires the real arm. For Task 8.2 we keep a
-// clear error so the binary builds + the dispatch table compiles.
+// linux_kernel — blocking TcpStream + per-read parsing.
 // ---------------------------------------------------------------------------
 
-fn run_linux_kernel(_args: &Args) -> anyhow::Result<Vec<BucketResult>> {
-    anyhow::bail!(
-        "bench-rx-burst --stack linux_kernel is not yet implemented \
-         (Phase 8 Task 8.3)"
-    )
+fn run_linux_kernel(args: &Args) -> anyhow::Result<Vec<BucketResult>> {
+    let peer_ip = parse_ip_host_order(&args.peer_ip)?;
+    let mut stream = linux_arm::open_control_connection(peer_ip, args.peer_control_port)
+        .context("linux_kernel open_control_connection")?;
+
+    let mut buckets: Vec<BucketResult> = Vec::new();
+    let mut bucket_id: u32 = 0;
+    for &segment_size in &args.segment_sizes {
+        for &burst_count in &args.burst_counts {
+            eprintln!(
+                "bench-rx-burst: linux_kernel W={} N={} (bucket {})",
+                segment_size, burst_count, bucket_id
+            );
+            let mut cfg = linux_arm::LinuxRxBurstCfg {
+                stream: &mut stream,
+                bucket_id,
+                segment_size,
+                burst_count,
+                warmup_bursts: args.warmup_bursts,
+                measure_bursts: args.measure_bursts,
+            };
+            let run = linux_arm::run_bucket(&mut cfg).with_context(|| {
+                format!("linux run_bucket W={segment_size} N={burst_count}")
+            })?;
+            buckets.push(BucketResult {
+                bucket_id,
+                segment_size,
+                burst_count,
+                samples: run.samples,
+            });
+            bucket_id += 1;
+        }
+    }
+    Ok(buckets)
 }
 
 // ---------------------------------------------------------------------------
-// fstack — Task 8.3 wires the real arm.
+// fstack — F-Stack RX-burst arm.
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "fstack")]
+fn run_fstack(args: &Args) -> anyhow::Result<Vec<BucketResult>> {
+    use bench_rx_burst::fstack as fstack_arm;
+
+    validate_fstack_args(args)?;
+    init_fstack(args)?;
+
+    let peer_ip = parse_ip_host_order(&args.peer_ip)?;
+
+    // Build the bucket grid.
+    let mut grid: Vec<fstack_arm::FstackBucketCfg> = Vec::new();
+    let mut bucket_id: u32 = 0;
+    let mut bucket_axis: Vec<(u32, usize, usize)> = Vec::new();
+    for &segment_size in &args.segment_sizes {
+        for &burst_count in &args.burst_counts {
+            grid.push(fstack_arm::FstackBucketCfg {
+                bucket_id,
+                segment_size,
+                burst_count,
+            });
+            bucket_axis.push((bucket_id, segment_size, burst_count));
+            bucket_id += 1;
+        }
+    }
+
+    let results = fstack_arm::run_grid(
+        &grid,
+        args.warmup_bursts,
+        args.measure_bursts,
+        peer_ip,
+        args.peer_control_port,
+    );
+
+    let mut buckets: Vec<BucketResult> = Vec::with_capacity(results.len());
+    for ((bid, segment_size, burst_count), res) in bucket_axis.iter().zip(results.into_iter()) {
+        match res.result {
+            Ok(run) => buckets.push(BucketResult {
+                bucket_id: *bid,
+                segment_size: *segment_size,
+                burst_count: *burst_count,
+                samples: run.samples,
+            }),
+            Err(e) => {
+                eprintln!(
+                    "bench-rx-burst: fstack bucket id={} (W={} N={}) failed: {}",
+                    bid, segment_size, burst_count, e
+                );
+                buckets.push(BucketResult {
+                    bucket_id: *bid,
+                    segment_size: *segment_size,
+                    burst_count: *burst_count,
+                    samples: Vec::new(),
+                });
+            }
+        }
+    }
+    Ok(buckets)
+}
+
+#[cfg(not(feature = "fstack"))]
 fn run_fstack(_args: &Args) -> anyhow::Result<Vec<BucketResult>> {
     anyhow::bail!(
-        "bench-rx-burst --stack fstack is not yet implemented \
-         (Phase 8 Task 8.3)"
+        "bench-rx-burst built without `fstack` feature; rebuild with \
+         `--features fstack` on the AMI where libfstack.a is installed."
     )
+}
+
+#[cfg(feature = "fstack")]
+fn validate_fstack_args(args: &Args) -> anyhow::Result<()> {
+    if !std::path::Path::new(&args.fstack_conf).exists() {
+        anyhow::bail!(
+            "--fstack-conf path `{}` does not exist; create it with the \
+             [dpdk] lcore_mask + allow=<PCI> + [port0] sections for the DUT",
+            args.fstack_conf
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "fstack")]
+fn init_fstack(args: &Args) -> anyhow::Result<()> {
+    let argv: Vec<String> = vec![
+        "bench-rx-burst".to_string(),
+        format!("--conf={}", args.fstack_conf),
+        "--proc-id=0".to_string(),
+    ];
+    eprintln!("bench-rx-burst: ff_init argv={:?}", argv);
+    bench_rx_burst::fstack_ffi::ff_init_from_args(&argv)
+        .map_err(|e| anyhow::anyhow!("ff_init failed: {e}"))
 }
 
 // ---------------------------------------------------------------------------

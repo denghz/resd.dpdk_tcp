@@ -20,16 +20,18 @@
 //! and append to a per-burst `recv_buf`, then drain in W-byte chunks
 //! and parse the header from each. See [`segment::parse_burst_chunk`].
 //!
-//! # Clock skew note
+//! # Clock anchor
 //!
-//! `peer_send_ns` is `CLOCK_REALTIME` from the peer host;
-//! `dut_recv_ns` is `clock::now_ns()` from the DUT (TSC-based).
-//! Because the two anchors differ (peer wall-clock vs. DUT TSC since
-//! calibration), the `latency_ns` field is dominated by the
-//! NTP-offset bound (~100 µs on AWS same-AZ) plus actual transport
-//! latency. For relative ordering and within-stack comparison the
-//! signal is fine; for absolute cross-host latency we need PTP
-//! (Phase 9 c7i HW-TS).
+//! Both `peer_send_ns` (segment header) and `dut_recv_ns` (this
+//! module) are `CLOCK_REALTIME` ns since the Unix epoch — anchored on
+//! the same wall clock. NTP offset (~100 µs on AWS same-AZ) bounds
+//! the absolute cross-host latency reading; the distribution shape
+//! (p50/p99 spread) is what we report.
+//!
+//! We deliberately do NOT use `dpdk_net_core::clock::now_ns()` here —
+//! that's TSC-based, anchored on calibration start, and not
+//! comparable to the peer's wall clock. Phase 9 c7i HW-TS will
+//! tighten the cross-host bound below the NTP floor.
 
 use std::time::{Duration, Instant};
 
@@ -147,7 +149,7 @@ fn run_one_burst(
             continue;
         }
 
-        let dut_recv_ns = dpdk_net_core::clock::now_ns();
+        let dut_recv_ns = wall_ns();
         last_progress = Instant::now();
 
         // Append fresh bytes; bound recv_buf to `total` (extra bytes
@@ -299,4 +301,16 @@ pub fn open_control_connection(
 ) -> anyhow::Result<ConnHandle> {
     open_connection(engine, peer_ip_host_order, peer_control_port)
         .context("dpdk_rx_burst open_connection")
+}
+
+/// CLOCK_REALTIME ns reading — the DUT-side wall-clock anchor used
+/// to subtract `peer_send_ns` (also CLOCK_REALTIME) from. Same shape
+/// as the linux arm's `wall_ns` so cross-stack rows in the same CSV
+/// share a clock namespace.
+fn wall_ns() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
 }
