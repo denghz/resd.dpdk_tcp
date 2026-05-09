@@ -1,6 +1,32 @@
 //! Linux kernel TCP max-sustained-throughput runner — comparator arm
 //! for spec §11.2.
 //!
+//! # Phase 6 Task 6.2: send→ACK latency asymmetry vs dpdk arm
+//!
+//! The dpdk arm's `--send-ack-csv` emits ONE ROW PER TCP SEGMENT for
+//! every cumulative ACK, with a precise `latency_ns` per (begin_seq,
+//! end_seq) range. The linux arm cannot replicate that granularity from
+//! user space — there's no kernel API that exposes per-segment send
+//! timestamps + ACK timestamps. The closest available knob is
+//! `getsockopt(IPPROTO_TCP, TCP_INFO)` which returns aggregate state
+//! (`tcpi_rtt`, `tcpi_total_retrans`, `tcpi_unacked`).
+//!
+//! When `--send-ack-csv` is passed, the linux arm emits one row per
+//! conn per `TCP_INFO_SAMPLE_INTERVAL` (1 s) during the measurement
+//! window, with `scope = "linux_tcp_info"` so downstream pivots can
+//! split linux rows from dpdk rows. The row carries `tcpi_rtt_us`
+//! (smoothed-RTT estimate, microseconds), `tcpi_total_retrans`
+//! (cumulative segment retransmits), and `tcpi_unacked` (in-flight
+//! segment count). All three are kernel-side counters / estimators —
+//! they describe the SAME phenomenon as the dpdk arm's per-segment
+//! samples, but at coarser cadence and without per-segment attribution.
+//!
+//! Bench analysis tools should treat the two stacks' rows asymmetrically:
+//! per-segment latency CDF for dpdk_segment scope; time-series of RTT /
+//! retrans for linux_tcp_info scope. A full per-segment kernel view
+//! would require eBPF instrumentation of `tcp_event_data_sent` /
+//! `tcp_event_data_recv` — out of scope for Phase 6.
+//!
 //! Drives the W × C grid against a live kernel-TCP sink peer using
 //! `std::net::TcpStream` (kernel sockets, no DPDK). For each bucket,
 //! opens `C` persistent connections, pumps W-byte writes round-robin
@@ -43,11 +69,78 @@
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
+use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
+use bench_common::raw_samples::RawSamplesWriter;
 
 use crate::maxtp::{Bucket, MaxtpSample};
+
+/// Phase 6 Task 6.2 sample interval for the linux arm's coarse
+/// `getsockopt(TCP_INFO)` snapshots. Mirrors the dpdk arm's
+/// `SAMPLE_INTERVAL` so the two stacks have comparable cadence — but the
+/// linux samples are aggregate (`tcpi_rtt`, `tcpi_total_retrans`,
+/// `tcpi_unacked`) rather than per-segment latency. Documented in the
+/// module header.
+const TCP_INFO_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Phase 6 Task 6.2 — minimal `tcp_info` mirror (linux/tcp.h). Only the
+/// fields we read are decoded; the rest of the kernel struct is treated
+/// as opaque trailing bytes and silently ignored. This is FAR less than
+/// the kernel's full `tcp_info` shape, but `getsockopt(TCP_INFO)` writes
+/// up to whatever buffer length we pass — a short buffer just gets
+/// truncated to fit, with `optlen` returning the actual write count.
+///
+/// Layout matches `linux/tcp.h::tcp_info` (linux 5.10+) for the prefix
+/// up through `tcpi_unacked`. Since we read only the listed three fields
+/// and rely on the offsets, the prefix layout is what matters — any
+/// future kernel additions appending past `tcpi_unacked` are absorbed
+/// into the remaining bytes of our larger buffer.
+#[repr(C)]
+#[derive(Default, Copy, Clone, Debug)]
+struct LinuxTcpInfoMinimal {
+    tcpi_state: u8,
+    tcpi_ca_state: u8,
+    tcpi_retransmits: u8,
+    tcpi_probes: u8,
+    tcpi_backoff: u8,
+    tcpi_options: u8,
+    /// Two 4-bit fields packed into a byte (snd_wscale lo, rcv_wscale hi).
+    tcpi_wscales: u8,
+    /// Three 1-bit flags packed into a byte (delivery_rate_app_limited,
+    /// fastopen_client_fail, _).
+    tcpi_flags: u8,
+
+    tcpi_rto: u32,
+    tcpi_ato: u32,
+    tcpi_snd_mss: u32,
+    tcpi_rcv_mss: u32,
+
+    tcpi_unacked: u32,
+    tcpi_sacked: u32,
+    tcpi_lost: u32,
+    tcpi_retrans: u32,
+    tcpi_fackets: u32,
+
+    tcpi_last_data_sent: u32,
+    tcpi_last_ack_sent: u32,
+    tcpi_last_data_recv: u32,
+    tcpi_last_ack_recv: u32,
+
+    tcpi_pmtu: u32,
+    tcpi_rcv_ssthresh: u32,
+    tcpi_rtt: u32,
+    tcpi_rttvar: u32,
+    tcpi_snd_ssthresh: u32,
+    tcpi_snd_cwnd: u32,
+    tcpi_advmss: u32,
+    tcpi_reordering: u32,
+    tcpi_rcv_rtt: u32,
+    tcpi_rcv_space: u32,
+
+    tcpi_total_retrans: u32,
+}
 
 /// Connect deadline for the initial kernel-TCP handshake. Same shape
 /// as bench-vs-linux's `linux_kernel.rs::CONNECT_TIMEOUT`.
@@ -151,7 +244,12 @@ pub fn assert_peer_is_sink(peer_port: u16) -> anyhow::Result<()> {
 /// 1. Pump writes for `warmup`, no sampling.
 /// 2. Pump writes for `duration`, accumulating bytes-sent.
 /// 3. Return `MaxtpSample::from_window(bytes_sent, 0, elapsed_ns)`.
-pub fn run_bucket(cfg: &LinuxMaxtpCfg, conns: &mut [TcpStream]) -> anyhow::Result<BucketRun> {
+pub fn run_bucket(
+    cfg: &LinuxMaxtpCfg,
+    conns: &mut [TcpStream],
+    mut send_ack_writer: Option<&mut RawSamplesWriter>,
+    bucket_id: &str,
+) -> anyhow::Result<BucketRun> {
     if conns.len() as u64 != cfg.bucket.conn_count {
         anyhow::bail!(
             "linux_maxtp: conns.len() = {} does not match bucket.conn_count = {}",
@@ -171,8 +269,10 @@ pub fn run_bucket(cfg: &LinuxMaxtpCfg, conns: &mut [TcpStream]) -> anyhow::Resul
     }
 
     // Warmup — pump until the warmup deadline, ignore the byte total.
+    // No TCP_INFO sink during warmup — those rows belong purely to the
+    // measurement window.
     let warmup_deadline = Instant::now() + cfg.warmup;
-    let _ = pump_round_robin(conns, &cfg.payload, warmup_deadline)
+    let _ = pump_round_robin(conns, &cfg.payload, warmup_deadline, None)
         .context("linux_maxtp warmup phase")?;
 
     // Measurement window — capture (t_start, t_end) tightly around the
@@ -180,8 +280,19 @@ pub fn run_bucket(cfg: &LinuxMaxtpCfg, conns: &mut [TcpStream]) -> anyhow::Resul
     // numerator's window exactly.
     let t_measure_start = Instant::now();
     let measure_deadline = t_measure_start + cfg.duration;
-    let bytes_sent_in_window = pump_round_robin(conns, &cfg.payload, measure_deadline)
-        .context("linux_maxtp measurement phase")?;
+    // Phase 6 Task 6.2: build the linux send-ack sink only if the caller
+    // wired a writer. The sink anchors `t_ns` to `t_measure_start` so
+    // emitted timestamps are window-relative.
+    let mut sink = send_ack_writer.as_deref_mut().map(|w| LinuxSendAckSink {
+        writer: w,
+        bucket_id,
+        measure_start: t_measure_start,
+        next_sample_at: t_measure_start + TCP_INFO_SAMPLE_INTERVAL,
+        sample_idx: 0,
+    });
+    let bytes_sent_in_window =
+        pump_round_robin(conns, &cfg.payload, measure_deadline, sink.as_mut())
+            .context("linux_maxtp measurement phase")?;
     let t_measure_end = Instant::now();
 
     let elapsed_ns = t_measure_end
@@ -197,14 +308,94 @@ pub fn run_bucket(cfg: &LinuxMaxtpCfg, conns: &mut [TcpStream]) -> anyhow::Resul
     })
 }
 
+/// Phase 6 Task 6.2 sink: per-conn TCP_INFO snapshots emitted once per
+/// `TCP_INFO_SAMPLE_INTERVAL` during the measurement window.
+pub struct LinuxSendAckSink<'a> {
+    pub writer: &'a mut RawSamplesWriter,
+    pub bucket_id: &'a str,
+    /// Wall-clock anchor for the `t_ns` column — `t_measure_start`.
+    pub measure_start: Instant,
+    /// Next sample wall-clock (`t_measure_start + k * SAMPLE_INTERVAL`).
+    pub next_sample_at: Instant,
+    /// 1-based sample index counter; bumped each time we emit a row.
+    pub sample_idx: u32,
+}
+
+/// Take one `getsockopt(IPPROTO_TCP, TCP_INFO)` snapshot from `fd`.
+/// Returns `None` if the syscall fails (closed socket, bad fd, etc.) —
+/// caller treats that as "no row this interval".
+fn getsockopt_tcp_info(fd: std::os::fd::RawFd) -> Option<LinuxTcpInfoMinimal> {
+    let mut info = LinuxTcpInfoMinimal::default();
+    let mut len = std::mem::size_of::<LinuxTcpInfoMinimal>() as libc::socklen_t;
+    // SAFETY: `info` is a stack-resident #[repr(C)] struct of `len` bytes;
+    // libc::getsockopt writes up to `len` bytes into it and updates `len`
+    // with the actual write count. Truncated writes (kernel struct larger
+    // than ours) are fine — we only read the prefix fields we care about.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_INFO,
+            (&mut info as *mut LinuxTcpInfoMinimal).cast(),
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    Some(info)
+}
+
+/// Emit one row per conn into the send-ack CSV with the three TCP_INFO
+/// fields we care about. Uses the conn index (`conns` iteration order)
+/// as the `conn_id` so per-conn time series stay grouped in the CSV.
+fn emit_tcp_info_rows(
+    conns: &[TcpStream],
+    sink: &mut LinuxSendAckSink<'_>,
+    now: Instant,
+) -> anyhow::Result<()> {
+    sink.sample_idx = sink.sample_idx.saturating_add(1);
+    let t_ns = now
+        .saturating_duration_since(sink.measure_start)
+        .as_nanos() as u64;
+    for (conn_idx, stream) in conns.iter().enumerate() {
+        let info = match getsockopt_tcp_info(stream.as_raw_fd()) {
+            Some(info) => info,
+            // Skip rows where the syscall failed; the conn may have been
+            // closed mid-window. Other conns still produce rows.
+            None => continue,
+        };
+        sink.writer.row(&[
+            sink.bucket_id,
+            &(conn_idx as u32).to_string(),
+            "linux_tcp_info",
+            &sink.sample_idx.to_string(),
+            &t_ns.to_string(),
+            "",
+            "",
+            "",
+            &info.tcpi_rtt.to_string(),
+            &info.tcpi_total_retrans.to_string(),
+            &info.tcpi_unacked.to_string(),
+        ])?;
+    }
+    Ok(())
+}
+
 /// Pump writes round-robin across `conns` until `deadline` fires.
 /// Returns the total bytes the kernel accepted on successful `write`
 /// calls. Errors only on a non-`WouldBlock` write failure — TCP
 /// reset, broken pipe, etc.
+///
+/// When `tcp_info_sink` is `Some`, every `TCP_INFO_SAMPLE_INTERVAL` the
+/// sink emits one row per conn carrying the kernel-side aggregate
+/// telemetry (`tcpi_rtt_us`, `tcpi_total_retrans`, `tcpi_unacked`).
+/// See module header for the asymmetry vs the dpdk arm.
 fn pump_round_robin(
     conns: &mut [TcpStream],
     payload: &[u8],
     deadline: Instant,
+    mut tcp_info_sink: Option<&mut LinuxSendAckSink<'_>>,
 ) -> anyhow::Result<u64> {
     if conns.is_empty() {
         anyhow::bail!("linux_maxtp: pump_round_robin: conns is empty");
@@ -223,7 +414,8 @@ fn pump_round_robin(
     // outer-loop check fires often enough).
     let check_between_conns = conns.len() == 1;
     loop {
-        if Instant::now() >= deadline {
+        let now_outer = Instant::now();
+        if now_outer >= deadline {
             return Ok(total);
         }
         for stream in conns.iter_mut() {
@@ -267,6 +459,15 @@ fn pump_round_robin(
             }
             if check_between_conns && Instant::now() >= deadline {
                 return Ok(total);
+            }
+        }
+        // Phase 6 Task 6.2: emit per-conn TCP_INFO snapshot rows once
+        // per SAMPLE_INTERVAL. Skipped on warmup pumps (sink is None).
+        if let Some(sink) = tcp_info_sink.as_deref_mut() {
+            let now = Instant::now();
+            if now >= sink.next_sample_at {
+                emit_tcp_info_rows(conns, sink, now)?;
+                sink.next_sample_at = now + TCP_INFO_SAMPLE_INTERVAL;
             }
         }
     }
@@ -326,7 +527,7 @@ mod tests {
             peer_port: port,
             payload: vec![0u8; 64],
         };
-        let err = run_bucket(&cfg, &mut conns).unwrap_err();
+        let err = run_bucket(&cfg, &mut conns, None, "test").unwrap_err();
         assert!(
             err.to_string().contains("does not match bucket.conn_count"),
             "expected conn_count mismatch error, got: {err}"
@@ -350,7 +551,7 @@ mod tests {
             peer_port: port,
             payload: vec![0u8; 32], // wrong size
         };
-        let err = run_bucket(&cfg, &mut conns).unwrap_err();
+        let err = run_bucket(&cfg, &mut conns, None, "test").unwrap_err();
         assert!(
             err.to_string().contains("does not match bucket.write_bytes"),
             "expected write_bytes mismatch error, got: {err}"
@@ -374,7 +575,7 @@ mod tests {
             peer_port: port,
             payload: vec![0u8; 64],
         };
-        let err = run_bucket(&cfg, &mut conns).unwrap_err();
+        let err = run_bucket(&cfg, &mut conns, None, "test").unwrap_err();
         assert!(
             err.to_string().contains("measurement duration must be > 0"),
             "expected zero-duration error, got: {err}"
@@ -451,7 +652,7 @@ mod tests {
             peer_port: port,
             payload: vec![0u8; 64],
         };
-        let run = run_bucket(&cfg, &mut conns).unwrap();
+        let run = run_bucket(&cfg, &mut conns, None, "test").unwrap();
         assert!(
             run.bytes_sent_in_window > 0,
             "expected non-zero bytes sent in window"

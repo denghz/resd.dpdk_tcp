@@ -116,6 +116,13 @@ pub struct DpdkMaxtpCfg<'a> {
     /// `None` skips raw-sample emission entirely; the bucket-level
     /// percentile aggregate is still computed.
     pub raw_samples: Option<&'a mut RawSamplesWriter>,
+    /// Phase 6 Task 6.2 send→ACK latency sidecar. When set, the pump
+    /// loop drains per-segment latency samples from the engine after
+    /// every `poll_once` and emits one row per sample with the
+    /// `dpdk_segment` scope. `None` skips emission entirely; caller is
+    /// responsible for calling `engine.enable_send_ack_logging(cap)`
+    /// before run_bucket so the engine actually retains samples.
+    pub send_ack_samples: Option<&'a mut RawSamplesWriter>,
 }
 
 /// One raw-sample row emitted at SAMPLE_INTERVAL granularity per
@@ -413,9 +420,16 @@ pub fn run_bucket(cfg: &mut DpdkMaxtpCfg<'_>) -> anyhow::Result<BucketRun> {
         anyhow::bail!("dpdk_maxtp: measurement duration must be > 0");
     }
 
-    // Warmup.
+    // Warmup. Phase 6 Task 6.2: warmup does NOT emit send-ack samples
+    // (passing `None`) so the CSV bytes belong purely to the measurement
+    // window — even though the engine's send_ack_log is recording during
+    // warmup, the pump just doesn't drain into the writer. Samples
+    // accumulated during warmup either drain naturally before the
+    // measurement loop starts (round-trip ACKs are sub-ms; a 10 s warmup
+    // means the log has cleared by t_measure_start) or get popped by the
+    // first measurement-phase ACK without ever reaching the writer.
     let warmup_deadline = Instant::now() + cfg.warmup;
-    pump_round_robin(cfg.engine, cfg.conns, cfg.payload, warmup_deadline, None)
+    pump_round_robin(cfg.engine, cfg.conns, cfg.payload, warmup_deadline, None, None)
         .context("dpdk_maxtp warmup phase")?;
 
     // Snapshot pre-window state.
@@ -462,12 +476,25 @@ pub fn run_bucket(cfg: &mut DpdkMaxtpCfg<'_>) -> anyhow::Result<BucketRun> {
     let t_measure_start = Instant::now();
     accumulator.anchor_measure_start(t_measure_start);
     let measure_deadline = t_measure_start + cfg.duration;
+    // Phase 6 Task 6.2: assemble the send-ack sink for the measurement
+    // phase. The Cfg holds an `Option<&mut RawSamplesWriter>`; we wrap
+    // the writer + bucket_id into a `SendAckSinkRef` and pass it through
+    // by `Option<...>::take()` so the inner pump_round_robin owns the
+    // borrow for the duration of the call.
+    let send_ack_sink: Option<SendAckSinkRef<'_>> = cfg
+        .send_ack_samples
+        .as_deref_mut()
+        .map(|w| SendAckSinkRef {
+            writer: w,
+            bucket_id: cfg.bucket_id,
+        });
     pump_round_robin(
         cfg.engine,
         cfg.conns,
         cfg.payload,
         measure_deadline,
         Some(&mut accumulator),
+        send_ack_sink,
     )
     .context("dpdk_maxtp measurement phase")?;
     let t_measure_end = Instant::now();
@@ -891,6 +918,7 @@ fn pump_round_robin(
     payload: &[u8],
     deadline: Instant,
     mut accumulator: Option<&mut SndUnaAccumulator>,
+    mut send_ack_sink: Option<SendAckSinkRef<'_>>,
 ) -> anyhow::Result<()> {
     if conns.is_empty() {
         anyhow::bail!("dpdk_maxtp: pump_round_robin: conns is empty");
@@ -944,6 +972,32 @@ fn pump_round_robin(
             let mut _last: Option<u64> = None;
             let _ = drain_and_accumulate_readable(engine, conn, &mut _last);
         }
+        // Phase 6 Task 6.2: drain per-segment send→ACK latency samples
+        // produced by the just-completed `poll_once`. Only fires when
+        // the pump was driven with a sink configured (measurement
+        // phase only — warmup passes None). Drain order matches the
+        // conn iteration order so per-conn streams in the CSV stay
+        // adjacent for downstream analysis.
+        if let Some(sink) = send_ack_sink.as_mut() {
+            for (conn_idx, &conn) in conns.iter().enumerate() {
+                let samples = engine.drain_send_ack_samples(conn);
+                for s in samples {
+                    sink.writer.row(&[
+                        sink.bucket_id,
+                        &(conn_idx as u32).to_string(),
+                        "dpdk_segment",
+                        "",
+                        "",
+                        &s.begin_seq.to_string(),
+                        &s.end_seq.to_string(),
+                        &s.latency_ns.to_string(),
+                        "",
+                        "",
+                        "",
+                    ])?;
+                }
+            }
+        }
         // Mid-window sample folding. Done after poll_once + drain so
         // the sample reflects the most recent ACKs. `Instant::now()`
         // here is a no-op on the warmup path (accumulator is None).
@@ -951,6 +1005,15 @@ fn pump_round_robin(
             acc.maybe_sample(Instant::now(), engine, conns);
         }
     }
+}
+
+/// Phase 6 Task 6.2: pump-loop sink for per-segment send→ACK samples.
+/// Borrowed reference to the writer + the bucket label — passed only
+/// through the measurement phase, so warmup-phase sample emission is
+/// suppressed by passing `None`.
+pub struct SendAckSinkRef<'a> {
+    pub writer: &'a mut RawSamplesWriter,
+    pub bucket_id: &'a str,
 }
 
 /// Per-conn `snd_una` snapshot. Returns one `u32` per element of

@@ -252,6 +252,7 @@ dependencies = [
  "dpdk-net-core",
  "dpdk-net-sys",
  "hostname",
+ "libc",
  "serde_json",
  "tempfile",
  "thiserror",

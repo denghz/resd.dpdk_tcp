@@ -65,6 +65,20 @@ struct Args {
     #[arg(long)]
     raw_samples_csv: Option<std::path::PathBuf>,
 
+    /// Optional sidecar CSV for per-segment send→ACK latency samples
+    /// (Phase 6 Task 6.2). When set:
+    /// - dpdk_net arm: emits one row per TCP segment for every cumulative
+    ///   ACK across the measurement window with columns
+    ///   `bucket_id, conn_id, begin_seq, end_seq, latency_ns`. Closes C-B4.
+    /// - linux_kernel arm: emits coarse `getsockopt(TCP_INFO)` snapshots
+    ///   per SAMPLE_INTERVAL with columns
+    ///   `bucket_id, conn_id, sample_idx, t_ns, tcpi_rtt_us,
+    ///   tcpi_total_retrans, tcpi_unacked, scope`.
+    /// - fstack arm: emits a single `unsupported` marker row per bucket
+    ///   so the schema stays uniform across stacks.
+    #[arg(long)]
+    send_ack_csv: Option<std::path::PathBuf>,
+
     /// Precondition mode: `strict` aborts on precondition failure;
     /// `lenient` warns and continues.
     #[arg(long, default_value = "strict")]
@@ -206,6 +220,42 @@ fn main() -> anyhow::Result<()> {
         None => None,
     };
 
+    // Phase 6 Task 6.2: optional sidecar send→ACK latency CSV.
+    //
+    // Header is a union over the per-stack row shapes:
+    //   * `scope` distinguishes per-segment (`dpdk_segment`), TCP_INFO
+    //     snapshot (`linux_tcp_info`), and stub (`fstack_unsupported`).
+    //   * `t_ns`/`sample_idx` populated by linux + fstack scopes;
+    //     dpdk_segment leaves them empty.
+    //   * `begin_seq`/`end_seq`/`latency_ns` populated by dpdk_segment;
+    //     others leave them empty.
+    //   * `tcpi_rtt_us`/`tcpi_total_retrans`/`tcpi_unacked` populated
+    //     by linux_tcp_info; others leave empty.
+    // Empty values are emitted as the empty string so downstream pivots
+    // can split rows by `scope`.
+    let mut send_ack_writer: Option<RawSamplesWriter> = match args.send_ack_csv.as_ref() {
+        Some(path) => {
+            let header = [
+                "bucket_id",
+                "conn_id",
+                "scope",
+                "sample_idx",
+                "t_ns",
+                "begin_seq",
+                "end_seq",
+                "latency_ns",
+                "tcpi_rtt_us",
+                "tcpi_total_retrans",
+                "tcpi_unacked",
+            ];
+            Some(
+                RawSamplesWriter::create(path, &header)
+                    .with_context(|| format!("creating send-ack CSV {path:?}"))?,
+            )
+        }
+        None => None,
+    };
+
     let peer_ip = parse_ip_host_order(&args.peer_ip)?;
     let nic_max_bps = resolve_nic_max_bps(args.nic_max_bps);
     if nic_max_bps.is_none() {
@@ -237,6 +287,7 @@ fn main() -> anyhow::Result<()> {
                 nic_max_bps,
                 &mut writer,
                 raw_samples_writer.as_mut(),
+                send_ack_writer.as_mut(),
             )?;
         }
         Stack::LinuxKernel => {
@@ -248,6 +299,7 @@ fn main() -> anyhow::Result<()> {
                 &metadata,
                 nic_max_bps,
                 &mut writer,
+                send_ack_writer.as_mut(),
             )?;
         }
         Stack::Fstack => {
@@ -259,6 +311,7 @@ fn main() -> anyhow::Result<()> {
                 &metadata,
                 nic_max_bps,
                 &mut writer,
+                send_ack_writer.as_mut(),
             )?;
         }
     }
@@ -266,6 +319,9 @@ fn main() -> anyhow::Result<()> {
     writer.flush()?;
     if let Some(rsw) = raw_samples_writer.as_mut() {
         rsw.flush().context("flushing raw-samples CSV")?;
+    }
+    if let Some(saw) = send_ack_writer.as_mut() {
+        saw.flush().context("flushing send-ack CSV")?;
     }
     Ok(())
 }
@@ -321,7 +377,17 @@ fn run_maxtp_grid_dpdk<W: std::io::Write>(
     nic_max_bps: Option<u64>,
     writer: &mut csv::Writer<W>,
     mut raw_samples_writer: Option<&mut RawSamplesWriter>,
+    mut send_ack_writer: Option<&mut RawSamplesWriter>,
 ) -> anyhow::Result<()> {
+    // Phase 6 Task 6.2: opt the engine into per-segment send→ACK
+    // latency tracking. Cap of 4096 — comfortably above the in-flight
+    // burst depth between cumulative-ACK arrivals at line-rate
+    // (a 1 Gbit/s flow with MSS=1460 absorbs ~85 in-flight segments
+    // per 1 ms RTT). When `--send-ack-csv` is unset, the toggle is left
+    // off — no per-conn allocation, hot-path branch stays predictable.
+    if send_ack_writer.is_some() {
+        engine.enable_send_ack_logging(4096);
+    }
     let mut payload_cache: std::collections::HashMap<u64, Vec<u8>> = std::collections::HashMap::new();
 
     let dut_ip: std::net::Ipv4Addr = args
@@ -403,6 +469,7 @@ fn run_maxtp_grid_dpdk<W: std::io::Write>(
             tx_ts_mode,
             bucket_id: &bucket_id,
             raw_samples: raw_samples_writer.as_deref_mut(),
+            send_ack_samples: send_ack_writer.as_deref_mut(),
         };
         let bucket_outcome = (|| -> anyhow::Result<()> {
             let run = match dpdk::run_bucket(&mut cfg).with_context(|| {
@@ -510,6 +577,7 @@ fn run_maxtp_grid_linux<W: std::io::Write>(
     metadata: &RunMetadata,
     nic_max_bps: Option<u64>,
     writer: &mut csv::Writer<W>,
+    mut send_ack_writer: Option<&mut RawSamplesWriter>,
 ) -> anyhow::Result<()> {
     use bench_tx_maxtp::linux::{self, LinuxMaxtpCfg};
 
@@ -594,9 +662,17 @@ fn run_maxtp_grid_linux<W: std::io::Write>(
             peer_port,
             payload: vec![0u8; bucket.write_bytes as usize],
         };
-        let run = match linux::run_bucket(&cfg, &mut conns).with_context(|| {
-            format!("linux::run_bucket for {}", bucket.label())
-        }) {
+        let bucket_id = format!(
+            "W={}B,C={}",
+            bucket.write_bytes, bucket.conn_count
+        );
+        let run = match linux::run_bucket(
+            &cfg,
+            &mut conns,
+            send_ack_writer.as_deref_mut(),
+            &bucket_id,
+        )
+        .with_context(|| format!("linux::run_bucket for {}", bucket.label())) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!(
@@ -755,6 +831,7 @@ fn run_maxtp_grid_fstack<W: std::io::Write>(
     metadata: &RunMetadata,
     nic_max_bps: Option<u64>,
     writer: &mut csv::Writer<W>,
+    mut send_ack_writer: Option<&mut RawSamplesWriter>,
 ) -> anyhow::Result<()> {
     use bench_tx_maxtp::fstack;
 
@@ -768,6 +845,31 @@ fn run_maxtp_grid_fstack<W: std::io::Write>(
 
     for gr in grid_results {
         let bucket = gr.bucket;
+        // Phase 6 Task 6.2: emit a single `fstack_unsupported` marker row
+        // per bucket so the CSV schema stays uniform with dpdk + linux
+        // arms. FreeBSD TCP_INFO is reachable via ff_getsockopt but the
+        // surface is wide enough that we defer per-segment / per-snapshot
+        // emission to a future phase.
+        if let Some(saw) = send_ack_writer.as_deref_mut() {
+            let bucket_id = format!(
+                "W={}B,C={}",
+                bucket.write_bytes, bucket.conn_count
+            );
+            saw.row(&[
+                &bucket_id,
+                "0",
+                "fstack_unsupported",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+            ])
+            .context("emit fstack_unsupported marker row")?;
+        }
         match gr.result {
             Err(e) => {
                 eprintln!(
@@ -821,6 +923,7 @@ fn run_maxtp_grid_fstack<W: std::io::Write>(
     metadata: &RunMetadata,
     _nic_max_bps: Option<u64>,
     writer: &mut csv::Writer<W>,
+    mut send_ack_writer: Option<&mut RawSamplesWriter>,
 ) -> anyhow::Result<()> {
     eprintln!(
         "bench-tx-maxtp: WARN --stack fstack selected but binary built without `fstack` \
@@ -828,6 +931,29 @@ fn run_maxtp_grid_fstack<W: std::io::Write>(
          where libfstack.a is installed."
     );
     for bucket in grid {
+        // Phase 6 Task 6.2: even on the stub path emit the
+        // `fstack_unsupported` marker row when --send-ack-csv was set,
+        // for schema uniformity.
+        if let Some(saw) = send_ack_writer.as_deref_mut() {
+            let bucket_id = format!(
+                "W={}B,C={}",
+                bucket.write_bytes, bucket.conn_count
+            );
+            saw.row(&[
+                &bucket_id,
+                "0",
+                "fstack_unsupported",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+            ])
+            .context("emit fstack_unsupported marker row (stub)")?;
+        }
         let agg = maxtp::BucketAggregate::from_sample(
             *bucket,
             Stack::Fstack,
