@@ -1,0 +1,41 @@
+[package]
+name = "bench-fstack-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# bench-fstack-ffi — minimal F-Stack FFI bindings shared across the
+# bench-* crates. Contains LINUX-namespace constants + ff_* extern
+# decls + a thin sockaddr_in helper.
+#
+# Phase 5 Task 5.4 of the 2026-05-09 bench-suite overhaul. Replaces the
+# three duplicated `fstack_ffi.rs` modules in bench-rtt, bench-tx-burst,
+# and bench-tx-maxtp.
+#
+# # Build-time linkage
+#
+# This crate does NOT emit any `cargo:rustc-link-*` directives. The
+# `ff_*` extern decls are unresolved at the crate's lib boundary; the
+# downstream binary's build.rs is responsible for pulling in
+# libfstack.a + the DPDK whole-archive block at the binary link step.
+# (Cargo only propagates `cargo:rustc-link-lib` from upstream
+# `links="<name>"` crates, but the F-Stack link layout requires a
+# specific argument ORDER — whole-archive libfstack.a sandwiched
+# between -Wl,--push-state,--no-as-needed / -Wl,--pop-state — that
+# Cargo's link-lib emit can't express. Putting the linkage in the
+# binary's own build.rs keeps the order explicit.)
+#
+# Default build → no F-Stack linkage. Feature-gated `fstack` enables
+# the actual extern decls.
+
+[lib]
+name = "bench_fstack_ffi"
+path = "src/lib.rs"
+
+[features]
+default = []
+# Enables the F-Stack extern decls. Consumer crates must also have
+# their own build.rs link to libfstack.a + DPDK; otherwise link
+# fails at the binary stage.
+fstack = []

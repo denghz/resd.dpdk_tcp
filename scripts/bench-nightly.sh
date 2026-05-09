@@ -9,10 +9,10 @@
 #      Build precedes provisioning so a local build failure costs $0.
 #   5. SCP compiled bench binaries + preconditions checker + peer binaries
 #      to DUT and peer hosts (under /tmp).
-#   6. Start peer echo-server (bench-e2e/bench-stress/bench-vs-mtcp) +
-#      linux-tcp-sink (bench-vs-linux) on the peer host.
-#   7. Run on DUT: bench-e2e, bench-stress, bench-vs-linux (mode A+B),
-#      bench-offload-ab, bench-obs-overhead, bench-vs-mtcp (burst+maxtp).
+#   6. Start peer echo-server (bench-tx-burst / bench-tx-maxtp / bench-rtt) +
+#      linux-tcp-sink (bench-vs-linux + bench-tx-maxtp linux arm) on the peer.
+#   7. Run on DUT: bench-rtt, bench-vs-linux (mode B), bench-offload-ab,
+#      bench-obs-overhead, bench-tx-burst (burst grid), bench-tx-maxtp (maxtp grid).
 #   8. Run locally: cargo bench -p bench-micro + summarize.
 #   9. Pull CSVs back to target/bench-results/<timestamp>/.
 #  10. Invoke bench-report → JSON + HTML + Markdown.
@@ -27,8 +27,9 @@
 #   OUT_DIR        (optional) output dir; default target/bench-results/<ts>/
 #   MY_CIDR        (optional) operator /32 for SSH allow-list; default
 #                  auto-discovered via ifconfig.me
-#   NIC_MAX_BPS    (optional) peer NIC line rate for bench-vs-mtcp
-#                  saturation guard; default 100 Gbps (c6in.metal ENA)
+#   NIC_MAX_BPS    (optional) peer NIC line rate for bench-tx-burst /
+#                  bench-tx-maxtp saturation guard; default 100 Gbps
+#                  (c6in.metal ENA)
 #   SKIP_TEARDOWN  (optional) set to 1 to skip the trap EXIT teardown;
 #                  useful for debugging failed runs
 #
@@ -107,8 +108,9 @@ make -C tools/bench-vs-linux/peer linux-tcp-sink
 # [3/12] cargo build --release --workspace.
 # Built BEFORE provisioning so a local build failure costs $0 AWS spend.
 # If libfstack.a is available at the F-Stack install path (FF_PATH or
-# /opt/f-stack), rebuild bench-vs-mtcp with --features fstack so the
-# F-Stack bench arm produces real data instead of invalid-marker rows.
+# /opt/f-stack), rebuild bench-tx-burst, bench-tx-maxtp and bench-rtt
+# with --features fstack so the F-Stack bench arms produce real data
+# instead of invalid-marker rows.
 # Requires linker=gcc (GCC ld) because rust-lld (Rust 1.95+) does not
 # auto-generate __start/__stop ELF section-set symbols that F-Stack's
 # FreeBSD-derived module system relies on.
@@ -117,12 +119,15 @@ log "[3/12] cargo build --release --workspace"
 cargo build --release --workspace
 FF_LIB="${FF_PATH:-/opt/f-stack}/lib/libfstack.a"
 if [ -f "$FF_LIB" ]; then
-  log "  libfstack.a found at $FF_LIB — rebuilding bench-vs-mtcp with --features fstack"
+  log "  libfstack.a found at $FF_LIB — rebuilding bench-tx-burst + bench-tx-maxtp + bench-rtt with --features fstack"
   RUSTFLAGS="${RUSTFLAGS:-} -C linker=gcc" \
-    cargo build --release -p bench-vs-mtcp --features fstack \
-    || log "  WARN bench-vs-mtcp fstack build failed; fstack arm will emit invalid-marker rows"
+    cargo build --release \
+      -p bench-tx-burst --features bench-tx-burst/fstack \
+      -p bench-tx-maxtp --features bench-tx-maxtp/fstack \
+      -p bench-rtt --features bench-rtt/fstack \
+    || log "  WARN fstack build failed; fstack arms will emit invalid-marker rows"
 else
-  log "  $FF_LIB not present — bench-vs-mtcp fstack arm will emit invalid-marker rows"
+  log "  $FF_LIB not present — fstack arms will emit invalid-marker rows"
 fi
 
 # ---------------------------------------------------------------------------
@@ -321,7 +326,8 @@ DUT_BINS=(
   target/release/bench-vs-linux
   target/release/bench-offload-ab
   target/release/bench-obs-overhead
-  target/release/bench-vs-mtcp
+  target/release/bench-tx-burst
+  target/release/bench-tx-maxtp
 )
 PEER_BINS=(
   tools/bench-e2e/peer/echo-server
@@ -442,9 +448,9 @@ ssh "${SSH_OPTS[@]}" "ubuntu@$PEER_SSH" \
 # No separate fstack-peer process needed.
 
 # Create /etc/f-stack.conf on DUT for the fstack bench pass.
-# F-Stack and dpdk_net cannot share an EAL process, so bench-vs-mtcp
-# runs them as separate invocations; the fstack pass needs its own
-# config with the DUT's data-plane IP.
+# F-Stack and dpdk_net cannot share an EAL process, so bench-tx-burst /
+# bench-tx-maxtp run them as separate invocations; the fstack pass needs
+# its own config with the DUT's data-plane IP.
 refresh_ec2_ic_grants
 ssh "${SSH_OPTS[@]}" "ubuntu@$DUT_SSH" \
     "sudo tee /etc/f-stack.conf > /dev/null <<'FSTACK_CONF'
@@ -535,8 +541,8 @@ run_dut_bench() {
   return $rc
 }
 
-# Common args shared across bench-e2e / bench-stress / bench-vs-linux /
-# bench-vs-mtcp (DPDK stacks). bench-offload-ab / bench-obs-overhead are
+# Common args shared across bench-rtt / bench-vs-linux / bench-tx-burst /
+# bench-tx-maxtp (DPDK stacks). bench-offload-ab / bench-obs-overhead are
 # A/B drivers that shell out to bench-ab-runner internally, so they take
 # a narrower arg set.
 #
@@ -748,7 +754,7 @@ else
   # captures remain readable if tcpdump is killed before normal exit.
   # `-s 0` disables truncation (we need full TCP payloads for the
   # canonicaliser's option walker). `-w <file>` writes pcap. The `tcp
-  # and port 10001` filter narrows to the bench-vs-mtcp / bench-e2e
+  # and port 10001` filter narrows to the bench-tx-burst / bench-rtt
   # peer port — mode B does not compare RTT-port traffic so excluding
   # port 10002 keeps the diff deterministic.
   TCPDUMP_FILTER="tcp and port 10001"
@@ -914,81 +920,90 @@ scp "${SCP_OPTS[@]}" \
     || log "  gdb log scp failed — continuing"
 
 # ---------------------------------------------------------------------------
-# [11/12] bench-vs-mtcp burst + maxtp grids — four separate passes.
-# dpdk/fstack/mtcp cannot share a process (all call rte_eal_init).
-# dpdk and linux are split so the peer doesn't accumulate backlog across
-# 56 buckets, which caused W=65536 C=64 / W=262144 handshake failures.
+# [11/12] bench-tx-burst + bench-tx-maxtp grids — six separate passes.
+# Phase 5 of the 2026-05-09 bench-suite overhaul split bench-vs-mtcp into
+# bench-tx-burst (K x G one-shot grid) and bench-tx-maxtp (W x C
+# sustained-rate grid). dpdk and fstack still cannot share an EAL process
+# (both call rte_eal_init); each stack runs as its own pass.
 # ---------------------------------------------------------------------------
-log "[11/12] bench-vs-mtcp burst grid — pass 1: dpdk"
-run_dut_bench bench-vs-mtcp bench-vs-mtcp-burst \
+log "[11/12] bench-tx-burst — pass 1: dpdk_net"
+run_dut_bench bench-tx-burst bench-tx-burst-dpdk_net \
     "${DPDK_COMMON[@]}" \
-    --workload burst \
     --peer-port 10001 \
-    --stacks dpdk \
-    --tool bench-vs-mtcp \
+    --stack dpdk_net \
+    --tool bench-tx-burst \
     --feature-set trading-latency \
     --nic-max-bps "$NIC_MAX_BPS" \
-    || log "  [11/12] bench-vs-mtcp burst dpdk exited non-zero — continuing"
+    || log "  [11/12] bench-tx-burst dpdk_net exited non-zero — continuing"
 
-log "[11a/12] bench-vs-mtcp burst grid — pass 2: fstack"
+log "[11a/12] bench-tx-burst — pass 2: linux_kernel"
+# Phase 5 Task 5.1 added the linux_kernel burst arm; peer is the same
+# echo-server on port 10001 (the recv path is drained but not measured).
+run_dut_bench bench-tx-burst bench-tx-burst-linux_kernel \
+    "${DPDK_COMMON[@]}" \
+    --peer-port 10001 \
+    --stack linux_kernel \
+    --tool bench-tx-burst \
+    --feature-set trading-latency \
+    --nic-max-bps "$NIC_MAX_BPS" \
+    || log "  [11a/12] bench-tx-burst linux_kernel exited non-zero — continuing"
+
+log "[11b/12] bench-tx-burst — pass 3: fstack"
 # fstack connects to port 10001 (same dpdk echo-server; standard TCP).
-run_dut_bench bench-vs-mtcp bench-vs-mtcp-burst-fstack \
+run_dut_bench bench-tx-burst bench-tx-burst-fstack \
     --peer-ip "$PEER_IP" \
     --local-ip "$DUT_IP" \
-    --workload burst \
-    --stacks fstack \
-    --fstack-peer-port 10001 \
+    --peer-port 10001 \
+    --stack fstack \
     --fstack-conf /etc/f-stack.conf \
     --fstack-eal-args "$EAL_ARGS" \
     --lcore 2 \
     --precondition-mode lenient \
-    --tool bench-vs-mtcp \
+    --tool bench-tx-burst \
     --feature-set trading-latency \
     --nic-max-bps "$NIC_MAX_BPS" \
-    || log "  [11a/12] bench-vs-mtcp burst fstack exited non-zero — continuing"
+    || log "  [11b/12] bench-tx-burst fstack exited non-zero — continuing"
 
-log "[11b/12] bench-vs-mtcp maxtp grid — pass 1: dpdk"
+log "[11c/12] bench-tx-maxtp — pass 1: dpdk_net"
 # dpdk alone so the peer stays below backlog threshold for large-W buckets.
-run_dut_bench bench-vs-mtcp bench-vs-mtcp-maxtp \
+run_dut_bench bench-tx-maxtp bench-tx-maxtp-dpdk_net \
     "${DPDK_COMMON[@]}" \
-    --workload maxtp \
     --peer-port 10001 \
-    --stacks dpdk \
-    --tool bench-vs-mtcp \
+    --stack dpdk_net \
+    --tool bench-tx-maxtp \
     --feature-set trading-latency \
     --nic-max-bps "$NIC_MAX_BPS" \
-    || log "  [11b/12] bench-vs-mtcp maxtp dpdk exited non-zero — continuing"
+    || log "  [11c/12] bench-tx-maxtp dpdk_net exited non-zero — continuing"
 
-log "[11b2/12] bench-vs-mtcp maxtp grid — pass 2: linux"
-# linux in its own pass (kernel TCP via veth/NAT); peer linux-tcp-sink
-# on port 10002 discards data so recv-buffer doesn't backpressure.
-run_dut_bench bench-vs-mtcp bench-vs-mtcp-maxtp-linux \
+log "[11d/12] bench-tx-maxtp — pass 2: linux_kernel"
+# linux_kernel arm targets port 10002 (linux-tcp-sink) which DISCARDS
+# bytes; pointing at echo-server back-pressures the kernel TCP recv
+# buffer to ~0 Gbps. Task 5.5 asserts peer_port=10002 inside the
+# linux arm at start-of-bench.
+run_dut_bench bench-tx-maxtp bench-tx-maxtp-linux_kernel \
     "${DPDK_COMMON[@]}" \
-    --workload maxtp \
-    --peer-port 10001 \
-    --linux-peer-port 10002 \
-    --stacks linux \
-    --tool bench-vs-mtcp \
+    --peer-port 10002 \
+    --stack linux_kernel \
+    --tool bench-tx-maxtp \
     --feature-set trading-latency \
     --nic-max-bps "$NIC_MAX_BPS" \
-    || log "  [11b2/12] bench-vs-mtcp maxtp linux exited non-zero — continuing"
+    || log "  [11d/12] bench-tx-maxtp linux_kernel exited non-zero — continuing"
 
-log "[11c/12] bench-vs-mtcp maxtp grid — pass 3: fstack"
+log "[11e/12] bench-tx-maxtp — pass 3: fstack"
 # fstack connects to port 10001 (dpdk echo-server); NIC stays vfio-pci.
-run_dut_bench bench-vs-mtcp bench-vs-mtcp-maxtp-fstack \
+run_dut_bench bench-tx-maxtp bench-tx-maxtp-fstack \
     --peer-ip "$PEER_IP" \
     --local-ip "$DUT_IP" \
-    --workload maxtp \
-    --stacks fstack \
-    --fstack-peer-port 10001 \
+    --peer-port 10001 \
+    --stack fstack \
     --fstack-conf /etc/f-stack.conf \
     --fstack-eal-args "$EAL_ARGS" \
     --lcore 2 \
     --precondition-mode lenient \
-    --tool bench-vs-mtcp \
+    --tool bench-tx-maxtp \
     --feature-set trading-latency \
     --nic-max-bps "$NIC_MAX_BPS" \
-    || log "  [11c/12] bench-vs-mtcp maxtp fstack exited non-zero — continuing"
+    || log "  [11e/12] bench-tx-maxtp fstack exited non-zero — continuing"
 
 # ---------------------------------------------------------------------------
 # [12/12] Local bench-micro + summarize + bench-report.

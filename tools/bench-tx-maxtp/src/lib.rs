@@ -22,12 +22,17 @@
 pub mod dpdk;
 #[cfg(feature = "fstack")]
 pub mod fstack;
-#[cfg(feature = "fstack")]
-pub mod fstack_ffi;
 pub mod linux;
 pub mod maxtp;
 pub mod peer_introspect;
 pub mod preflight;
+
+// Phase 5 Task 5.4 of the 2026-05-09 bench-suite overhaul lifted the
+// `fstack_ffi` module into the shared `bench-fstack-ffi` crate. Re-
+// export under the legacy path so the F-Stack pump's
+// `crate::fstack_ffi::...` imports keep working without churn.
+#[cfg(feature = "fstack")]
+pub use bench_fstack_ffi as fstack_ffi;
 
 /// Stack identifier for CSV `dimensions_json` + runner dispatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

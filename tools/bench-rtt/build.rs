@@ -2,12 +2,12 @@
 //! cargo feature is enabled. No-op otherwise so default workspace
 //! builds don't require F-Stack on the dev host.
 //!
-//! Mirrors `tools/bench-vs-mtcp/build.rs` verbatim. The duplication
-//! exists for the same reason `src/fstack_ffi.rs` is duplicated:
-//! bench-vs-mtcp depends on bench-rtt for the workload helpers, so
-//! bench-rtt cannot depend back on bench-vs-mtcp without a cycle.
-//! Phase 5 of the bench-suite overhaul lifts both this build script
-//! and the FFI bindings into a shared crate.
+//! Phase 5 Task 5.4 of the 2026-05-09 bench-suite overhaul lifted the
+//! FFI bindings (`src/fstack_ffi.rs`) into the shared
+//! `bench-fstack-ffi` crate; this build.rs stayed in-place because
+//! the libfstack.a + DPDK link-arg ORDER cannot be expressed via
+//! Cargo's link-lib emit (it requires the push-state, --no-as-needed,
+//! whole-archive sandwich shape).
 //!
 //! DPDK is intentionally NOT re-linked here. dpdk-net-sys (a transitive
 //! dep via dpdk-net-core) already links DPDK via pkg-config. Adding a

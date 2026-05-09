@@ -49,13 +49,17 @@ default = []
 # (image-builder component 04b-install-f-stack.yaml). Default builds
 # skip the F-Stack arm so the workspace compiles on dev hosts without
 # F-Stack.
-fstack = []
+#
+# The FFI bindings come from the shared `bench-fstack-ffi` crate
+# (Phase 5 Task 5.4 consolidation); this crate's own build.rs still
+# owns the link-arg recipe.
+fstack = ["bench-fstack-ffi/fstack"]
 
 [dependencies]
 bench-common = { path = "../bench-common" }
+bench-fstack-ffi = { path = "../bench-fstack-ffi" }
 # bench-rtt provides workload helpers (open_connection,
 # drain_and_accumulate_readable, tsc_delta_to_ns) used by the dpdk arm.
-# Same dependency shape the legacy bench-vs-mtcp had.
 bench-rtt = { path = "../bench-rtt" }
 dpdk-net-core = { path = "../../crates/dpdk-net-core" }
 dpdk-net-sys = { path = "../../crates/dpdk-net-sys" }

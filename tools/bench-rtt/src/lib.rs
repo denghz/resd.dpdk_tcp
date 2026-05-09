@@ -13,10 +13,16 @@
 
 pub mod attribution;
 pub mod fstack;
-#[cfg(feature = "fstack")]
-pub mod fstack_ffi;
 pub mod hw_task_18;
 pub mod linux_kernel;
 pub mod stack;
 pub mod sum_identity;
 pub mod workload;
+
+// Phase 5 Task 5.4 of the 2026-05-09 bench-suite overhaul lifted the
+// `fstack_ffi` module into the shared `bench-fstack-ffi` crate. Re-
+// export under the legacy path so internal `crate::fstack_ffi::...`
+// imports keep working without churn through the F-Stack pump
+// state machine.
+#[cfg(feature = "fstack")]
+pub use bench_fstack_ffi as fstack_ffi;

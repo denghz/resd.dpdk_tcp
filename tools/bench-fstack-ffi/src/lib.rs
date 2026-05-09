@@ -1,22 +1,21 @@
-//! F-Stack FFI bindings — minimal subset for bench-vs-mtcp burst + maxtp.
+//! F-Stack FFI bindings — minimal subset shared across bench tools.
 //!
 //! F-Stack (https://github.com/F-Stack/f-stack, Tencent) is a FreeBSD
 //! TCP/IP stack ported to userspace on DPDK. Unlike mTCP (last
 //! meaningful upstream commit 2021, dormant) F-Stack is actively
 //! maintained and builds against DPDK 23.11 directly.
 //!
-//! This module is gated behind the `fstack` cargo feature so default
-//! builds don't require libfstack.a (which only exists on the
-//! bench-pair AMI — see image-builder component
-//! `04b-install-f-stack.yaml`). The Rust workspace builds cleanly on
-//! dev hosts that don't have F-Stack installed.
+//! Phase 5 Task 5.4 of the 2026-05-09 bench-suite overhaul lifted these
+//! bindings out of the three duplicated `fstack_ffi.rs` modules in
+//! bench-rtt, bench-tx-burst, and bench-tx-maxtp. All three crates
+//! now `use bench_fstack_ffi::...` instead.
 //!
 //! # API surface
 //!
 //! F-Stack exposes a BSD-socket-shaped API prefixed `ff_*`:
 //! `ff_init`, `ff_socket`, `ff_bind`, `ff_listen`, `ff_connect`,
 //! `ff_accept`, `ff_read`, `ff_write`, `ff_close`. We bind a tight
-//! subset — just enough to drive the burst + maxtp comparators
+//! subset — just enough to drive RTT, burst, and maxtp comparators
 //! against the same `bench-peer-fstack` listener that the AMI
 //! component installs at `/opt/f-stack-peer/bench-peer`.
 //!
@@ -29,12 +28,34 @@
 //! use a `#[repr(C)]` mirror of `linux_sockaddr` here so the FFI
 //! signature lines up exactly.
 //!
+//! # Errno + sockopt namespace (T50 lessons)
+//!
+//! F-Stack runs on Linux but its compat layer uses LINUX-namespace
+//! constants for both errno (`EAGAIN=11`, `EINPROGRESS=115`) and
+//! `getsockopt(SOL_SOCKET=1, SO_ERROR=4, ...)` via the
+//! `ff_getsockopt` (NOT `_freebsd`) entry point.
+//!
+//! # Connect detection — `ff_poll(POLLOUT, timeout=0)`
+//!
+//! `SO_ERROR` alone is unreliable for non-blocking connect (returns 0
+//! both during SYN_SENT and after success). Poll for POLLOUT readiness
+//! first; once it fires, check SO_ERROR to distinguish success from
+//! refused.
+//!
 //! # Lifetime + thread-safety
 //!
 //! `ff_init` MUST be called exactly once per process and from the
-//! lcore F-Stack pinned. Bench-vs-mtcp drives a single lcore so this
-//! is naturally one-shot. Caller (`fstack_burst`/`fstack_maxtp`) owns
-//! the `ff_init` call site.
+//! lcore F-Stack pinned. Each bench binary owns its own ff_init call
+//! site; this crate just exposes the binding.
+//!
+//! # Build-time linkage
+//!
+//! This crate emits NO `cargo:rustc-link-*` directives. The
+//! downstream binary's build.rs is responsible for pulling in
+//! libfstack.a + the DPDK whole-archive block at the binary link
+//! step. See bench-tx-burst/build.rs for the canonical recipe.
+
+#![cfg(feature = "fstack")]
 
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int, c_uint, c_void};
@@ -42,9 +63,7 @@ use std::os::raw::{c_char, c_int, c_uint, c_void};
 /// F-Stack's internal sockaddr shape — BSD-style on the wire for AF_INET,
 /// but the API is named `linux_sockaddr` because F-Stack converts between
 /// Linux + FreeBSD layouts internally. For AF_INET this is byte-identical
-/// to `libc::sockaddr_in` minus the trailing 8-byte padding (16 B vs 16 B
-/// — the trailing `sa_data[14]` covers everything but the first 2 B of
-/// family). See `lib/ff_api.h::linux_sockaddr`.
+/// to `libc::sockaddr_in`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct LinuxSockaddr {
@@ -139,9 +158,6 @@ pub const POLLOUT: i16 = 0x0004;
 
 /// Socket-level option identifier — Linux value, for use with
 /// `ff_getsockopt` / `ff_setsockopt` (NOT the `_freebsd` variants).
-/// F-Stack exposes two getsockopt APIs: `ff_getsockopt` takes Linux-
-/// namespace level/optname; `ff_getsockopt_freebsd` takes FreeBSD-
-/// namespace. We use `ff_getsockopt` so this is 1, not FreeBSD 0xffff.
 pub const SOL_SOCKET: c_int = 1;
 
 /// Socket option: pending connect error (getsockopt after EINPROGRESS).
