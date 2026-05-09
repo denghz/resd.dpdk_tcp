@@ -102,6 +102,7 @@ fi
 # ---------------------------------------------------------------------------
 log "[2/12] building peer C binaries"
 make -C tools/bench-e2e/peer echo-server
+make -C tools/bench-e2e/peer burst-echo-server
 make -C tools/bench-vs-linux/peer linux-tcp-sink
 
 # ---------------------------------------------------------------------------
@@ -119,12 +120,13 @@ log "[3/12] cargo build --release --workspace"
 cargo build --release --workspace
 FF_LIB="${FF_PATH:-/opt/f-stack}/lib/libfstack.a"
 if [ -f "$FF_LIB" ]; then
-  log "  libfstack.a found at $FF_LIB — rebuilding bench-tx-burst + bench-tx-maxtp + bench-rtt with --features fstack"
+  log "  libfstack.a found at $FF_LIB — rebuilding bench-tx-burst + bench-tx-maxtp + bench-rtt + bench-rx-burst with --features fstack"
   RUSTFLAGS="${RUSTFLAGS:-} -C linker=gcc" \
     cargo build --release \
       -p bench-tx-burst --features bench-tx-burst/fstack \
       -p bench-tx-maxtp --features bench-tx-maxtp/fstack \
       -p bench-rtt --features bench-rtt/fstack \
+      -p bench-rx-burst --features bench-rx-burst/fstack \
     || log "  WARN fstack build failed; fstack arms will emit invalid-marker rows"
 else
   log "  $FF_LIB not present — fstack arms will emit invalid-marker rows"
@@ -328,9 +330,11 @@ DUT_BINS=(
   target/release/bench-obs-overhead
   target/release/bench-tx-burst
   target/release/bench-tx-maxtp
+  target/release/bench-rx-burst
 )
 PEER_BINS=(
   tools/bench-e2e/peer/echo-server
+  tools/bench-e2e/peer/burst-echo-server
   tools/bench-vs-linux/peer/linux-tcp-sink
 )
 # F-Stack peer is built on the AMI itself (against the AMI's libfstack.a +
@@ -442,6 +446,14 @@ ssh "${SSH_OPTS[@]}" "ubuntu@$PEER_SSH" \
 refresh_ec2_ic_grants
 ssh "${SSH_OPTS[@]}" "ubuntu@$PEER_SSH" \
     "nohup /tmp/linux-tcp-sink 10002 >/tmp/linux-tcp-sink.log 2>&1 </dev/null &"
+# Phase 8 of the 2026-05-09 bench-suite overhaul: burst-echo-server is
+# the peer for bench-rx-burst. Listens on port 10003; bench-rx-burst
+# sends `BURST N W\n` commands and the server ships N segments of W
+# bytes back-to-back with 16-byte headers (be64 seq_idx + be64
+# peer_send_ns).
+refresh_ec2_ic_grants
+ssh "${SSH_OPTS[@]}" "ubuntu@$PEER_SSH" \
+    "nohup /tmp/burst-echo-server 10003 >/tmp/burst-echo-server.log 2>&1 </dev/null &"
 
 # F-Stack uses the same dpdk echo-server on port 10001 (fstack sends
 # standard TCP; the peer DPDK echo-server echoes it back transparently).
@@ -1040,6 +1052,78 @@ run_dut_bench bench-tx-maxtp bench-tx-maxtp-fstack \
     --feature-set trading-latency \
     --nic-max-bps "$NIC_MAX_BPS" \
     || log "  [11e/12] bench-tx-maxtp fstack exited non-zero — continuing"
+
+# ---------------------------------------------------------------------------
+# [11f/12] bench-rx-burst grid — three passes (dpdk_net + linux_kernel +
+# fstack). Phase 8 of the 2026-05-09 bench-suite overhaul. Closes
+# claims C-A3 (final replacement for bench-rx-zero-copy placeholder),
+# C-B3 (per-RX-segment latency), C-C2 (RX burst workload).
+#
+# Per stack: W in {64,128,256} × N in {16,64,256,1024} = 12 buckets.
+# All three passes target the burst-echo-server on port 10003 (peer
+# binary built in step [2/12], deployed in step [5/12], started in
+# step [6/12]).
+# ---------------------------------------------------------------------------
+BENCH_RX_MEASURE_BURSTS="${BENCH_RX_MEASURE_BURSTS:-1000}"
+
+log "[11f/12] bench-rx-burst — pass 1: dpdk_net"
+run_dut_bench bench-rx-burst bench-rx-burst-dpdk_net \
+    "${DPDK_COMMON[@]}" \
+    --stack dpdk_net \
+    --peer-control-port 10003 \
+    --segment-sizes 64,128,256 \
+    --burst-counts 16,64,256,1024 \
+    --warmup-bursts 100 \
+    --measure-bursts "$BENCH_RX_MEASURE_BURSTS" \
+    --raw-samples-csv /tmp/bench-rx-burst-dpdk_net-raw.csv \
+    --tool bench-rx-burst \
+    --feature-set trading-latency \
+    || log "  [11f/12] bench-rx-burst dpdk_net exited non-zero — continuing"
+# Pull the raw-samples sidecar back for offline analysis.
+refresh_ec2_ic_grants
+scp "${SCP_OPTS[@]}" \
+    "ubuntu@$DUT_SSH:/tmp/bench-rx-burst-dpdk_net-raw.csv" "$OUT_DIR/" \
+    || log "  scp bench-rx-burst-dpdk_net-raw.csv failed — continuing"
+
+log "[11g/12] bench-rx-burst — pass 2: linux_kernel"
+run_dut_bench bench-rx-burst bench-rx-burst-linux_kernel \
+    "${DPDK_COMMON[@]}" \
+    --stack linux_kernel \
+    --peer-control-port 10003 \
+    --segment-sizes 64,128,256 \
+    --burst-counts 16,64,256,1024 \
+    --warmup-bursts 100 \
+    --measure-bursts "$BENCH_RX_MEASURE_BURSTS" \
+    --raw-samples-csv /tmp/bench-rx-burst-linux_kernel-raw.csv \
+    --tool bench-rx-burst \
+    --feature-set trading-latency \
+    || log "  [11g/12] bench-rx-burst linux_kernel exited non-zero — continuing"
+refresh_ec2_ic_grants
+scp "${SCP_OPTS[@]}" \
+    "ubuntu@$DUT_SSH:/tmp/bench-rx-burst-linux_kernel-raw.csv" "$OUT_DIR/" \
+    || log "  scp bench-rx-burst-linux_kernel-raw.csv failed — continuing"
+
+log "[11h/12] bench-rx-burst — pass 3: fstack"
+run_dut_bench bench-rx-burst bench-rx-burst-fstack \
+    --peer-ip "$PEER_IP" \
+    --local-ip "$DUT_IP" \
+    --stack fstack \
+    --peer-control-port 10003 \
+    --segment-sizes 64,128,256 \
+    --burst-counts 16,64,256,1024 \
+    --warmup-bursts 100 \
+    --measure-bursts "$BENCH_RX_MEASURE_BURSTS" \
+    --raw-samples-csv /tmp/bench-rx-burst-fstack-raw.csv \
+    --fstack-conf /etc/f-stack.conf \
+    --lcore 2 \
+    --precondition-mode lenient \
+    --tool bench-rx-burst \
+    --feature-set trading-latency \
+    || log "  [11h/12] bench-rx-burst fstack exited non-zero — continuing"
+refresh_ec2_ic_grants
+scp "${SCP_OPTS[@]}" \
+    "ubuntu@$DUT_SSH:/tmp/bench-rx-burst-fstack-raw.csv" "$OUT_DIR/" \
+    || log "  scp bench-rx-burst-fstack-raw.csv failed — continuing"
 
 # ---------------------------------------------------------------------------
 # [12/12] Local bench-micro + summarize + bench-report.
