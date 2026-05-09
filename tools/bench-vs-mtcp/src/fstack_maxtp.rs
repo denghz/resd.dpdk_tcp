@@ -434,13 +434,12 @@ fn pump_round_robin_once(fds: &[c_int], payload: &[u8], discard: &mut [u8]) -> u
     for &fd in fds {
         // Drain inbound (non-blocking). Cap at 8 reads per conn per
         // sweep so a fast peer cannot starve other conns this callback.
+        // Break only on EAGAIN (n ≤ 0); a partial read does NOT indicate
+        // the recv buffer is drained.
         for _ in 0..8 {
             let n = unsafe { ff_read(fd, discard.as_mut_ptr() as *mut c_void, discard.len()) };
             if n <= 0 {
                 break; // EAGAIN or EOF
-            }
-            if (n as usize) < discard.len() {
-                break; // partial read → recv buffer now empty
             }
         }
         // Single non-blocking write attempt.
