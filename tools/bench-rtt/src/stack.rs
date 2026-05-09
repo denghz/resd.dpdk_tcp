@@ -12,13 +12,20 @@
 
 use clap::ValueEnum;
 
+/// Stack selector. Variant names use snake_case via `value(name="...")`
+/// so the operator-facing form is `dpdk_net` / `linux_kernel` / `fstack`
+/// (matching the historical bench-vs-linux `--stacks` token shape and
+/// the bench-nightly.sh wiring), not clap's default kebab-case.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Stack {
     /// dpdk_net (this crate's `dpdk_net_core::Engine` path).
+    #[value(name = "dpdk_net")]
     DpdkNet,
     /// Linux kernel TCP via `std::net::TcpStream` — comparator baseline.
+    #[value(name = "linux_kernel")]
     LinuxKernel,
     /// F-Stack on DPDK (feature-gated).
+    #[value(name = "fstack")]
     Fstack,
 }
 
