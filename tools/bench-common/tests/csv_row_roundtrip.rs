@@ -36,6 +36,8 @@ fn sample_row() -> CsvRow {
         dpdk_version_pkgconfig: Some("23.11.2".into()),
         worktree_branch: Some("a10-perf-23.11".into()),
         uprof_session_id: None,
+        raw_samples_path: None,
+        failed_iter_count: 0,
     }
 }
 
@@ -263,6 +265,10 @@ fn csv_row_deserialize_tolerates_missing_task_2_8_columns() {
 /// write-then-read through the CSV reader, including the numeric
 /// `cpu_family` (u32) and the mixed-populated `uprof_session_id` case
 /// (None emits empty and reads back as None).
+///
+/// Phase 3 adds `raw_samples_path` and `failed_iter_count` after the Task
+/// 2.8 columns, so the header's `ends_with` assertion now covers both
+/// blocks; the data row's trailing `,0` is the `failed_iter_count` cell.
 #[test]
 fn csv_row_round_trip_task_2_8_identification_fields() {
     let row = sample_row();
@@ -272,12 +278,18 @@ fn csv_row_round_trip_task_2_8_identification_fields() {
         row.write_with_header(&mut wtr).unwrap();
     }
     let text = std::str::from_utf8(&buf).unwrap();
-    // Sanity: header and data row both contain the new columns.
+    // Sanity: header includes the Task 2.8 + Phase 3 trailing columns in
+    // the expected order.
     let header = text.lines().next().unwrap();
-    assert!(header.ends_with(",cpu_family,cpu_model_name,dpdk_version_pkgconfig,worktree_branch,uprof_session_id"));
-    // Data row ends with a trailing empty cell for the `None` uprof_session_id.
+    assert!(header.ends_with(
+        ",cpu_family,cpu_model_name,dpdk_version_pkgconfig,worktree_branch,\
+         uprof_session_id,raw_samples_path,failed_iter_count"
+    ));
+    // Data row ends with `,0` — the `failed_iter_count` cell for a default
+    // sample. The two cells before it are the empty `uprof_session_id` and
+    // empty `raw_samples_path`, so the suffix is `,,,0`.
     let data = text.lines().nth(1).unwrap();
-    assert!(data.ends_with(","), "last cell should be empty for None: got {data}");
+    assert!(data.ends_with(",,,0"), "expected trailing ,,,0 (uprof+raw_samples_path empty, failed_iter_count=0): got {data}");
 
     let mut rdr = csv::Reader::from_reader(&buf[..]);
     let parsed: CsvRow = rdr.deserialize().next().unwrap().unwrap();

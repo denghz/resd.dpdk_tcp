@@ -553,6 +553,8 @@ fn emit_csv(args: &Args, meta: &RunMetadata, samples: &[f64]) -> anyhow::Result<
             dpdk_version_pkgconfig: None,
             worktree_branch: None,
             uprof_session_id: None,
+            raw_samples_path: None,
+            failed_iter_count: 0,
         };
         wtr.serialize(&row)?;
     }

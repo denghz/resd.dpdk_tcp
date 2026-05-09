@@ -126,6 +126,8 @@ mod tests {
             dpdk_version_pkgconfig: None,
             worktree_branch: None,
             uprof_session_id: None,
+            raw_samples_path: None,
+            failed_iter_count: 0,
         }
     }
 
