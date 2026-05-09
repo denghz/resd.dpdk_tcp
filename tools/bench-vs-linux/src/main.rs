@@ -1,10 +1,11 @@
 //! bench-vs-linux — dual-stack latency comparison vs. Linux TCP.
 //!
 //! A10 Plan B Task 8 (spec §8, parent spec §11.5). Mode A only: RTT
-//! distribution across up to three stacks (dpdk_net, linux_kernel,
-//! afpacket) under the trading-latency preset. Mode B (wire-diff,
-//! rfc_compliance preset) lands in T9 — `--mode wire-diff` routes to
-//! the T9 stub and errors with a pointer.
+//! distribution across the comparator stacks (dpdk_net, linux_kernel,
+//! and optionally fstack) under the trading-latency preset. Mode B
+//! (wire-diff, rfc_compliance preset) lands in T9 — `--mode wire-diff`
+//! routes to the T9 stub and errors with a pointer. The legacy
+//! `afpacket` stub was removed in the 2026-05-09 bench-suite overhaul.
 //!
 //! # Preset
 //!
@@ -59,8 +60,11 @@ struct Args {
     #[arg(long, default_value_t = 10_001)]
     peer_port: u16,
 
-    /// Peer iface name — used by the AF_PACKET path (unused on the
-    /// dpdk + linux_kernel paths; still required for uniform CLI).
+    /// Peer iface name. Currently unused — the live comparator stacks
+    /// (dpdk_net, linux_kernel, fstack) all source the iface from
+    /// either DPDK PCI binding (dpdk/fstack) or the kernel routing
+    /// table (linux_kernel). Kept on the CLI for downstream tooling
+    /// that expects the slot.
     #[arg(long, default_value = "")]
     peer_iface: String,
 
@@ -70,11 +74,10 @@ struct Args {
     #[arg(long, default_value_t = 10_003)]
     fstack_peer_port: u16,
 
-    /// CSV of stacks to run. Tokens: `dpdk`, `linux`, `afpacket`.
-    /// Default is all three; the AF_PACKET path errors at startup in
-    /// T8 (see src/afpacket.rs module docs) so real T8 runs pass
-    /// `--stacks dpdk,linux` unless lenient mode is set.
-    #[arg(long, default_value = "dpdk,linux,afpacket")]
+    /// CSV of stacks to run. Tokens: `dpdk`, `linux`, `fstack`.
+    /// Default `dpdk,linux` — fstack requires `--features fstack`
+    /// and libfstack.a so it's opt-in.
+    #[arg(long, default_value = "dpdk,linux")]
     stacks: String,
 
     /// Request payload size in bytes (same default as bench-e2e).
@@ -98,8 +101,9 @@ struct Args {
     output_csv: std::path::PathBuf,
 
     /// Precondition mode: `strict` aborts on precondition failure OR
-    /// on a selected stack failing bring-up (e.g. the AF_PACKET stub
-    /// error); `lenient` warns and skips the stack.
+    /// on a selected stack failing bring-up; `lenient` warns and
+    /// continues (e.g. drops fstack when the binary was built without
+    /// `--features fstack`).
     #[arg(long, default_value = "strict")]
     precondition_mode: String,
 
@@ -164,21 +168,11 @@ fn main() -> anyhow::Result<()> {
     // init is needed.
     let mut stacks = parse_stacks(&args.stacks)?;
 
-    // In lenient mode, drop AF_PACKET from the selection with a warning
-    // — its implementation is deferred. Strict mode keeps it and lets
-    // the per-stack bring-up surface the `Unimplemented` error.
+    // In lenient mode, drop F-Stack from the selection if the binary
+    // was built without the `fstack` feature — the run-time arm bails
+    // immediately otherwise. Strict mode keeps it and lets the per-
+    // stack bring-up surface the cargo-feature error.
     if matches!(mode, PreconditionMode::Lenient) {
-        let before = stacks.len();
-        stacks.retain(|s| !matches!(s, Stack::AfPacket));
-        if stacks.len() != before {
-            eprintln!(
-                "bench-vs-linux: WARN dropping afpacket stack in lenient mode \
-                 (Plan B T8 stub — see src/afpacket.rs)"
-            );
-        }
-        // Drop F-Stack in lenient mode too if the binary was built
-        // without the `fstack` feature — the run-time arm bails
-        // immediately otherwise.
         #[cfg(not(feature = "fstack"))]
         {
             let before = stacks.len();
@@ -619,10 +613,10 @@ mod tests {
 
     #[test]
     fn parse_stacks_default_is_all_three() {
-        let out = parse_stacks("dpdk,linux,afpacket").unwrap();
+        let out = parse_stacks("dpdk,linux,fstack").unwrap();
         assert_eq!(
             out,
-            vec![Stack::DpdkNet, Stack::LinuxKernel, Stack::AfPacket]
+            vec![Stack::DpdkNet, Stack::LinuxKernel, Stack::FStack]
         );
     }
 
@@ -649,14 +643,15 @@ mod tests {
 
     #[test]
     fn parse_stacks_rejects_unknown_token() {
+        // Includes the legacy `afpacket` token (removed 2026-05-09).
+        assert!(parse_stacks("dpdk,afpacket").is_err());
         assert!(parse_stacks("dpdk,garbage").is_err());
     }
 
     #[test]
     fn parse_stacks_empty_returns_empty() {
         // Empty selection is allowed at parse time; main.rs rejects it
-        // after lenient-mode AF_PACKET pruning so the error message is
-        // localised.
+        // after lenient-mode pruning so the error message is localised.
         let out = parse_stacks("").unwrap();
         assert!(out.is_empty());
     }

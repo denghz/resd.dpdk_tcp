@@ -5,7 +5,6 @@
 //! can validate the pure-Rust primitives without touching DPDK/EAL.
 //! The binary consumes the same modules via `use bench_vs_linux::*`.
 
-pub mod afpacket;
 #[cfg(feature = "fstack")]
 pub mod fstack;
 pub mod linux_kernel;
@@ -16,20 +15,23 @@ pub mod normalize;
 
 /// Stack identifier for CSV `dimensions_json` + mode-A iteration.
 ///
-/// Four values for mode A: `dpdk_net` (our stack), `linux_kernel`
-/// (standard socket path), `afpacket` (AF_PACKET mmap user-space
-/// delivery), `fstack` (F-Stack — FreeBSD TCP/IP stack ported to
-/// userspace on DPDK; actively maintained, builds against DPDK 23.11).
-/// The F-Stack arm is feature-gated (`--features fstack`) so default
-/// builds compile on dev hosts without libfstack.a; the AMI build
-/// provides libfstack.a at `/opt/f-stack/lib/libfstack.a` (image-builder
-/// component `04b-install-f-stack.yaml`). The enum serialises to the
-/// lowercase string form emitted into `dimensions_json.stack`.
+/// Three values for mode A: `dpdk_net` (our stack), `linux_kernel`
+/// (standard socket path), and `fstack` (F-Stack — FreeBSD TCP/IP
+/// stack ported to userspace on DPDK; actively maintained, builds
+/// against DPDK 23.11). The F-Stack arm is feature-gated
+/// (`--features fstack`) so default builds compile on dev hosts
+/// without libfstack.a; the AMI build provides libfstack.a at
+/// `/opt/f-stack/lib/libfstack.a` (image-builder component
+/// `04b-install-f-stack.yaml`). The enum serialises to the lowercase
+/// string form emitted into `dimensions_json.stack`.
+///
+/// The legacy `afpacket` arm was removed in the 2026-05-09 bench-suite
+/// overhaul — it was a stub that strict mode errored on and lenient
+/// mode skipped, with no real implementation ever wired up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stack {
     DpdkNet,
     LinuxKernel,
-    AfPacket,
     FStack,
 }
 
@@ -40,7 +42,6 @@ impl Stack {
         match self {
             Stack::DpdkNet => "dpdk_net",
             Stack::LinuxKernel => "linux_kernel",
-            Stack::AfPacket => "afpacket",
             Stack::FStack => "fstack",
         }
     }
@@ -51,10 +52,9 @@ impl Stack {
         match s {
             "dpdk" | "dpdk_net" => Ok(Stack::DpdkNet),
             "linux" | "linux_kernel" | "kernel" => Ok(Stack::LinuxKernel),
-            "afpacket" | "af_packet" => Ok(Stack::AfPacket),
             "fstack" | "f-stack" | "f_stack" => Ok(Stack::FStack),
             other => Err(format!(
-                "unknown stack `{other}` (valid: dpdk, linux, afpacket, fstack)"
+                "unknown stack `{other}` (valid: dpdk, linux, fstack)"
             )),
         }
     }
@@ -92,8 +92,6 @@ mod tests {
         assert_eq!(Stack::parse("linux").unwrap(), Stack::LinuxKernel);
         assert_eq!(Stack::parse("linux_kernel").unwrap(), Stack::LinuxKernel);
         assert_eq!(Stack::parse("kernel").unwrap(), Stack::LinuxKernel);
-        assert_eq!(Stack::parse("afpacket").unwrap(), Stack::AfPacket);
-        assert_eq!(Stack::parse("af_packet").unwrap(), Stack::AfPacket);
         assert_eq!(Stack::parse("fstack").unwrap(), Stack::FStack);
         assert_eq!(Stack::parse("f-stack").unwrap(), Stack::FStack);
         assert_eq!(Stack::parse("f_stack").unwrap(), Stack::FStack);
@@ -101,6 +99,10 @@ mod tests {
 
     #[test]
     fn stack_parse_rejects_unknown() {
+        // Includes the legacy `afpacket` and `af_packet` tokens
+        // (removed 2026-05-09) and any other unknown name.
+        assert!(Stack::parse("afpacket").is_err());
+        assert!(Stack::parse("af_packet").is_err());
         let err = Stack::parse("garbage").unwrap_err();
         assert!(err.contains("unknown stack"));
     }
@@ -109,7 +111,6 @@ mod tests {
     fn stack_as_dimension_is_stable() {
         assert_eq!(Stack::DpdkNet.as_dimension(), "dpdk_net");
         assert_eq!(Stack::LinuxKernel.as_dimension(), "linux_kernel");
-        assert_eq!(Stack::AfPacket.as_dimension(), "afpacket");
         assert_eq!(Stack::FStack.as_dimension(), "fstack");
     }
 

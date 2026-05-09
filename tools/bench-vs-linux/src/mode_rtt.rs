@@ -1,13 +1,16 @@
 //! Mode A — RTT comparison, trading-latency preset. Spec §8.
 //!
-//! Drives up to three stacks side-by-side against the same TCP echo
-//! server peer:
+//! Drives the comparator stacks side-by-side against the same TCP
+//! echo server peer:
 //!
 //!   1. `dpdk_net` via `dpdk_net_core::Engine` (bench-e2e's
 //!      `workload::run_rtt_workload`)
 //!   2. `linux_kernel` via `std::net::TcpStream`
-//!   3. `afpacket` via `libc::socket(PF_PACKET, SOCK_RAW, ...)`
-//!      (stubbed in T8 — see `src/afpacket.rs` for rationale)
+//!   3. `fstack` (F-Stack on DPDK) — feature-gated behind `fstack`
+//!
+//! The legacy `afpacket` arm was removed in the 2026-05-09 bench-suite
+//! overhaul (it was a stub that strict mode errored on and lenient
+//! mode skipped, with no real implementation ever wired up).
 //!
 //! For each selected stack we capture N measurements, summarise, and
 //! emit the 7-row CSV aggregation tuple (`p50`/`p99`/`p999`/`mean`/
@@ -41,7 +44,7 @@ use bench_e2e::workload::{open_connection as dpdk_open, run_rtt_workload as dpdk
 
 use dpdk_net_core::engine::Engine;
 
-use crate::{afpacket, linux_kernel, Stack};
+use crate::{linux_kernel, Stack};
 
 /// Per-run configuration extracted from the CLI in `main.rs`. This
 /// shape lets us keep `run_mode_rtt` a pure function that takes the
@@ -130,18 +133,6 @@ fn run_one_stack(
                 cfg.iterations,
             )
             .context("linux_kernel run_rtt_workload")
-        }
-        Stack::AfPacket => {
-            let af_cfg = afpacket::AfPacketConfig {
-                iface: cfg.peer_iface,
-                peer_ip_host_order: cfg.peer_ip_host_order,
-                peer_port: cfg.peer_port,
-                request_bytes: cfg.request_bytes,
-                response_bytes: cfg.response_bytes,
-                warmup: cfg.warmup,
-                iterations: cfg.iterations,
-            };
-            afpacket::run_rtt_workload(&af_cfg).map_err(|e| anyhow::anyhow!(e))
         }
         Stack::FStack => run_fstack_rtt(cfg),
     }
@@ -243,12 +234,7 @@ mod tests {
 
     #[test]
     fn build_dimensions_json_shape() {
-        for stack in [
-            Stack::DpdkNet,
-            Stack::LinuxKernel,
-            Stack::AfPacket,
-            Stack::FStack,
-        ] {
+        for stack in [Stack::DpdkNet, Stack::LinuxKernel, Stack::FStack] {
             let dims = build_dimensions_json(stack);
             let parsed: serde_json::Value = serde_json::from_str(&dims).unwrap();
             assert_eq!(parsed["preset"], "latency");
