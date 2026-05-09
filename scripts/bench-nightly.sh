@@ -569,6 +569,13 @@ run_dut_bench() {
 BENCH_ITERATIONS="${BENCH_ITERATIONS:-5000}"
 BENCH_WARMUP="${BENCH_WARMUP:-500}"
 
+# Phase 10 Task 10.1: payload-bytes sweep applied to every bench-rtt
+# invocation. Default covers the trading quote/trade size range
+# (64/128/256 B) plus 1024 B for "RTT scales with payload" sanity.
+# Operator can override via env: BENCH_RTT_PAYLOADS=64,256,4096 ...
+# Closes C-C1.
+BENCH_RTT_PAYLOADS="${BENCH_RTT_PAYLOADS:-64,128,256,1024}"
+
 DPDK_COMMON=(
   --peer-ip "$PEER_IP"
   --local-ip "$DUT_IP"
@@ -583,14 +590,15 @@ DPDK_COMMON=(
 # ---------------------------------------------------------------------------
 # Phase 4 of the 2026-05-09 bench-suite overhaul retired bench-e2e; the
 # dpdk_net RTT inner loop migrated into bench-rtt, which sweeps over a
-# `--payload-bytes-sweep` axis. For this slot we keep the legacy
-# 128/128 default (bench-rtt's default for `--payload-bytes-sweep` is
-# `128`); Phase 10 expands the sweep to 64/128/256.
+# `--payload-bytes-sweep` axis. Phase 10 (Task 10.1) parameterises the
+# sweep via $BENCH_RTT_PAYLOADS (default 64,128,256,1024) so every
+# bench-rtt invocation in the nightly hits the trading quote/trade size
+# range plus 1024B for "RTT scales with payload" sanity. Closes C-C1.
 log "[7/12] bench-rtt (with --assert-hw-task-18)"
 run_dut_bench bench-rtt bench-rtt \
     --stack dpdk_net \
     --connections 1 \
-    --payload-bytes-sweep 128 \
+    --payload-bytes-sweep "$BENCH_RTT_PAYLOADS" \
     "${DPDK_COMMON[@]}" \
     --peer-port 10001 \
     --iterations "$BENCH_ITERATIONS" \
@@ -674,7 +682,7 @@ for scenario in "${NETEM_SCENARIOS[@]}"; do
     if ! run_dut_bench bench-rtt "$csv_name" \
         --stack dpdk_net \
         --connections 1 \
-        --payload-bytes-sweep 128 \
+        --payload-bytes-sweep "$BENCH_RTT_PAYLOADS" \
         "${DPDK_COMMON[@]}" \
         --peer-port 10001 \
         --iterations "$BENCH_ITERATIONS" \
@@ -732,7 +740,7 @@ log "[9/12] bench-rtt cross-stack RTT (dpdk_net + linux_kernel + fstack)"
 run_dut_bench bench-rtt bench-rtt-dpdk_net \
     --stack dpdk_net \
     --connections 1 \
-    --payload-bytes-sweep 128 \
+    --payload-bytes-sweep "$BENCH_RTT_PAYLOADS" \
     "${DPDK_COMMON[@]}" \
     --peer-port 10001 \
     --iterations "$BENCH_ITERATIONS" \
@@ -748,7 +756,7 @@ run_dut_bench bench-rtt bench-rtt-dpdk_net \
 run_dut_bench bench-rtt bench-rtt-linux_kernel \
     --stack linux_kernel \
     --connections 1 \
-    --payload-bytes-sweep 128 \
+    --payload-bytes-sweep "$BENCH_RTT_PAYLOADS" \
     --peer-ip "$PEER_IP" \
     --peer-port 10002 \
     --local-ip "$DUT_IP" \
@@ -768,7 +776,7 @@ run_dut_bench bench-rtt bench-rtt-linux_kernel \
 run_dut_bench bench-rtt bench-rtt-fstack \
     --stack fstack \
     --connections 1 \
-    --payload-bytes-sweep 128 \
+    --payload-bytes-sweep "$BENCH_RTT_PAYLOADS" \
     --peer-ip "$PEER_IP" \
     --peer-port 10003 \
     --local-ip "$DUT_IP" \
