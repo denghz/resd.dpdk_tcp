@@ -20,6 +20,7 @@ use bench_common::raw_samples::RawSamplesWriter;
 use bench_common::run_metadata::RunMetadata;
 
 use bench_rtt::attribution::AttributionMode;
+use bench_rtt::attribution_csv::{attribution_csv_header, attribution_row_cols};
 use bench_rtt::fstack;
 use bench_rtt::hw_task_18::{
     assert_all_events_rx_hw_ts_ns_zero, assert_hw_task_18_post_run, HwTask18Expectations,
@@ -27,7 +28,8 @@ use bench_rtt::hw_task_18::{
 use bench_rtt::linux_kernel;
 use bench_rtt::stack::Stack;
 use bench_rtt::sum_identity::assert_sum_identity;
-use bench_rtt::workload::{open_connection, request_response_attributed, IterRecord};
+use bench_rtt::workload::{open_connection, request_response_attributed};
+use bench_rtt::attribution::IterRecord;
 
 use dpdk_net_core::engine::Engine;
 use dpdk_net_core::flow_table::ConnHandle;
@@ -76,6 +78,16 @@ struct Args {
     /// iteration with columns (bucket_id, iter_idx, rtt_ns).
     #[arg(long)]
     raw_samples_csv: Option<std::path::PathBuf>,
+
+    /// Optional sidecar CSV for per-iter attribution-bucket detail.
+    /// Closes T51 deferred-work item 4: surfaces Phase 9's
+    /// `unsupported_buckets` bitfield so c7i Hw-mode runs can tell
+    /// "0 ns measured" from "no engine-side probe available".
+    /// Schema documented in `bench_rtt::attribution_csv`. Emitted only
+    /// for the dpdk_net arm — linux_kernel + fstack paths have no
+    /// per-iter attribution captures and skip this sidecar.
+    #[arg(long)]
+    attribution_csv: Option<std::path::PathBuf>,
 
     /// Output CSV path. One row per (payload, aggregation) tuple — 7
     /// aggregations per payload bucket (p50, p99, p999, mean, stddev,
@@ -146,6 +158,12 @@ struct BucketResult {
     /// leave it empty.
     #[allow(dead_code)]
     rx_hw_ts_ns: Vec<u64>,
+    /// Per-iter attribution records (dpdk_net only); empty for the
+    /// linux_kernel + fstack arms which have no per-iter attribution
+    /// captures. Closes T51 deferred-work item 4: surfaces Phase 9's
+    /// `unsupported_buckets` bitfield via the `--attribution-csv`
+    /// sidecar emit.
+    iter_records: Vec<IterRecord>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -210,8 +228,49 @@ fn main() -> anyhow::Result<()> {
         writer.flush().context("flushing raw-samples CSV")?;
     }
 
-    // 5. Emit the summary CSV.
+    // 5. Optional attribution-bucket sidecar (T51 deferred-work item 4).
+    // Streams per-iter rows surfacing Phase 9's `unsupported_buckets`
+    // bitfield so c7i Hw-mode runs distinguish "0 ns measured" from
+    // "no engine-side probe available". Only the dpdk_net arm
+    // populates `iter_records`; linux_kernel + fstack buckets emit no
+    // attribution rows by construction (no per-iter captures
+    // available).
+    if let Some(path) = args.attribution_csv.as_ref() {
+        emit_attribution_csv(path, &buckets)
+            .with_context(|| format!("writing attribution CSV {path:?}"))?;
+    }
+
+    // 6. Emit the summary CSV.
     emit_csv(&args, &metadata, &buckets)?;
+    Ok(())
+}
+
+/// Stream per-iter attribution rows into the sidecar CSV at `path`.
+/// Header + row layout pinned by `bench_rtt::attribution_csv`. Rows are
+/// flushed once at the end (RawSamplesWriter buffers ~64 KiB, so the
+/// per-row write is cheap even at 10^7 iterations).
+fn emit_attribution_csv(
+    path: &std::path::Path,
+    buckets: &[BucketResult],
+) -> anyhow::Result<()> {
+    let header = attribution_csv_header();
+    let mut writer = RawSamplesWriter::create(path, header)
+        .with_context(|| format!("creating attribution CSV {path:?}"))?;
+
+    for bucket in buckets {
+        for (i, rec) in bucket.iter_records.iter().enumerate() {
+            let cols = attribution_row_cols(&bucket.bucket_id, i as u64, rec);
+            let refs: Vec<&str> = cols.iter().map(String::as_str).collect();
+            writer.row(&refs).with_context(|| {
+                format!(
+                    "writing attribution row bucket={} iter={i}",
+                    bucket.bucket_id
+                )
+            })?;
+        }
+    }
+
+    writer.flush().context("flushing attribution CSV")?;
     Ok(())
 }
 
@@ -254,10 +313,20 @@ fn run_dpdk_net(args: &Args) -> anyhow::Result<Vec<BucketResult>> {
         // C-D3 / Task 4.6).
         let mut samples_rtt: Vec<f64> = Vec::with_capacity(args.iterations as usize);
         let mut samples_rx_hw_ts: Vec<u64> = Vec::with_capacity(args.iterations as usize);
+        // Capture per-iter attribution records only when the
+        // attribution-CSV sidecar is requested. Avoids the
+        // O(iterations * struct_size) heap footprint on the common
+        // path where nightly only wants summary + raw rtt_ns.
+        let capture_iter_records = args.attribution_csv.is_some();
+        let mut iter_records: Vec<IterRecord> = if capture_iter_records {
+            Vec::with_capacity(args.iterations as usize)
+        } else {
+            Vec::new()
+        };
         let mut failed_total: u64 = 0;
         let per_conn_iters = args.iterations / conn_count as u64;
         for conn in &conns {
-            let (rtt, rx_hw_ts, failed) = run_dpdk_workload_one(
+            let (rtt, rx_hw_ts, recs, failed) = run_dpdk_workload_one(
                 &engine,
                 *conn,
                 payload_bytes,
@@ -265,9 +334,13 @@ fn run_dpdk_net(args: &Args) -> anyhow::Result<Vec<BucketResult>> {
                 per_conn_iters,
                 tsc_hz,
                 args.sum_identity_tol_ns,
+                capture_iter_records,
             )?;
             samples_rtt.extend(rtt);
             samples_rx_hw_ts.extend(rx_hw_ts);
+            if capture_iter_records {
+                iter_records.extend(recs);
+            }
             failed_total += failed;
         }
 
@@ -286,6 +359,7 @@ fn run_dpdk_net(args: &Args) -> anyhow::Result<Vec<BucketResult>> {
             samples: samples_rtt,
             failed_iter_count: failed_total,
             rx_hw_ts_ns: samples_rx_hw_ts,
+            iter_records,
         });
     }
     Ok(buckets)
@@ -293,10 +367,15 @@ fn run_dpdk_net(args: &Args) -> anyhow::Result<Vec<BucketResult>> {
 
 /// Drive warmup + measurement iterations on a single connection,
 /// enforcing sum-identity per iter. Returns
-/// `(rtt_samples, rx_hw_ts_per_sample, failed_iter_count)`. Per-iter
-/// failures are counted into `failed_iter_count` rather than aborting
-/// the bucket; the loop only bails if more than 50% of iterations
-/// fail (closes C-D3 / Task 4.6).
+/// `(rtt_samples, rx_hw_ts_per_sample, iter_records, failed_iter_count)`.
+/// Per-iter failures are counted into `failed_iter_count` rather than
+/// aborting the bucket; the loop only bails if more than 50% of
+/// iterations fail (closes C-D3 / Task 4.6).
+///
+/// `capture_iter_records` controls whether the per-iter `IterRecord`
+/// values are retained in the returned vec. Caller passes `true` only
+/// when the `--attribution-csv` sidecar is requested — keeps the heap
+/// footprint at zero on the common nightly path.
 fn run_dpdk_workload_one(
     engine: &Engine,
     conn: ConnHandle,
@@ -305,7 +384,8 @@ fn run_dpdk_workload_one(
     iterations: u64,
     tsc_hz: u64,
     sum_identity_tol_ns: u64,
-) -> anyhow::Result<(Vec<f64>, Vec<u64>, u64)> {
+    capture_iter_records: bool,
+) -> anyhow::Result<(Vec<f64>, Vec<u64>, Vec<IterRecord>, u64)> {
     let request = vec![0u8; payload_bytes];
     let mut carry_forward: usize = 0;
 
@@ -326,6 +406,11 @@ fn run_dpdk_workload_one(
 
     let mut rtt_ns: Vec<f64> = Vec::with_capacity(iterations as usize);
     let mut rx_hw_ts_ns: Vec<u64> = Vec::with_capacity(iterations as usize);
+    let mut iter_records: Vec<IterRecord> = if capture_iter_records {
+        Vec::with_capacity(iterations as usize)
+    } else {
+        Vec::new()
+    };
     let mut failed: u64 = 0;
     for i in 0..iterations {
         let rec_res: anyhow::Result<IterRecord> = request_response_attributed(
@@ -371,8 +456,11 @@ fn run_dpdk_workload_one(
 
         rtt_ns.push(rec.rtt_ns as f64);
         rx_hw_ts_ns.push(rec.rx_hw_ts_ns);
+        if capture_iter_records {
+            iter_records.push(rec);
+        }
     }
-    Ok((rtt_ns, rx_hw_ts_ns, failed))
+    Ok((rtt_ns, rx_hw_ts_ns, iter_records, failed))
 }
 
 // ---------------------------------------------------------------------------
@@ -406,6 +494,9 @@ fn run_linux_kernel(args: &Args) -> anyhow::Result<Vec<BucketResult>> {
             samples,
             failed_iter_count: 0,
             rx_hw_ts_ns: Vec::new(),
+            // No per-iter attribution captures on the kernel arm —
+            // request_response cycles through std::net, not the engine.
+            iter_records: Vec::new(),
         });
     }
     Ok(buckets)
@@ -449,6 +540,9 @@ fn run_fstack(args: &Args) -> anyhow::Result<Vec<BucketResult>> {
             samples,
             failed_iter_count: 0,
             rx_hw_ts_ns: Vec::new(),
+            // F-Stack drives its own ff_run loop with no per-iter
+            // attribution captures — sidecar emit is dpdk_net only.
+            iter_records: Vec::new(),
         });
     }
     Ok(buckets)

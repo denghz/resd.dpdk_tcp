@@ -521,6 +521,29 @@ run_dut_bench() {
   local csv_name="$2"
   shift 2
   local cmd="sudo /tmp/$bench"
+  # Scan the caller-provided args for any sidecar CSV paths whose
+  # files we should pull back alongside the primary --output-csv.
+  # Today bench-rtt's --attribution-csv (T51 deferred-work item 4) and
+  # --raw-samples-csv are the two sidecars; widening this list to any
+  # `--*-csv path` arg keeps the helper future-proof. Paths must start
+  # with "/tmp/" (DUT-local) to qualify; absolute non-/tmp paths and
+  # relative paths are skipped — the bench wouldn't write them where
+  # we'd know how to pull them back from.
+  local sidecars=()
+  local i=1
+  while [ $i -le $# ]; do
+    local cur="${!i}"
+    if [[ "$cur" == --*-csv ]]; then
+      local nxt_idx=$((i + 1))
+      if [ $nxt_idx -le $# ]; then
+        local nxt="${!nxt_idx}"
+        if [[ "$nxt" == /tmp/* ]]; then
+          sidecars+=("$nxt")
+        fi
+      fi
+    fi
+    i=$((i + 1))
+  done
   local arg
   for arg in "$@"; do
     cmd+=" $(printf '%q' "$arg")"
@@ -550,6 +573,14 @@ run_dut_bench() {
   refresh_ec2_ic_grants
   scp "${SCP_OPTS[@]}" "ubuntu@$DUT_SSH:/tmp/${csv_name}.csv" "$OUT_DIR/" \
     || log "  scp ${csv_name}.csv failed (bench may have exited before write)"
+  # Pull any sidecar CSVs the bench was asked to emit (raw-samples,
+  # attribution). Same forgiving semantics: a partial sidecar after a
+  # bench failure is still forensically valuable.
+  local sidecar
+  for sidecar in "${sidecars[@]}"; do
+    scp "${SCP_OPTS[@]}" "ubuntu@$DUT_SSH:${sidecar}" "$OUT_DIR/" \
+      || log "  scp $(basename "$sidecar") failed (bench may have skipped sidecar)"
+  done
   return $rc
 }
 
@@ -606,6 +637,7 @@ run_dut_bench bench-rtt bench-rtt \
     --assert-hw-task-18 \
     --tool bench-rtt \
     --feature-set trading-latency \
+    --attribution-csv /tmp/bench-rtt-attribution.csv \
     || log "  [7/12] bench-rtt exited non-zero — continuing"
 
 # ---------------------------------------------------------------------------
@@ -723,7 +755,8 @@ for scenario in "${NETEM_SCENARIOS[@]}"; do
         --iterations "$iters" \
         --warmup "$BENCH_WARMUP" \
         --tool bench-stress \
-        --feature-set "trading-latency-${scenario}-${direction}"; then
+        --feature-set "trading-latency-${scenario}-${direction}" \
+        --attribution-csv "/tmp/${csv_name}-attribution.csv"; then
       log "    $scenario/$direction bench-rtt exited non-zero — continuing"
     fi
 
@@ -811,6 +844,7 @@ run_dut_bench bench-rtt bench-rtt-dpdk_net \
     --warmup "$BENCH_WARMUP" \
     --tool bench-vs-linux \
     --feature-set trading-latency \
+    --attribution-csv /tmp/bench-rtt-dpdk_net-attribution.csv \
     || log "  [9/12] bench-rtt --stack dpdk_net exited non-zero — continuing"
 
 # linux_kernel arm needs no DPDK args — connect to the linux-tcp-sink
@@ -832,6 +866,7 @@ run_dut_bench bench-rtt bench-rtt-linux_kernel \
     --warmup "$BENCH_WARMUP" \
     --tool bench-vs-linux \
     --feature-set trading-latency \
+    --attribution-csv /tmp/bench-rtt-linux_kernel-attribution.csv \
     || log "  [9/12] bench-rtt --stack linux_kernel exited non-zero — continuing"
 
 # fstack arm: requires the binary built with `--features fstack`; the
@@ -852,6 +887,7 @@ run_dut_bench bench-rtt bench-rtt-fstack \
     --warmup "$BENCH_WARMUP" \
     --tool bench-vs-linux \
     --feature-set trading-latency \
+    --attribution-csv /tmp/bench-rtt-fstack-attribution.csv \
     || log "  [9/12] bench-rtt --stack fstack exited non-zero — continuing"
 
 # Mode B: wire-diff — consume pcaps captured around a short live
