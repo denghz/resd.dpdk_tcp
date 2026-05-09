@@ -126,9 +126,13 @@ pub struct DpdkMaxtpCfg<'a> {
 }
 
 /// One raw-sample row emitted at SAMPLE_INTERVAL granularity per
-/// connection during the maxtp measurement window. Phase 5 Task 5.3:
-/// closes C-B1 (no percentiles), C-B5 (multi-conn visibility), and
-/// C-E1 (queue-depth time series via `snd_nxt_minus_una`).
+/// connection during the maxtp measurement window. Phase 5 Task 5.3
+/// closed C-B1 (no percentiles), C-B5 (multi-conn visibility), and the
+/// queue-depth half of C-E1 via `snd_nxt_minus_una`. Phase 11 Task 11.2
+/// closes the rest of C-E1 by adding `snd_wnd` and `room_in_peer_wnd`
+/// alongside the existing queue-depth column. Field order is stable
+/// (additions appended only); the CSV header in
+/// `emit_per_conn_raw_sample` mirrors this order.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MaxtpRawPoint {
     /// Index of the connection inside the bucket's `conns` slice
@@ -147,6 +151,22 @@ pub struct MaxtpRawPoint {
     /// has handed to the wire that the peer hasn't ACKed yet. Direct
     /// queue-depth proxy.
     pub snd_nxt_minus_una: u32,
+    /// Phase 11 Task 11.2 (C-E1): per-conn `snd_wnd` at sample time —
+    /// the peer's most-recently-advertised receive window (already
+    /// shifted by the negotiated WSCALE on RX). Combined with
+    /// `room_in_peer_wnd`, lets downstream tooling distinguish "we are
+    /// sending as fast as the peer's window allows" from "the peer's
+    /// window is wide open and we're under-driving" — both look identical
+    /// from the goodput row alone.
+    pub snd_wnd: u32,
+    /// Phase 11 Task 11.2 (C-E1): per-conn `snd_wnd - (snd_nxt - snd_una)`
+    /// at sample time — bytes of headroom remaining inside the peer's
+    /// advertised window before the next outbound segment hits zero-room.
+    /// Saturates at 0 when in-flight already meets / exceeds the peer
+    /// window (peer is the bottleneck). Mirrors the `room_in_peer_wnd`
+    /// computation in the per-bucket DIAG dump path so downstream
+    /// time-series + the DIAG attribution agree on the value.
+    pub room_in_peer_wnd: u32,
 }
 
 /// Emit one raw-sample row to the sidecar CSV. Splitting this out
@@ -155,7 +175,14 @@ pub struct MaxtpRawPoint {
 /// formatting rules.
 ///
 /// Header (same order):
-/// `bucket_id, conn_id, sample_idx, t_ns, goodput_bps_window, snd_nxt_minus_una`
+/// `bucket_id, conn_id, sample_idx, t_ns, goodput_bps_window,
+///  snd_nxt_minus_una, snd_wnd, room_in_peer_wnd`
+///
+/// Phase 11 Task 11.2 (C-E1): the trailing `snd_wnd` and
+/// `room_in_peer_wnd` columns were appended (not interleaved); existing
+/// downstream consumers indexing the first six columns by position
+/// continue to work. New consumers reading the queue-depth time series
+/// pick up the appended pair.
 pub fn emit_per_conn_raw_sample(
     writer: &mut RawSamplesWriter,
     bucket_id: &str,
@@ -168,6 +195,8 @@ pub fn emit_per_conn_raw_sample(
         &point.t_ns.to_string(),
         &point.goodput_bps_window.to_string(),
         &point.snd_nxt_minus_una.to_string(),
+        &point.snd_wnd.to_string(),
+        &point.room_in_peer_wnd.to_string(),
     ])?;
     Ok(())
 }
@@ -736,6 +765,13 @@ impl SndUnaAccumulator {
     /// raw points (goodput over the just-closed interval +
     /// `snd_nxt - snd_una` queue depth) into `self.raw_points`. The
     /// per-conn-state read goes via `engine.diag_conn_stats`.
+    ///
+    /// Phase 11 Task 11.2 (C-E1): captures `snd_wnd` and
+    /// `room_in_peer_wnd` (saturating-sub of in-flight from peer window)
+    /// alongside `snd_nxt - snd_una`. All four values come from a
+    /// single `diag_conn_stats` snapshot per conn so the row is
+    /// internally consistent — no race between the snd_nxt and snd_wnd
+    /// reads.
     fn maybe_sample(&mut self, now: Instant, engine: &Engine, conns: &[ConnHandle]) {
         let due = match self.next_sample_at {
             None => {
@@ -750,17 +786,39 @@ impl SndUnaAccumulator {
         // Snapshot per-conn snd_una for goodput delta.
         let current =
             snapshot_snd_una_per_conn(engine, conns, Some(&self.last_sample));
-        // Per-conn snd_nxt - snd_una for queue-depth column.
-        let snd_nxt_minus_una: Vec<u32> = conns
-            .iter()
-            .map(|&conn| {
-                engine
-                    .diag_conn_stats(conn)
-                    .map(|s| s.snd_nxt.wrapping_sub(s.snd_una))
-                    .unwrap_or(0)
-            })
-            .collect();
-        self.record_sample(now, &current, &snd_nxt_minus_una);
+        // Per-conn (snd_nxt - snd_una, snd_wnd, room_in_peer_wnd) from a
+        // single diag_conn_stats snapshot per conn so the queue-depth
+        // tuple is internally consistent. `room_in_peer_wnd` mirrors
+        // the run_bucket DIAG dump's saturating-sub formula at lines
+        // ~568 (`s.snd_wnd.saturating_sub(in_flight)`).
+        let mut snd_nxt_minus_una: Vec<u32> = Vec::with_capacity(conns.len());
+        let mut snd_wnd: Vec<u32> = Vec::with_capacity(conns.len());
+        let mut room_in_peer_wnd: Vec<u32> = Vec::with_capacity(conns.len());
+        for &conn in conns {
+            match engine.diag_conn_stats(conn) {
+                Some(s) => {
+                    let in_flight = s.snd_nxt.wrapping_sub(s.snd_una);
+                    snd_nxt_minus_una.push(in_flight);
+                    snd_wnd.push(s.snd_wnd);
+                    room_in_peer_wnd.push(s.snd_wnd.saturating_sub(in_flight));
+                }
+                None => {
+                    // Conn missing from flow table (force-closed or
+                    // never-opened) — emit zeros so the per-conn row
+                    // stream stays aligned with the conns slice.
+                    snd_nxt_minus_una.push(0);
+                    snd_wnd.push(0);
+                    room_in_peer_wnd.push(0);
+                }
+            }
+        }
+        self.record_sample(
+            now,
+            &current,
+            &snd_nxt_minus_una,
+            &snd_wnd,
+            &room_in_peer_wnd,
+        );
         self.next_sample_at = Some(now + SAMPLE_INTERVAL);
     }
 
@@ -772,16 +830,27 @@ impl SndUnaAccumulator {
     /// Split out from `maybe_sample` so unit tests can drive the
     /// SAMPLE_INTERVAL emission without standing up a live Engine —
     /// the engine reads stay in `maybe_sample`. This function is
-    /// pure: same `(now, current, snd_nxt_minus_una)` inputs always
-    /// produce the same `raw_points` push.
+    /// pure: same `(now, current, snd_nxt_minus_una, snd_wnd,
+    /// room_in_peer_wnd)` inputs always produce the same `raw_points`
+    /// push.
+    ///
+    /// Phase 11 Task 11.2 (C-E1): two new slice arguments append to the
+    /// existing signature (`snd_wnd`, `room_in_peer_wnd`); all four
+    /// per-conn slices must be the same length as `current` (caller
+    /// asserts). Order-stable: the i-th element of every slice describes
+    /// the same conn.
     pub(crate) fn record_sample(
         &mut self,
         now: Instant,
         current: &[u32],
         snd_nxt_minus_una: &[u32],
+        snd_wnd: &[u32],
+        room_in_peer_wnd: &[u32],
     ) {
         debug_assert_eq!(current.len(), self.last_sample.len());
         debug_assert_eq!(snd_nxt_minus_una.len(), self.last_sample.len());
+        debug_assert_eq!(snd_wnd.len(), self.last_sample.len());
+        debug_assert_eq!(room_in_peer_wnd.len(), self.last_sample.len());
         let prior_totals: Vec<u64> = self.accumulated_bytes.clone();
         self.accumulate(current);
         self.sample_idx = self.sample_idx.saturating_add(1);
@@ -809,6 +878,8 @@ impl SndUnaAccumulator {
                 t_ns,
                 goodput_bps_window,
                 snd_nxt_minus_una: queue_depth,
+                snd_wnd: snd_wnd.get(i).copied().unwrap_or(0),
+                room_in_peer_wnd: room_in_peer_wnd.get(i).copied().unwrap_or(0),
             });
         }
     }
@@ -832,6 +903,8 @@ mod accumulator_tests {
             now + SAMPLE_INTERVAL,
             &[1_000_000, 2_000_000, 3_000_000, 4_000_000],
             &[16_384, 16_384, 16_384, 16_384],
+            &[65_535, 65_535, 65_535, 65_535],
+            &[49_151, 49_151, 49_151, 49_151],
         );
         assert_eq!(acc.raw_points.len(), 4);
         assert_eq!(acc.sample_idx, 1);
@@ -856,6 +929,8 @@ mod accumulator_tests {
                 start + SAMPLE_INTERVAL * k,
                 &snd_una_per_conn,
                 &[1024, 1024, 1024, 1024],
+                &[65_535, 65_535, 65_535, 65_535],
+                &[64_511, 64_511, 64_511, 64_511],
             );
         }
         assert_eq!(acc.raw_points.len(), 20);
@@ -878,12 +953,16 @@ mod accumulator_tests {
             start + SAMPLE_INTERVAL,
             &[1 << 30],
             &[0],
+            &[0],
+            &[0],
         );
         // Interval 2: another 1 GiB ACKed, cumulative now 2 GiB.
         // The per-interval goodput should still be 8e9, not 16e9.
         acc.record_sample(
             start + SAMPLE_INTERVAL * 2,
             &[2 << 30],
+            &[0],
+            &[0],
             &[0],
         );
         assert_eq!(acc.raw_points.len(), 2);
@@ -892,6 +971,56 @@ mod accumulator_tests {
         let expected = (1u64 << 30) as f64 * 8.0;
         assert!((g1 - expected).abs() / expected < 1e-9, "g1={g1}");
         assert!((g2 - expected).abs() / expected < 1e-9, "g2={g2}");
+    }
+
+    /// Phase 11 Task 11.2 (C-E1): record_sample captures per-conn snd_wnd
+    /// and room_in_peer_wnd alongside the existing snd_nxt - snd_una. The
+    /// three queue-depth columns appear in MaxtpRawPoint and downstream
+    /// emit_per_conn_raw_sample writes them into the raw-samples CSV. This
+    /// test asserts that the captured values pass through unchanged from
+    /// the inputs and that the per-conn invariant `room <= snd_wnd` is
+    /// preserved by the recording path (the engine is responsible for the
+    /// invariant — record_sample is a passthrough).
+    #[test]
+    fn record_sample_captures_snd_wnd_and_room_in_peer_wnd() {
+        let mut acc = SndUnaAccumulator::new(vec![0, 0, 0]);
+        let now = Instant::now();
+        acc.anchor_measure_start(now);
+        // 3 conns with distinct (snd_wnd, room_in_peer_wnd) shapes:
+        //   conn 0: full window, peer fully open  → wnd=65535, room=65535
+        //   conn 1: peer window throttled, half-full → wnd=32768, room=16384
+        //   conn 2: zero-window scenario              → wnd=0,    room=0
+        acc.record_sample(
+            now + SAMPLE_INTERVAL,
+            &[1_000_000, 2_000_000, 3_000_000],
+            &[16_384, 8_192, 0],
+            &[65_535, 32_768, 0],
+            &[65_535, 16_384, 0],
+        );
+        assert_eq!(acc.raw_points.len(), 3);
+        // Conn 0
+        assert_eq!(acc.raw_points[0].snd_nxt_minus_una, 16_384);
+        assert_eq!(acc.raw_points[0].snd_wnd, 65_535);
+        assert_eq!(acc.raw_points[0].room_in_peer_wnd, 65_535);
+        // Conn 1
+        assert_eq!(acc.raw_points[1].snd_nxt_minus_una, 8_192);
+        assert_eq!(acc.raw_points[1].snd_wnd, 32_768);
+        assert_eq!(acc.raw_points[1].room_in_peer_wnd, 16_384);
+        // Conn 2
+        assert_eq!(acc.raw_points[2].snd_nxt_minus_una, 0);
+        assert_eq!(acc.raw_points[2].snd_wnd, 0);
+        assert_eq!(acc.raw_points[2].room_in_peer_wnd, 0);
+        // Invariant: room never exceeds snd_wnd (engine guarantees;
+        // record_sample is a passthrough so the invariant survives).
+        for p in &acc.raw_points {
+            assert!(
+                p.room_in_peer_wnd <= p.snd_wnd,
+                "room ({}) should be <= snd_wnd ({}) for conn {}",
+                p.room_in_peer_wnd,
+                p.snd_wnd,
+                p.conn_id
+            );
+        }
     }
 }
 

@@ -56,12 +56,16 @@ struct Args {
     output_csv: std::path::PathBuf,
 
     /// Optional sidecar CSV for per-conn raw maxtp samples (Phase 5
-    /// Task 5.3). When set, the dpdk_net arm emits one row per conn
-    /// per SAMPLE_INTERVAL during the measurement window with columns
+    /// Task 5.3 + Phase 11 Task 11.2). When set, the dpdk_net arm emits
+    /// one row per conn per SAMPLE_INTERVAL during the measurement
+    /// window with columns
     /// `bucket_id, conn_id, sample_idx, t_ns, goodput_bps_window,
-    /// snd_nxt_minus_una`. Only the dpdk arm currently emits raw
-    /// samples — linux + fstack arms ignore this flag (they have no
-    /// equivalent per-conn snd_una hook).
+    /// snd_nxt_minus_una, snd_wnd, room_in_peer_wnd`. The trailing two
+    /// columns were appended in Phase 11 (C-E1: queue-depth + window
+    /// time series) — append-only; pre-Phase-11 column positions are
+    /// stable. Only the dpdk arm currently emits raw samples —
+    /// linux + fstack arms ignore this flag (they have no equivalent
+    /// per-conn snd_una hook).
     #[arg(long)]
     raw_samples_csv: Option<std::path::PathBuf>,
 
@@ -200,8 +204,13 @@ fn main() -> anyhow::Result<()> {
     let mut writer = csv::Writer::from_path(&args.output_csv)
         .with_context(|| format!("creating output CSV {:?}", args.output_csv))?;
 
-    // Phase 5 Task 5.3: optional sidecar raw-sample CSV. Header order is
-    // co-located with `dpdk::emit_per_conn_raw_sample`'s row layout.
+    // Phase 5 Task 5.3 + Phase 11 Task 11.2 (C-E1): optional sidecar
+    // raw-sample CSV. Header order is co-located with
+    // `dpdk::emit_per_conn_raw_sample`'s row layout. The trailing
+    // `snd_wnd` and `room_in_peer_wnd` columns were appended in Phase 11
+    // (closing C-E1's queue-depth time series) — additions are
+    // append-only; the first six columns are stable so existing
+    // downstream consumers indexing by position continue to work.
     let mut raw_samples_writer: Option<RawSamplesWriter> = match args.raw_samples_csv.as_ref() {
         Some(path) => {
             let header = [
@@ -211,6 +220,8 @@ fn main() -> anyhow::Result<()> {
                 "t_ns",
                 "goodput_bps_window",
                 "snd_nxt_minus_una",
+                "snd_wnd",
+                "room_in_peer_wnd",
             ];
             Some(
                 RawSamplesWriter::create(path, &header)
