@@ -53,7 +53,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 
-use bench_e2e::workload::{drain_and_accumulate_readable, open_connection, tsc_delta_to_ns};
+use bench_rtt::workload::{drain_and_accumulate_readable, open_connection, tsc_delta_to_ns};
 
 use dpdk_net_core::engine::Engine;
 use dpdk_net_core::flow_table::ConnHandle;
@@ -214,7 +214,7 @@ pub fn run_bucket(cfg: &DpdkBurstCfg<'_>) -> anyhow::Result<BucketRun> {
 
 /// Open a single persistent connection to the peer. Returns the
 /// connection handle to be reused across every bucket in the run.
-/// Thin wrapper over `bench_e2e::workload::open_connection` so the
+/// Thin wrapper over `bench_rtt::workload::open_connection` so the
 /// bench-vs-mtcp call sites don't have to know about that dependency
 /// shape.
 pub fn open_persistent_connection(

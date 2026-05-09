@@ -43,7 +43,11 @@ fstack = ["bench-vs-mtcp/fstack"]
 
 [dependencies]
 bench-common = { path = "../bench-common" }
-bench-e2e = { path = "../bench-e2e" }
+# Phase 4 bench-suite overhaul (2026-05-09): the dpdk_net RTT inner
+# loop migrated from bench-e2e into bench-rtt. mode_rtt's mode-A
+# dpdk_net arm threads through the same `workload::run_rtt_workload`
+# helper, just sourced from the new crate.
+bench-rtt = { path = "../bench-rtt" }
 # F-Stack FFI bindings live in bench-vs-mtcp; reuse them for the
 # bench-vs-linux mode A F-Stack arm so we don't duplicate `extern "C"`
 # blocks. The path-dep is free; we only consume the `fstack_ffi`

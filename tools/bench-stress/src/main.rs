@@ -47,7 +47,7 @@ use bench_common::percentile::{summarize, Summary};
 use bench_common::preconditions::{PreconditionMode, PreconditionValue, Preconditions};
 use bench_common::run_metadata::RunMetadata;
 
-use bench_e2e::workload::{open_connection, run_rtt_workload};
+use bench_rtt::workload::{open_connection, run_rtt_workload};
 
 use dpdk_net_core::engine::Engine;
 

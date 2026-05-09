@@ -58,7 +58,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 
-use bench_e2e::workload::{drain_and_accumulate_readable, open_connection};
+use bench_rtt::workload::{drain_and_accumulate_readable, open_connection};
 
 use dpdk_net_core::engine::{Engine, CLOSE_FLAG_FORCE_TW_SKIP};
 use dpdk_net_core::flow_table::ConnHandle;

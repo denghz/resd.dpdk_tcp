@@ -6,11 +6,11 @@
 //! accounting primitives in the library façade, so they run on any
 //! host without an ENA VF or EAL init.
 
-use bench_e2e::attribution::{AttributionMode, HwTsBuckets, TscFallbackBuckets};
-use bench_e2e::hw_task_18::{
+use bench_rtt::attribution::{AttributionMode, HwTsBuckets, TscFallbackBuckets};
+use bench_rtt::hw_task_18::{
     assert_all_events_rx_hw_ts_ns_zero, assert_hw_task_18_post_run, HwTask18Expectations,
 };
-use bench_e2e::sum_identity::assert_sum_identity;
+use bench_rtt::sum_identity::assert_sum_identity;
 
 use dpdk_net_core::counters::Counters;
 use std::sync::atomic::Ordering;

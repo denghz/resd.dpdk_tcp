@@ -16,6 +16,14 @@ publish = false
 default = []
 fstack = ["dep:libc"]
 
+[lib]
+name = "bench_rtt"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bench-rtt"
+path = "src/main.rs"
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }

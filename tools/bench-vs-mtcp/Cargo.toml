@@ -60,7 +60,9 @@ bench-common = { path = "../bench-common" }
 # T12 reuses open_connection / drain_and_accumulate_readable for the
 # dpdk_net-side burst driver's connect-once pattern. The request-response
 # RTT helpers are NOT used — burst workload is one-shot send, drain ACKs.
-bench-e2e = { path = "../bench-e2e" }
+# Phase 4 bench-suite overhaul (2026-05-09) moved these helpers from
+# bench-e2e into bench-rtt; the dependency follows the move.
+bench-rtt = { path = "../bench-rtt" }
 dpdk-net-core = { path = "../../crates/dpdk-net-core" }
 dpdk-net-sys = { path = "../../crates/dpdk-net-sys" }
 clap = { version = "4", features = ["derive"] }

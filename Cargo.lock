@@ -136,19 +136,6 @@ dependencies = [
 [[package]]
 name = "bench-e2e"
 version = "0.1.0"
-dependencies = [
- "anyhow",
- "bench-common",
- "chrono",
- "clap 4.6.1",
- "csv",
- "dpdk-net",
- "dpdk-net-core",
- "dpdk-net-sys",
- "hostname",
- "serde_json",
- "uuid",
-]
 
 [[package]]
 name = "bench-micro"
@@ -237,7 +224,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bench-common",
- "bench-e2e",
+ "bench-rtt",
  "chrono",
  "clap 4.6.1",
  "csv",
@@ -256,7 +243,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bench-common",
- "bench-e2e",
+ "bench-rtt",
  "bench-vs-mtcp",
  "chrono",
  "clap 4.6.1",
@@ -278,7 +265,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bench-common",
- "bench-e2e",
+ "bench-rtt",
  "chrono",
  "clap 4.6.1",
  "csv",
@@ -942,7 +929,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bench-common",
- "bench-e2e",
+ "bench-rtt",
  "bench-stress",
  "chrono",
  "clap 4.6.1",

@@ -40,7 +40,7 @@ use bench_common::csv_row::{CsvRow, MetricAggregation};
 use bench_common::percentile::{summarize, Summary};
 use bench_common::run_metadata::RunMetadata;
 
-use bench_e2e::workload::{open_connection as dpdk_open, run_rtt_workload as dpdk_run};
+use bench_rtt::workload::{open_connection as dpdk_open, run_rtt_workload as dpdk_run};
 
 use dpdk_net_core::engine::Engine;
 

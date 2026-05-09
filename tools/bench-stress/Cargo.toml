@@ -24,7 +24,11 @@ path = "src/main.rs"
 
 [dependencies]
 bench-common = { path = "../bench-common" }
-bench-e2e = { path = "../bench-e2e" }
+# bench-stress is scheduled for removal in Task 4.7 of the 2026-05-09
+# bench-suite overhaul. Until then we keep the crate compiling by
+# reusing the workload helpers from bench-rtt (which absorbed the
+# bench-e2e RTT inner loop in Task 4.2).
+bench-rtt = { path = "../bench-rtt" }
 dpdk-net-core = { path = "../../crates/dpdk-net-core" }
 dpdk-net-sys = { path = "../../crates/dpdk-net-sys" }
 clap = { version = "4", features = ["derive"] }

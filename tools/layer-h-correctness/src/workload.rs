@@ -67,7 +67,7 @@ pub fn run_one_scenario(
     use std::time::Instant;
 
     use anyhow::Context as _;
-    use bench_e2e::workload::{open_connection, run_rtt_workload};
+    use bench_rtt::workload::{open_connection, run_rtt_workload};
 
     use crate::assertions::{
         evaluate_counter_expectations, evaluate_disjunctive,
