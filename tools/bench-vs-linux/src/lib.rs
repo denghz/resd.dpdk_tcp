@@ -1,73 +1,31 @@
 //! bench-vs-linux — library façade for the binary.
 //!
-//! A10 Plan B Task 8 (spec §8, parent spec §11.5). Exposes the mode
-//! modules + stack-specific helpers so integration tests in `tests/`
-//! can validate the pure-Rust primitives without touching DPDK/EAL.
-//! The binary consumes the same modules via `use bench_vs_linux::*`.
+//! After the 2026-05-09 bench-suite overhaul Phase 4 the bench-vs-linux
+//! crate retains only **mode B (wire-diff, rfc_compliance preset)**.
+//! Mode A (RTT comparison) was consolidated into the new `bench-rtt`
+//! crate (`tools/bench-rtt/`) so the dpdk_net + linux_kernel + fstack
+//! triplet share a single binary.
+//!
+//! The lib-façade exists so integration tests in `tests/` can validate
+//! the pcap-canonicalise / byte-diff engine without going through the
+//! binary entry. The binary consumes the same modules via
+//! `use bench_vs_linux::*`.
 
-#[cfg(feature = "fstack")]
-pub mod fstack;
-pub mod linux_kernel;
-pub mod mode_rtt;
 pub mod mode_wire_diff;
 // A10 Plan B Task 9: pcap divergence-normalisation for mode B.
 pub mod normalize;
 
-/// Stack identifier for CSV `dimensions_json` + mode-A iteration.
-///
-/// Three values for mode A: `dpdk_net` (our stack), `linux_kernel`
-/// (standard socket path), and `fstack` (F-Stack — FreeBSD TCP/IP
-/// stack ported to userspace on DPDK; actively maintained, builds
-/// against DPDK 23.11). The F-Stack arm is feature-gated
-/// (`--features fstack`) so default builds compile on dev hosts
-/// without libfstack.a; the AMI build provides libfstack.a at
-/// `/opt/f-stack/lib/libfstack.a` (image-builder component
-/// `04b-install-f-stack.yaml`). The enum serialises to the lowercase
-/// string form emitted into `dimensions_json.stack`.
-///
-/// The legacy `afpacket` arm was removed in the 2026-05-09 bench-suite
-/// overhaul — it was a stub that strict mode errored on and lenient
-/// mode skipped, with no real implementation ever wired up.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Stack {
-    DpdkNet,
-    LinuxKernel,
-    FStack,
-}
-
-impl Stack {
-    /// CSV `dimensions_json.stack` string form. Stable, used by
-    /// downstream bench-report to bucket rows by stack.
-    pub const fn as_dimension(self) -> &'static str {
-        match self {
-            Stack::DpdkNet => "dpdk_net",
-            Stack::LinuxKernel => "linux_kernel",
-            Stack::FStack => "fstack",
-        }
-    }
-
-    /// Parse a single token from the `--stacks` CSV arg. Unknown
-    /// tokens error; the parser in `main.rs` aggregates the errors.
-    pub fn parse(s: &str) -> Result<Self, String> {
-        match s {
-            "dpdk" | "dpdk_net" => Ok(Stack::DpdkNet),
-            "linux" | "linux_kernel" | "kernel" => Ok(Stack::LinuxKernel),
-            "fstack" | "f-stack" | "f_stack" => Ok(Stack::FStack),
-            other => Err(format!(
-                "unknown stack `{other}` (valid: dpdk, linux, fstack)"
-            )),
-        }
-    }
-}
-
-/// Mode selector: mode A (RTT, Task 8) vs. mode B (wire-diff, Task 9).
-/// Task 9 delivers the pcap canonicalise + byte-diff engine and an
-/// MVP runner that consumes pre-captured pcaps via `--local-pcap` /
-/// `--peer-pcap`; live tcpdump+SSH capture orchestration is a Task 15
-/// follow-up (see `src/mode_wire_diff.rs` module docs).
+/// Mode selector. Pre-Phase-4 the binary supported `rtt` (mode A) and
+/// `wire-diff` (mode B); mode A migrated to `bench-rtt` so this is now
+/// effectively `wire-diff`-only. The `Mode` enum is retained for CLI
+/// stability — operators can still invoke with `--mode wire-diff` and
+/// the wire-diff path is the only valid value (mode A errors out via a
+/// pointer to bench-rtt).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
+    /// Phase-4 stub: returns an error pointing at bench-rtt.
     Rtt,
+    /// Wire-format divergence diff against pre-captured pcaps.
     WireDiff,
 }
 
@@ -84,35 +42,6 @@ impl Mode {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn stack_parse_accepts_all_aliases() {
-        assert_eq!(Stack::parse("dpdk").unwrap(), Stack::DpdkNet);
-        assert_eq!(Stack::parse("dpdk_net").unwrap(), Stack::DpdkNet);
-        assert_eq!(Stack::parse("linux").unwrap(), Stack::LinuxKernel);
-        assert_eq!(Stack::parse("linux_kernel").unwrap(), Stack::LinuxKernel);
-        assert_eq!(Stack::parse("kernel").unwrap(), Stack::LinuxKernel);
-        assert_eq!(Stack::parse("fstack").unwrap(), Stack::FStack);
-        assert_eq!(Stack::parse("f-stack").unwrap(), Stack::FStack);
-        assert_eq!(Stack::parse("f_stack").unwrap(), Stack::FStack);
-    }
-
-    #[test]
-    fn stack_parse_rejects_unknown() {
-        // Includes the legacy `afpacket` and `af_packet` tokens
-        // (removed 2026-05-09) and any other unknown name.
-        assert!(Stack::parse("afpacket").is_err());
-        assert!(Stack::parse("af_packet").is_err());
-        let err = Stack::parse("garbage").unwrap_err();
-        assert!(err.contains("unknown stack"));
-    }
-
-    #[test]
-    fn stack_as_dimension_is_stable() {
-        assert_eq!(Stack::DpdkNet.as_dimension(), "dpdk_net");
-        assert_eq!(Stack::LinuxKernel.as_dimension(), "linux_kernel");
-        assert_eq!(Stack::FStack.as_dimension(), "fstack");
-    }
 
     #[test]
     fn mode_parse_accepts_both_forms() {

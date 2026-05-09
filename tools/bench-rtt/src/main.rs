@@ -5,9 +5,9 @@
 //! runner), and bench-vs-linux mode A by parameterising the stack,
 //! payload size, connection count, and (in nightly) netem-spec axes.
 //!
-//! Task 4.2 lands the dpdk_net path verbatim (the gold standard from
-//! bench-e2e). Stack dispatch (linux_kernel / fstack), payload-axis
-//! sweep, and per-iter-failure capture arrive in Tasks 4.3-4.6.
+//! Tasks 4.2-4.4 land the dpdk_net + linux_kernel + fstack inner
+//! loops behind `--stack`. Tasks 4.5-4.6 wire the payload-axis
+//! sweep + per-iter-failure capture.
 
 use anyhow::Context;
 use clap::Parser;
@@ -21,6 +21,8 @@ use bench_rtt::attribution::AttributionMode;
 use bench_rtt::hw_task_18::{
     assert_all_events_rx_hw_ts_ns_zero, assert_hw_task_18_post_run, HwTask18Expectations,
 };
+use bench_rtt::linux_kernel;
+use bench_rtt::stack::Stack;
 use bench_rtt::sum_identity::assert_sum_identity;
 use bench_rtt::workload::{open_connection, request_response_attributed, IterRecord};
 
@@ -33,6 +35,12 @@ use dpdk_net_core::flow_table::ConnHandle;
 #[derive(Parser, Debug)]
 #[command(version, about = "bench-rtt — request/response RTT + attribution")]
 struct Args {
+    /// Comparator stack to drive: `dpdk_net` (this stack),
+    /// `linux_kernel` (kernel TCP), or `fstack` (F-Stack on DPDK,
+    /// requires `--features fstack`).
+    #[arg(long, value_enum)]
+    stack: Stack,
+
     /// Peer IP (dotted-quad IPv4, e.g. 10.0.0.42).
     #[arg(long)]
     peer_ip: String,
@@ -67,28 +75,29 @@ struct Args {
     #[arg(long, default_value = "strict")]
     precondition_mode: String,
 
-    /// Local IP (dotted-quad IPv4).
-    #[arg(long)]
+    /// Local IP (dotted-quad IPv4). Required when `--stack dpdk_net`
+    /// or `--stack fstack`.
+    #[arg(long, default_value = "")]
     local_ip: String,
 
-    /// Local gateway IP (dotted-quad IPv4).
-    #[arg(long)]
+    /// Local gateway IP (dotted-quad IPv4). Required when `--stack dpdk_net`.
+    #[arg(long, default_value = "")]
     gateway_ip: String,
 
     /// EAL args, whitespace-separated. Passed verbatim after an implicit
-    /// argv[0]="bench-rtt" prefix — same shape as bench-ab-runner.
-    #[arg(long, allow_hyphen_values = true)]
+    /// argv[0]="bench-rtt" prefix. Required when `--stack dpdk_net`.
+    #[arg(long, default_value = "", allow_hyphen_values = true)]
     eal_args: String,
 
     /// Sum-identity tolerance in ns. Default 50 ns per spec §6.
-    /// Values >= 50 ns are accepted; a mismatch beyond `tol` bails
-    /// out under strict precondition mode.
+    /// Only meaningful for `--stack dpdk_net` (the linux_kernel /
+    /// fstack arms have no attribution-bucket decomposition).
     #[arg(long, default_value_t = 50)]
     sum_identity_tol_ns: u64,
 
     /// Post-run, assert the ENA steady-state offload-counter profile
-    /// plus per-event `rx_hw_ts_ns == 0`. Off by default so mlx5/ice
-    /// smoke runs don't misfire; on for ENA bench nightly.
+    /// plus per-event `rx_hw_ts_ns == 0`. Only valid with
+    /// `--stack dpdk_net`; otherwise silently ignored.
     #[arg(long, default_value_t = false)]
     assert_hw_task_18: bool,
 
@@ -121,29 +130,49 @@ fn main() -> anyhow::Result<()> {
         std::process::exit(1);
     }
 
-    // 2. EAL init — routed through `dpdk_net_core::engine::eal_init`
-    // (NOT the raw bindgen FFI).
-    eal_init(&args)?;
+    // 2. Dispatch to the per-stack runner. The dpdk_net path is the
+    // gold-standard implementation (one EAL init, one engine, one
+    // connection, sum-identity per iter, optional A-HW Task 18
+    // post-run assertions); the linux_kernel path is the kernel-TCP
+    // baseline; the fstack path is feature-gated.
+    let metadata = build_run_metadata(mode, preconditions)?;
+
+    match args.stack {
+        Stack::DpdkNet => run_dpdk_net(&args, &metadata)?,
+        Stack::LinuxKernel => run_linux_kernel(&args, &metadata)?,
+        Stack::Fstack => run_fstack(&args, &metadata)?,
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// dpdk_net stack — preserved verbatim from bench-e2e (the gold standard).
+// ---------------------------------------------------------------------------
+
+fn run_dpdk_net(args: &Args, metadata: &RunMetadata) -> anyhow::Result<()> {
+    validate_dpdk_args(args)?;
+
+    // EAL init — routed through `dpdk_net_core::engine::eal_init`.
+    eal_init(args)?;
     let _eal_guard = EalGuard;
 
-    // 3. Engine::new.
-    let engine = build_engine(&args)?;
+    // Engine::new.
+    let engine = build_engine(args)?;
 
-    // 4. Cache tsc_hz once. Returns 0 before EAL init; we're past
-    // that gate at this point.
+    // Cache tsc_hz once.
     let tsc_hz = unsafe { dpdk_net_sys::rte_get_tsc_hz() };
     if tsc_hz == 0 {
         anyhow::bail!("rte_get_tsc_hz() returned 0 — EAL not initialised?");
     }
 
-    // 5. Open the TCP connection.
+    // Open the TCP connection.
     let peer_ip = parse_ip_host_order(&args.peer_ip)?;
     let conn = open_connection(&engine, peer_ip, args.peer_port)?;
 
-    // 6. Warmup + measurement loops.
-    let (samples_rtt, samples_rx_hw_ts_ns) = run_workload(&engine, conn, &args, tsc_hz)?;
+    // Warmup + measurement loops.
+    let (samples_rtt, samples_rx_hw_ts_ns) = run_dpdk_workload(&engine, conn, args, tsc_hz)?;
 
-    // 7. Optional A-HW Task 18 post-run assertions.
+    // Optional A-HW Task 18 post-run assertions.
     if args.assert_hw_task_18 {
         assert_hw_task_18_post_run(engine.counters(), &HwTask18Expectations::default())
             .map_err(anyhow::Error::msg)
@@ -153,26 +182,12 @@ fn main() -> anyhow::Result<()> {
             .context("A-HW Task 18 rx_hw_ts_ns-per-event assertion failed")?;
     }
 
-    // 8. Summarise + emit CSV.
-    let metadata = build_run_metadata(mode, preconditions)?;
-    emit_csv(&args, &metadata, &samples_rtt)?;
-
-    // 9. Engine drop before EalGuard — Rust drops in reverse declared
-    // order (engine declared after _eal_guard → engine drops first).
+    emit_csv(args, metadata, &samples_rtt)?;
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Workload — warmup + measurement loop over one TCP connection.
-//
-// The per-iter helpers (`request_response_attributed`, `open_connection`,
-// etc.) live in `bench_rtt::workload`. This function composes them with
-// the bench-rtt specifics: sum-identity assertion per iteration +
-// rx_hw_ts_ns capture for the A-HW Task 18 post-run assertion.
-// ---------------------------------------------------------------------------
-
 /// Drive warmup + measurement iterations with sum-identity enforcement.
-fn run_workload(
+fn run_dpdk_workload(
     engine: &Engine,
     conn: ConnHandle,
     args: &Args,
@@ -230,7 +245,38 @@ fn run_workload(
 }
 
 // ---------------------------------------------------------------------------
-// Precondition plumbing + CSV emit — shape borrowed from bench-ab-runner.
+// linux_kernel stack — `std::net::TcpStream` over the host's kernel TCP.
+// ---------------------------------------------------------------------------
+
+fn run_linux_kernel(args: &Args, metadata: &RunMetadata) -> anyhow::Result<()> {
+    let peer_ip = parse_ip_host_order(&args.peer_ip)?;
+    let mut stream = linux_kernel::connect(peer_ip, args.peer_port)
+        .context("linux_kernel connect")?;
+    let samples = linux_kernel::run_rtt_workload(
+        &mut stream,
+        args.request_bytes,
+        args.response_bytes,
+        args.warmup,
+        args.iterations,
+    )
+    .context("linux_kernel run_rtt_workload")?;
+    emit_csv(args, metadata, &samples)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// fstack stack — placeholder until Task 4.4 lands the inner loop.
+// ---------------------------------------------------------------------------
+
+fn run_fstack(_args: &Args, _metadata: &RunMetadata) -> anyhow::Result<()> {
+    anyhow::bail!(
+        "fstack stack dispatch landed in Task 4.3 but the inner loop is wired \
+         in Task 4.4. Re-run after Task 4.4 commits."
+    )
+}
+
+// ---------------------------------------------------------------------------
+// CLI parse + DPDK bring-up + preconditions plumbing.
 // ---------------------------------------------------------------------------
 
 /// RAII guard that runs `rte_eal_cleanup` on drop.
@@ -253,6 +299,19 @@ fn parse_ip_host_order(s: &str) -> anyhow::Result<u32> {
         .parse()
         .with_context(|| format!("invalid IPv4 address: {s}"))?;
     Ok(u32::from_be_bytes(addr.octets()))
+}
+
+fn validate_dpdk_args(args: &Args) -> anyhow::Result<()> {
+    if args.local_ip.is_empty() {
+        anyhow::bail!("--local-ip is required when --stack dpdk_net is selected");
+    }
+    if args.gateway_ip.is_empty() {
+        anyhow::bail!("--gateway-ip is required when --stack dpdk_net is selected");
+    }
+    if args.eal_args.is_empty() {
+        anyhow::bail!("--eal-args is required when --stack dpdk_net is selected");
+    }
+    Ok(())
 }
 
 fn eal_init(args: &Args) -> anyhow::Result<()> {
@@ -477,7 +536,7 @@ fn run_capture(argv: &[&str]) -> Option<String> {
 /// Emit the 7-row CSV (one per aggregation) to `args.output_csv`. The
 /// schema is the unified bench-common CSV (spec §14); `test_case` is
 /// the fixed string "request_response_rtt", `dimensions_json` captures
-/// request/response byte sizes.
+/// request/response byte sizes + the stack dimension.
 fn emit_csv(args: &Args, meta: &RunMetadata, samples: &[f64]) -> anyhow::Result<()> {
     if samples.is_empty() {
         anyhow::bail!("emit_csv: no samples to summarise (iterations=0?)");
@@ -489,6 +548,7 @@ fn emit_csv(args: &Args, meta: &RunMetadata, samples: &[f64]) -> anyhow::Result<
     let mut wtr = csv::Writer::from_writer(file);
 
     let dims = serde_json::json!({
+        "stack": args.stack.as_dimension(),
         "request_bytes": args.request_bytes,
         "response_bytes": args.response_bytes,
     })
