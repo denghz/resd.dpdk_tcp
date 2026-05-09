@@ -842,16 +842,23 @@ pub fn add(a: &AtomicU64, n: u64) {
 }
 
 /// Phase 11 (C-E2): bump the per-trigger `tcp.tx_retrans_rto` sub-counter
-/// alongside the aggregate `tcp.tx_retrans`. The aggregate is bumped by
-/// the `retransmit()` primitive in `engine.rs` (one bump per emitted
-/// retransmit segment), so emit-site callers (RTO / RACK / TLP) only need
-/// to bump the per-trigger sub-counter via these helpers. Pairing the
-/// helper call with each `engine.retransmit(...)` call keeps the partition
-/// invariant `tx_retrans_rto + tx_retrans_rack + tx_retrans_tlp +
-/// (SYN-retrans-only-aggregate-bumps) == tx_retrans` valid at every
-/// quiescent observation. SYN-retrans bumps the aggregate directly (it
-/// does not go through `retransmit_inner` and is not partitioned across
-/// the three sub-counters).
+/// alongside the aggregate `tcp.tx_retrans`. These helpers bump BOTH the
+/// per-trigger sub-counter AND the aggregate `tcp.tx_retrans`. The
+/// `retransmit()` primitive in `engine.rs::retransmit_inner` no longer
+/// bumps `tx_retrans` itself (Phase 11 split) — every
+/// `engine.retransmit(...)` callsite must be paired with exactly one of
+/// these helpers, with the sole exceptions of:
+///   - SYN-retrans paths (`engine.rs:3571` passive, `engine.rs:7363`
+///     active replay) which use `emit_syn_with_flags` and bump
+///     `tcp.tx_retrans` directly — these are not partitioned across
+///     RTO/RACK/TLP since they fire only during handshake.
+///   - `engine.rs::debug_retransmit_for_test` which calls
+///     `retransmit_inner` directly with a compensating aggregate
+///     bump for the `multiseg_retrans_tap` test invariant.
+/// Pairing the helper call with each `engine.retransmit(...)` call keeps
+/// the partition invariant `tx_retrans_rto + tx_retrans_rack +
+/// tx_retrans_tlp + (SYN-retrans-only-aggregate-bumps) == tx_retrans`
+/// valid at every quiescent observation.
 ///
 /// Slow-path: retransmit fires only on packet loss recovery; no hot-path
 /// cost. Distinct from `tx_rto` (which counts RTO timer fire events, not

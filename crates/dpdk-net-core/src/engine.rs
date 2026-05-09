@@ -6237,8 +6237,16 @@ impl Engine {
     /// at drain time, the drain walks the chain via `rte_pktmbuf_free(head)`
     /// per DPDK semantics and bumps `eth.tx_drop_full_ring`.
     ///
-    /// Bumps `xmit_count` + `xmit_ts_ns` on the entry and `tcp.tx_retrans` on
-    /// success. Does NOT decide whether to retransmit — that's the caller's
+    /// Bumps `xmit_count` + `xmit_ts_ns` on the entry. Per-trigger
+    /// counter bumping is the caller's responsibility — pair every
+    /// `engine.retransmit(...)` with one of:
+    ///   - `inc_tx_retrans_rto(&self.counters.tcp)` for RTO-driven retransmits
+    ///   - `inc_tx_retrans_rack(&self.counters.tcp)` for RACK-driven retransmits
+    ///   - `inc_tx_retrans_tlp(&self.counters.tcp)` for TLP-driven retransmits
+    /// Each helper bumps both its specific sub-counter AND the aggregate
+    /// `tcp.tx_retrans`. SYN-retrans paths use a different emit primitive
+    /// and bump `tcp.tx_retrans` directly (no per-trigger attribution).
+    /// Does NOT decide whether to retransmit — that's the caller's
     /// responsibility (Tasks 12 RTO / 15 RACK / 17 TLP / 18 SYN).
     ///
     /// Spec §6.5 "retransmit primitive": fresh header mbuf chained to the
