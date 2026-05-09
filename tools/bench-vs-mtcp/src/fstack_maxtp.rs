@@ -78,7 +78,9 @@ enum Phase {
     /// Open all C sockets, set non-blocking, issue non-blocking connects.
     ConnectAll,
     /// Wait for every connect to complete (poll SO_ERROR per fd).
-    WaitConnectAll { checked: usize },
+    /// `deadline` caps how long we wait before failing the bucket — prevents
+    /// indefinite hang if DPDK/ARP state is dirty and SYNs never complete.
+    WaitConnectAll { checked: usize, deadline: Instant },
     /// Pump writes round-robin during the warmup window.
     Warmup { warmup_deadline: Instant },
     /// Pump writes round-robin during the measurement window. `bytes`
@@ -195,7 +197,7 @@ fn advance(state: &mut MaxtpGridState<'_>) -> Step {
 
     match phase {
         Phase::ConnectAll => phase_connect_all(state),
-        Phase::WaitConnectAll { checked } => phase_wait_connect_all(state, checked),
+        Phase::WaitConnectAll { checked, deadline } => phase_wait_connect_all(state, checked, deadline),
         Phase::Warmup { warmup_deadline } => phase_warmup(state, warmup_deadline),
         Phase::Measure {
             t_start,
@@ -263,13 +265,24 @@ fn phase_connect_all(state: &mut MaxtpGridState<'_>) -> Step {
         fds.push(fd);
     }
     state.fds = fds;
-    state.phase = Phase::WaitConnectAll { checked: 0 };
+    state.phase = Phase::WaitConnectAll {
+        checked: 0,
+        deadline: Instant::now() + Duration::from_secs(30),
+    };
     // Yield once so the kernel has a chance to advance the handshakes
     // before we start polling SO_ERROR.
     Step::Yield
 }
 
-fn phase_wait_connect_all(state: &mut MaxtpGridState<'_>, mut checked: usize) -> Step {
+fn phase_wait_connect_all(state: &mut MaxtpGridState<'_>, mut checked: usize, deadline: Instant) -> Step {
+    if Instant::now() > deadline {
+        state.phase = Phase::BucketError(
+            "connect timeout: connections did not complete within 30 s \
+             (DPDK/ARP state may be dirty — clean /run/dpdk/rte/ and retry)"
+                .into(),
+        );
+        return Step::Continue;
+    }
     while checked < state.fds.len() {
         let fd = state.fds[checked];
         // Poll POLLOUT to detect handshake completion — SO_ERROR alone
@@ -283,7 +296,7 @@ fn phase_wait_connect_all(state: &mut MaxtpGridState<'_>, mut checked: usize) ->
         }
         if n == 0 || (pfd.revents & POLLOUT) == 0 {
             // This connection not ready yet; yield and retry all from here.
-            state.phase = Phase::WaitConnectAll { checked };
+            state.phase = Phase::WaitConnectAll { checked, deadline };
             return Step::Yield;
         }
         // POLLOUT: check SO_ERROR for outcome.
