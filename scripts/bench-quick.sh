@@ -179,12 +179,26 @@ cmd_run() {
 
     log "=== bench-quick run: workload=$workload peer=$PEER_IP ==="
 
-    log "[1/2] Building bench-vs-mtcp (incremental)..."
-    cargo build --release -p bench-vs-mtcp 2>&1 \
-        | grep -E '^error|Compiling bench-vs-mtcp|Finished' | tail -5
+    # Phase 5 of the 2026-05-09 bench-suite overhaul split the legacy
+    # bench-vs-mtcp into bench-tx-burst (one-shot K x G grid) and
+    # bench-tx-maxtp (sustained-rate W x C grid). One binary per
+    # workload; one --stack per invocation.
+    local bin
+    case "$workload" in
+        burst) bin=bench-tx-burst ;;
+        maxtp) bin=bench-tx-maxtp ;;
+        *)
+            log "ERROR unknown workload `$workload` (valid: burst, maxtp)"
+            return 2
+            ;;
+    esac
+
+    log "[1/2] Building $bin (incremental)..."
+    cargo build --release -p "$bin" 2>&1 \
+        | grep -E "^error|Compiling $bin|Finished" | tail -5
 
     local csv_out="/tmp/bench-quick-${workload}.csv"
-    log "[2/2] Running bench-vs-mtcp ${workload} → $csv_out"
+    log "[2/2] Running $bin ${workload} → $csv_out"
 
     local workload_args=()
     case "$workload" in
@@ -192,13 +206,12 @@ cmd_run() {
             workload_args+=(--bursts-per-bucket "$BENCH_BURSTS_PER_BUCKET"
                             --warmup            "$BENCH_BURST_WARMUP") ;;
         maxtp)
-            workload_args+=(--maxtp-warmup-secs    "$BENCH_MAXTP_WARMUP_SECS"
-                            --maxtp-duration-secs  "$BENCH_MAXTP_DURATION_SECS") ;;
+            workload_args+=(--warmup-secs   "$BENCH_MAXTP_WARMUP_SECS"
+                            --duration-secs "$BENCH_MAXTP_DURATION_SECS") ;;
     esac
 
-    sudo target/release/bench-vs-mtcp \
-        --workload            "$workload" \
-        --stacks              dpdk \
+    sudo "target/release/$bin" \
+        --stack               dpdk_net \
         --local-ip            "$DUT_IP" \
         --gateway-ip          "$DUT_GATEWAY" \
         --peer-ip             "$PEER_IP" \
@@ -207,7 +220,7 @@ cmd_run() {
         --lcore               "$DUT_LCORE" \
         "${workload_args[@]}" \
         --nic-max-bps         "$DUT_NIC_MAX_BPS" \
-        --tool                bench-vs-mtcp \
+        --tool                "$bin" \
         --feature-set         trading-latency \
         --precondition-mode   lenient \
         --output-csv          "$csv_out" \
@@ -254,9 +267,9 @@ Usage: bench-quick.sh <command> [args]
 
 Commands:
   setup               spin up peer EC2 + bind DUT data NIC to vfio-pci
-  run [workload] ...  incremental build + run bench-vs-mtcp
-                      workload: burst (default) or maxtp
-                      remaining args forwarded to bench-vs-mtcp
+  run [workload] ...  incremental build + run bench-tx-burst (workload=burst)
+                      or bench-tx-maxtp (workload=maxtp). Default: burst.
+                      Remaining args forwarded to the selected binary.
   teardown            terminate peer instance + rebind DUT NIC to ena
 
 Env overrides (export before calling):
