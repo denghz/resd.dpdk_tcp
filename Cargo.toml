@@ -12,6 +12,7 @@ members = [
     "tools/bench-obs-overhead",
     "tools/bench-offload-ab",
     "tools/bench-report",
+    "tools/bench-rtt",
     "tools/bench-stress",
     "tools/bench-vs-linux",
     "tools/bench-vs-mtcp",
