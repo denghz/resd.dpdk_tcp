@@ -3,8 +3,9 @@
 //! Phase 8 of the 2026-05-09 bench-suite overhaul. Drives the peer's
 //! `burst-echo-server` over a single dpdk_net TCP connection: per
 //! bucket (W, N) sends `BURST N W\n`, reads N segments of W bytes
-//! back-to-back, captures `clock::now_ns()` at delivery for each
-//! segment, computes `latency_ns = now_ns() - peer_send_ns`.
+//! back-to-back, captures `wall_ns()` (CLOCK_REALTIME) per chunk
+//! arrival; coalesced segments share a chunk's recv timestamp.
+//! Computes `latency_ns = dut_recv_ns - peer_send_ns`.
 //!
 //! # Threading
 //!

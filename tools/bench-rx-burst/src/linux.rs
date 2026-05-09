@@ -3,8 +3,8 @@
 //! Phase 8 of the 2026-05-09 bench-suite overhaul. Drives the peer's
 //! `burst-echo-server` over a single blocking `TcpStream`: per bucket
 //! (W, N) sends `BURST N W\n`, reads N×W bytes back-to-back, captures
-//! `Instant::now()` at each `read()` return, parses headers, records
-//! per-segment latency.
+//! `wall_ns()` (CLOCK_REALTIME) at each `read()` return, parses
+//! headers, records per-event app-delivery latency.
 //!
 //! # Why blocking I/O
 //!
@@ -12,24 +12,32 @@
 //! `read` blocks until the kernel has at least one byte buffered and
 //! returns whatever is available (possibly multiple coalesced
 //! segments). For RX-burst measurement we want exactly that: one
-//! `read()` syscall per kernel-side delivery, with `Instant::now()`
+//! `read()` syscall per kernel-side delivery, with `wall_ns()`
 //! captured immediately on return. Non-blocking + epoll would add
 //! poll overhead to the very thing we're measuring.
 //!
-//! # Clock asymmetry vs. dpdk_net
+//! # Clock model
 //!
-//! `dut_recv_ns` is captured via `Instant::now()` — relative to the
-//! per-burst `t0`, NOT a wall clock. The `peer_send_ns` (from the
-//! segment header) is `CLOCK_REALTIME`. The two anchors don't share
-//! an epoch, so the raw `latency_ns = dut_recv_ns - peer_send_ns`
-//! computed on the linux arm is NOT directly comparable to the
-//! dpdk_net arm's `clock::now_ns()` based reading. Both are
-//! relative-cadence-correct within a single bucket; cross-stack
-//! comparisons should anchor on the bucket's own distribution shape
-//! (p50/p99 spread) rather than the absolute median.
+//! All three arms anchor on CLOCK_REALTIME on both peer and DUT:
+//!   - Peer: `clock_gettime(CLOCK_REALTIME, ...)` inside
+//!     `burst-echo-server.c`.
+//!   - DUT: `wall_ns()` (`SystemTime::now() - UNIX_EPOCH`) at chunk
+//!     arrival.
+//! `latency_ns = dut_recv_ns - peer_send_ns` is therefore wall-clock-
+//! vs-wall-clock and skewed only by NTP offset (~100 µs typical on
+//! AWS same-AZ). Phase 9 c7i HW-TS will tighten the cross-host bound
+//! below the NTP floor.
 //!
-//! Phase 9 c7i HW-TS will harmonize both anchors against a single
-//! wall-clock source.
+//! # Per-event coalescing
+//!
+//! The kernel may deliver several 16-byte-header segments in a single
+//! `read()` chunk. The recv-side parser in
+//! `crate::segment::parse_burst_chunk` decomposes a chunk of length
+//! M*W into M `(seq_idx, peer_send_ns)` entries. All M entries share
+//! the same `dut_recv_ns` (the time of the read return), so the
+//! latency CDF for a coalesced burst will show per-event plateaus —
+//! the metric measured is per-event delivery, not per-segment NIC
+//! arrival.
 
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
@@ -116,8 +124,8 @@ pub fn run_bucket(cfg: &mut LinuxRxBurstCfg<'_>) -> anyhow::Result<LinuxRxBurstR
 }
 
 /// Send one `BURST N W\n` and drain N×W bytes back. Captures
-/// per-`read()` `Instant::now()` so the latency cadence is preserved
-/// across coalesced kernel deliveries.
+/// per-`read()` `wall_ns()` (CLOCK_REALTIME) so the latency cadence
+/// is preserved across coalesced kernel deliveries.
 fn run_one_burst(
     cfg: &mut LinuxRxBurstCfg<'_>,
     burst_idx: u64,

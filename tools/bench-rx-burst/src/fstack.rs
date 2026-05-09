@@ -30,7 +30,7 @@
 #![cfg(feature = "fstack")]
 
 use std::os::raw::{c_int, c_uint, c_void};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::fstack_ffi::{
     ff_close, ff_connect, ff_getsockopt, ff_ioctl, ff_poll, ff_read, ff_run, ff_socket,
@@ -519,12 +519,4 @@ fn wall_ns() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0)
-}
-
-// Silence unused-import warnings on the F-Stack-only timing helpers
-// when the feature is on but we don't reference them directly.
-#[allow(dead_code)]
-fn _suppress_unused_import_warnings() {
-    let _ = Duration::from_secs(0);
-    let _ = Instant::now();
 }
