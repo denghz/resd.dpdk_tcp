@@ -34,6 +34,7 @@ pub mod tcp_reassembly;
 pub mod tcp_retrans;
 pub mod tcp_rtt;
 pub mod tcp_sack;
+pub mod tcp_send_ack_log;
 pub mod tcp_seq;
 pub mod tcp_state;
 // a10-perf-23.11 T2.2: module is `pub(crate)` by default; `bench-internals`

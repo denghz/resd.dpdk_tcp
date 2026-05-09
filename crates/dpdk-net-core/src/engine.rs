@@ -769,6 +769,17 @@ pub struct Engine {
     /// `&self` like every other engine method.
     pub(crate) rx_drop_nomem_prev: std::cell::Cell<u64>,
 
+    /// Phase 6 (bench instrumentation): default capacity for new conns'
+    /// `send_ack_log`. `0` (the default) means logging is disabled and
+    /// the per-conn log is left at `disabled()`. A non-zero value (set
+    /// by `enable_send_ack_logging`) is applied to:
+    ///   1. every newly-created conn (`connect_with_opts` /
+    ///      `test_server` accept path) right after insertion, AND
+    ///   2. all already-existing conns at the moment of the call.
+    /// Single-lcore engine, so a `Cell<usize>` is sufficient — no
+    /// cross-thread coordination needed.
+    pub(crate) send_ack_log_default_cap: std::cell::Cell<usize>,
+
     // A-HW runtime latches — populated by configure_port_offloads.
     // When a compile-enabled offload was advertised by the PMD the latch
     // is true; the corresponding hot-path branch uses the offload. When
@@ -1524,6 +1535,9 @@ impl Engine {
             // the P99 without visibly warming.
             rack_lost_idxs_scratch: RefCell::new(Vec::with_capacity(64)),
             rx_drop_nomem_prev: std::cell::Cell::new(0),
+            // Phase 6 (bench instrumentation): logging disabled by default.
+            // `enable_send_ack_logging` switches it on for bench tooling.
+            send_ack_log_default_cap: std::cell::Cell::new(0),
             tx_cksum_offload_active: outcome.tx_cksum_offload_active,
             rx_cksum_offload_active: outcome.rx_cksum_offload_active,
             rss_hash_offload_active: outcome.rss_hash_offload_active,
@@ -4603,6 +4617,18 @@ impl Engine {
                 if let Some(c) = ft.get_mut(handle) {
                     c.snd_retrans
                         .prune_below_into_mbufs(new_snd_una, &mut scratch);
+                    // Phase 6 (bench instrumentation): pop send→ACK
+                    // samples for every segment fully covered by the
+                    // new snd_una. Disabled-path is a single early-
+                    // return on `cap == 0`. Bench tools drain the
+                    // resulting samples via `Engine::drain_send_ack_samples`.
+                    if c.send_ack_log.is_enabled() {
+                        let now_ack_ns = crate::clock::now_ns();
+                        let samples = c
+                            .send_ack_log
+                            .observe_cumulative_ack(new_snd_una, now_ack_ns);
+                        c.send_ack_samples_pending.extend(samples);
+                    }
                 }
             }
             {
@@ -5525,6 +5551,14 @@ impl Engine {
                 c.tlp_skip_flight_size_gate = opts.tlp_skip_flight_size_gate;
                 c.tlp_max_consecutive_probes = tlp_max_probes;
                 c.tlp_skip_rtt_sample_gate = opts.tlp_skip_rtt_sample_gate;
+                // Phase 6 (bench instrumentation): inherit the engine-wide
+                // default send_ack_log capacity. `0` (the default) leaves
+                // the conn's log at `disabled()` so the hot-path branch
+                // is a single early-return.
+                let cap = self.send_ack_log_default_cap.get();
+                if cap > 0 {
+                    c.send_ack_log.set_capacity(cap);
+                }
             }
         }
         if opts.rack_aggressive {
@@ -5842,6 +5876,16 @@ impl Engine {
                 let arm_rto = if let Some(c) = ft.get_mut(handle) {
                     let was_empty = c.snd_retrans.is_empty();
                     c.snd_retrans.push_after_tx(new_entry);
+                    // Phase 6 (bench instrumentation): record per-segment
+                    // send timestamp. Disabled by default — record_send is
+                    // a single early-return when send_ack_log is disabled.
+                    c.send_ack_log.record_send(
+                        crate::tcp_send_ack_log::SeqRange {
+                            begin: cur_seq,
+                            end: cur_seq.wrapping_add(take as u32),
+                        },
+                        first_tx_ts_ns,
+                    );
                     was_empty && c.rto_timer_id.is_none()
                 } else {
                     false
@@ -5979,6 +6023,56 @@ impl Engine {
     /// wrapper over `force_close_etimedout` (same cleanup, same diagnostic).
     pub fn abort_conn(&self, handle: ConnHandle) {
         self.force_close_etimedout(handle);
+    }
+
+    /// Phase 6 (bench instrumentation): enable per-segment send→ACK
+    /// latency tracking on this engine.
+    ///
+    /// * Sets the engine-wide default capacity so newly-created conns
+    ///   (`connect_with_opts` / passive accept) initialize their
+    ///   `send_ack_log` to the given size.
+    /// * Walks every connection currently in the flow table and applies
+    ///   the same capacity so already-running conns start recording
+    ///   immediately.
+    ///
+    /// `cap` is the per-conn ringbuffer slot count. A typical bench-mode
+    /// value is 4096 — comfortably above the in-flight burst depth between
+    /// cumulative-ACK arrivals at a 1 Gbit/s+ wire rate. Pass `0` to
+    /// disable (resets every conn's log to `disabled()`).
+    ///
+    /// Slow-path; only intended to be called once at bench-arm setup.
+    pub fn enable_send_ack_logging(&self, cap: usize) {
+        self.send_ack_log_default_cap.set(cap);
+        let mut ft = self.flow_table.borrow_mut();
+        let handles: Vec<ConnHandle> = ft.iter_handles().collect();
+        for h in handles {
+            if let Some(c) = ft.get_mut(h) {
+                c.send_ack_log.set_capacity(cap);
+                if cap == 0 {
+                    c.send_ack_samples_pending.clear();
+                }
+            }
+        }
+    }
+
+    /// Phase 6 (bench instrumentation): drain the per-conn pending
+    /// send→ACK samples queue. Returns an owned `Vec` of every sample
+    /// produced since the last drain (typically since the last
+    /// `poll_once` iteration). Empty when `send_ack_log` is disabled
+    /// or no ACKs have advanced `snd_una` since the last drain.
+    ///
+    /// Bench tools call this once per pump-loop iteration, after
+    /// `poll_once`, to convert the per-segment samples into raw-CSV rows.
+    /// Slow-path: bench instrumentation only.
+    pub fn drain_send_ack_samples(
+        &self,
+        handle: ConnHandle,
+    ) -> Vec<crate::tcp_send_ack_log::SendAckSample> {
+        let mut ft = self.flow_table.borrow_mut();
+        match ft.get_mut(handle) {
+            Some(c) => std::mem::take(&mut c.send_ack_samples_pending),
+            None => Vec::new(),
+        }
     }
 
     pub fn close_conn(&self, handle: ConnHandle) -> Result<(), Error> {
@@ -6530,10 +6624,24 @@ impl Engine {
             if let Some(conn) = ft.get_mut(conn_handle) {
                 if let Some(entry) = conn.snd_retrans.entries.get_mut(entry_index) {
                     entry.xmit_count = entry.xmit_count.saturating_add(1);
-                    entry.xmit_ts_ns = crate::clock::now_ns();
+                    let now_ns_xmit = crate::clock::now_ns();
+                    entry.xmit_ts_ns = now_ns_xmit;
                     entry.lost = false;
                     let _ = did_adj;
                 }
+                // Phase 6 (bench instrumentation): retransmit re-emits
+                // `seg_seq..seg_seq+entry_len`. SendAckLog::record_send
+                // detects the duplicate seq range and updates the stored
+                // t_send_ns rather than pushing a duplicate, so the
+                // sample reported on cum-ACK reflects the most recent
+                // (re-)send→ACK time. No-op when send_ack_log disabled.
+                conn.send_ack_log.record_send(
+                    crate::tcp_send_ack_log::SeqRange {
+                        begin: seg_seq,
+                        end: seg_seq.wrapping_add(entry_len as u32),
+                    },
+                    crate::clock::now_ns(),
+                );
             }
         }
         // Per-retransmit-occurrence counter — NOT per-tx-burst. `eth.tx_pkts`
@@ -7141,6 +7249,13 @@ impl Engine {
             let mut ft = self.flow_table.borrow_mut();
             if let Some(c) = ft.get_mut(h) {
                 c.ws_shift_out = compute_ws_shift_for(self.cfg.recv_buffer_bytes);
+                // Phase 6 (bench instrumentation): inherit engine-wide
+                // default send_ack_log capacity. `0` (default) leaves
+                // log disabled; non-zero opt-in by bench tooling.
+                let cap = self.send_ack_log_default_cap.get();
+                if cap > 0 {
+                    c.send_ack_log.set_capacity(cap);
+                }
             }
         }
         self.emit_syn_ack_for_passive(h);

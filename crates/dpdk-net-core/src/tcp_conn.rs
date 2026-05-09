@@ -361,6 +361,18 @@ pub struct TcpConn {
     /// `dpdk_net_iovec_t` has identical `#[repr(C)]` layout (layout-
     /// asserted in `crates/dpdk-net/src/api.rs`).
     pub readable_scratch_iovecs: Vec<crate::iovec::DpdkNetIovec>,
+
+    /// Phase 6 (bench instrumentation): per-segment send→ACK latency
+    /// ringbuffer. Defaults to `disabled()` so the hot-path branch in
+    /// `record_send` is a single early-return; bench tools call
+    /// `Engine::enable_send_ack_logging(cap)` to opt in. Drained by
+    /// the bench tool via `Engine::drain_send_ack_samples`.
+    pub send_ack_log: crate::tcp_send_ack_log::SendAckLog,
+    /// Phase 6 (bench instrumentation): pending samples produced by
+    /// `send_ack_log.observe_cumulative_ack` after an ACK advances
+    /// `snd_una`. Drained by `Engine::drain_send_ack_samples`. Always
+    /// empty when `send_ack_log` is disabled.
+    pub send_ack_samples_pending: Vec<crate::tcp_send_ack_log::SendAckSample>,
 }
 
 impl TcpConn {
@@ -483,6 +495,10 @@ impl TcpConn {
             // top of each `poll_once`; capacity retained across polls.
             delivered_segments: smallvec::SmallVec::new(),
             readable_scratch_iovecs: Vec::new(),
+            // Phase 6 (bench instrumentation): disabled by default —
+            // bench tooling opts in via `Engine::enable_send_ack_logging`.
+            send_ack_log: crate::tcp_send_ack_log::SendAckLog::disabled(),
+            send_ack_samples_pending: Vec::new(),
         }
     }
 
