@@ -33,11 +33,11 @@ Baseline: T50 report at `docs/bench-reports/t50-bench-pair-2026-05-08.md` and T5
 ## Phase status
 
 - [x] Phase 1 — Pre-work + tracker
-- [ ] Phase 2 — Remove dead bench arms
-- [ ] Phase 3 — Raw-sample CSV writer in bench-common
-- [ ] Phase 4 — Consolidate RTT benches into bench-rtt
-- [ ] Phase 5 — Split bench-vs-mtcp into bench-tx-burst + bench-tx-maxtp
-- [ ] Phase 6 — Per-segment send→ACK latency
+- [x] Phase 2 — Remove dead bench arms
+- [x] Phase 3 — Raw-sample CSV writer in bench-common
+- [x] Phase 4 — Consolidate RTT benches into bench-rtt
+- [x] Phase 5 — Split bench-vs-mtcp into bench-tx-burst + bench-tx-maxtp
+- [x] Phase 6 — Per-segment send→ACK latency
 - [x] Phase 7 — Bidirectional netem via peer IFB ingress
   - Tasks 7.1, 7.2 done 2026-05-09
   - Netem matrix expanded from `4 scenarios × 1 direction = 4 buckets`
@@ -52,9 +52,10 @@ Baseline: T50 report at `docs/bench-reports/t50-bench-pair-2026-05-08.md` and T5
   - Wallclock-budget impact: nightly's [8/12] block grows by 3× on
     the netem axis (composed multiplicatively with the Phase 10
     iter-count expansion).
-- [ ] Phase 8 — bench-rx-burst tool
-- [ ] Phase 9 — HW-TS attribution validation on c7i
-- [/] Phase 10 — Nightly script rewire + scenario expansion
+- [x] Phase 8 — bench-rx-burst tool
+- [x] Phase 9 — HW-TS attribution validation on c7i (code-validated; live c7i
+  validation deferred to operator — see t51 §c7i validation)
+- [x] Phase 10 — Nightly script rewire + scenario expansion
   - Task 10.1 done 2026-05-09: bench-rtt invocations now sweep
     `$BENCH_RTT_PAYLOADS` (default `64,128,256,1024`) instead of the
     legacy hard-coded `--payload-bytes-sweep 128`. Closes C-C1.
@@ -88,8 +89,20 @@ Plus bench-tx-burst + bench-rx-burst per direction: ~2 hours combined.
 Plus the existing clean-wire passes: ~1.5 hours.
 
 Estimated nightly total: ~6.5 hours (was ~2 hours pre-Phase-10).
-- [ ] Phase 11 — Counters + observability
-- [ ] Phase 12 — Cleanup, c7i validation, t51 report
+- [x] Phase 11 — Counters + observability
+- [x] Phase 12 — Cleanup, c7i validation deferral, t51 report
+  - Task 12.1 done 2026-05-09: bench-ab-runner crate deleted (workspace
+    leaf since Phase 4); doc comments + bail messages in bench-offload-ab
+    + bench-obs-overhead refreshed to point at bench-rtt.
+  - Task 12.2 deferred: c7i live HW-TS validation requires fleet
+    provisioning + ~6.5h nightly run — operator follow-up. See
+    `docs/bench-reports/t51-bench-overhaul-2026-05-09.md` §c7i validation
+    for the runbook + grep cookbook.
+  - Task 12.3 done 2026-05-09: t51 final report at
+    `docs/bench-reports/t51-bench-overhaul-2026-05-09.md`. All 22
+    catalogued claims (C-A1..C-F2) closed or explicitly deferred.
+  - Task 12.4 done 2026-05-09: tag `bench-overhaul-2026-05` (local only,
+    not pushed).
 
 ## Claims (from 2026-05-09 audit)
 
