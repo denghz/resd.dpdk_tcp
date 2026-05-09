@@ -128,7 +128,7 @@ pub fn run_one_scenario(
             engine, conn, request_bytes, response_bytes, tsc_hz, 0,
             OBSERVATION_BATCH,
         ) {
-            Ok(_samples) => {}
+            Ok((_samples, _failed)) => {}
             Err(e) => {
                 workload_error = Some(FailureReason::WorkloadError {
                     error: e.to_string(),

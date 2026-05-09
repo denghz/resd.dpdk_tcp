@@ -298,12 +298,20 @@ fn drain_until_connected_or_error(
     Ok(false)
 }
 
-/// Run `iterations` measured request-response round-trips and return the
-/// raw RTT samples in nanoseconds. `warmup` iterations are discarded.
+/// Run `iterations` measured request-response round-trips and return
+/// the raw RTT samples in nanoseconds plus the count of iterations
+/// that hit a per-iter timeout (and were skipped rather than aborting
+/// the bucket). `warmup` iterations are discarded; a warmup failure
+/// still aborts the run because the bucket isn't yet primed.
 ///
-/// The outer harness (bench-e2e main, bench-stress) owns the connection
-/// lifetime + CSV emit + counter-delta plumbing; this helper is the
-/// pure workload inner loop.
+/// Closes C-D3: previously a single per-iter `?` propagation killed
+/// the entire scenario, dropping all earlier samples. Now we count
+/// failed iters into a column and only abort if more than 50% of the
+/// measurement iterations fail (the bucket is genuinely wedged).
+///
+/// The outer harness (bench-rtt main, bench-stress) owns the
+/// connection lifetime + CSV emit + counter-delta plumbing; this
+/// helper is the pure workload inner loop.
 pub fn run_rtt_workload(
     engine: &Engine,
     conn: ConnHandle,
@@ -312,7 +320,7 @@ pub fn run_rtt_workload(
     tsc_hz: u64,
     warmup: u64,
     iterations: u64,
-) -> anyhow::Result<Vec<f64>> {
+) -> anyhow::Result<(Vec<f64>, u64)> {
     let request = vec![0u8; request_bytes];
     let mut carry_forward: usize = 0;
 
@@ -328,9 +336,8 @@ pub fn run_rtt_workload(
         .with_context(|| format!("warmup iteration {i}"))?;
     }
 
-    let mut samples: Vec<f64> = Vec::with_capacity(iterations as usize);
-    for i in 0..iterations {
-        let rec = request_response_attributed(
+    run_rtt_measurement_loop(iterations, |i| {
+        request_response_attributed(
             engine,
             conn,
             &request,
@@ -338,11 +345,48 @@ pub fn run_rtt_workload(
             tsc_hz,
             &mut carry_forward,
         )
-        .with_context(|| format!("measurement iteration {i}"))?;
-        samples.push(rec.rtt_ns as f64);
-    }
+        .with_context(|| format!("measurement iteration {i}"))
+        .map(|rec| rec.rtt_ns as f64)
+    })
+}
 
-    Ok(samples)
+/// Pure measurement-loop that counts per-iter failures into a u64 and
+/// only bails if more than 50% of `iterations` failed. Shared between
+/// `run_rtt_workload` and any future cross-stack call site.
+///
+/// The closure receives the iter index and returns either the RTT in
+/// ns (as f64) or an error. Errors are logged at eprintln and counted;
+/// success values are pushed into the returned sample vec.
+///
+/// This shape is what makes the "fail-count semantics" testable
+/// without a live DPDK engine — the unit test below feeds a closure
+/// that fails on a deterministic schedule and asserts the
+/// (samples_len, failed_count) pair. See C-D3 in the plan.
+pub fn run_rtt_measurement_loop<F>(
+    iterations: u64,
+    mut step: F,
+) -> anyhow::Result<(Vec<f64>, u64)>
+where
+    F: FnMut(u64) -> anyhow::Result<f64>,
+{
+    let mut samples: Vec<f64> = Vec::with_capacity(iterations as usize);
+    let mut failed: u64 = 0;
+    for i in 0..iterations {
+        match step(i) {
+            Ok(rtt_ns) => samples.push(rtt_ns),
+            Err(e) => {
+                eprintln!("bench-rtt: iter {i} failed: {e:#}");
+                failed += 1;
+                if failed > iterations / 2 {
+                    anyhow::bail!(
+                        "more than 50% of iterations failed ({failed}/{iterations}); \
+                         aborting scenario (last error: {e:#})"
+                    );
+                }
+            }
+        }
+    }
+    Ok((samples, failed))
 }
 
 #[cfg(test)]
@@ -360,5 +404,52 @@ mod tests {
         let t0 = u64::MAX - 999;
         let t1 = t0.wrapping_add(3_000);
         assert_eq!(tsc_delta_to_ns(t0, t1, 3_000_000_000), 1_000);
+    }
+
+    /// C-D3 regression guard: per-iter failures must NOT propagate
+    /// out via `?` — they must be counted into a separate `failed`
+    /// counter and only abort if more than 50% fail. The 7 success
+    /// + 3 failure case here is the canonical "kept what you had"
+    /// scenario from the plan.
+    #[test]
+    fn run_rtt_measurement_loop_keeps_samples_on_per_iter_failure() {
+        let mut iter_idx = 0;
+        let result = run_rtt_measurement_loop(10, |i| {
+            iter_idx = i;
+            // Fail iters {2, 5, 8} — same set the plan calls out.
+            if i == 2 || i == 5 || i == 8 {
+                anyhow::bail!("synthetic per-iter failure at iter={i}")
+            }
+            Ok(1_000.0)
+        });
+        let (samples, failed) = result.expect("loop should not bail at 30% failure rate");
+        assert_eq!(samples.len(), 7, "successful iters must survive");
+        assert_eq!(failed, 3, "failed counter must increment per failure");
+    }
+
+    /// Spec gate: more than 50% failures aborts the scenario with a
+    /// diagnostic. Boundary case: 6 failures out of 10 is > 5.
+    #[test]
+    fn run_rtt_measurement_loop_bails_above_50pct_failures() {
+        let result = run_rtt_measurement_loop(10, |i| {
+            if i < 6 {
+                anyhow::bail!("synthetic failure at iter={i}")
+            }
+            Ok(2_000.0)
+        });
+        let err = result.expect_err("should bail above 50% failure rate");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("more than 50% of iterations failed"),
+            "abort message must reference the threshold: {msg}"
+        );
+    }
+
+    /// All-success path returns failed=0 and full sample count.
+    #[test]
+    fn run_rtt_measurement_loop_all_success() {
+        let (samples, failed) = run_rtt_measurement_loop(5, |_| Ok(3_000.0)).unwrap();
+        assert_eq!(samples.len(), 5);
+        assert_eq!(failed, 0);
     }
 }

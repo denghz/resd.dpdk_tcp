@@ -248,12 +248,16 @@ fn run_dpdk_net(args: &Args) -> anyhow::Result<Vec<BucketResult>> {
             );
         }
 
-        // Run warmup + measurement on each connection.
+        // Run warmup + measurement on each connection. Per-iter
+        // failures are counted into `failed_total` rather than
+        // propagated; if more than 50% fail the bucket bails (see
+        // C-D3 / Task 4.6).
         let mut samples_rtt: Vec<f64> = Vec::with_capacity(args.iterations as usize);
         let mut samples_rx_hw_ts: Vec<u64> = Vec::with_capacity(args.iterations as usize);
+        let mut failed_total: u64 = 0;
         let per_conn_iters = args.iterations / conn_count as u64;
         for conn in &conns {
-            let (rtt, rx_hw_ts) = run_dpdk_workload_one(
+            let (rtt, rx_hw_ts, failed) = run_dpdk_workload_one(
                 &engine,
                 *conn,
                 payload_bytes,
@@ -264,6 +268,7 @@ fn run_dpdk_net(args: &Args) -> anyhow::Result<Vec<BucketResult>> {
             )?;
             samples_rtt.extend(rtt);
             samples_rx_hw_ts.extend(rx_hw_ts);
+            failed_total += failed;
         }
 
         if args.assert_hw_task_18 {
@@ -279,7 +284,7 @@ fn run_dpdk_net(args: &Args) -> anyhow::Result<Vec<BucketResult>> {
             bucket_id: format!("payload_{payload_bytes}"),
             payload_bytes,
             samples: samples_rtt,
-            failed_iter_count: 0,
+            failed_iter_count: failed_total,
             rx_hw_ts_ns: samples_rx_hw_ts,
         });
     }
@@ -287,7 +292,11 @@ fn run_dpdk_net(args: &Args) -> anyhow::Result<Vec<BucketResult>> {
 }
 
 /// Drive warmup + measurement iterations on a single connection,
-/// enforcing sum-identity per iter.
+/// enforcing sum-identity per iter. Returns
+/// `(rtt_samples, rx_hw_ts_per_sample, failed_iter_count)`. Per-iter
+/// failures are counted into `failed_iter_count` rather than aborting
+/// the bucket; the loop only bails if more than 50% of iterations
+/// fail (closes C-D3 / Task 4.6).
 fn run_dpdk_workload_one(
     engine: &Engine,
     conn: ConnHandle,
@@ -296,10 +305,13 @@ fn run_dpdk_workload_one(
     iterations: u64,
     tsc_hz: u64,
     sum_identity_tol_ns: u64,
-) -> anyhow::Result<(Vec<f64>, Vec<u64>)> {
+) -> anyhow::Result<(Vec<f64>, Vec<u64>, u64)> {
     let request = vec![0u8; payload_bytes];
     let mut carry_forward: usize = 0;
 
+    // Warmup still bails on any error — the bucket isn't primed yet
+    // so a warmup failure means the measurement window isn't safe to
+    // enter.
     for i in 0..warmup {
         request_response_attributed(
             engine,
@@ -314,8 +326,9 @@ fn run_dpdk_workload_one(
 
     let mut rtt_ns: Vec<f64> = Vec::with_capacity(iterations as usize);
     let mut rx_hw_ts_ns: Vec<u64> = Vec::with_capacity(iterations as usize);
+    let mut failed: u64 = 0;
     for i in 0..iterations {
-        let rec: IterRecord = request_response_attributed(
+        let rec_res: anyhow::Result<IterRecord> = request_response_attributed(
             engine,
             conn,
             &request,
@@ -323,12 +336,30 @@ fn run_dpdk_workload_one(
             tsc_hz,
             &mut carry_forward,
         )
-        .with_context(|| format!("measurement iteration {i}"))?;
+        .with_context(|| format!("measurement iteration {i}"));
+
+        let rec = match rec_res {
+            Ok(rec) => rec,
+            Err(e) => {
+                eprintln!("bench-rtt: iter {i} failed: {e:#}");
+                failed += 1;
+                if failed > iterations / 2 {
+                    anyhow::bail!(
+                        "more than 50% of iterations failed ({failed}/{iterations}); \
+                         aborting scenario (last error: {e:#})"
+                    );
+                }
+                continue;
+            }
+        };
 
         let sum = match rec.mode {
             AttributionMode::Hw => rec.hw_buckets.unwrap_or_default().total_ns(),
             AttributionMode::Tsc => rec.tsc_buckets.unwrap_or_default().total_ns(),
         };
+        // Sum-identity drift is treated as a hard error — it indicates
+        // a TSC/clock-source problem, not a per-iter wedge, so the
+        // bucket isn't recoverable by counting.
         assert_sum_identity(sum, rec.rtt_ns, sum_identity_tol_ns)
             .map_err(anyhow::Error::msg)
             .with_context(|| {
@@ -341,7 +372,7 @@ fn run_dpdk_workload_one(
         rtt_ns.push(rec.rtt_ns as f64);
         rx_hw_ts_ns.push(rec.rx_hw_ts_ns);
     }
-    Ok((rtt_ns, rx_hw_ts_ns))
+    Ok((rtt_ns, rx_hw_ts_ns, failed))
 }
 
 // ---------------------------------------------------------------------------

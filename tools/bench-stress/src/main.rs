@@ -299,7 +299,11 @@ fn run_one_scenario<W: std::io::Write>(
     // doesn't leak across scenarios.
     let peer_ip = parse_ip_host_order(&args.peer_ip)?;
     let conn = open_connection(engine, peer_ip, args.peer_port)?;
-    let samples = run_rtt_workload(
+    // bench-rtt's run_rtt_workload now returns (samples, failed_count)
+    // — bench-stress drops bench-overhaul Phase 4 Task 4.7 anyway, so
+    // the failed-count is intentionally discarded here. Until that
+    // landing, scenario rows continue to omit the column.
+    let (samples, _failed) = run_rtt_workload(
         engine,
         conn,
         args.request_bytes,
@@ -381,7 +385,7 @@ fn run_idle_baseline(engine: &Engine, args: &Args, tsc_hz: u64) -> anyhow::Resul
     eprintln!("bench-stress: idle baseline");
     let peer_ip = parse_ip_host_order(&args.peer_ip)?;
     let conn = open_connection(engine, peer_ip, args.peer_port)?;
-    let samples = run_rtt_workload(
+    let (samples, _failed) = run_rtt_workload(
         engine,
         conn,
         args.request_bytes,
