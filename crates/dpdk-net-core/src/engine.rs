@@ -3053,15 +3053,20 @@ impl Engine {
         }
 
         // Phase 3: retransmit every §6.3-eligible in-flight entry.
-        // `retransmit()` bumps `tx_retrans` per call (N total), and
-        // clears `entry.lost` on success so sub-sequent RACK-detect
-        // passes don't see stale flags. `tx_rto` bumps exactly once
-        // per fire — preserves A5 one-RTO-fire-counter semantics
-        // (one `tx_rto` + N `tx_retrans`).
+        // `retransmit()` is the primitive — Phase 11 (C-E2) makes it the
+        // caller's job to bump the aggregate + per-trigger sub-counter
+        // (here: `inc_tx_retrans_rto` for both the aggregate `tx_retrans`
+        // and the RTO-trigger sub-counter `tx_retrans_rto`). Clears
+        // `entry.lost` on success so subsequent RACK-detect passes don't
+        // see stale flags. `tx_rto` bumps exactly once per fire —
+        // preserves A5 one-RTO-fire-counter semantics (one `tx_rto` per
+        // fire + N `tx_retrans` + N `tx_retrans_rto` for N retransmitted
+        // segments).
         let lost_is_empty = self.rack_lost_idxs_scratch.borrow().is_empty();
         if lost_is_empty {
             // Defensive fallback — helper should always pick the front.
             self.retransmit(handle, 0);
+            crate::counters::inc_tx_retrans_rto(&self.counters.tcp);
         } else {
             // Clone indexes into a small local so `retransmit` (which
             // re-borrows the engine) doesn't conflict with the scratch
@@ -3077,6 +3082,7 @@ impl Engine {
                 .collect();
             for &idx in indexes.iter() {
                 self.retransmit(handle, idx as usize);
+                crate::counters::inc_tx_retrans_rto(&self.counters.tcp);
             }
         }
         crate::counters::inc(&self.counters.tcp.tx_rto);
@@ -3395,6 +3401,10 @@ impl Engine {
         if crate::tcp_tlp::select_probe(!pending_empty, retrans_len > 0).is_some() {
             let probe_idx = retrans_len - 1;
             self.retransmit(handle, probe_idx);
+            // Phase 11 (C-E2): bump aggregate `tx_retrans` + the TLP
+            // sub-counter `tx_retrans_tlp`. `tx_tlp` (probe-fire counter)
+            // remains a separate per-fire bump.
+            crate::counters::inc_tx_retrans_tlp(&self.counters.tcp);
             crate::counters::inc(&self.counters.tcp.tx_tlp);
 
             // A5.5 Task 11: record the probe in the recent-probes ring,
@@ -4559,6 +4569,10 @@ impl Engine {
         if !outcome.rack_lost_indexes.is_empty() {
             for i in &outcome.rack_lost_indexes {
                 self.retransmit(handle, *i as usize);
+                // Phase 11 (C-E2): bump aggregate `tx_retrans` + the RACK
+                // sub-counter `tx_retrans_rack`. `tx_rack_loss` (loss-
+                // detection counter) remains a separate per-detection bump.
+                crate::counters::inc_tx_retrans_rack(&self.counters.tcp);
                 crate::counters::inc(&self.counters.tcp.tx_rack_loss);
                 // A10 D4 (G1+G2): obs-none compiles the per-packet
                 // TcpRetrans + TcpLossDetected pair away; the retransmit
@@ -6241,9 +6255,17 @@ impl Engine {
     /// exercise the multi-segment retrans path (and the `data_len ==
     /// hdrs_len + len` invariant assertion). Hidden from the public API
     /// surface — production callers must use the timer-driven paths.
+    ///
+    /// Phase 11 (C-E2) note: bumps `tcp.tx_retrans` (the aggregate) but NOT
+    /// any per-trigger sub-counter — the synthetic call doesn't represent
+    /// a production RTO/RACK/TLP trigger. Keeps `multiseg_retrans_tap`'s
+    /// "delta tx_retrans by N" assertion working unchanged. Aggregate
+    /// minus (tx_retrans_rto + tx_retrans_rack + tx_retrans_tlp) gives the
+    /// non-attributed retransmit count (SYN-retrans + this debug path).
     #[doc(hidden)]
     pub fn debug_retransmit_for_test(&self, conn_handle: ConnHandle, entry_index: usize) {
-        self.retransmit_inner(conn_handle, entry_index)
+        self.retransmit_inner(conn_handle, entry_index);
+        crate::counters::inc(&self.counters.tcp.tx_retrans);
     }
 
     fn retransmit_inner(&self, conn_handle: ConnHandle, entry_index: usize) {
@@ -6653,10 +6675,18 @@ impl Engine {
                 );
             }
         }
-        // Per-retransmit-occurrence counter — NOT per-tx-burst. `eth.tx_pkts`
-        // is owned by `drain_tx_pending_data` (Task 5); `eth.tx_bytes` stays
+        // Phase 11 (C-E2): the aggregate `tcp.tx_retrans` and the per-
+        // trigger sub-counter (`tx_retrans_rto` / `tx_retrans_rack` /
+        // `tx_retrans_tlp`) are bumped TOGETHER by the caller via the
+        // `inc_tx_retrans_{rto,rack,tlp}` helpers in `crate::counters`.
+        // The primitive has no trigger-attribution context, so attribution
+        // happens at the call site (every `engine.retransmit()` invocation
+        // is paired with one helper call). The synthetic-retransmit test
+        // path `debug_retransmit_for_test` bumps the aggregate directly
+        // (with no sub-counter attribution, since it doesn't represent a
+        // production trigger). `eth.tx_pkts` is owned by
+        // `drain_tx_pending_data` (Task 5); `eth.tx_bytes` stays
         // per-segment to mirror `send_bytes` accepted-byte accounting.
-        inc(&self.counters.tcp.tx_retrans);
         crate::counters::add(
             &self.counters.eth.tx_bytes,
             (hdr_n + entry_len as usize) as u64,
