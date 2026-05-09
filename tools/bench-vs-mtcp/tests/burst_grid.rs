@@ -1,10 +1,9 @@
 //! Integration tests for the `burst` sub-workload (spec §11.1).
 //!
-//! These tests don't touch DPDK / a live peer / libmtcp. They cover
-//! the pure-Rust primitives: grid enumeration, per-burst sample
-//! aggregation, preflight check helpers, and the mTCP stub's config
-//! validation. The real end-to-end smoke (dpdk_net + kernel peer +
-//! mTCP peer) lives post-AMI bake (Plan A T6+T7).
+//! These tests don't touch DPDK / a live peer. They cover the
+//! pure-Rust primitives: grid enumeration, per-burst sample
+//! aggregation, and preflight check helpers. The mTCP arm was
+//! removed in the 2026-05-09 bench-suite overhaul.
 
 use bench_vs_mtcp::burst::{
     enumerate_filtered_grid, enumerate_grid, Bucket, BucketAggregate, BurstSample, BUCKET_COUNT,
@@ -12,7 +11,6 @@ use bench_vs_mtcp::burst::{
 };
 use bench_vs_mtcp::dpdk_burst::TxTsMode;
 use bench_vs_mtcp::maxtp;
-use bench_vs_mtcp::mtcp::{self, MtcpConfig};
 use bench_vs_mtcp::preflight::{
     check_mss_and_burst_agreement, check_nic_saturation_bps, check_peer_window,
     check_sanity_invariant, BucketVerdict,
@@ -27,18 +25,20 @@ use bench_vs_mtcp::{Stack, Workload};
 fn stack_parse_covers_all_stacks() {
     assert_eq!(Stack::parse("dpdk").unwrap(), Stack::DpdkNet);
     assert_eq!(Stack::parse("dpdk_net").unwrap(), Stack::DpdkNet);
-    assert_eq!(Stack::parse("mtcp").unwrap(), Stack::Mtcp);
     // 2026-05-03 follow-up — linux maxtp comparator landed.
     assert_eq!(Stack::parse("linux").unwrap(), Stack::Linux);
     assert_eq!(Stack::parse("linux_kernel").unwrap(), Stack::Linux);
+    assert_eq!(Stack::parse("fstack").unwrap(), Stack::FStack);
+    // 2026-05-09 bench-suite overhaul — mTCP and afpacket dropped.
+    assert!(Stack::parse("mtcp").is_err());
     assert!(Stack::parse("afpacket").is_err());
 }
 
 #[test]
 fn stack_as_dimension_is_the_documented_string() {
     assert_eq!(Stack::DpdkNet.as_dimension(), "dpdk_net");
-    assert_eq!(Stack::Mtcp.as_dimension(), "mtcp");
     assert_eq!(Stack::Linux.as_dimension(), "linux");
+    assert_eq!(Stack::FStack.as_dimension(), "fstack");
 }
 
 #[test]
@@ -229,90 +229,6 @@ fn preflight_sanity_invariant_gate_enforces_exact_equality() {
     assert!(check_sanity_invariant(1_048_576_000, 1_048_576_000).is_ok());
     assert!(check_sanity_invariant(1_048_576_000, 1_048_575_999).is_err());
     assert!(check_sanity_invariant(1_048_576_000, 1_048_576_001).is_err());
-}
-
-// ---------------------------------------------------------------------------
-// mTCP stub — config validation surface.
-// ---------------------------------------------------------------------------
-
-fn good_mtcp_cfg() -> MtcpConfig<'static> {
-    MtcpConfig {
-        peer_ip: "10.0.0.42",
-        peer_port: 10_001,
-        peer_binary: "/opt/mtcp-peer/bench-peer",
-        driver_binary: "/opt/mtcp-peer/mtcp-driver",
-        mtcp_conf: "/opt/mtcp/etc/mtcp.conf",
-        burst_bytes: 64 * 1024,
-        gap_ms: 0,
-        bursts: 10_000,
-        warmup: 100,
-        mss: 1460,
-        num_cores: 1,
-        timeout: std::time::Duration::from_secs(60),
-    }
-}
-
-#[test]
-fn mtcp_stub_validate_config_accepts_good_shape() {
-    assert!(mtcp::validate_config(&good_mtcp_cfg()).is_ok());
-}
-
-#[test]
-fn mtcp_run_burst_workload_surfaces_missing_driver_when_path_does_not_exist() {
-    // Subprocess wrapper returns DriverMissing when driver_binary
-    // doesn't exist on the host. This integration-level test mirrors
-    // the unit-test in src/mtcp.rs but exercises the public API entry
-    // point a real caller would use.
-    let mut cfg = good_mtcp_cfg();
-    cfg.driver_binary = "/this/path/does/not/exist/mtcp-driver";
-    match mtcp::run_burst_workload(&cfg) {
-        Err(mtcp::Error::DriverMissing { .. }) => {}
-        other => panic!("expected Error::DriverMissing, got {other:?}"),
-    }
-}
-
-#[test]
-fn mtcp_stub_rejects_malformed_peer_binary() {
-    let mut c = good_mtcp_cfg();
-    c.peer_binary = "bench-peer"; // relative — must be absolute.
-    let err = mtcp::validate_config(&c).unwrap_err();
-    assert!(err.contains("absolute path"), "err = {err}");
-}
-
-#[test]
-fn mtcp_stub_rejects_empty_peer_ip() {
-    let mut c = good_mtcp_cfg();
-    c.peer_ip = "";
-    let err = mtcp::validate_config(&c).unwrap_err();
-    assert!(err.contains("peer-ip"));
-}
-
-#[test]
-fn mtcp_stub_rejects_zero_port() {
-    let mut c = good_mtcp_cfg();
-    c.peer_port = 0;
-    assert!(mtcp::validate_config(&c).is_err());
-}
-
-#[test]
-fn mtcp_stub_rejects_zero_k() {
-    let mut c = good_mtcp_cfg();
-    c.burst_bytes = 0;
-    assert!(mtcp::validate_config(&c).is_err());
-}
-
-#[test]
-fn mtcp_stub_rejects_zero_bursts() {
-    let mut c = good_mtcp_cfg();
-    c.bursts = 0;
-    assert!(mtcp::validate_config(&c).is_err());
-}
-
-#[test]
-fn mtcp_stub_rejects_zero_mss() {
-    let mut c = good_mtcp_cfg();
-    c.mss = 0;
-    assert!(mtcp::validate_config(&c).is_err());
 }
 
 // ---------------------------------------------------------------------------

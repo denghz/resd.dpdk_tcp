@@ -19,12 +19,11 @@ publish = false
 #
 # Peer: kernel-side TCP sink (receives + ACKs, no echo), same binary
 # bench-vs-linux uses at `/opt/bench-peer-linux/bench-peer`. The mTCP
-# comparator was dropped per spec §11 R2 escalation — mTCP upstream
-# targets DPDK 18.05/19.08, doesn't compile against the AMI's DPDK
-# 23.11, and porting exceeds the 50-line escalation budget. See
-# src/mtcp.rs module docs +
-# docs/superpowers/reports/perf-a10-mtcp-rebuild-investigation.md.
-# The dpdk_net + Linux kernel TCP arms are the live comparators.
+# comparator was removed in the 2026-05-09 bench-suite overhaul —
+# upstream is dormant, DPDK 20.11 sidecar maintenance is expensive,
+# and the driver never had a working workload pump. The dpdk_net,
+# Linux kernel TCP, and F-Stack arms are the live comparators. See
+# docs/superpowers/plans/2026-05-09-bench-suite-overhaul.md.
 #
 # Measurement contract (spec §11.1):
 #   - t0 = inline TSC pre-first-send

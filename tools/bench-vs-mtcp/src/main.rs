@@ -1,16 +1,14 @@
-//! bench-vs-mtcp — dpdk_net vs. mTCP comparison harness.
+//! bench-vs-mtcp — dpdk_net vs. linux/fstack comparison harness.
 //!
 //! A10 Plan B Task 12 (spec §11.1, parent spec §11.5.1) +
 //! Task 13 (spec §11.2, parent spec §11.5.2) — same binary
 //! dispatches on `--workload burst` (K × G = 20 grid) or
 //! `--workload maxtp` (W × C = 28 grid).
 //!
-//! # MVP scope flex (T12)
-//!
-//! The mTCP stack is stubbed (see `src/mtcp.rs` module docs) because
-//! the AMI bake that installs `/opt/mtcp/` + `/opt/mtcp-peer/` does
-//! not exist yet. The dpdk_net side is fully wired. When the AMI is
-//! available, swapping the stub for a real driver is the only change.
+//! The mTCP comparator arm was removed in the 2026-05-09 bench-suite
+//! overhaul — the upstream project is dormant and the driver never
+//! had a working workload pump. The binary name is retained for CSV
+//! schema continuity (`tool` column = `"bench-vs-mtcp"`).
 //!
 //! # Preset
 //!
@@ -51,14 +49,14 @@ use bench_vs_mtcp::preflight::{
     check_mss_and_burst_agreement, check_nic_saturation_bps, check_peer_window,
     check_sanity_invariant, BucketVerdict,
 };
-use bench_vs_mtcp::{mtcp, Stack, Workload};
+use bench_vs_mtcp::{Stack, Workload};
 
 use dpdk_net_core::engine::Engine;
 
 #[derive(Parser, Debug)]
 #[command(
     version,
-    about = "bench-vs-mtcp — burst-grid comparison vs. mTCP (spec §11.1)"
+    about = "bench-vs-mtcp — burst/maxtp grid comparison across dpdk_net + linux + fstack"
 )]
 struct Args {
     /// Peer IP (dotted-quad IPv4).
@@ -89,13 +87,11 @@ struct Args {
     #[arg(long, default_value = "burst")]
     workload: String,
 
-    /// CSV of stacks to run. Tokens: `dpdk`, `mtcp`, `linux`. Default
-    /// runs `dpdk` + `linux` (the mTCP comparator was dropped per spec
-    /// §11 R2 escalation — see src/mtcp.rs module docs and
-    /// docs/superpowers/reports/perf-a10-mtcp-rebuild-investigation.md;
-    /// `--stacks mtcp` is left available for shape-validation and
-    /// strict-mode error surfacing). The Linux path is wired for the
-    /// `maxtp` workload only — `burst` skips it with a warning.
+    /// CSV of stacks to run. Tokens: `dpdk`, `linux`, `fstack`.
+    /// Default runs `dpdk` + `linux` (the `mtcp` token was dropped in
+    /// the 2026-05-09 bench-suite overhaul — see lib.rs module docs).
+    /// The Linux path is wired for the `maxtp` workload only —
+    /// `burst` skips it with a warning.
     #[arg(long, default_value = "dpdk,linux")]
     stacks: String,
 
@@ -117,8 +113,7 @@ struct Args {
     #[arg(long)]
     output_csv: std::path::PathBuf,
 
-    /// Precondition mode: `strict` aborts on precondition failure or
-    /// on a selected stack failing bring-up (e.g. mTCP stub);
+    /// Precondition mode: `strict` aborts on precondition failure;
     /// `lenient` warns and continues.
     #[arg(long, default_value = "strict")]
     precondition_mode: String,
@@ -179,43 +174,6 @@ struct Args {
     /// Maxtp measurement duration in seconds. Spec §11.2 locks at 60.
     #[arg(long, default_value_t = maxtp::DURATION_SECS)]
     maxtp_duration_secs: u64,
-
-    /// mTCP **server-side** peer binary absolute path on the baked
-    /// AMI. The peer host runs this; bench-vs-mtcp validates the path
-    /// shape but never execs it (the bench-pair script handles peer
-    /// launch).
-    #[arg(long, default_value = "/opt/mtcp-peer/bench-peer")]
-    mtcp_peer_binary: String,
-
-    /// mTCP **client-side** workload-driver binary absolute path on
-    /// this host. bench-vs-mtcp invokes this via subprocess (DPDK
-    /// 20.11 + libmtcp.a links cleanly here, but not in the Rust
-    /// process which already pulls DPDK 23.11). Today the driver is a
-    /// stub that returns ENOSYS; this wrapper surfaces it as
-    /// `mtcp::Error::DriverUnimplemented`. See `tools/bench-vs-mtcp/
-    /// peer/mtcp-driver.c` module docs for the frozen CLI + JSON
-    /// contracts.
-    #[arg(long, default_value = "/opt/mtcp-peer/mtcp-driver")]
-    mtcp_driver_binary: String,
-
-    /// mTCP startup config file absolute path. Passed to the driver
-    /// via `--mtcp-conf` and consumed by `mtcp_init()` inside the
-    /// driver process.
-    #[arg(long, default_value = "/opt/mtcp/etc/mtcp.conf")]
-    mtcp_conf: String,
-
-    /// mTCP core count for the driver. Single-core (1) for the burst
-    /// grid (one persistent connection); multi-core (== conn_count)
-    /// for the maxtp grid. Default 1.
-    #[arg(long, default_value_t = 1)]
-    mtcp_num_cores: u32,
-
-    /// Per-driver-invocation timeout in seconds. Hard cap on a single
-    /// burst- or maxtp-bucket subprocess run. Default 600 (10 min) —
-    /// covers the maxtp 70 s window (warmup + measurement + buffer)
-    /// plus DPDK EAL spin-up.
-    #[arg(long, default_value_t = 600)]
-    mtcp_driver_timeout_secs: u64,
 
     /// NIC line-rate cap (bits-per-second) for the post-run
     /// NIC-saturation check (spec §11.1 check 3 — "achieved rate ≤
@@ -367,9 +325,6 @@ fn main() -> anyhow::Result<()> {
                             &mut writer,
                         )?;
                     }
-                    Stack::Mtcp => {
-                        run_burst_grid_mtcp(&args, &grid, &metadata, mode, &mut writer)?;
-                    }
                     Stack::Linux => {
                         // Linux burst arm is out of scope for the
                         // 2026-05-03 follow-up — user only asked for
@@ -421,9 +376,6 @@ fn main() -> anyhow::Result<()> {
                             nic_max_bps,
                             &mut writer,
                         )?;
-                    }
-                    Stack::Mtcp => {
-                        run_maxtp_grid_mtcp(&args, &grid, &metadata, mode, &mut writer)?;
                     }
                     Stack::Linux => {
                         // Use linux_peer_port (default 10002, linux-tcp-sink)
@@ -564,11 +516,10 @@ fn run_burst_grid_dpdk<W: std::io::Write>(
 
         // Pre-run check (2): MSS + TX burst size agreement. We drive
         // our MSS from EngineConfig; peer MSS is fixed at the same
-        // value (spec locks it at 1460 on both stacks). For the burst
-        // size (mTCP's `nb_pkts` vs. our `TX_BURST_SIZE`), we use the
-        // engine's configured ring size as a proxy since the
+        // value (spec locks it at 1460 on both stacks). The
         // `rte_eth_tx_burst`-level batch size is a compile-time
-        // constant in our stack; mTCP stub records its intent only.
+        // constant in our stack — pass 32/32 as a placeholder
+        // satisfying the bench-common shape contract.
         let mss_verdict =
             check_mss_and_burst_agreement(args.mss, args.mss, 32, 32);
 
@@ -714,90 +665,6 @@ fn mean_throughput_bps(run: &dpdk_burst::BucketRun) -> f64 {
     }
     let sum: f64 = run.samples.iter().map(|s| s.throughput_bps).sum();
     sum / (run.samples.len() as f64)
-}
-
-// ---------------------------------------------------------------------------
-// mTCP stub driver.
-// ---------------------------------------------------------------------------
-
-fn run_burst_grid_mtcp<W: std::io::Write>(
-    args: &Args,
-    grid: &[bench_vs_mtcp::burst::Bucket],
-    metadata: &RunMetadata,
-    mode: PreconditionMode,
-    writer: &mut csv::Writer<W>,
-) -> anyhow::Result<()> {
-    for bucket in grid {
-        let cfg = mtcp::MtcpConfig {
-            peer_ip: &args.peer_ip,
-            peer_port: args.peer_port,
-            peer_binary: &args.mtcp_peer_binary,
-            driver_binary: &args.mtcp_driver_binary,
-            mtcp_conf: &args.mtcp_conf,
-            burst_bytes: bucket.burst_bytes,
-            gap_ms: bucket.gap_ms,
-            bursts: args.bursts_per_bucket,
-            warmup: args.warmup,
-            mss: args.mss,
-            num_cores: args.mtcp_num_cores,
-            timeout: std::time::Duration::from_secs(args.mtcp_driver_timeout_secs),
-        };
-        // Validate shape first so a bad CLI combo fails loudly even
-        // in lenient mode (strict mode handles the Unimplemented
-        // below).
-        if let Err(reason) = mtcp::validate_config(&cfg) {
-            anyhow::bail!("mTCP config validation failed: {reason}");
-        }
-        match mtcp::run_burst_workload(&cfg) {
-            Ok(samples_bps) => {
-                // Real driver returned per-burst bps samples. Wire
-                // them into the bench-common burst pipeline by
-                // synthesising BurstSamples — the driver doesn't have
-                // engine-level introspection (counters / TSC mode), so
-                // tx_ts_mode is recorded as `n/a` and bench-report can
-                // filter the rows accordingly.
-                //
-                // NOTE: this branch is currently unreachable while the
-                // driver is a stub returning ENOSYS. Kept as a forward
-                // contract so the wiring is in place when the C-side
-                // workload pump lands.
-                let _ = samples_bps;
-                anyhow::bail!(
-                    "mtcp::run_burst_workload returned Ok but bench-common \
-                     wiring for the real driver path is not yet finalised — \
-                     tracked alongside peer/mtcp-driver.c implementation."
-                );
-            }
-            Err(e) => match mode {
-                PreconditionMode::Strict => {
-                    anyhow::bail!(
-                        "mTCP stack is stubbed in T12: {e}. Pass \
-                         `--precondition-mode lenient` to skip with a CSV \
-                         marker, or wait for Plan A AMI T6+T7 to land."
-                    );
-                }
-                PreconditionMode::Lenient => {
-                    // Emit an invalidated-bucket marker row so
-                    // bench-report sees the intent (and doesn't just
-                    // lose the run). `bucket_invalid` carries the
-                    // stub reason. `tx_ts_mode = None` — the mTCP
-                    // stack doesn't expose TX-TS measurement modes to
-                    // the harness yet, so we don't tag the row with a
-                    // possibly-misleading dpdk_net mode.
-                    let agg = BucketAggregate::from_samples(
-                        *bucket,
-                        Stack::Mtcp,
-                        &[],
-                        BucketVerdict::Invalid(format!("mtcp stub: {e}")),
-                        None,
-                    );
-                    emit_bucket_rows(writer, metadata, &args.tool, &args.feature_set, &agg)
-                        .context("emit mtcp-stub marker row")?;
-                }
-            },
-        }
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1024,8 +891,7 @@ fn run_maxtp_grid_dpdk<W: std::io::Write>(
 }
 
 // ---------------------------------------------------------------------------
-// Linux kernel-TCP maxtp grid driver — comparator arm landed
-// 2026-05-03 while the mTCP arm stays stubbed (AMI rebuild blocked).
+// Linux kernel-TCP maxtp grid driver — comparator arm landed 2026-05-03.
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
@@ -1283,71 +1149,6 @@ fn emit_linux_bucket_rows<W: std::io::Write>(
     Ok(())
 }
 
-
-// ---------------------------------------------------------------------------
-// mTCP maxtp stub driver.
-// ---------------------------------------------------------------------------
-
-fn run_maxtp_grid_mtcp<W: std::io::Write>(
-    args: &Args,
-    grid: &[maxtp::Bucket],
-    metadata: &RunMetadata,
-    mode: PreconditionMode,
-    writer: &mut csv::Writer<W>,
-) -> anyhow::Result<()> {
-    for bucket in grid {
-        let cfg = mtcp::MaxtpConfig {
-            peer_ip: &args.peer_ip,
-            peer_port: args.peer_port,
-            peer_binary: &args.mtcp_peer_binary,
-            driver_binary: &args.mtcp_driver_binary,
-            mtcp_conf: &args.mtcp_conf,
-            write_bytes: bucket.write_bytes,
-            conn_count: bucket.conn_count,
-            warmup_secs: args.maxtp_warmup_secs,
-            duration_secs: args.maxtp_duration_secs,
-            mss: args.mss,
-            num_cores: args.mtcp_num_cores,
-            timeout: std::time::Duration::from_secs(args.mtcp_driver_timeout_secs),
-        };
-        if let Err(reason) = mtcp::validate_maxtp_config(&cfg) {
-            anyhow::bail!("mTCP maxtp config validation failed: {reason}");
-        }
-        match mtcp::run_maxtp_workload(&cfg) {
-            Ok(_) => {
-                // See burst-side note above — same forward-contract
-                // shape; bench-common wiring lands alongside the C
-                // driver implementation.
-                anyhow::bail!(
-                    "mtcp::run_maxtp_workload returned Ok but bench-common \
-                     wiring for the real driver path is not yet finalised — \
-                     tracked alongside peer/mtcp-driver.c implementation."
-                );
-            }
-            Err(e) => match mode {
-                PreconditionMode::Strict => {
-                    anyhow::bail!(
-                        "mTCP stack is stubbed in T13: {e}. Pass \
-                         `--precondition-mode lenient` to skip with a CSV \
-                         marker, or wait for Plan A AMI T6+T7 to land."
-                    );
-                }
-                PreconditionMode::Lenient => {
-                    let agg = maxtp::BucketAggregate::from_sample(
-                        *bucket,
-                        Stack::Mtcp,
-                        None,
-                        BucketVerdict::Invalid(format!("mtcp stub: {e}")),
-                        None,
-                    );
-                    maxtp::emit_bucket_rows(writer, metadata, &args.tool, &args.feature_set, &agg)
-                        .context("emit mtcp-stub maxtp marker row")?;
-                }
-            },
-        }
-    }
-    Ok(())
-}
 
 // ---------------------------------------------------------------------------
 // F-Stack burst + maxtp grid drivers — feature-gated behind `fstack`.
@@ -1998,8 +1799,8 @@ mod tests {
 
     #[test]
     fn parse_stacks_default_is_both() {
-        let out = parse_stacks("dpdk,mtcp").unwrap();
-        assert_eq!(out, vec![Stack::DpdkNet, Stack::Mtcp]);
+        let out = parse_stacks("dpdk,linux").unwrap();
+        assert_eq!(out, vec![Stack::DpdkNet, Stack::Linux]);
     }
 
     #[test]
@@ -2015,24 +1816,26 @@ mod tests {
 
     #[test]
     fn parse_stacks_accepts_three_stacks() {
-        let out = parse_stacks("dpdk,mtcp,linux").unwrap();
-        assert_eq!(out, vec![Stack::DpdkNet, Stack::Mtcp, Stack::Linux]);
+        let out = parse_stacks("dpdk,linux,fstack").unwrap();
+        assert_eq!(out, vec![Stack::DpdkNet, Stack::Linux, Stack::FStack]);
     }
 
     #[test]
     fn parse_stacks_dedupes() {
-        let out = parse_stacks("dpdk,dpdk,mtcp,dpdk").unwrap();
-        assert_eq!(out, vec![Stack::DpdkNet, Stack::Mtcp]);
+        let out = parse_stacks("dpdk,dpdk,linux,dpdk").unwrap();
+        assert_eq!(out, vec![Stack::DpdkNet, Stack::Linux]);
     }
 
     #[test]
     fn parse_stacks_handles_whitespace_and_empty_entries() {
-        let out = parse_stacks(" dpdk , , mtcp ").unwrap();
-        assert_eq!(out, vec![Stack::DpdkNet, Stack::Mtcp]);
+        let out = parse_stacks(" dpdk , , linux ").unwrap();
+        assert_eq!(out, vec![Stack::DpdkNet, Stack::Linux]);
     }
 
     #[test]
     fn parse_stacks_rejects_unknown_token() {
+        // Includes the legacy `mtcp` token (removed 2026-05-09).
+        assert!(parse_stacks("dpdk,mtcp").is_err());
         assert!(parse_stacks("dpdk,garbage").is_err());
     }
 

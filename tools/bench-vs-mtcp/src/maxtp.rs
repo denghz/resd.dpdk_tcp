@@ -7,7 +7,9 @@
 //!
 //! Grid enumeration + CSV row emission for the max-sustained-throughput
 //! workload. The per-stack implementation lives in
-//! [`crate::dpdk_maxtp`] (dpdk_net side) and [`crate::mtcp`] (stub).
+//! [`crate::dpdk_maxtp`] (dpdk_net side), [`crate::linux_maxtp`]
+//! (Linux kernel TCP), and [`crate::fstack_maxtp`] (F-Stack,
+//! feature-gated).
 //!
 //! # Measurement contract (spec §11.2)
 //!
@@ -193,11 +195,11 @@ pub struct BucketAggregate {
     pub stack: Stack,
     pub verdict: BucketVerdict,
     /// `None` if the verdict is `Invalid` (skipped measurement) or if
-    /// the stack didn't produce a sample (e.g. mTCP stub marker row).
+    /// the stack didn't produce a sample.
     pub sample: Option<MaxtpSample>,
-    /// TX-TS mode the runner used. `None` on mTCP stub rows. Mirrors
-    /// the `burst::BucketAggregate.tx_ts_mode` field for CSV schema
-    /// uniformity.
+    /// TX-TS mode the runner used. `None` on non-dpdk_net stacks
+    /// (Linux). Mirrors the `burst::BucketAggregate.tx_ts_mode` field
+    /// for CSV schema uniformity.
     pub tx_ts_mode: Option<TxTsMode>,
 }
 
@@ -237,8 +239,7 @@ impl BucketAggregate {
 ///
 /// `{"workload":"maxtp","W_bytes":<int>,"C":<int>,"stack":<str>}` —
 /// plus `"tx_ts_mode":<str>` when the row's runner records it (dpdk_net
-/// side; mTCP stub leaves it unset) and `"bucket_invalid":<str>` when
-/// the bucket is invalidated.
+/// side) and `"bucket_invalid":<str>` when the bucket is invalidated.
 pub fn build_dimensions_json(
     bucket: Bucket,
     stack: Stack,
@@ -589,13 +590,13 @@ mod tests {
     fn dimensions_json_carries_invalid_reason_when_present() {
         let dims = build_dimensions_json(
             Bucket::new(262_144, 64),
-            Stack::Mtcp,
-            Some("mtcp stub"),
+            Stack::Linux,
+            Some("NIC-bound"),
             None,
         );
         let parsed: serde_json::Value = serde_json::from_str(&dims).unwrap();
-        assert_eq!(parsed["stack"], "mtcp");
-        assert_eq!(parsed["bucket_invalid"], "mtcp stub");
+        assert_eq!(parsed["stack"], "linux");
+        assert_eq!(parsed["bucket_invalid"], "NIC-bound");
     }
 
     #[test]
@@ -622,8 +623,8 @@ mod tests {
     fn dimensions_json_is_stable_across_calls() {
         // bench-report groups rows by the verbatim string; serialisation
         // must be deterministic.
-        let a = build_dimensions_json(Bucket::new(1024, 4), Stack::Mtcp, None, None);
-        let b = build_dimensions_json(Bucket::new(1024, 4), Stack::Mtcp, None, None);
+        let a = build_dimensions_json(Bucket::new(1024, 4), Stack::Linux, None, None);
+        let b = build_dimensions_json(Bucket::new(1024, 4), Stack::Linux, None, None);
         assert_eq!(a, b);
     }
 
@@ -776,13 +777,16 @@ mod tests {
     }
 
     #[test]
-    fn emit_bucket_rows_omits_tx_ts_mode_for_mtcp_stub() {
+    fn emit_bucket_rows_omits_tx_ts_mode_for_linux_row() {
+        // Linux rows never carry a tx_ts_mode (the runner doesn't read
+        // NIC HW timestamps); absence = downstream reports group them
+        // separately from the dpdk_net rows.
         let bucket = Bucket::new(64, 1);
         let agg = BucketAggregate::from_sample(
             bucket,
-            Stack::Mtcp,
+            Stack::Linux,
             None,
-            BucketVerdict::Invalid("mtcp stub".to_string()),
+            BucketVerdict::Invalid("rwnd low".to_string()),
             None,
         );
         let mut buf = Vec::new();
@@ -803,7 +807,7 @@ mod tests {
             serde_json::from_str(rec.get(dims_idx).unwrap()).unwrap();
         assert!(
             dims.get("tx_ts_mode").is_none(),
-            "expected tx_ts_mode absent for mtcp stub row; got {dims}"
+            "expected tx_ts_mode absent for linux row; got {dims}"
         );
     }
 

@@ -7,8 +7,8 @@
 //!
 //! Grid enumeration + CSV row emission + aggregation of per-burst
 //! throughput samples live here. The per-stack implementation lives
-//! in [`crate::dpdk_burst`] (dpdk_net side) and [`crate::mtcp`]
-//! (stub).
+//! in [`crate::dpdk_burst`] (dpdk_net side) and
+//! [`crate::fstack_burst`] (F-Stack side, feature-gated).
 //!
 //! # CSV dimensions
 //!
@@ -199,11 +199,10 @@ pub struct BucketAggregate {
     /// equals `len - warmup`. Useful for the sanity invariant check.
     pub measurement_sample_count: usize,
     /// TX-TS mode the runner used. `None` on rows produced by non-
-    /// dpdk_net stacks (e.g. the mTCP stub) where the concept does not
-    /// apply; `Some(mode)` on dpdk_net rows. Emitted into
-    /// `dimensions_json.tx_ts_mode` so downstream reports can
-    /// distinguish HW-TS rows from TSC-fallback rows on the same NIC /
-    /// across NICs.
+    /// dpdk_net stacks where the concept does not apply; `Some(mode)`
+    /// on dpdk_net rows. Emitted into `dimensions_json.tx_ts_mode` so
+    /// downstream reports can distinguish HW-TS rows from TSC-fallback
+    /// rows on the same NIC / across NICs.
     pub tx_ts_mode: Option<TxTsMode>,
 }
 
@@ -218,7 +217,7 @@ impl BucketAggregate {
     /// skipped to avoid writing untrustworthy percentiles.
     ///
     /// `tx_ts_mode` is `None` on rows that don't involve the dpdk_net
-    /// TX path (e.g. mTCP stub marker rows).
+    /// TX path.
     pub fn from_samples(
         bucket: Bucket,
         stack: Stack,
@@ -272,8 +271,7 @@ impl BucketAggregate {
 /// `{"workload":"burst","K_bytes":<int>,"G_ms":<float>,"stack":<str>}`;
 /// we additionally append `"tx_ts_mode": <str>` when the row's runner
 /// knows which TX-TS source it used (dpdk_net side) so downstream
-/// reports can filter HW-TS rows from TSC-fallback rows. The mTCP stub
-/// leaves it unset.
+/// reports can filter HW-TS rows from TSC-fallback rows.
 /// `G_ms` is emitted as `f64` (0.0, 1.0, 10.0, 100.0) to match the
 /// `<float>` designation; downstream bench-report parses it as
 /// `serde_json::Value::Number` so either integer or float form works
@@ -678,12 +676,12 @@ mod tests {
     fn dimensions_json_carries_invalid_reason_when_present() {
         let dims = build_dimensions_json(
             Bucket::new(1 << 20, 100),
-            Stack::Mtcp,
+            Stack::Linux,
             Some("NIC-bound"),
             None,
         );
         let parsed: serde_json::Value = serde_json::from_str(&dims).unwrap();
-        assert_eq!(parsed["stack"], "mtcp");
+        assert_eq!(parsed["stack"], "linux");
         assert_eq!(parsed["bucket_invalid"], "NIC-bound");
     }
 
@@ -691,8 +689,8 @@ mod tests {
     fn dimensions_json_is_stable_across_calls() {
         // bench-report groups rows by the verbatim string; serialisation
         // must be deterministic.
-        let a = build_dimensions_json(Bucket::new(256 * 1024, 10), Stack::Mtcp, None, None);
-        let b = build_dimensions_json(Bucket::new(256 * 1024, 10), Stack::Mtcp, None, None);
+        let a = build_dimensions_json(Bucket::new(256 * 1024, 10), Stack::Linux, None, None);
+        let b = build_dimensions_json(Bucket::new(256 * 1024, 10), Stack::Linux, None, None);
         assert_eq!(a, b);
     }
 
@@ -862,14 +860,14 @@ mod tests {
 
     #[test]
     fn emit_bucket_rows_omits_tx_ts_mode_when_none() {
-        // mTCP stub rows don't carry a tx_ts_mode; absence = downstream
+        // Linux rows don't carry a tx_ts_mode; absence = downstream
         // reports group them separately from the dpdk_net rows.
         let bucket = Bucket::new(64 * 1024, 0);
         let agg = BucketAggregate::from_samples(
             bucket,
-            Stack::Mtcp,
+            Stack::Linux,
             &[],
-            BucketVerdict::Invalid("mtcp stub".to_string()),
+            BucketVerdict::Invalid("linux stub".to_string()),
             None,
         );
         let mut buf = Vec::new();

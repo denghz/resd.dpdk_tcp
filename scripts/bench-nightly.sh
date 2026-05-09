@@ -896,21 +896,6 @@ run_dut_bench bench-vs-mtcp bench-vs-mtcp-burst-fstack \
     --nic-max-bps "$NIC_MAX_BPS" \
     || log "  [11a/12] bench-vs-mtcp burst fstack exited non-zero — continuing"
 
-log "[11a2/12] bench-vs-mtcp burst grid — pass 3: mtcp"
-# mTCP runs as a subprocess (mtcp-driver) linking DPDK 20.11 sidecar.
-# peer echo-server on port 10001 handles mTCP's standard TCP packets.
-run_dut_bench bench-vs-mtcp bench-vs-mtcp-burst-mtcp \
-    "${DPDK_COMMON[@]}" \
-    --workload burst \
-    --peer-port 10001 \
-    --stacks mtcp \
-    --mtcp-conf /opt/mtcp/etc/mtcp.conf \
-    --mtcp-driver-binary /opt/mtcp-peer/mtcp-driver \
-    --tool bench-vs-mtcp \
-    --feature-set trading-latency \
-    --nic-max-bps "$NIC_MAX_BPS" \
-    || log "  [11a2/12] bench-vs-mtcp burst mtcp exited non-zero — continuing"
-
 log "[11b/12] bench-vs-mtcp maxtp grid — pass 1: dpdk"
 # dpdk alone so the peer stays below backlog threshold for large-W buckets.
 run_dut_bench bench-vs-mtcp bench-vs-mtcp-maxtp \
@@ -953,20 +938,6 @@ run_dut_bench bench-vs-mtcp bench-vs-mtcp-maxtp-fstack \
     --feature-set trading-latency \
     --nic-max-bps "$NIC_MAX_BPS" \
     || log "  [11c/12] bench-vs-mtcp maxtp fstack exited non-zero — continuing"
-
-log "[11c2/12] bench-vs-mtcp maxtp grid — pass 4: mtcp"
-# mTCP subprocess uses DPDK 20.11 sidecar; peer echo-server on 10001.
-run_dut_bench bench-vs-mtcp bench-vs-mtcp-maxtp-mtcp \
-    "${DPDK_COMMON[@]}" \
-    --workload maxtp \
-    --peer-port 10001 \
-    --stacks mtcp \
-    --mtcp-conf /opt/mtcp/etc/mtcp.conf \
-    --mtcp-driver-binary /opt/mtcp-peer/mtcp-driver \
-    --tool bench-vs-mtcp \
-    --feature-set trading-latency \
-    --nic-max-bps "$NIC_MAX_BPS" \
-    || log "  [11c2/12] bench-vs-mtcp maxtp mtcp exited non-zero — continuing"
 
 # ---------------------------------------------------------------------------
 # [12/12] Local bench-micro + summarize + bench-report.

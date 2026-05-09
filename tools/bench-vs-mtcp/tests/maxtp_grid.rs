@@ -1,16 +1,15 @@
 //! Integration tests for the `maxtp` sub-workload (spec §11.2).
 //!
-//! These tests don't touch DPDK / a live peer / libmtcp. They cover
-//! the pure-Rust primitives: grid enumeration, per-window sample
-//! construction, preflight check helpers, sanity-invariant math, and
-//! the mTCP stub's config validation.
+//! These tests don't touch DPDK / a live peer. They cover the
+//! pure-Rust primitives: grid enumeration, per-window sample
+//! construction, preflight check helpers, and sanity-invariant math.
+//! The mTCP arm was removed in the 2026-05-09 bench-suite overhaul.
 
 use bench_vs_mtcp::dpdk_maxtp::TxTsMode;
 use bench_vs_mtcp::maxtp::{
     self, check_sanity_invariant, enumerate_filtered_grid, enumerate_grid, Bucket,
     BucketAggregate, MaxtpSample, BUCKET_COUNT, C_CONNS, DURATION_SECS, WARMUP_SECS, W_BYTES,
 };
-use bench_vs_mtcp::mtcp::{self, MaxtpConfig};
 use bench_vs_mtcp::preflight::BucketVerdict;
 use bench_vs_mtcp::Stack;
 
@@ -333,73 +332,6 @@ fn emit_bucket_rows_invalid_bucket_emits_single_marker() {
     let dims: serde_json::Value =
         serde_json::from_str(rec.get(dims_idx).unwrap()).unwrap();
     assert_eq!(dims["bucket_invalid"], "NIC-bound");
-}
-
-// ---------------------------------------------------------------------------
-// mTCP maxtp stub — config validation surface.
-// ---------------------------------------------------------------------------
-
-fn good_mtcp_maxtp_cfg() -> MaxtpConfig<'static> {
-    MaxtpConfig {
-        peer_ip: "10.0.0.42",
-        peer_port: 10_001,
-        peer_binary: "/opt/mtcp-peer/bench-peer",
-        driver_binary: "/opt/mtcp-peer/mtcp-driver",
-        mtcp_conf: "/opt/mtcp/etc/mtcp.conf",
-        write_bytes: 4096,
-        conn_count: 4,
-        warmup_secs: 10,
-        duration_secs: 60,
-        mss: 1460,
-        num_cores: 1,
-        timeout: std::time::Duration::from_secs(120),
-    }
-}
-
-#[test]
-fn mtcp_maxtp_stub_accepts_good_shape() {
-    assert!(mtcp::validate_maxtp_config(&good_mtcp_maxtp_cfg()).is_ok());
-}
-
-#[test]
-fn mtcp_maxtp_run_surfaces_missing_driver_when_path_does_not_exist() {
-    // Mirrors burst-side integration test: subprocess wrapper returns
-    // DriverMissing when the configured driver binary doesn't exist.
-    let mut cfg = good_mtcp_maxtp_cfg();
-    cfg.driver_binary = "/this/path/does/not/exist/mtcp-driver";
-    match mtcp::run_maxtp_workload(&cfg) {
-        Err(mtcp::Error::DriverMissing { .. }) => {}
-        other => panic!("expected Error::DriverMissing, got {other:?}"),
-    }
-}
-
-#[test]
-fn mtcp_maxtp_stub_rejects_zero_write_bytes() {
-    let mut c = good_mtcp_maxtp_cfg();
-    c.write_bytes = 0;
-    assert!(mtcp::validate_maxtp_config(&c).is_err());
-}
-
-#[test]
-fn mtcp_maxtp_stub_rejects_zero_conn_count() {
-    let mut c = good_mtcp_maxtp_cfg();
-    c.conn_count = 0;
-    assert!(mtcp::validate_maxtp_config(&c).is_err());
-}
-
-#[test]
-fn mtcp_maxtp_stub_rejects_zero_duration() {
-    let mut c = good_mtcp_maxtp_cfg();
-    c.duration_secs = 0;
-    assert!(mtcp::validate_maxtp_config(&c).is_err());
-}
-
-#[test]
-fn mtcp_maxtp_stub_rejects_relative_peer_binary() {
-    let mut c = good_mtcp_maxtp_cfg();
-    c.peer_binary = "bench-peer";
-    let err = mtcp::validate_maxtp_config(&c).unwrap_err();
-    assert!(err.contains("absolute path"));
 }
 
 fn sample_metadata() -> bench_common::run_metadata::RunMetadata {
