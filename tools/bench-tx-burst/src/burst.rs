@@ -7,8 +7,9 @@
 //!
 //! Grid enumeration + CSV row emission + aggregation of per-burst
 //! throughput samples live here. The per-stack implementation lives
-//! in [`crate::dpdk_burst`] (dpdk_net side) and
-//! [`crate::fstack_burst`] (F-Stack side, feature-gated).
+//! in [`crate::dpdk`] (dpdk_net side), [`crate::linux`] (Linux kernel
+//! TCP via `std::net::TcpStream`), and [`crate::fstack`] (F-Stack
+//! side, feature-gated).
 //!
 //! # CSV dimensions
 //!
@@ -38,7 +39,7 @@ use bench_common::csv_row::{CsvRow, MetricAggregation};
 use bench_common::percentile::{summarize, Summary};
 use bench_common::run_metadata::RunMetadata;
 
-use crate::dpdk_burst::TxTsMode;
+use crate::dpdk::TxTsMode;
 use crate::preflight::BucketVerdict;
 use crate::Stack;
 
@@ -117,7 +118,7 @@ pub fn enumerate_filtered_grid(
 }
 
 /// One burst's raw measurement product. All times in TSC-ns units
-/// (the `dpdk_burst` runner converts TSC cycles to ns before passing).
+/// (the `dpdk` runner converts TSC cycles to ns before passing).
 ///
 /// - `throughput_bps` = primary metric (K / (t1 − t0) in bits/s).
 /// - `initiation_ns` = t_first_wire − t0, the wall-clock from the
@@ -680,12 +681,12 @@ mod tests {
     fn dimensions_json_carries_invalid_reason_when_present() {
         let dims = build_dimensions_json(
             Bucket::new(1 << 20, 100),
-            Stack::Linux,
+            Stack::LinuxKernel,
             Some("NIC-bound"),
             None,
         );
         let parsed: serde_json::Value = serde_json::from_str(&dims).unwrap();
-        assert_eq!(parsed["stack"], "linux");
+        assert_eq!(parsed["stack"], "linux_kernel");
         assert_eq!(parsed["bucket_invalid"], "NIC-bound");
     }
 
@@ -693,8 +694,8 @@ mod tests {
     fn dimensions_json_is_stable_across_calls() {
         // bench-report groups rows by the verbatim string; serialisation
         // must be deterministic.
-        let a = build_dimensions_json(Bucket::new(256 * 1024, 10), Stack::Linux, None, None);
-        let b = build_dimensions_json(Bucket::new(256 * 1024, 10), Stack::Linux, None, None);
+        let a = build_dimensions_json(Bucket::new(256 * 1024, 10), Stack::LinuxKernel, None, None);
+        let b = build_dimensions_json(Bucket::new(256 * 1024, 10), Stack::LinuxKernel, None, None);
         assert_eq!(a, b);
     }
 
@@ -764,7 +765,7 @@ mod tests {
         let mut buf = Vec::new();
         {
             let mut writer = csv::Writer::from_writer(&mut buf);
-            emit_bucket_rows(&mut writer, &sample_metadata(), "bench-vs-mtcp", "trading-latency", &agg)
+            emit_bucket_rows(&mut writer, &sample_metadata(), "bench-tx-burst", "trading-latency", &agg)
                 .unwrap();
             writer.flush().unwrap();
         }
@@ -785,7 +786,7 @@ mod tests {
         let mut buf = Vec::new();
         {
             let mut writer = csv::Writer::from_writer(&mut buf);
-            emit_bucket_rows(&mut writer, &sample_metadata(), "bench-vs-mtcp", "trading-latency", &agg)
+            emit_bucket_rows(&mut writer, &sample_metadata(), "bench-tx-burst", "trading-latency", &agg)
                 .unwrap();
             writer.flush().unwrap();
         }
@@ -832,7 +833,7 @@ mod tests {
         let mut buf = Vec::new();
         {
             let mut writer = csv::Writer::from_writer(&mut buf);
-            emit_bucket_rows(&mut writer, &sample_metadata(), "bench-vs-mtcp", "trading-latency", &agg)
+            emit_bucket_rows(&mut writer, &sample_metadata(), "bench-tx-burst", "trading-latency", &agg)
                 .unwrap();
             writer.flush().unwrap();
         }
@@ -854,7 +855,7 @@ mod tests {
         let mut buf = Vec::new();
         {
             let mut writer = csv::Writer::from_writer(&mut buf);
-            emit_bucket_rows(&mut writer, &sample_metadata(), "bench-vs-mtcp", "trading-latency", &agg)
+            emit_bucket_rows(&mut writer, &sample_metadata(), "bench-tx-burst", "trading-latency", &agg)
                 .unwrap();
             writer.flush().unwrap();
         }
@@ -869,7 +870,7 @@ mod tests {
         let bucket = Bucket::new(64 * 1024, 0);
         let agg = BucketAggregate::from_samples(
             bucket,
-            Stack::Linux,
+            Stack::LinuxKernel,
             &[],
             BucketVerdict::Invalid("linux stub".to_string()),
             None,
@@ -877,7 +878,7 @@ mod tests {
         let mut buf = Vec::new();
         {
             let mut writer = csv::Writer::from_writer(&mut buf);
-            emit_bucket_rows(&mut writer, &sample_metadata(), "bench-vs-mtcp", "trading-latency", &agg)
+            emit_bucket_rows(&mut writer, &sample_metadata(), "bench-tx-burst", "trading-latency", &agg)
                 .unwrap();
             writer.flush().unwrap();
         }

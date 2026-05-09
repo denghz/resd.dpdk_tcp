@@ -29,11 +29,12 @@
 //!   wired (out of scope for the 2026-05-03 follow-up).
 //! - `maxtp` (T13) — W × C = 28 buckets (spec §11.2). Linux arm wired.
 
-pub mod burst;
-pub mod dpdk_burst;
+// Phase 5 of the 2026-05-09 bench-suite overhaul moved the burst grid
+// modules (burst, dpdk_burst, fstack_burst) out of this crate and into
+// the new sibling `bench-tx-burst`. The maxtp modules below stay here
+// until Task 5.2 splits them into `bench-tx-maxtp`. Once 5.2 + 5.4 land
+// this whole crate is deleted.
 pub mod dpdk_maxtp;
-#[cfg(feature = "fstack")]
-pub mod fstack_burst;
 #[cfg(feature = "fstack")]
 pub mod fstack_ffi;
 #[cfg(feature = "fstack")]

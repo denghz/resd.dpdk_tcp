@@ -50,7 +50,7 @@ use std::os::raw::{c_int, c_uint, c_void};
 use std::time::{Duration, Instant};
 
 use crate::burst::{Bucket, BurstSample};
-use crate::dpdk_burst::TxTsMode;
+use crate::dpdk::TxTsMode;
 use crate::fstack_ffi::{
     ff_close, ff_connect, ff_getsockopt, ff_ioctl, ff_poll, ff_read, ff_run, ff_socket,
     ff_stop_run, ff_write, fstack_errno, make_linux_sockaddr_in, AF_INET, FF_EAGAIN,

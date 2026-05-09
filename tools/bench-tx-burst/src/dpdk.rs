@@ -187,7 +187,7 @@ pub fn run_bucket(cfg: &DpdkBurstCfg<'_>) -> anyhow::Result<BucketRun> {
             || t1_ns < t_first_wire_ns
         {
             eprintln!(
-                "bench-vs-mtcp: WARN dropping burst {i} — non-monotonic TSC \
+                "bench-tx-burst: WARN dropping burst {i} — non-monotonic TSC \
                  (t0={t0_ns} t_first_wire={t_first_wire_ns} t1={t1_ns})"
             );
             continue;
@@ -215,7 +215,7 @@ pub fn run_bucket(cfg: &DpdkBurstCfg<'_>) -> anyhow::Result<BucketRun> {
 /// Open a single persistent connection to the peer. Returns the
 /// connection handle to be reused across every bucket in the run.
 /// Thin wrapper over `bench_rtt::workload::open_connection` so the
-/// bench-vs-mtcp call sites don't have to know about that dependency
+/// bench-tx-burst call sites don't have to know about that dependency
 /// shape.
 pub fn open_persistent_connection(
     engine: &Engine,

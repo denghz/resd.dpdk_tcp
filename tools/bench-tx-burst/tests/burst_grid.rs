@@ -1,34 +1,35 @@
-//! Integration tests for the `burst` sub-workload (spec §11.1).
+//! Integration tests for the `burst` workload (spec §11.1).
 //!
 //! These tests don't touch DPDK / a live peer. They cover the
 //! pure-Rust primitives: grid enumeration, per-burst sample
-//! aggregation, and preflight check helpers. The mTCP arm was
-//! removed in the 2026-05-09 bench-suite overhaul.
+//! aggregation, and preflight check helpers.
+//!
+//! Phase 5 of the 2026-05-09 bench-suite overhaul moved the burst
+//! workload out of bench-vs-mtcp into this `bench-tx-burst` crate;
+//! the test file moved with it.
 
-use bench_vs_mtcp::burst::{
+use bench_tx_burst::burst::{
     enumerate_filtered_grid, enumerate_grid, Bucket, BucketAggregate, BurstSample, BUCKET_COUNT,
     G_MS, K_BYTES,
 };
-use bench_vs_mtcp::dpdk_burst::TxTsMode;
-use bench_vs_mtcp::maxtp;
-use bench_vs_mtcp::preflight::{
+use bench_tx_burst::dpdk::TxTsMode;
+use bench_tx_burst::preflight::{
     check_mss_and_burst_agreement, check_nic_saturation_bps, check_peer_window,
     check_sanity_invariant, BucketVerdict,
 };
-use bench_vs_mtcp::{Stack, Workload};
+use bench_tx_burst::Stack;
 
 // ---------------------------------------------------------------------------
-// Stack + Workload enums.
+// Stack enum.
 // ---------------------------------------------------------------------------
 
 #[test]
 fn stack_parse_covers_all_stacks() {
     assert_eq!(Stack::parse("dpdk").unwrap(), Stack::DpdkNet);
     assert_eq!(Stack::parse("dpdk_net").unwrap(), Stack::DpdkNet);
-    // 2026-05-03 follow-up — linux maxtp comparator landed.
-    assert_eq!(Stack::parse("linux").unwrap(), Stack::Linux);
-    assert_eq!(Stack::parse("linux_kernel").unwrap(), Stack::Linux);
-    assert_eq!(Stack::parse("fstack").unwrap(), Stack::FStack);
+    assert_eq!(Stack::parse("linux").unwrap(), Stack::LinuxKernel);
+    assert_eq!(Stack::parse("linux_kernel").unwrap(), Stack::LinuxKernel);
+    assert_eq!(Stack::parse("fstack").unwrap(), Stack::Fstack);
     // 2026-05-09 bench-suite overhaul — mTCP and afpacket dropped.
     assert!(Stack::parse("mtcp").is_err());
     assert!(Stack::parse("afpacket").is_err());
@@ -37,15 +38,8 @@ fn stack_parse_covers_all_stacks() {
 #[test]
 fn stack_as_dimension_is_the_documented_string() {
     assert_eq!(Stack::DpdkNet.as_dimension(), "dpdk_net");
-    assert_eq!(Stack::Linux.as_dimension(), "linux");
-    assert_eq!(Stack::FStack.as_dimension(), "fstack");
-}
-
-#[test]
-fn workload_parse_accepts_burst_and_maxtp() {
-    assert_eq!(Workload::parse("burst").unwrap(), Workload::Burst);
-    assert_eq!(Workload::parse("maxtp").unwrap(), Workload::Maxtp);
-    assert!(Workload::parse("loopback").is_err());
+    assert_eq!(Stack::LinuxKernel.as_dimension(), "linux_kernel");
+    assert_eq!(Stack::Fstack.as_dimension(), "fstack");
 }
 
 // ---------------------------------------------------------------------------
@@ -232,18 +226,6 @@ fn preflight_sanity_invariant_gate_enforces_exact_equality() {
 }
 
 // ---------------------------------------------------------------------------
-// maxtp placeholder — grid constants only; runner is todo!() in T13.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn maxtp_placeholder_grid_constants_match_spec_11_2() {
-    assert_eq!(maxtp::W_BYTES, &[64, 256, 1024, 4096, 16_384, 65_536, 262_144]);
-    assert_eq!(maxtp::C_CONNS, &[1, 4, 16, 64]);
-    assert_eq!(maxtp::BUCKET_COUNT, 28);
-    assert_eq!(maxtp::W_BYTES.len() * maxtp::C_CONNS.len(), 28);
-}
-
-// ---------------------------------------------------------------------------
 // CSV row shape — one bucket's emit path produces the expected
 // (dimensions_json, metric_name, metric_unit) tuples.
 // ---------------------------------------------------------------------------
@@ -268,7 +250,7 @@ fn emit_bucket_rows_dimensions_json_matches_spec_11_3_shape() {
     let mut buf = Vec::new();
     {
         let mut w = csv::Writer::from_writer(&mut buf);
-        bench_vs_mtcp::burst::emit_bucket_rows(&mut w, &metadata, "bench-vs-mtcp", "trading-latency", &agg)
+        bench_tx_burst::burst::emit_bucket_rows(&mut w, &metadata, "bench-tx-burst", "trading-latency", &agg)
             .unwrap();
         w.flush().unwrap();
     }
@@ -299,14 +281,14 @@ fn emit_bucket_rows_dimensions_json_matches_spec_11_3_shape() {
         );
         assert_eq!(dims["stack"], "dpdk_net");
         assert!(dims.get("bucket_invalid").is_none());
-        // I3: every dpdk_net row tags the TX-TS measurement source so
+        // Every dpdk_net row tags the TX-TS measurement source so
         // CSV consumers can filter HW-TS vs TSC-fallback rows.
         assert_eq!(dims["tx_ts_mode"], "tsc_fallback");
         let metric_name = rec.get(metric_name_idx).unwrap();
         let metric_unit = rec.get(metric_unit_idx).unwrap();
         match metric_name {
             "throughput_per_burst_bps" => {
-                // I1: throughput unit is spelled out as `bits_per_sec`
+                // Throughput unit is spelled out as `bits_per_sec`
                 // (not the ambiguous `bps`) per spec §14.1.
                 assert_eq!(metric_unit, "bits_per_sec");
                 seen_throughput = true;

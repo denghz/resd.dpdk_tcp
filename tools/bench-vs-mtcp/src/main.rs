@@ -39,15 +39,10 @@ use clap::Parser;
 use bench_common::preconditions::{PreconditionMode, PreconditionValue, Preconditions};
 use bench_common::run_metadata::RunMetadata;
 
-use bench_vs_mtcp::burst::{
-    emit_bucket_rows, enumerate_filtered_grid, BucketAggregate,
-};
-use bench_vs_mtcp::dpdk_burst::{self, DpdkBurstCfg, TxTsMode};
 use bench_vs_mtcp::dpdk_maxtp::{self, DpdkMaxtpCfg};
 use bench_vs_mtcp::maxtp;
 use bench_vs_mtcp::preflight::{
-    check_mss_and_burst_agreement, check_nic_saturation_bps, check_peer_window,
-    check_sanity_invariant, BucketVerdict,
+    check_mss_and_burst_agreement, check_nic_saturation_bps, check_peer_window, BucketVerdict,
 };
 use bench_vs_mtcp::{Stack, Workload};
 
@@ -259,13 +254,12 @@ fn main() -> anyhow::Result<()> {
     }
     let mut _eal_guard: Option<EalGuard> = None;
     let mut engine: Option<Engine> = None;
-    let mut tsc_hz: u64 = 0;
     if needs_dpdk {
         validate_dpdk_args(&args)?;
         eal_init(&args)?;
         _eal_guard = Some(EalGuard);
         engine = Some(build_engine(&args)?);
-        tsc_hz = unsafe { dpdk_net_sys::rte_get_tsc_hz() };
+        let tsc_hz = unsafe { dpdk_net_sys::rte_get_tsc_hz() };
         if tsc_hz == 0 {
             anyhow::bail!("rte_get_tsc_hz() returned 0 — EAL not initialised?");
         }
@@ -278,7 +272,7 @@ fn main() -> anyhow::Result<()> {
         validate_fstack_args(&args)?;
         init_fstack(&args)?;
         // ff_init initialises EAL, so rte_get_tsc_hz() is valid now.
-        tsc_hz = unsafe { dpdk_net_sys::rte_get_tsc_hz() };
+        let tsc_hz = unsafe { dpdk_net_sys::rte_get_tsc_hz() };
         if tsc_hz == 0 {
             anyhow::bail!("rte_get_tsc_hz() returned 0 after ff_init");
         }
@@ -300,57 +294,16 @@ fn main() -> anyhow::Result<()> {
 
     match workload {
         Workload::Burst => {
-            // Parse burst-specific grid subset filters.
-            let k_filter = parse_u64_list(&args.burst_sizes)?;
-            let g_filter = parse_u64_list(&args.gap_mss)?;
-            let grid = enumerate_filtered_grid(k_filter.as_deref(), g_filter.as_deref())
-                .map_err(|e| anyhow::anyhow!(e))?;
-            for stack in stacks {
-                match stack {
-                    Stack::DpdkNet => {
-                        let engine = engine.as_ref().ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "DpdkNet stack selected but engine not provided — main.rs invariant violated"
-                            )
-                        })?;
-                        run_burst_grid_dpdk(
-                            engine,
-                            peer_ip,
-                            args.peer_port,
-                            &grid,
-                            &args,
-                            &metadata,
-                            tsc_hz,
-                            nic_max_bps,
-                            &mut writer,
-                        )?;
-                    }
-                    Stack::Linux => {
-                        // Linux burst arm is out of scope for the
-                        // 2026-05-03 follow-up — user only asked for
-                        // maxtp comparison. Skip with a warning so
-                        // `--stacks dpdk,linux --workload burst` doesn't
-                        // wedge the operator's pipeline; the dpdk burst
-                        // arm still runs.
-                        eprintln!(
-                            "bench-vs-mtcp: WARN linux stack is wired for `maxtp` only; \
-                             skipping burst grid for Linux"
-                        );
-                    }
-                    Stack::FStack => {
-                        run_burst_grid_fstack(
-                            peer_ip,
-                            args.fstack_peer_port,
-                            &grid,
-                            &args,
-                            &metadata,
-                            tsc_hz,
-                            nic_max_bps,
-                            &mut writer,
-                        )?;
-                    }
-                }
-            }
+            // Phase 5 of the 2026-05-09 bench-suite overhaul split the
+            // burst grid into a dedicated `bench-tx-burst` binary. This
+            // crate is being unwound; the burst entry point bails with
+            // a pointer so existing scripts surface the rename instead
+            // of running an empty grid.
+            anyhow::bail!(
+                "bench-vs-mtcp --workload burst is gone (Phase 5 split); \
+                 use `bench-tx-burst --stack <dpdk_net|linux_kernel|fstack>` \
+                 instead"
+            );
         }
         Workload::Maxtp => {
             // Parse maxtp-specific grid subset filters.
@@ -468,204 +421,6 @@ fn resolve_peer_rwnd_bytes(
     }
 }
 
-// ---------------------------------------------------------------------------
-// dpdk_net grid driver.
-// ---------------------------------------------------------------------------
-
-#[allow(clippy::too_many_arguments)]
-fn run_burst_grid_dpdk<W: std::io::Write>(
-    engine: &Engine,
-    peer_ip: u32,
-    peer_port: u16,
-    grid: &[bench_vs_mtcp::burst::Bucket],
-    args: &Args,
-    metadata: &RunMetadata,
-    tsc_hz: u64,
-    nic_max_bps: Option<u64>,
-    writer: &mut csv::Writer<W>,
-) -> anyhow::Result<()> {
-    // One persistent connection, reused for all buckets. Spec §11.1:
-    // "One connection per lcore, established once, reused for the
-    // whole run".
-    eprintln!(
-        "bench-vs-mtcp: opening persistent connection to {}:{}",
-        args.peer_ip, peer_port
-    );
-    let conn = dpdk_burst::open_persistent_connection(engine, peer_ip, peer_port)?;
-
-    // T15-B I-2: parse the DUT's local IP once for the `ss -ti`
-    // filter. `validate_dpdk_args` already bailed if `local_ip` was
-    // empty, so the parse only fails on truly invalid input — we want
-    // the whole run to abort in that case rather than silently fall
-    // back to the placebo bucket-after-bucket.
-    let dut_ip: std::net::Ipv4Addr = args
-        .local_ip
-        .parse()
-        .with_context(|| format!("parsing --local-ip `{}` for peer rwnd probe", args.local_ip))?;
-
-    // Pre-allocate one payload buffer per K (reused across bursts
-    // within a bucket to keep the inner loop allocation-free).
-    let mut payload_cache: std::collections::HashMap<u64, Vec<u8>> = std::collections::HashMap::new();
-
-    for bucket in grid {
-        eprintln!("bench-vs-mtcp: running dpdk_net bucket {}", bucket.label());
-
-        let payload = payload_cache
-            .entry(bucket.burst_bytes)
-            .or_insert_with(|| vec![0u8; bucket.burst_bytes as usize]);
-
-        // Pre-run check (2): MSS + TX burst size agreement. We drive
-        // our MSS from EngineConfig; peer MSS is fixed at the same
-        // value (spec locks it at 1460 on both stacks). The
-        // `rte_eth_tx_burst`-level batch size is a compile-time
-        // constant in our stack — pass 32/32 as a placeholder
-        // satisfying the bench-common shape contract.
-        let mss_verdict =
-            check_mss_and_burst_agreement(args.mss, args.mss, 32, 32);
-
-        // Pre-run check (1): peer receive window.
-        //
-        // A10 Plan B T15-B / T12-I4: if `--peer-ssh` is set, shell out
-        // to the peer and parse `ss -ti | rcv_space` for the real
-        // kernel-side advertised receive window. If unset OR the SSH
-        // probe fails, fall back to the T12 placebo (peer_rwnd := K)
-        // and emit a WARN — nightly runs record the degraded check
-        // rather than silently passing.
-        let peer_rwnd = resolve_peer_rwnd_bytes(
-            args.peer_ssh.as_deref(),
-            dut_ip,
-            peer_port,
-            bucket.burst_bytes,
-        );
-        let rwnd_verdict = check_peer_window(peer_rwnd, bucket.burst_bytes);
-
-        // Pre-run check (3): NIC saturation is only knowable post-
-        // run; we run the bucket and check after (see
-        // `check_nic_saturation_bps` call further down).
-        let verdict = if !mss_verdict.is_ok() {
-            mss_verdict
-        } else if !rwnd_verdict.is_ok() {
-            rwnd_verdict
-        } else {
-            BucketVerdict::Ok
-        };
-
-        // ENA does not advertise the TX HW-TS dynfield — so the
-        // dpdk_net side always runs with TscFallback in T12. Hoisted
-        // out of the DpdkBurstCfg block so we can thread it into the
-        // aggregate builder for invalidated-pre-run rows too (I3: CSV
-        // consumers should see the mode tag on every dpdk_net row,
-        // not just the happy-path ones).
-        let tx_ts_mode = TxTsMode::TscFallback;
-
-        if !verdict.is_ok() {
-            eprintln!(
-                "bench-vs-mtcp: bucket {} invalidated pre-run: {}",
-                bucket.label(),
-                verdict.reason().unwrap_or("<unknown>")
-            );
-            let agg = BucketAggregate::from_samples(
-                *bucket,
-                Stack::DpdkNet,
-                &[],
-                verdict,
-                Some(tx_ts_mode),
-            );
-            emit_bucket_rows(writer, metadata, &args.tool, &args.feature_set, &agg)
-                .context("emit invalidated bucket row")?;
-            continue;
-        }
-
-        // Snapshot the TCP payload byte counter pre-run.
-        let tx_payload_pre = engine
-            .counters()
-            .tcp
-            .tx_payload_bytes
-            .load(std::sync::atomic::Ordering::Relaxed);
-
-        let cfg = DpdkBurstCfg {
-            engine,
-            conn,
-            bucket: *bucket,
-            warmup: args.warmup,
-            bursts: args.bursts_per_bucket,
-            tsc_hz,
-            payload,
-            tx_ts_mode,
-        };
-        let run = dpdk_burst::run_bucket(&cfg).with_context(|| {
-            format!("dpdk_burst::run_bucket for {}", bucket.label())
-        })?;
-
-        // Snapshot the counter post-run + assert sanity invariant.
-        let tx_payload_post = engine
-            .counters()
-            .tcp
-            .tx_payload_bytes
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let counter_delta = tx_payload_post.saturating_sub(tx_payload_pre);
-        // `obs-byte-counters` feature is OFF by default → counter
-        // does not increment → delta will be 0 regardless of sent
-        // bytes. Only assert when we actually have a non-zero delta
-        // (i.e. the operator built with `--features obs-byte-counters`).
-        if counter_delta > 0 {
-            if let Err(e) = check_sanity_invariant(run.sum_over_bursts_bytes, counter_delta) {
-                eprintln!(
-                    "bench-vs-mtcp: sanity invariant violated for bucket {}: {e}",
-                    bucket.label()
-                );
-                anyhow::bail!(e);
-            }
-        } else {
-            eprintln!(
-                "bench-vs-mtcp: sanity invariant check skipped for bucket {} \
-                 (tx_payload_bytes counter is 0 — build with \
-                 `--features obs-byte-counters` to enable)",
-                bucket.label()
-            );
-        }
-
-        // Post-run check (spec §11.1 check 3): NIC saturation. If the
-        // achieved mean throughput exceeds 70% of the NIC line rate,
-        // the bucket is NIC-bound and its stack-attributable
-        // percentiles are untrustworthy — flip the verdict to
-        // Invalid before emitting. Skipped with a warn if --nic-max-
-        // bps / NIC_MAX_BPS is unset.
-        let mut agg = BucketAggregate::from_samples(
-            *bucket,
-            Stack::DpdkNet,
-            &run.samples,
-            BucketVerdict::Ok,
-            Some(tx_ts_mode),
-        );
-        if let Some(max_bps) = nic_max_bps {
-            let achieved_bps = mean_throughput_bps(&run) as u64;
-            let sat_verdict = check_nic_saturation_bps(achieved_bps, max_bps);
-            if !sat_verdict.is_ok() {
-                eprintln!(
-                    "bench-vs-mtcp: bucket {} NIC-bound post-run: {}",
-                    bucket.label(),
-                    sat_verdict.reason().unwrap_or("<unknown>")
-                );
-                agg.override_verdict(sat_verdict);
-            }
-        }
-        emit_bucket_rows(writer, metadata, &args.tool, &args.feature_set, &agg)
-            .context("emit bucket rows")?;
-    }
-    Ok(())
-}
-
-/// Mean throughput (bits-per-second) across a bucket's per-burst
-/// samples. Returns 0.0 when there are no samples. Split out so the
-/// NIC-saturation post-run check is independently testable.
-fn mean_throughput_bps(run: &dpdk_burst::BucketRun) -> f64 {
-    if run.samples.is_empty() {
-        return 0.0;
-    }
-    let sum: f64 = run.samples.iter().map(|s| s.throughput_bps).sum();
-    sum / (run.samples.len() as f64)
-}
 
 // ---------------------------------------------------------------------------
 // dpdk_net maxtp grid driver (spec §11.2).
@@ -1168,94 +923,6 @@ fn emit_linux_bucket_rows<W: std::io::Write>(
 
 #[cfg(feature = "fstack")]
 #[allow(clippy::too_many_arguments)]
-fn run_burst_grid_fstack<W: std::io::Write>(
-    peer_ip: u32,
-    peer_port: u16,
-    grid: &[bench_vs_mtcp::burst::Bucket],
-    args: &Args,
-    metadata: &RunMetadata,
-    tsc_hz: u64,
-    nic_max_bps: Option<u64>,
-    writer: &mut csv::Writer<W>,
-) -> anyhow::Result<()> {
-    use bench_vs_mtcp::dpdk_burst::TxTsMode;
-    use bench_vs_mtcp::fstack_burst;
-
-    let tx_ts_mode = TxTsMode::TscFallback;
-
-    // Drive the entire grid inside one ff_run invocation.
-    // ff_run is synchronous and calls rte_eal_cleanup on exit.
-    let grid_results = fstack_burst::run_burst_grid(
-        grid,
-        args.warmup,
-        args.bursts_per_bucket,
-        tsc_hz,
-        peer_ip,
-        peer_port,
-        tx_ts_mode,
-    );
-
-    // Post-process: apply NIC saturation check and emit CSV rows.
-    for gr in grid_results {
-        let bucket = gr.bucket;
-        match gr.result {
-            Err(e) => {
-                eprintln!(
-                    "bench-vs-mtcp: fstack burst bucket {} failed: {e}",
-                    bucket.label()
-                );
-                let agg = bench_vs_mtcp::burst::BucketAggregate::from_samples(
-                    bucket,
-                    Stack::FStack,
-                    &[],
-                    BucketVerdict::Invalid(e),
-                    Some(tx_ts_mode),
-                );
-                bench_vs_mtcp::burst::emit_bucket_rows(
-                    writer,
-                    metadata,
-                    &args.tool,
-                    &args.feature_set,
-                    &agg,
-                )
-                .context("emit fstack burst bucket rows")?;
-            }
-            Ok(run) => {
-                let mut agg = bench_vs_mtcp::burst::BucketAggregate::from_samples(
-                    bucket,
-                    Stack::FStack,
-                    &run.samples,
-                    BucketVerdict::Ok,
-                    Some(tx_ts_mode),
-                );
-                if let Some(max_bps) = nic_max_bps {
-                    let achieved = mean_throughput_from_burst_samples(&run.samples) as u64;
-                    let sat = check_nic_saturation_bps(achieved, max_bps);
-                    if !sat.is_ok() {
-                        eprintln!(
-                            "bench-vs-mtcp: fstack burst bucket {} NIC-bound post-run: {}",
-                            bucket.label(),
-                            sat.reason().unwrap_or("<unknown>")
-                        );
-                        agg.override_verdict(sat);
-                    }
-                }
-                bench_vs_mtcp::burst::emit_bucket_rows(
-                    writer,
-                    metadata,
-                    &args.tool,
-                    &args.feature_set,
-                    &agg,
-                )
-                .context("emit fstack burst bucket rows")?;
-            }
-        }
-    }
-    Ok(())
-}
-
-#[cfg(feature = "fstack")]
-#[allow(clippy::too_many_arguments)]
 fn run_maxtp_grid_fstack<W: std::io::Write>(
     peer_ip: u32,
     peer_port: u16,
@@ -1321,59 +988,11 @@ fn run_maxtp_grid_fstack<W: std::io::Write>(
     Ok(())
 }
 
-#[cfg(feature = "fstack")]
-fn mean_throughput_from_burst_samples(samples: &[bench_vs_mtcp::burst::BurstSample]) -> f64 {
-    if samples.is_empty() {
-        return 0.0;
-    }
-    let sum: f64 = samples.iter().map(|s| s.throughput_bps).sum();
-    sum / (samples.len() as f64)
-}
-
 // ----- F-Stack stubs (when fstack feature is off) -------------------
 //
 // Default builds skip the F-Stack arms entirely; if --stacks fstack is
 // passed without the feature, we emit an Invalid marker row so
 // bench-report still sees the row instead of silently dropping it.
-
-#[cfg(not(feature = "fstack"))]
-#[allow(clippy::too_many_arguments)]
-fn run_burst_grid_fstack<W: std::io::Write>(
-    _peer_ip: u32,
-    _peer_port: u16,
-    grid: &[bench_vs_mtcp::burst::Bucket],
-    args: &Args,
-    metadata: &RunMetadata,
-    _tsc_hz: u64,
-    _nic_max_bps: Option<u64>,
-    writer: &mut csv::Writer<W>,
-) -> anyhow::Result<()> {
-    eprintln!(
-        "bench-vs-mtcp: WARN fstack stack selected but binary built without `fstack` \
-         feature; emitting marker rows. Rebuild with `--features fstack` on the \
-         AMI where libfstack.a is installed."
-    );
-    for bucket in grid {
-        let agg = bench_vs_mtcp::burst::BucketAggregate::from_samples(
-            *bucket,
-            Stack::FStack,
-            &[],
-            BucketVerdict::Invalid(
-                "fstack feature not compiled in (libfstack.a not available)".to_string(),
-            ),
-            None,
-        );
-        bench_vs_mtcp::burst::emit_bucket_rows(
-            writer,
-            metadata,
-            &args.tool,
-            &args.feature_set,
-            &agg,
-        )
-        .context("emit fstack-stub burst marker row")?;
-    }
-    Ok(())
-}
 
 #[cfg(not(feature = "fstack"))]
 #[allow(clippy::too_many_arguments)]
@@ -1908,101 +1527,10 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // mean_throughput_bps: simple arithmetic mean over samples.
+    // The Phase 5 split moved the burst-grid unit tests + the
+    // mean_throughput_bps helper into bench-tx-burst alongside the
+    // burst code itself. The remaining maxtp tests exercise the maxtp
+    // dispatch path; the integration test in tests/maxtp_grid.rs
+    // covers the maxtp bucket aggregation shape end-to-end.
     // ------------------------------------------------------------------
-
-    #[test]
-    fn mean_throughput_bps_empty_is_zero() {
-        let run = dpdk_burst::BucketRun {
-            samples: vec![],
-            sum_over_bursts_bytes: 0,
-            tx_ts_mode: TxTsMode::TscFallback,
-        };
-        assert_eq!(mean_throughput_bps(&run), 0.0);
-    }
-
-    #[test]
-    fn mean_throughput_bps_averages_samples() {
-        use bench_vs_mtcp::burst::BurstSample;
-        let run = dpdk_burst::BucketRun {
-            samples: vec![
-                BurstSample {
-                    throughput_bps: 8_000_000_000.0,
-                    initiation_ns: 100.0,
-                    steady_bps: 8_000_000_000.0,
-                },
-                BurstSample {
-                    throughput_bps: 10_000_000_000.0,
-                    initiation_ns: 200.0,
-                    steady_bps: 10_000_000_000.0,
-                },
-            ],
-            sum_over_bursts_bytes: 2 * 64 * 1024,
-            tx_ts_mode: TxTsMode::TscFallback,
-        };
-        let m = mean_throughput_bps(&run);
-        assert!((m - 9_000_000_000.0).abs() < 1.0, "m = {m}");
-    }
-
-    // ------------------------------------------------------------------
-    // Post-run NIC-saturation flip on the aggregate's verdict.
-    //
-    // Proves that `check_nic_saturation_bps(achieved, max)` with
-    // achieved > 70% of max returns Invalid, and
-    // `BucketAggregate::override_verdict` nukes the Summary slots so
-    // `emit_bucket_rows` produces the single-marker-row shape
-    // downstream reports expect.
-    // ------------------------------------------------------------------
-
-    #[test]
-    fn post_run_nic_saturation_flips_aggregate_verdict() {
-        use bench_vs_mtcp::burst::{Bucket, BucketAggregate, BurstSample};
-
-        // Synthetic run: 100 Gbps NIC max, all samples at 80 Gbps =
-        // 80% of line rate → fails the 70% ceiling.
-        let samples: Vec<BurstSample> = (0..10)
-            .map(|_| BurstSample {
-                throughput_bps: 80_000_000_000.0,
-                initiation_ns: 100.0,
-                steady_bps: 80_000_000_000.0,
-            })
-            .collect();
-        let run = dpdk_burst::BucketRun {
-            samples: samples.clone(),
-            sum_over_bursts_bytes: 10 * 64 * 1024,
-            tx_ts_mode: TxTsMode::TscFallback,
-        };
-        let mut agg = BucketAggregate::from_samples(
-            Bucket::new(64 * 1024, 0),
-            Stack::DpdkNet,
-            &samples,
-            BucketVerdict::Ok,
-            Some(TxTsMode::TscFallback),
-        );
-        // Pre-flip: verdict ok, summaries present.
-        assert!(agg.verdict.is_ok());
-        assert!(agg.throughput_bps.is_some());
-
-        // Run the post-bucket saturation check (same path main.rs
-        // takes).
-        let achieved = mean_throughput_bps(&run) as u64;
-        let sat = check_nic_saturation_bps(achieved, 100_000_000_000);
-        assert!(!sat.is_ok(), "expected NIC-bound fail; got {sat:?}");
-        agg.override_verdict(sat);
-
-        // Post-flip: verdict invalid, summaries cleared — the CSV
-        // emit path will produce a single marker row.
-        assert!(!agg.verdict.is_ok());
-        assert!(agg.throughput_bps.is_none());
-        assert!(agg.initiation_ns.is_none());
-        assert!(agg.steady_bps.is_none());
-        assert!(
-            agg.verdict
-                .reason()
-                .unwrap()
-                .contains("NIC-bound"),
-            "reason was {:?}",
-            agg.verdict.reason()
-        );
-    }
 }
