@@ -651,6 +651,23 @@ NETEM_SCENARIOS=(
   symmetric_3pct
 )
 
+# Phase 10 Task 10.3: per-scenario iteration override. The default
+# $BENCH_ITERATIONS=5000 yields ~5 lossy events at 0.1% loss — far too
+# few for a meaningful p999 tail estimate. Low-loss scenarios get 1M
+# iters (~1k lossy events); high-loss scenarios scale down because
+# their RTT tail samples more lossy iters per second of wallclock.
+# bench-tx-burst and bench-rx-burst use their own measure_bursts so
+# the override applies only to bench-rtt. Closes C-D1.
+declare -A SCENARIO_ITERS=(
+  [random_loss_01pct_10ms]=1000000
+  [correlated_burst_loss_1pct]=200000
+  [reorder_depth_3]=20000
+  [duplication_2x]=20000
+  [high_loss_3pct]=200000
+  [high_loss_5pct]=100000
+  [symmetric_3pct]=200000
+)
+
 # Direction axis: each netem scenario runs three times — once on peer
 # egress (current default; shapes peer→DUT, i.e. DUT-RX), once on peer
 # ingress via IFB (shapes DUT→peer, i.e. DUT-TX so DUT-TX-data-loss can
@@ -693,6 +710,9 @@ for scenario in "${NETEM_SCENARIOS[@]}"; do
         ;;
     esac
 
+    # Phase 10 Task 10.3: per-scenario iter override (bench-rtt only).
+    iters="${SCENARIO_ITERS[$scenario]:-$BENCH_ITERATIONS}"
+
     csv_name="bench-stress-${scenario}-${direction}"
     if ! run_dut_bench bench-rtt "$csv_name" \
         --stack dpdk_net \
@@ -700,7 +720,7 @@ for scenario in "${NETEM_SCENARIOS[@]}"; do
         --payload-bytes-sweep "$BENCH_RTT_PAYLOADS" \
         "${DPDK_COMMON[@]}" \
         --peer-port 10001 \
-        --iterations "$BENCH_ITERATIONS" \
+        --iterations "$iters" \
         --warmup "$BENCH_WARMUP" \
         --tool bench-stress \
         --feature-set "trading-latency-${scenario}-${direction}"; then

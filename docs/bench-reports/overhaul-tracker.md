@@ -67,6 +67,27 @@ Baseline: T50 report at `docs/bench-reports/t50-bench-pair-2026-05-08.md` and T5
     `bench-tx-burst` and `bench-rx-burst` now run under the netem
     matrix (dpdk_net only) in addition to bench-rtt: 21 cells × 3
     tools = 63 sub-runs per nightly. Closes C-C3.
+  - Task 10.3 done 2026-05-09: per-scenario iter override
+    (`SCENARIO_ITERS`) lifts low-loss buckets to 1M iters so p999 of
+    loss-affected events is statistically meaningful. Closes C-D1.
+
+## Phase 10 wallclock impact
+
+The netem matrix now has 7 scenarios × 3 directions = 21 cells per
+tool. With per-scenario iter overrides:
+  - random_loss_01pct_10ms: 1M iters (3 directions ≈ 3 × 30 min = 90 min)
+  - correlated_burst_loss_1pct: 200k iters (3 × 6 min = 18 min)
+  - reorder_depth_3: 20k iters (3 × 1 min = 3 min)
+  - duplication_2x: 20k iters (3 × 1 min = 3 min)
+  - high_loss_3pct: 200k iters (3 × 6 min = 18 min)
+  - high_loss_5pct: 100k iters (3 × 3 min = 9 min)
+  - symmetric_3pct: 200k iters (3 × 6 min = 18 min)
+
+Total bench-rtt wallclock under netem: ~3 hours
+Plus bench-tx-burst + bench-rx-burst per direction: ~2 hours combined.
+Plus the existing clean-wire passes: ~1.5 hours.
+
+Estimated nightly total: ~6.5 hours (was ~2 hours pre-Phase-10).
 - [ ] Phase 11 — Counters + observability
 - [ ] Phase 12 — Cleanup, c7i validation, t51 report
 
