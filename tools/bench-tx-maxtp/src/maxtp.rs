@@ -852,7 +852,7 @@ mod tests {
         let mut buf = Vec::new();
         {
             let mut writer = csv::Writer::from_writer(&mut buf);
-            emit_bucket_rows(&mut writer, &sample_metadata(), "bench-vs-mtcp", "trading-latency", &agg)
+            emit_bucket_rows(&mut writer, &sample_metadata(), "bench-tx-maxtp", "trading-latency", &agg)
                 .unwrap();
             writer.flush().unwrap();
         }
@@ -873,7 +873,7 @@ mod tests {
         let mut buf = Vec::new();
         {
             let mut writer = csv::Writer::from_writer(&mut buf);
-            emit_bucket_rows(&mut writer, &sample_metadata(), "bench-vs-mtcp", "trading-latency", &agg)
+            emit_bucket_rows(&mut writer, &sample_metadata(), "bench-tx-maxtp", "trading-latency", &agg)
                 .unwrap();
             writer.flush().unwrap();
         }
@@ -894,7 +894,7 @@ mod tests {
         let mut buf = Vec::new();
         {
             let mut writer = csv::Writer::from_writer(&mut buf);
-            emit_bucket_rows(&mut writer, &sample_metadata(), "bench-vs-mtcp", "trading-latency", &agg)
+            emit_bucket_rows(&mut writer, &sample_metadata(), "bench-tx-maxtp", "trading-latency", &agg)
                 .unwrap();
             writer.flush().unwrap();
         }
@@ -928,7 +928,7 @@ mod tests {
         let mut buf = Vec::new();
         {
             let mut writer = csv::Writer::from_writer(&mut buf);
-            emit_bucket_rows(&mut writer, &sample_metadata(), "bench-vs-mtcp", "trading-latency", &agg)
+            emit_bucket_rows(&mut writer, &sample_metadata(), "bench-tx-maxtp", "trading-latency", &agg)
                 .unwrap();
             writer.flush().unwrap();
         }
@@ -961,7 +961,7 @@ mod tests {
         let mut buf = Vec::new();
         {
             let mut writer = csv::Writer::from_writer(&mut buf);
-            emit_bucket_rows(&mut writer, &sample_metadata(), "bench-vs-mtcp", "trading-latency", &agg)
+            emit_bucket_rows(&mut writer, &sample_metadata(), "bench-tx-maxtp", "trading-latency", &agg)
                 .unwrap();
             writer.flush().unwrap();
         }

@@ -17,8 +17,9 @@
 //! `FF_EINPROGRESS=115`) and supports Linux-namespace
 //! `SOL_SOCKET=1`/`SO_ERROR=4` via `ff_getsockopt` (NOT the
 //! `_freebsd` variants). This was confirmed in T50 of the bench-vs-mtcp
-//! work; we reuse the same namespace constants here via the FFI module
-//! in bench-vs-mtcp.
+//! work; we reuse the same namespace constants here via the shared
+//! `bench-fstack-ffi` crate (re-exported as `crate::fstack_ffi` for
+//! backwards-compatible internal imports).
 //!
 //! # Connect detection — `ff_poll(POLLOUT, timeout=0)` not SO_ERROR
 //!

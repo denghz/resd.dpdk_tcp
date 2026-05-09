@@ -421,14 +421,18 @@ fn run_fstack(args: &Args) -> anyhow::Result<Vec<BucketResult>> {
     let mut buckets: Vec<BucketResult> = Vec::with_capacity(args.payload_bytes_sweep.len());
     for &payload_bytes in &args.payload_bytes_sweep {
         // fstack's run_rtt_workload uses one ff_run invocation; we drive
-        // a single connection per bucket. Multi-conn fstack RTT lands
-        // alongside the bench-tx-maxtp work in Phase 5 (the F-Stack
-        // ff_run model needs a unified state machine across buckets).
+        // a single connection per bucket. Multi-conn fstack RTT remains
+        // future work. bench-tx-maxtp's fstack arm shows it's possible
+        // (per-conn ff_socket + ff_poll multiplexing), but bench-rtt's
+        // request/response inner loop needs the same callback restructure
+        // before --connections > 1 is correct here. Tracked as a Phase 6+
+        // follow-up.
         if args.connections > 1 {
             anyhow::bail!(
                 "--connections > 1 is not yet supported on the fstack arm \
-                 (single ff_run invocation per process; multi-conn lands \
-                 in Phase 5). Use --connections 1 or pick another stack."
+                 (single ff_run invocation per process; multi-conn fstack \
+                 RTT is Phase 6+ future work). Use --connections 1 or pick \
+                 another stack."
             );
         }
         let samples = fstack::imp::run_rtt_workload(
