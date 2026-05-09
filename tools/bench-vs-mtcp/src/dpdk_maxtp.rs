@@ -149,9 +149,40 @@ pub fn open_persistent_connections(
     }
     let mut out = Vec::with_capacity(conn_count as usize);
     for i in 0..conn_count {
-        let h = open_connection(engine, peer_ip_host_order, peer_port)
-            .with_context(|| format!("dpdk_maxtp: open connection {i}"))?;
-        out.push(h);
+        // The peer echo-server occasionally sends FIN immediately after the
+        // handshake when its accept backlog is momentarily saturated (observed
+        // as "connection closed during handshake: err=0").  Retry up to 3
+        // times with brief engine polls between attempts so the peer backlog
+        // drains and reuses the closed slot.
+        const MAX_TRIES: u32 = 3;
+        let mut last_err = anyhow::anyhow!("no attempts");
+        let mut succeeded = false;
+        for attempt in 0..MAX_TRIES {
+            match open_connection(engine, peer_ip_host_order, peer_port) {
+                Ok(h) => {
+                    out.push(h);
+                    succeeded = true;
+                    break;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "dpdk_maxtp: open connection {i} attempt {attempt} failed: {e:#}; \
+                         retrying after drain"
+                    );
+                    // Poll the engine to reap the failed connection's flow-table
+                    // slot before the next connect attempt.
+                    for _ in 0..20 {
+                        engine.poll_once();
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                    last_err = e;
+                }
+            }
+        }
+        if !succeeded {
+            return Err(last_err)
+                .with_context(|| format!("dpdk_maxtp: open connection {i} failed after {MAX_TRIES} attempts"));
+        }
     }
     Ok(out)
 }
