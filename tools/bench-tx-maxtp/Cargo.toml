@@ -71,5 +71,10 @@ thiserror = { workspace = true }
 # Phase 6 Task 6.2: TCP_INFO getsockopt for the linux_kernel arm.
 libc = "0.2"
 
+[build-dependencies]
+# T51 deferred-work item 2: shared libfstack.a + DPDK link-arg emit.
+# build.rs delegates to bench_build_helpers::emit_fstack_link_args_if_enabled().
+bench-build-helpers = { path = "../bench-build-helpers" }
+
 [dev-dependencies]
 tempfile = "3"

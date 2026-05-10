@@ -139,9 +139,22 @@ no measurable wallclock.
    churn was needed; the helpers are pure-data + `std::process::Command` so they
    slot in alongside `csv_row` / `percentile` / `raw_samples` / `run_metadata` /
    `preconditions` without expanding the crate's dep closure.
-2. build.rs duplication across bench-rtt + bench-tx-burst + bench-tx-maxtp + bench-rx-burst.
-   The link-arg-order constraint limits Cargo's expressiveness; a build-helpers crate
-   could push the pragmas into one place.
+2. **CLOSED** (2026-05-10): build.rs duplication across bench-rtt + bench-tx-burst +
+   bench-tx-maxtp + bench-rx-burst was lifted into a new `tools/bench-build-helpers`
+   crate consumed via `[build-dependencies]`. The four consumer build.rs files (each
+   ~50-65 LoC pre-extraction) shrink to a 13-line stub that emits two
+   `cargo:rerun-if-*` pragmas and calls
+   `bench_build_helpers::emit_fstack_link_args_if_enabled()`. The helper emits the
+   exact same byte sequence the originals did (verified by sha256 of build-script
+   output for all four consumers). The link-arg ORDER constraint
+   (push-state / --no-as-needed / --whole-archive / -lfstack / --no-whole-archive /
+   DPDK rte_* libs / --pop-state) is captured once in
+   `tools/bench-build-helpers/src/lib.rs`. Net workspace LoC delta is approximately
+   -78 (4×~55 LoC originals → 4×13-line stubs + 93 LoC of helper). Default
+   (no-fstack) and `--features fstack` workspace builds both clean; nm-T spot
+   check confirms 118 `ff_*` text symbols in each fstack-built binary, identical
+   across all four. A separate crate (rather than extending bench-fstack-ffi)
+   keeps build-time deps from bleeding into the runtime crate's feature surface.
 3. RACK / TLP retransmit triggers under <3% loss don't fire the RTO path. Phase 10
    added high-loss scenarios (3%, 5%) to exercise RTO; if those scenarios still don't
    produce non-zero `tcp.tx_retrans_rto` deltas after a real run, the assumption

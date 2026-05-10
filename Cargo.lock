@@ -106,6 +106,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
+name = "bench-build-helpers"
+version = "0.1.0"
+
+[[package]]
 name = "bench-common"
 version = "0.1.0"
 dependencies = [
@@ -188,6 +192,7 @@ name = "bench-rtt"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bench-build-helpers",
  "bench-common",
  "bench-fstack-ffi",
  "chrono",
@@ -208,6 +213,7 @@ name = "bench-rx-burst"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bench-build-helpers",
  "bench-common",
  "bench-fstack-ffi",
  "bench-rtt",
@@ -229,6 +235,7 @@ name = "bench-tx-burst"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bench-build-helpers",
  "bench-common",
  "bench-fstack-ffi",
  "bench-rtt",
@@ -248,6 +255,7 @@ name = "bench-tx-maxtp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bench-build-helpers",
  "bench-common",
  "bench-fstack-ffi",
  "bench-rtt",

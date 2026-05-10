@@ -5,6 +5,7 @@ members = [
     "crates/dpdk-net-core",
     "crates/dpdk-net",
     "tests/ffi-test",
+    "tools/bench-build-helpers",
     "tools/bench-common",
     "tools/bench-micro",
     "tools/bench-obs-overhead",
