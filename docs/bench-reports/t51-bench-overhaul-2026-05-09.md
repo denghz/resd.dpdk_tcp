@@ -155,10 +155,21 @@ no measurable wallclock.
    check confirms 118 `ff_*` text symbols in each fstack-built binary, identical
    across all four. A separate crate (rather than extending bench-fstack-ffi)
    keeps build-time deps from bleeding into the runtime crate's feature surface.
-3. RACK / TLP retransmit triggers under <3% loss don't fire the RTO path. Phase 10
-   added high-loss scenarios (3%, 5%) to exercise RTO; if those scenarios still don't
-   produce non-zero `tcp.tx_retrans_rto` deltas after a real run, the assumption
-   needs revisiting.
+3. **CLOSED** (2026-05-10, operator-runnable): the RACK / TLP / RTO trigger paths
+   under Phase 10's high-loss scenarios now have an operator-runnable verification
+   harness at `scripts/verify-rack-tlp.sh`, paired with documentation at
+   `docs/bench-reports/verify-rack-tlp.md`. The script applies each scenario's
+   netem spec on the peer (egress), runs `bench-rtt` with the new `--counters-csv`
+   flag (lifted into `tools/bench-rtt/src/main.rs` — pre/post snapshots over
+   `dpdk_net_core::counters::ALL_COUNTER_NAMES`), parses the resulting
+   `name,pre,post,delta` CSV, and asserts `delta > 0` per scenario:
+   `high_loss_3pct` requires non-zero `tcp.tx_retrans_rto` and `tcp.tx_retrans_rack`,
+   `high_loss_5pct` requires non-zero `tcp.tx_retrans_rto`, and `symmetric_3pct`
+   requires non-zero `tcp.tx_retrans_rack` and `tcp.tx_retrans_tlp`. Auto-running
+   it in CI is out of scope (needs a real DUT+peer), so the closure is
+   "operator-runnable, not nightly-wired". Any future regression in retransmit
+   plumbing surfaces as a FAIL row in the script's summary table; the doc covers
+   the diagnostic path for each common FAIL shape.
 4. **CLOSED** (2026-05-09, commit `f05b114`): bench-rtt's
    `--attribution-csv` sidecar now emits one row per measurement iteration with
    the 14-column schema (`bucket_id, iter, mode, rtt_ns, rx_hw_ts_ns,` 5 Hw-bucket

@@ -89,6 +89,21 @@ struct Args {
     #[arg(long)]
     attribution_csv: Option<std::path::PathBuf>,
 
+    /// Optional sidecar CSV for engine-counter pre/post snapshots. Emits
+    /// one row per name in `dpdk_net_core::counters::ALL_COUNTER_NAMES`
+    /// with columns `name,pre,post,delta`. The pre snapshot is taken
+    /// after the engine boots but before the first connection opens; the
+    /// post snapshot is taken after the last bucket's measurement loop
+    /// completes (before any post-run A-HW Task 18 assertion).
+    ///
+    /// Closes T51 deferred-work item 3: lets `scripts/verify-rack-tlp.sh`
+    /// assert that the Phase 11 RTO/RACK/TLP counter split fires under
+    /// Phase 10's high-loss netem scenarios. dpdk_net arm only —
+    /// linux_kernel + fstack paths emit no counter snapshots because
+    /// they don't run the dpdk-net-core engine.
+    #[arg(long)]
+    counters_csv: Option<std::path::PathBuf>,
+
     /// Output CSV path. One row per (payload, aggregation) tuple — 7
     /// aggregations per payload bucket (p50, p99, p999, mean, stddev,
     /// ci95_lower, ci95_upper).
@@ -290,6 +305,16 @@ fn run_dpdk_net(args: &Args) -> anyhow::Result<Vec<BucketResult>> {
         anyhow::bail!("rte_get_tsc_hz() returned 0 — EAL not initialised?");
     }
 
+    // T51 deferred-work item 3: snapshot every named engine counter
+    // immediately after engine boot, before the first connection opens.
+    // Pair with a post-snapshot after the last bucket completes so the
+    // operator-runnable verify-rack-tlp.sh can compute deltas across the
+    // workload window.
+    let counters_pre: Option<Vec<(&'static str, u64)>> = args
+        .counters_csv
+        .as_ref()
+        .map(|_| snapshot_named_counters(engine.counters()));
+
     let peer_ip = parse_ip_host_order(&args.peer_ip)?;
 
     let mut buckets: Vec<BucketResult> = Vec::with_capacity(args.payload_bytes_sweep.len());
@@ -362,7 +387,90 @@ fn run_dpdk_net(args: &Args) -> anyhow::Result<Vec<BucketResult>> {
             iter_records,
         });
     }
+
+    // T51 deferred-work item 3: pair the counter pre-snapshot with a
+    // post-snapshot here, after every bucket's measurement loop has
+    // closed. We emit the sidecar from inside this function (rather than
+    // bubbling the snapshots up) because `engine` lives in this scope —
+    // the linux_kernel + fstack arms have no engine to read from.
+    if let (Some(path), Some(pre)) = (args.counters_csv.as_ref(), counters_pre.as_ref()) {
+        let post = snapshot_named_counters(engine.counters());
+        emit_counters_csv(path, pre, &post)
+            .with_context(|| format!("writing counters CSV {path:?}"))?;
+    }
+
     Ok(buckets)
+}
+
+/// Snapshot every name in `dpdk_net_core::counters::ALL_COUNTER_NAMES`
+/// against the live engine `Counters` table. Order matches the source
+/// list so pre/post zip iterates in lockstep without a name-sort pass.
+///
+/// `lookup_counter` returns `None` only for typos or removed paths; the
+/// engine ships an exhaustive table (see `lookup_counter` rustdoc), so
+/// any `None` here is a counters.rs bug. We `expect` to surface it
+/// loudly rather than silently dropping rows from the snapshot.
+fn snapshot_named_counters(c: &dpdk_net_core::counters::Counters) -> Vec<(&'static str, u64)> {
+    use std::sync::atomic::Ordering;
+    dpdk_net_core::counters::ALL_COUNTER_NAMES
+        .iter()
+        .map(|&name| {
+            let v = dpdk_net_core::counters::lookup_counter(c, name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "ALL_COUNTER_NAMES path {name:?} not resolvable via \
+                         lookup_counter — counters.rs name table out of sync"
+                    )
+                })
+                .load(Ordering::Relaxed);
+            (name, v)
+        })
+        .collect()
+}
+
+/// Emit the counters sidecar CSV with columns `name,pre,post,delta`.
+/// `pre` and `post` MUST be index-aligned (both produced by
+/// `snapshot_named_counters` against the same `ALL_COUNTER_NAMES` list).
+fn emit_counters_csv(
+    path: &std::path::Path,
+    pre: &[(&'static str, u64)],
+    post: &[(&'static str, u64)],
+) -> anyhow::Result<()> {
+    if pre.len() != post.len() {
+        anyhow::bail!(
+            "counters CSV: pre/post length mismatch (pre={}, post={}) — \
+             ALL_COUNTER_NAMES not stable across the run?",
+            pre.len(),
+            post.len()
+        );
+    }
+    let file = std::fs::File::create(path)
+        .with_context(|| format!("creating counters CSV {path:?}"))?;
+    let mut wtr = csv::Writer::from_writer(file);
+    wtr.write_record(["name", "pre", "post", "delta"])?;
+    for ((name_pre, v_pre), (name_post, v_post)) in pre.iter().zip(post.iter()) {
+        if name_pre != name_post {
+            anyhow::bail!(
+                "counters CSV: pre/post name mismatch at index {} \
+                 ({name_pre:?} vs {name_post:?})",
+                pre.iter().position(|(n, _)| n == name_pre).unwrap_or(0)
+            );
+        }
+        // Defensive saturating_sub: counters are monotonic u64 so post
+        // >= pre on every well-behaved path. A wrap (counter clearing
+        // mid-run) would be a counters.rs bug; saturating to 0 keeps
+        // the CSV emit infallible while still flagging the anomaly via
+        // a 0-delta cell that the verify script can spot-check.
+        let delta = v_post.saturating_sub(*v_pre);
+        wtr.write_record([
+            name_pre,
+            v_pre.to_string().as_str(),
+            v_post.to_string().as_str(),
+            delta.to_string().as_str(),
+        ])?;
+    }
+    wtr.flush()?;
+    Ok(())
 }
 
 /// Drive warmup + measurement iterations on a single connection,
