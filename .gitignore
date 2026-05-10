@@ -7,3 +7,4 @@ Cargo.lock.bak
 /.claude/
 /profile/
 /tools/bench-vs-mtcp/peer/mtcp-driver
+/.fast-iter.env

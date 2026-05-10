@@ -188,6 +188,51 @@ shorten for development cycles, override:
 - `BENCH_RX_MEASURE_BURSTS=100` (default 1000 for clean wire).
 - Skip the netem matrix entirely by emptying `NETEM_SCENARIOS=()`.
 
+### fast-iter setup (single-peer dev iteration)
+
+`scripts/fast-iter-setup.sh` (added 2026-05-10 follow-up) provisions a single
+peer instance from the bench-pair AMI (`ami-0e483926d07d19647`) and treats the
+current host as the DUT. The peer runs all three echo servers used by the new
+bench tools — `echo-server` on :10001, `linux-tcp-sink` on :10002,
+`burst-echo-server` on :10003 — mirroring step `[6/12]` of `bench-nightly.sh`.
+
+Round-trip is ~1-2 min provision + ~30 s teardown, vs. the ~6.5h
+`bench-nightly.sh` cycle (which provisions a full DUT/peer fleet and walks
+the entire matrix). Use it for RX/TX bench iteration, compatibility tests,
+and regression spot-checks where you don't need the full nightly matrix.
+
+Usage:
+```
+./scripts/fast-iter-setup.sh up           # provision + start servers
+source ./.fast-iter.env                   # exports PEER_IP / PEER_SSH / PEER_*_PORT
+sudo ./target/release/bench-rtt --stack dpdk_net \
+    --peer-ip "$PEER_IP" --peer-port "$PEER_ECHO_PORT" \
+    --output-csv /tmp/quick-rtt.csv ...
+./scripts/fast-iter-setup.sh down         # terminate + clear state
+```
+
+State files:
+- `$HOME/.bench-fast-iter.state.json` — peer instance id + ip + port map
+  (overridable via `$BENCH_FAST_ITER_STATE`).
+- `./.fast-iter.env` — sourceable env file with `PEER_IP`, `PEER_SSH`,
+  `PEER_INSTANCE_ID`, `PEER_ECHO_PORT`, `PEER_SINK_PORT`, `PEER_BURST_PORT`
+  (overridable via `$BENCH_FAST_ITER_ENV`; gitignored).
+
+The script fails fast on prereq / build / SSH errors and traps `EXIT` to
+terminate a half-provisioned peer so the operator never gets stuck paying
+for a peer with no echo-server. The current-host DUT setup (NIC bind to
+vfio-pci, hugepage allocation) is operator-managed — `scripts/bench-quick.sh
+setup` handles that path if the operator wants the bench-quick DUT-bind
+flow on top of the fast-iter peer.
+
+`scripts/fast-iter-setup.sh` differs from `scripts/bench-quick.sh` in two
+ways: (a) it starts all three peer servers (bench-quick only starts
+`echo-server`, since it only drives `bench-tx-burst` / `bench-tx-maxtp`),
+and (b) it produces a sourceable `./.fast-iter.env` so any bench tool can
+plug in without re-discovering the peer state. `bench-quick.sh` remains
+the right choice when you want the integrated build + run loop for the
+two TX workloads it knows about.
+
 ## Plan reference
 
 docs/superpowers/plans/2026-05-09-bench-suite-overhaul.md — 41 tasks across 12
