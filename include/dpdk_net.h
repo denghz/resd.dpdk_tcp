@@ -89,6 +89,7 @@ struct dpdk_net_engine_config_t {
   bool tcp_nagle;
   bool tcp_delayed_ack;
   uint8_t cc_mode;
+  uint32_t tcp_min_rto_ms;
   uint32_t tcp_min_rto_us;
   uint32_t tcp_initial_rto_us;
   uint32_t tcp_max_rto_us;
@@ -283,8 +284,7 @@ struct DPDK_NET_ALIGNED(64) dpdk_net_eth_counters_t {
   uint64_t rx_q0_bad_desc_num;
   uint64_t rx_q0_bad_req_id;
   uint64_t rx_q0_mbuf_alloc_fail;
-  uint64_t rx_multi_seg_linearized;
-  uint64_t _pad[1];
+  uint64_t _pad[2];
 };
 
 struct DPDK_NET_ALIGNED(64) dpdk_net_ip_counters_t {

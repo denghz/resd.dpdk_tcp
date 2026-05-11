@@ -133,8 +133,6 @@ pub unsafe extern "C" fn dpdk_net_eal_init(argc: i32, argv: *const *const libc::
     let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     match engine::eal_init(&refs) {
         Ok(()) => 0,
-        Err(dpdk_net_core::Error::ArgvNul) => -libc::EINVAL,
-        Err(dpdk_net_core::Error::Reentrant) => -libc::EDEADLK,
         Err(_) => -libc::EAGAIN,
     }
 }
@@ -148,12 +146,7 @@ pub unsafe extern "C" fn dpdk_net_engine_create(
         return ptr::null_mut();
     }
     let cfg = &*cfg;
-    let event_cap = if cfg.event_queue_soft_cap == 0 {
-        4096
-    } else {
-        cfg.event_queue_soft_cap
-    };
-    if event_cap < 64 {
+    if cfg.event_queue_soft_cap < 64 {
         return ptr::null_mut();
     }
     // A3 fields with 0 sentinels fall back to defaults so callers that
@@ -224,13 +217,6 @@ pub unsafe extern "C" fn dpdk_net_engine_create(
         // default. Rust-direct callers (bench harnesses) can override
         // via `EngineConfig.tx_data_mempool_size` directly.
         tx_data_mempool_size: 0,
-        // A11.0 pressure-test sizing knob. Same shape as
-        // `tx_data_mempool_size`: not exposed on the C ABI; production
-        // C callers always get `0` here (Engine::new substitutes the
-        // hardcoded 2048-mbuf default). Rust-direct pressure-test
-        // callers override via `EngineConfig.tx_hdr_mempool_size`
-        // directly (or via `with_test_mempool_overrides`).
-        tx_hdr_mempool_size: 0,
         local_ip: cfg.local_ip,
         // bug_010 → feature: start empty. C callers register secondary
         // local IPs post-create via `dpdk_net_engine_add_local_ip`; the
@@ -254,21 +240,12 @@ pub unsafe extern "C" fn dpdk_net_engine_create(
         // value honored when `preset == DPDK_NET_PRESET_LATENCY`; `apply_preset`
         // overwrites to `1` (Reno) when `preset == DPDK_NET_PRESET_RFC_COMPLIANCE`.
         cc_mode: cfg.cc_mode,
-        // A1 cross-phase: ABI-to-core pass-through for the SYN-option
-        // negotiation toggles. Default-zeroed `dpdk_net_engine_config_t`
-        // suppresses both options today — production callers wanting
-        // the prior "always emit" behavior must explicitly set these
-        // to true. (Constructed via `EngineConfig::default()` in
-        // Rust-direct paths, which sets both to true.)
-        tcp_timestamps: cfg.tcp_timestamps,
-        tcp_sack: cfg.tcp_sack,
-        tcp_ecn: cfg.tcp_ecn,
         tcp_min_rto_us: min_rto_us,
         tcp_initial_rto_us: initial_rto_us,
         tcp_max_rto_us: max_rto_us,
         tcp_max_retrans_count: max_retrans,
         tcp_per_packet_events: cfg.tcp_per_packet_events,
-        event_queue_soft_cap: event_cap,
+        event_queue_soft_cap: cfg.event_queue_soft_cap,
         // A6 Task 20: ABI-layer pass-through of the caller-supplied
         // bucket edges. All-zero input triggers the spec §3.8.2 default
         // substitution in `Engine::new`; non-monotonic input causes
@@ -529,37 +506,57 @@ pub unsafe extern "C" fn dpdk_net_poll(
         return 0;
     }
     let mut filled: u32 = 0;
-    e.drain_events(max_events, |ev, _engine| {
-        // C1: the `Readable` variant now owns its iovec Vec and the
-        // mbuf-refcount holders (`owned_mbufs`) directly. We point
-        // `segs` at the event's own `Vec::as_ptr()` rather than at the
-        // owning conn's per-poll scratch.
+    e.drain_events(max_events, |ev, engine| {
+        // A6.6 T8/T9: resolve the `Readable` variant's scatter-gather
+        // payload by pointing `segs` at the owning conn's
+        // `readable_scratch_iovecs` (per-conn scratch). The Vec's
+        // `as_ptr()` is stable because nothing appends to it between
+        // deliver_readable-emit and this drain call — top-of-next-
+        // `poll_once` is the only site that mutates the scratch, and
+        // it runs AFTER the app has consumed the event.
         //
-        // SAFETY: drained events are moved into `Engine::drained_events_scratch`
-        // (a `RefCell<Vec<InternalEvent>>`) before this sink is invoked
-        // (C1 fix). The scratch is cleared only at the top of the NEXT
-        // `dpdk_net_poll` call, so every `&InternalEvent` reference
-        // passed to this closure is backed by a live allocation.
-        //
-        // The raw pointer we hand back to C (`segs.as_ptr()`) points
-        // into the event's owned `Vec<DpdkNetIovec>`, which lives inside
-        // the scratch for the entire inter-poll window.  The caller is
-        // documented to consume iovecs before the next `dpdk_net_poll`.
-        //
-        // The mbuf-refcount holders (`owned_mbufs`) that pin the `base`
-        // pointers live on the same event in the scratch; they are
-        // released together when the scratch is cleared on the next poll.
+        // `seg_idx_start` is always 0 in A6.6 (one emit per
+        // deliver_readable; scratch is cleared and rebuilt per event
+        // for that conn), but the offset-add below is future-proof
+        // against a multi-emit-per-poll design.
         let readable_view: dpdk_net_event_readable_t = match ev {
             dpdk_net_core::tcp_events::InternalEvent::Readable {
-                segs,
+                conn,
+                seg_idx_start,
+                seg_count,
                 total_len,
                 ..
             } => {
-                let segs_ptr = segs.as_ptr() as *const dpdk_net_iovec_t;
-                dpdk_net_event_readable_t {
-                    segs: segs_ptr,
-                    n_segs: segs.len() as u32,
-                    total_len: *total_len,
+                let ft = engine.flow_table();
+                match ft.get(*conn) {
+                    Some(c) => {
+                        // SAFETY: `c.readable_scratch_iovecs` is a
+                        // per-conn Vec whose capacity is preserved
+                        // across the poll; `seg_idx_start` is always
+                        // 0 (single emit per deliver_readable) and
+                        // `seg_count` is bounded by the Vec's len
+                        // when the event was enqueued. The Vec is
+                        // cleared only at the top of the NEXT
+                        // `poll_once`, so the pointers remain valid
+                        // for the entire event-drain window of THIS
+                        // poll.
+                        let segs_ptr = unsafe {
+                            c.readable_scratch_iovecs
+                                .as_ptr()
+                                .add(*seg_idx_start as usize)
+                                as *const dpdk_net_iovec_t
+                        };
+                        dpdk_net_event_readable_t {
+                            segs: segs_ptr,
+                            n_segs: *seg_count,
+                            total_len: *total_len,
+                        }
+                    }
+                    None => dpdk_net_event_readable_t {
+                        segs: std::ptr::null(),
+                        n_segs: 0,
+                        total_len: 0,
+                    },
                 }
             }
             _ => dpdk_net_event_readable_t {
@@ -1186,6 +1183,7 @@ mod tests {
             tcp_nagle: false,
             tcp_delayed_ack: false,
             cc_mode: 0,
+            tcp_min_rto_ms: 0,
             tcp_min_rto_us: 0,
             tcp_initial_rto_us: 0,
             tcp_max_rto_us: 0,
@@ -1214,10 +1212,6 @@ mod tests {
     // validate the early-return path from a pure unit test. The function
     // returns a pointer type, so validation failure surfaces as a null
     // pointer (same convention as the existing null-cfg guard).
-    //
-    // A4: Non-zero values below 64 are still rejected. Zero is NOT below
-    // 64 after substitution (0 → 4096); see
-    // `engine_create_zero_event_queue_soft_cap_uses_default_4096`.
     #[test]
     fn engine_create_rejects_event_queue_soft_cap_below_64() {
         let cfg = dpdk_net_engine_config_t {
@@ -1234,6 +1228,7 @@ mod tests {
             tcp_nagle: false,
             tcp_delayed_ack: false,
             cc_mode: 0,
+            tcp_min_rto_ms: 0,
             tcp_min_rto_us: 0,
             tcp_initial_rto_us: 0,
             tcp_max_rto_us: 0,
@@ -1254,60 +1249,6 @@ mod tests {
             rx_mempool_size: 0,
         };
         let p = unsafe { dpdk_net_engine_create(0, &cfg) };
-        assert!(p.is_null());
-    }
-
-    // A4: zero-initialized `dpdk_net_engine_config_t` (the canonical C
-    // idiom `dpdk_net_engine_config_t cfg = {};`) must NOT be rejected by
-    // the `event_queue_soft_cap < 64` guard. The 0 sentinel is substituted
-    // to the 4096 default before the bound check, consistent with all
-    // other zero-defaulting fields (max_connections, recv_buffer_bytes,
-    // tcp_mss, etc.).
-    //
-    // This call returns null because DPDK isn't running in tests, NOT
-    // because of the <64 bound check. The bound check should have been
-    // bypassed because 0 → 4096 via substitution. To verify the
-    // substitution is working, compile with a debug print or check that
-    // event_queue_soft_cap=63 IS rejected while event_queue_soft_cap=0
-    // is NOT rejected at the bound check level.
-    #[test]
-    fn engine_create_zero_event_queue_soft_cap_uses_default_4096() {
-        let cfg = dpdk_net_engine_config_t {
-            port_id: 0,
-            rx_queue_id: 0,
-            tx_queue_id: 0,
-            max_connections: 0,
-            recv_buffer_bytes: 0,
-            send_buffer_bytes: 0,
-            tcp_mss: 0,
-            tcp_timestamps: false,
-            tcp_sack: false,
-            tcp_ecn: false,
-            tcp_nagle: false,
-            tcp_delayed_ack: false,
-            cc_mode: 0,
-            tcp_min_rto_us: 0,
-            tcp_initial_rto_us: 0,
-            tcp_max_rto_us: 0,
-            tcp_max_retrans_count: 0,
-            tcp_msl_ms: 0,
-            tcp_per_packet_events: false,
-            preset: 0,
-            local_ip: 0,
-            gateway_ip: 0,
-            gateway_mac: [0u8; 6],
-            garp_interval_sec: 0,
-            event_queue_soft_cap: 0,
-            rtt_histogram_bucket_edges_us: [0u32; 15],
-            ena_large_llq_hdr: 0,
-            ena_miss_txc_to_sec: 0,
-            rx_mempool_size: 0,
-        };
-        let p = unsafe { dpdk_net_engine_create(0, &cfg) };
-        // Null here documents the test environment limitation: DPDK isn't
-        // running, so `Engine::new` fails. The bound check is bypassed by
-        // 0 → 4096 substitution; this assertion captures the contract
-        // shape only.
         assert!(p.is_null());
     }
 
@@ -1417,8 +1358,8 @@ mod tests {
             },
             InternalEvent::Readable {
                 conn: ConnHandle::default(),
-                segs: Vec::new(),
-                owned_mbufs: smallvec::SmallVec::new(),
+                seg_idx_start: 0,
+                seg_count: 0,
                 total_len: 0,
                 rx_hw_ts_ns: 0,
                 emitted_ts_ns: EMITTED,

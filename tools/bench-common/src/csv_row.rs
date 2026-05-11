@@ -19,10 +19,11 @@
 //! - Keep `RunMetadata` and `Preconditions` as ergonomic nested structs for
 //!   callers populating a row — they stay strongly typed and easy to build.
 //! - Implement `Serialize` on `CsvRow` by hand, writing one `SerializeStruct`
-//!   with all 40 columns as flat scalar fields. The breakdown is
+//!   with all 42 columns as flat scalar fields. The breakdown is
 //!   13 run-metadata columns (12 scalars + `precondition_mode`) +
 //!   14 precondition-value columns + 8 per-row columns + 5 host/dpdk/worktree
-//!   identification columns = 40. That shape is exactly what csv expects.
+//!   identification columns + 2 Phase 3 columns (`raw_samples_path`,
+//!   `failed_iter_count`) = 42. That shape is exactly what csv expects.
 //! - Implement `Deserialize` on `CsvRow` via a `Visitor` that walks the
 //!   matching set of field keys and rebuilds the nested structs.
 //!
@@ -154,6 +155,15 @@ pub const COLUMNS: &[&str] = &[
     "dpdk_version_pkgconfig",
     "worktree_branch",
     "uprof_session_id",
+    // Phase 3 schema additions: sidecar pointer + per-iter timeout count.
+    // `raw_samples_path` is the relative path to a per-iter sidecar CSV
+    // produced by `raw_samples::RawSamplesWriter`; `None`/empty means the
+    // tool emitted aggregates only. `failed_iter_count` records iters that
+    // hit the per-iter timeout (was previously fatal — see C-D3). Both are
+    // appended at the END so all existing column positions are unchanged
+    // and older CSVs still deserialise (visitor tolerates them as absent).
+    "raw_samples_path",
+    "failed_iter_count",
 ];
 
 /// One row in the unified benchmark CSV. Spec §14.1.
@@ -196,6 +206,18 @@ pub struct CsvRow {
     /// to an AMD uProf profiling session so the same run produces aligned
     /// counter + profile data.
     pub uprof_session_id: Option<String>,
+    /// Phase 3 schema addition: relative path to the per-iter raw-sample
+    /// sidecar CSV produced by `raw_samples::RawSamplesWriter`. `None` (the
+    /// empty cell on disk) means this tool/test emitted aggregates only and
+    /// no sidecar exists. Older CSVs without this column round-trip with
+    /// `None` because the visitor tolerates the column as absent.
+    pub raw_samples_path: Option<String>,
+    /// Phase 3 schema addition: count of per-iter measurements that hit the
+    /// per-iter timeout and were skipped rather than aborting the whole
+    /// bucket (closes C-D3 — the timeout was previously fatal). Defaults to
+    /// `0` for tools that don't enforce per-iter timeouts and for older
+    /// CSVs without this column.
+    pub failed_iter_count: u64,
 }
 
 impl CsvRow {
@@ -262,6 +284,12 @@ impl Serialize for CsvRow {
         st.serialize_field("dpdk_version_pkgconfig", &self.dpdk_version_pkgconfig)?;
         st.serialize_field("worktree_branch", &self.worktree_branch)?;
         st.serialize_field("uprof_session_id", &self.uprof_session_id)?;
+        // Phase 3 schema additions. `raw_samples_path` is `Option<String>`,
+        // which serialises to the empty cell when `None`. `failed_iter_count`
+        // is a `u64`, always emitted as a decimal — the convention is `0`
+        // when the tool didn't track per-iter timeouts.
+        st.serialize_field("raw_samples_path", &self.raw_samples_path)?;
+        st.serialize_field("failed_iter_count", &self.failed_iter_count)?;
         st.end()
     }
 }
@@ -340,6 +368,12 @@ impl<'de> Visitor<'de> for CsvRowVisitor {
         let mut worktree_branch: Option<Option<String>> = None;
         let mut uprof_session_id: Option<Option<String>> = None;
 
+        // Phase 3 schema additions — same tolerated-absent pattern as the
+        // Task 2.8 columns. `raw_samples_path` defaults to `None`,
+        // `failed_iter_count` defaults to `0` for older CSVs.
+        let mut raw_samples_path: Option<Option<String>> = None;
+        let mut failed_iter_count: Option<u64> = None;
+
         while let Some(key) = map.next_key::<String>()? {
             match key.as_str() {
                 "run_id" => run_id = Some(map.next_value()?),
@@ -382,6 +416,8 @@ impl<'de> Visitor<'de> for CsvRowVisitor {
                 "dpdk_version_pkgconfig" => dpdk_version_pkgconfig = Some(map.next_value()?),
                 "worktree_branch" => worktree_branch = Some(map.next_value()?),
                 "uprof_session_id" => uprof_session_id = Some(map.next_value()?),
+                "raw_samples_path" => raw_samples_path = Some(map.next_value()?),
+                "failed_iter_count" => failed_iter_count = Some(map.next_value()?),
                 _ => {
                     // Unknown column — skip. Forward-compat with future
                     // schema additions that older tools don't know about.
@@ -446,6 +482,9 @@ impl<'de> Visitor<'de> for CsvRowVisitor {
             dpdk_version_pkgconfig: dpdk_version_pkgconfig.unwrap_or(None),
             worktree_branch: worktree_branch.unwrap_or(None),
             uprof_session_id: uprof_session_id.unwrap_or(None),
+            // Phase 3 schema additions — same tolerated-absent treatment.
+            raw_samples_path: raw_samples_path.unwrap_or(None),
+            failed_iter_count: failed_iter_count.unwrap_or(0),
         })
     }
 }
@@ -488,6 +527,8 @@ mod tests {
             dpdk_version_pkgconfig: Some("23.11.2".into()),
             worktree_branch: Some("a10-perf-23.11".into()),
             uprof_session_id: None,
+            raw_samples_path: None,
+            failed_iter_count: 0,
         }
     }
 
@@ -510,12 +551,13 @@ mod tests {
 
     /// Invariance guard: the column count must match the spec. Breakdown:
     /// 13 run-metadata, 14 precondition, 8 per-row, 5 host/dpdk/worktree
-    /// identification (Task 2.8) — 40 total. If this fires, a column was
+    /// identification (Task 2.8), 2 Phase 3 additions (`raw_samples_path`,
+    /// `failed_iter_count`) — 42 total. If this fires, a column was
     /// added/removed without updating the companion tests and the Serialize
     /// impl.
     #[test]
     fn columns_len_is_expected() {
-        assert_eq!(COLUMNS.len(), 40);
+        assert_eq!(COLUMNS.len(), 42);
     }
 
     /// Invariance guard: the header row that csv::Writer emits when it
@@ -549,5 +591,79 @@ mod tests {
         for col in COLUMNS {
             assert!(map.contains_key(*col), "missing column {col}");
         }
+    }
+
+    /// Phase 3 schema addition: `raw_samples_path` and `failed_iter_count`
+    /// must be appended to the column list (positions preserved for all
+    /// existing columns). Populated `raw_samples_path` plus a non-zero
+    /// `failed_iter_count` must round-trip to the last two cells of the
+    /// emitted CSV row, in that order.
+    #[test]
+    fn summary_row_includes_raw_samples_path_and_failed_iter_count() {
+        let mut row = sample_row();
+        row.raw_samples_path = Some("raw/bench-rtt-128b.csv".to_string());
+        row.failed_iter_count = 3;
+
+        let mut buf = Vec::new();
+        {
+            let mut wtr = csv::Writer::from_writer(&mut buf);
+            wtr.serialize(&row).unwrap();
+            wtr.flush().unwrap();
+        }
+        let text = std::str::from_utf8(&buf).unwrap();
+        let mut lines = text.lines();
+        let header = lines.next().unwrap();
+        let data = lines.next().unwrap();
+        assert!(
+            header.ends_with(",raw_samples_path,failed_iter_count"),
+            "header must end with the two new columns: got {header}"
+        );
+
+        // Use a CSV-aware reader so commas embedded in `dimensions_json`
+        // don't shred a naive split.
+        let mut rdr = csv::ReaderBuilder::new()
+            .has_headers(false)
+            .from_reader(text.as_bytes());
+        let mut records = rdr.records();
+        let _hdr = records.next().unwrap().unwrap();
+        let data_record = records.next().unwrap().unwrap();
+        let cols: Vec<&str> = data_record.iter().collect();
+        let last_two = &cols[cols.len() - 2..];
+        assert_eq!(last_two[0], "raw/bench-rtt-128b.csv");
+        assert_eq!(last_two[1], "3");
+
+        // Smoke check the raw text too, to mirror the plan's intent.
+        assert!(
+            data.contains("raw/bench-rtt-128b.csv"),
+            "data row must contain the raw_samples_path value: {data}"
+        );
+    }
+
+    /// Phase 3 schema addition: a `None` `raw_samples_path` emits as an
+    /// empty cell, and `failed_iter_count = 0` emits as `0` — both at the
+    /// trailing positions so existing column indices are unchanged.
+    #[test]
+    fn summary_row_emits_empty_cell_when_raw_samples_path_is_none() {
+        let mut row = sample_row();
+        row.raw_samples_path = None;
+        row.failed_iter_count = 0;
+
+        let mut buf = Vec::new();
+        {
+            let mut wtr = csv::Writer::from_writer(&mut buf);
+            wtr.serialize(&row).unwrap();
+            wtr.flush().unwrap();
+        }
+        let text = std::str::from_utf8(&buf).unwrap();
+        let mut rdr = csv::ReaderBuilder::new()
+            .has_headers(false)
+            .from_reader(text.as_bytes());
+        let mut records = rdr.records();
+        let _hdr = records.next().unwrap().unwrap();
+        let data_record = records.next().unwrap().unwrap();
+        let cols: Vec<&str> = data_record.iter().collect();
+        let last_two = &cols[cols.len() - 2..];
+        assert_eq!(last_two[0], "");
+        assert_eq!(last_two[1], "0");
     }
 }

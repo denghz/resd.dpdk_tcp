@@ -215,6 +215,7 @@ pub fn ip_decode_offload_aware(
                     .eth
                     .rx_drop_cksum_bad
                     .fetch_add(1, Ordering::Relaxed);
+                counters.ip.rx_csum_bad.fetch_add(1, Ordering::Relaxed);
                 Err(L3Drop::CsumBad)
             }
             _ => ip_decode(pkt, our_ip, false),

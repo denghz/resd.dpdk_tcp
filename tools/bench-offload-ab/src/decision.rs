@@ -95,15 +95,7 @@ pub fn classify(
 /// 440 ns) overshoot — easily inside criterion noise on AWS — and
 /// erroring on it created a false flag rather than catching a real
 /// composition regression. Threshold tuned to fire on >5% only.
-///
-/// 2026-05-04 update: bumped 5% → 10% after T16 follow-up surfaced a
-/// 5.4% gap (38280→39190 obs-none vs default p99) that tripped the
-/// 5% bound. Natural p99 jitter on c6a.12xlarge ENA at the 38 µs
-/// measurement scale is ~5-8% run-to-run; 10% gives real composition
-/// regressions room to surface while suppressing pure measurement
-/// noise. Composition violations >10% are still genuinely worth
-/// investigating.
-pub const COMPOSE_NOISE_FRAC: f64 = 0.10;
+pub const COMPOSE_NOISE_FRAC: f64 = 0.05;
 
 /// Enforce the §9 sanity invariant: the full-offload configuration's
 /// p99 must be no worse than the best individual single-offload
@@ -250,11 +242,11 @@ mod tests {
 
     #[test]
     fn sanity_invariant_violation_errors_when_outside_noise_band() {
-        // full 120 > best_individual 100 × 1.10 = 110 → violation
-        // (20% overshoot is comfortably outside the 10% band).
-        let err = check_sanity_invariant(120.0, 100.0).unwrap_err();
-        assert!(err.contains("full p99 120"), "err should mention full p99: {err}");
-        assert!(err.contains("100"), "err should mention best individual p99: {err}");
+        // full 100 > best_individual 92 × 1.05 = 96.6 → violation
+        // (8.7% overshoot is comfortably outside the 5% band).
+        let err = check_sanity_invariant(100.0, 92.0).unwrap_err();
+        assert!(err.contains("full p99 100"), "err should mention full p99: {err}");
+        assert!(err.contains("92"), "err should mention best individual p99: {err}");
     }
 
     #[test]

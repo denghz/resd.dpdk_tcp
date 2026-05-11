@@ -1,0 +1,10 @@
+[2026-05-09T06:39:00Z] T53 fast-iter start (commit=64970d4)
+[2026-05-09T06:39:00Z] Pass 1: dpdk burst
+[2026-05-09T06:40:35Z] Pass 1 done — 421 CSV lines
+[2026-05-09T06:40:35Z] Pass 2: fstack burst
+[2026-05-09T07:01:01Z] Pass 2 done — 421 CSV lines
+[2026-05-09T07:01:01Z] Pass 3: dpdk+linux maxtp
+[2026-05-09T07:15:01Z] Pass 3 done — 113 CSV lines
+[2026-05-09T07:15:01Z] Pass 4: fstack maxtp
+[2026-05-09T07:20:38Z] Pass 4 done — 57 CSV lines
+[2026-05-09T07:20:38Z] ALL T53 FAST-ITER PASSES COMPLETE

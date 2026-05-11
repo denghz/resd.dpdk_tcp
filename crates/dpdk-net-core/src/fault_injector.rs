@@ -272,8 +272,8 @@ impl FaultInjector {
                 unsafe {
                     *data_ptr.add(idx) ^= xor;
                 }
-                counters.corrupts.fetch_add(1, Ordering::Relaxed);
             }
+            counters.corrupts.fetch_add(1, Ordering::Relaxed);
         }
 
         out.push(mbuf);

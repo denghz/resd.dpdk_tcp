@@ -74,9 +74,15 @@ while IFS= read -r name; do
   #       makes the bare form common)
   #   (c) &<...>.field passed as an argument — e.g.,
   #       and_offload_with_miss_counter(...,&counters.eth.offload_missing_rss_hash, ...)
+  #   (d) Phase 11 (C-E2): split helper `inc_<field>` taking &TcpCounters —
+  #       e.g., `inc_tx_retrans_rto(&counters.tcp)` bumps tx_retrans_rto
+  #       (and the aggregate). Recognizes any helper named exactly
+  #       `inc_<field>` so future similar split helpers don't need a script
+  #       change.
   pattern="(\.${field}\s*\.\s*(fetch_add|fetch_max|store)\b"
   pattern+="|(inc|add)\s*\(\s*&[^,)]*\.${field}\b"
-  pattern+="|&[^,)]*\.${field}\s*[,)])"
+  pattern+="|&[^,)]*\.${field}\s*[,)]"
+  pattern+="|\binc_${field}\s*\()"
 
   # Search the crate source trees (both dpdk-net-core and dpdk-net), but
   # exclude counters.rs itself: it contains the struct declaration,

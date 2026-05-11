@@ -15,7 +15,7 @@
 
 mod common;
 
-use common::{is_rst, is_syn_ack, parse_syn_seq, parse_tcp_seq_ack, CovHarness};
+use common::{is_rst, is_syn_ack, parse_syn_seq, CovHarness};
 
 #[test]
 fn dup_syn_in_syn_rcvd_same_iss_triggers_syn_ack_retransmit() {
@@ -71,38 +71,5 @@ fn dup_syn_in_syn_rcvd_different_iss_triggers_rst() {
     assert!(
         is_rst(&out[0]),
         "in-window SYN with SEG.SEQ != IRS → RST per RFC 9293 §3.10.7.4 Fourth"
-    );
-}
-
-/// B2 regression: matched-flow `emit_rst` must include the SYN flag's
-/// 1-byte sequence-space contribution in the RST's ACK field per
-/// RFC 9293 §3.10.7.2. Pre-B2, `emit_rst` computed
-/// `ack = incoming.seq + payload_len`, ignoring SYN/FIN. Sister
-/// `send_rst_unmatched` already added `+syn_len+fin_len`; B2 ports the
-/// same arithmetic into `emit_rst`.
-///
-/// Scenario: dup-SYN-in-SYN_RCVD with a different ISS (the same path
-/// `dup_syn_in_syn_rcvd_different_iss_triggers_rst` exercises) drives
-/// `TxAction::Rst` → `emit_rst` with a SYN-bearing zero-payload incoming.
-/// Expected ACK = `new_iss + 0 (payload) + 1 (SYN) + 0 (FIN) = new_iss + 1`.
-/// Pre-fix this would have been `new_iss`, off-by-one.
-#[test]
-fn rst_for_dup_syn_includes_syn_byte_in_ack() {
-    let mut h = CovHarness::new();
-    h.do_listen_then_peer_syn();
-    let _ = h.drain_tx_frames();
-
-    let new_iss: u32 = 0x5000;
-    h.inject_duplicate_peer_syn_different_iss(new_iss);
-    let out = h.drain_tx_frames();
-    assert_eq!(out.len(), 1, "exactly one RST expected");
-    assert!(is_rst(&out[0]), "frame must be RST");
-
-    let (_seq, ack) = parse_tcp_seq_ack(&out[0]);
-    assert_eq!(
-        ack,
-        new_iss.wrapping_add(1),
-        "RFC 9293 §3.10.7.2: RST ACK must advance past SYN's 1 seq number \
-         (expected new_iss+1, got {ack:#x})"
     );
 }

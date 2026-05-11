@@ -4,24 +4,13 @@ version.workspace = true
 edition.workspace = true
 publish = false
 
-# A10 Plan B Task 8: dual-stack latency comparison vs. Linux TCP.
+# Post-2026-05-09 bench-suite overhaul Phase 4: bench-vs-linux retains
+# only **mode B** (wire-diff, rfc_compliance preset). Mode A (RTT
+# comparison across stacks) consolidated into the new bench-rtt crate.
 #
-# Mode A (RTT comparison, trading-latency preset) runs three stacks
-# side-by-side against the same C echo-server peer:
-#   1. dpdk_net via dpdk_net_core::Engine (bench-e2e's workload reused)
-#   2. Linux kernel TCP via std::net::TcpStream
-#   3. Linux AF_PACKET mmap via libc::socket(PF_PACKET, SOCK_RAW, ...)
-#
-# A10 Plan B Task 9: Mode B (wire-diff, rfc_compliance preset) — the
-# engine is built with `apply_preset(1, &mut cfg)` (from `dpdk-net`,
-# re-used here via a rlib link — the cdylib/staticlib build artefacts
-# are side-effects of cbindgen running in dpdk-net's build script) and
-# pcap captures are canonicalised + byte-diffed via `src/normalize.rs`.
-# Task 9 ships the normalise + diff engine and an MVP runner that
-# consumes pre-captured pcap files (`--local-pcap` / `--peer-pcap`).
-# Live tcpdump+SSH orchestration is a follow-up — it needs the paired
-# EC2 fleet that only bench-nightly.sh has access to (see Task 15).
-#
+# Mode B canonicalises a DUT pcap + a peer pcap and byte-diffs them.
+# The MVP consumes pre-captured pcaps via `--local-pcap` /
+# `--peer-pcap`; live tcpdump+SSH orchestration is a follow-up (Task 15).
 # See docs/superpowers/specs/2026-04-21-stage1-phase-a10-benchmark-
 # harness-design.md §8 and parent spec §11.5.
 
@@ -34,22 +23,10 @@ name = "bench-vs-linux"
 path = "src/main.rs"
 
 [features]
-default = ["fstack"]
-# Enables the F-Stack RTT arm. Requires libfstack.a + DPDK 23.11
-# at /opt/f-stack/lib (image-builder component
-# 04b-install-f-stack.yaml). Default-on as of T23 (AMI 1.0.15
-# ami-0e483926d07d19647) since the bench-pair image ships F-Stack
-# pre-installed; pass `--no-default-features` on dev hosts without it.
-fstack = ["bench-vs-mtcp/fstack"]
+default = []
 
 [dependencies]
 bench-common = { path = "../bench-common" }
-bench-e2e = { path = "../bench-e2e" }
-# F-Stack FFI bindings live in bench-vs-mtcp; reuse them for the
-# bench-vs-linux mode A F-Stack arm so we don't duplicate `extern "C"`
-# blocks. The path-dep is free; we only consume the `fstack_ffi`
-# module surface.
-bench-vs-mtcp = { path = "../bench-vs-mtcp" }
 dpdk-net-core = { path = "../../crates/dpdk-net-core" }
 # Task 9: imported for `apply_preset(DPDK_NET_PRESET_RFC_COMPLIANCE, ..)`
 # so mode B's engine build goes through the same preset entry point as

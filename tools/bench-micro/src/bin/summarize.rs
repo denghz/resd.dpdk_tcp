@@ -273,6 +273,8 @@ fn main() -> anyhow::Result<()> {
                     dpdk_version_pkgconfig: host_meta.dpdk_version_pkgconfig.clone(),
                     worktree_branch: host_meta.worktree_branch.clone(),
                     uprof_session_id: host_meta.uprof_session_id.clone(),
+                    raw_samples_path: None,
+                    failed_iter_count: 0,
                 };
                 wtr.serialize(&row)?;
                 count += 1;

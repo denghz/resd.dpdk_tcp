@@ -240,44 +240,20 @@ fn compute_ws_shift_for(recv_buffer_bytes: u32) -> u8 {
 /// Emits MSS + WS (from `compute_ws_shift_for`) + SACK-permitted + TS
 /// (TSval = `now_ns / 1000` microsecond ticks per RFC 7323 §4.1;
 /// TSecr = 0 — no received TSval yet on an initial SYN).
-/// `ts_enabled` / `sack_enabled` come from `EngineConfig.tcp_timestamps` /
-/// `tcp_sack` so C callers who set those false suppress the corresponding
-/// SYN option.
 fn build_connect_syn_opts(
     recv_buffer_bytes: u32,
     our_mss: u16,
     now_ns: u64,
-    ts_enabled: bool,
-    sack_enabled: bool,
 ) -> crate::tcp_options::TcpOpts {
     let ws_out = compute_ws_shift_for(recv_buffer_bytes);
     let tsval_initial = (now_ns / 1000) as u32;
     crate::tcp_options::TcpOpts {
         mss: Some(our_mss),
         wscale: Some(ws_out),
-        sack_permitted: sack_enabled,
-        timestamps: if ts_enabled {
-            Some((tsval_initial, 0))
-        } else {
-            None
-        },
+        sack_permitted: true,
+        timestamps: Some((tsval_initial, 0)),
         ..Default::default()
     }
-}
-
-/// Test-only wrapper around `build_connect_syn_opts` for integration tests
-/// (`tests/cabi_field_wired.rs`) that verify `EngineConfig.tcp_timestamps`
-/// and `tcp_sack` actually drive SYN-option emission. Stays `pub` (rather
-/// than `#[cfg(test)]`) because integration tests compile outside the
-/// crate's own `cfg(test)`. Not a production API.
-pub fn build_connect_syn_opts_for_test(
-    recv_buffer_bytes: u32,
-    our_mss: u16,
-    now_ns: u64,
-    ts_enabled: bool,
-    sack_enabled: bool,
-) -> crate::tcp_options::TcpOpts {
-    build_connect_syn_opts(recv_buffer_bytes, our_mss, now_ns, ts_enabled, sack_enabled)
 }
 
 /// Outcome of computing the window + option bundle for a bare ACK. The
@@ -471,18 +447,6 @@ pub struct EngineConfig {
     /// risk knowingly. Retrievable via `Engine::tx_data_mempool_size()`.
     pub tx_data_mempool_size: u32,
 
-    /// A11.0 pressure-test knob: TX **header** mempool capacity in mbufs.
-    /// `0` = production default (2048 mbufs, hardcoded historically).
-    /// Non-zero caller value is used verbatim — pressure-test suites use
-    /// this to drive header-mempool drought scenarios (e.g. ACK-storm
-    /// pressure: bump every conn's `tx_ack` simultaneously and starve
-    /// the header pool to confirm `eth.tx_drop_nomem` rises predictably).
-    /// Production callers leave this at 0; the formula-default path is
-    /// unchanged. The field is unconditionally present (matches
-    /// `rx_mempool_size` / `tx_data_mempool_size` shape) so the C ABI
-    /// layout does not flip on the `pressure-test` feature.
-    pub tx_hdr_mempool_size: u32,
-
     // Phase A2 additions (host byte order for IPs; raw bytes for MAC)
     pub local_ip: u32,
     /// bug_010 → feature: additional local IPs the engine is willing to
@@ -523,13 +487,6 @@ pub struct EngineConfig {
     /// (A3–A5.5 behavior preserved); `1` = Reno (RFC 5681). Default 0.
     /// `preset=rfc_compliance` forces 1.
     pub cc_mode: u8,
-
-    /// Whether to negotiate TCP timestamps (RFC 7323). Default: true.
-    pub tcp_timestamps: bool,
-    /// Whether to offer SACK-permitted in SYN (RFC 2018). Default: true.
-    pub tcp_sack: bool,
-    /// Whether to negotiate ECN (RFC 3168). Default: false.
-    pub tcp_ecn: bool,
 
     // Phase A5 additions
     /// A5 Task 21: RFC 6298 RTO floor (µs). Spec §6.4 default 5ms
@@ -608,7 +565,6 @@ impl Default for EngineConfig {
             // mbuf_data_room` in-flight segments + driver-held + in-batch
             // headroom. See doc-comment for the full breakdown.
             tx_data_mempool_size: 0,
-            tx_hdr_mempool_size: 0,
             local_ip: 0,
             secondary_local_ips: Vec::new(),
             gateway_ip: 0,
@@ -625,9 +581,6 @@ impl Default for EngineConfig {
             tcp_delayed_ack: false,
             // A6 (spec §3.5): 0 = latency (A3–A5.5 behavior preserved).
             cc_mode: 0,
-            tcp_timestamps: true,
-            tcp_sack: true,
-            tcp_ecn: false,
             tcp_min_rto_us: 5_000,
             tcp_initial_rto_us: 5_000,
             tcp_max_rto_us: 1_000_000,
@@ -638,36 +591,6 @@ impl Default for EngineConfig {
             ena_large_llq_hdr: 0,
             ena_miss_txc_to_sec: 0,
         }
-    }
-}
-
-#[cfg(feature = "pressure-test")]
-impl EngineConfig {
-    /// Test-only builder that sets all three pressure-test mempool
-    /// sizing overrides in one shot. Slow-path (constructor); gated by
-    /// `pressure-test` cargo feature; do NOT call from production code.
-    ///
-    /// Equivalent to setting `rx_mempool_size`, `tx_data_mempool_size`,
-    /// and `tx_hdr_mempool_size` directly — provided as an ergonomic
-    /// helper so pressure-test scenarios read as a single line:
-    ///
-    /// ```ignore
-    /// let cfg = EngineConfig::default()
-    ///     .with_test_mempool_overrides(64, 64, 64);
-    /// ```
-    ///
-    /// A `0` for any field falls back to the production default for that
-    /// pool (formula for `rx`/`tx_data`, hardcoded 2048 for `tx_hdr`).
-    pub fn with_test_mempool_overrides(
-        mut self,
-        rx_mempool_size: u32,
-        tx_data_mempool_size: u32,
-        tx_hdr_mempool_size: u32,
-    ) -> Self {
-        self.rx_mempool_size = rx_mempool_size;
-        self.tx_data_mempool_size = tx_data_mempool_size;
-        self.tx_hdr_mempool_size = tx_hdr_mempool_size;
-        self
     }
 }
 
@@ -696,10 +619,6 @@ pub const ENGINE_CONFIG_FIELD_NAMES: &[&str] = &[
     "mbuf_data_room",
     // A6.6-7: RX mempool sizing.
     "rx_mempool_size",
-    // 2026-04-29 fix: TX data mempool sizing knob.
-    "tx_data_mempool_size",
-    // A11.0 pressure-test: TX header mempool sizing knob.
-    "tx_hdr_mempool_size",
     // A2: L2/L3 identity + GARP cadence.
     "local_ip",
     "secondary_local_ips",
@@ -716,10 +635,6 @@ pub const ENGINE_CONFIG_FIELD_NAMES: &[&str] = &[
     "tcp_nagle",
     "tcp_delayed_ack",
     "cc_mode",
-    // A1 cross-phase: TCP option/negotiation toggles wired through the C ABI.
-    "tcp_timestamps",
-    "tcp_sack",
-    "tcp_ecn",
     // A5: RTO timing + retransmit budget + per-packet events.
     "tcp_min_rto_us",
     "tcp_initial_rto_us",
@@ -757,13 +672,6 @@ pub struct Engine {
     /// `Cell<u64>` because writes happen from the single engine lcore.
     pub(crate) rx_mempool_avail_last_sample_tsc: Cell<u64>,
     tx_hdr_mempool: Mempool,
-    /// A11.0 pressure-test (T1 review I-1, I-2): resolved TX **header**
-    /// mempool capacity (post zero-sentinel substitution; production
-    /// default = 2048). Mirrors the `rx_mempool_size` /
-    /// `tx_data_mempool_size` field shape; exposed via
-    /// `Engine::tx_hdr_mempool_size()` so pressure-test consumers can
-    /// confirm the engine resolved the override.
-    pub(crate) tx_hdr_mempool_size: u32,
     tx_data_mempool: Mempool,
     /// 2026-04-29 fix: resolved TX data mempool capacity (post zero-
     /// sentinel substitution + formula application). Mirrors the
@@ -861,6 +769,17 @@ pub struct Engine {
     /// `&self` like every other engine method.
     pub(crate) rx_drop_nomem_prev: std::cell::Cell<u64>,
 
+    /// Phase 6 (bench instrumentation): default capacity for new conns'
+    /// `send_ack_log`. `0` (the default) means logging is disabled and
+    /// the per-conn log is left at `disabled()`. A non-zero value (set
+    /// by `enable_send_ack_logging`) is applied to:
+    ///   1. every newly-created conn (`connect_with_opts` /
+    ///      `test_server` accept path) right after insertion, AND
+    ///   2. all already-existing conns at the moment of the call.
+    /// Single-lcore engine, so a `Cell<usize>` is sufficient — no
+    /// cross-thread coordination needed.
+    pub(crate) send_ack_log_default_cap: std::cell::Cell<usize>,
+
     // A-HW runtime latches — populated by configure_port_offloads.
     // When a compile-enabled offload was advertised by the PMD the latch
     // is true; the corresponding hot-path branch uses the offload. When
@@ -949,11 +868,6 @@ pub struct Engine {
     /// can treat `0` as a sentinel; overflow returns `Error::InvalidArgument`.
     #[cfg(feature = "test-server")]
     next_listen_id: std::cell::Cell<crate::test_server::ListenHandle>,
-
-    /// C1: holds events drained by drain_events() alive until the next
-    /// poll_once() clears it. Keeps InternalEvent::Readable's segs Vec
-    /// (and owned_mbufs) alive for the full inter-poll window.
-    drained_events_scratch: RefCell<Vec<InternalEvent>>,
 }
 
 /// A4: map an `Outcome` to per-segment `TcpCounters` bumps. Pure slow-path
@@ -1025,10 +939,7 @@ fn apply_tcp_input_counters(
 static EAL_INIT: Mutex<bool> = Mutex::new(false);
 
 pub fn eal_init(args: &[&str]) -> Result<(), Error> {
-    let mut guard = match EAL_INIT.lock() {
-        Ok(g) => g,
-        Err(_) => return Err(Error::Reentrant),
-    };
+    let mut guard = EAL_INIT.lock().unwrap();
     if *guard {
         return Ok(());
     }
@@ -1054,10 +965,7 @@ pub fn eal_init(args: &[&str]) -> Result<(), Error> {
     #[cfg(feature = "hw-verify-llq")]
     let args = &effective_args[..];
 
-    let cstrs: Vec<CString> = args
-        .iter()
-        .map(|s| CString::new(*s).map_err(|_| Error::ArgvNul))
-        .collect::<Result<Vec<_>, _>>()?;
+    let cstrs: Vec<CString> = args.iter().map(|s| CString::new(*s).unwrap()).collect();
     let mut argv: Vec<*mut libc::c_char> = cstrs.iter().map(|c| c.as_ptr() as *mut _).collect();
 
     // A-HW Task 12 fixup: install an fmemopen-backed capture of DPDK's
@@ -1245,24 +1153,6 @@ pub enum InjectErr {
 
 impl Engine {
     pub fn new(cfg: EngineConfig) -> Result<Self, Error> {
-        // A3 (Part 3 BLOCK-A11 B1, Pattern P6): validate RTO bounds in
-        // release builds. `RttEstimator::new` only `debug_assert!`s
-        // `min <= initial <= max`, so a release-build caller passing
-        // `tcp_min_rto_us > tcp_max_rto_us` would reach
-        // `u32::clamp(min, max)` on the first RTT sample and panic. We
-        // surface the error here, before any DPDK / clock APIs, so the
-        // failure is observable at engine bring-up — and so this check is
-        // testable without EAL initialization. Only `min > max` is
-        // checked (the case that triggers the clamp panic); `0` sentinels
-        // for default substitution are handled by the lib.rs ABI layer
-        // before they ever reach `Engine::new`.
-        if cfg.tcp_min_rto_us > cfg.tcp_max_rto_us {
-            return Err(Error::InvalidRtoBounds {
-                min: cfg.tcp_min_rto_us,
-                max: cfg.tcp_max_rto_us,
-            });
-        }
-
         // Fail fast on non-invariant-TSC hosts (spec §7.5). Also primes
         // the global TscEpoch so later now_ns() calls don't pay the
         // 50ms calibration cost on the hot path.
@@ -1324,19 +1214,9 @@ impl Engine {
             cfg.mbuf_data_room + sys::RTE_PKTMBUF_HEADROOM as u16,
             socket_id,
         )?;
-        // A11.0 pressure-test: honor `tx_hdr_mempool_size` override
-        // (`0` = production default 2048). Non-zero caller value is used
-        // verbatim. Production builds always pass 0 unless the caller
-        // explicitly sets the field; the resolved size is identical to
-        // the historical hardcoded value when the override is absent.
-        let tx_hdr_mempool_size = if cfg.tx_hdr_mempool_size > 0 {
-            cfg.tx_hdr_mempool_size
-        } else {
-            2048
-        };
         let tx_hdr_mempool = Mempool::new_pktmbuf(
             &format!("tx_hdr_mp_{}", cfg.lcore_id),
-            tx_hdr_mempool_size,
+            2048,
             64,
             0,
             256,
@@ -1579,7 +1459,6 @@ impl Engine {
             rx_mempool_size,
             rx_mempool_avail_last_sample_tsc: Cell::new(0),
             tx_hdr_mempool,
-            tx_hdr_mempool_size,
             tx_data_mempool,
             tx_data_mempool_size,
             our_mac,
@@ -1656,6 +1535,9 @@ impl Engine {
             // the P99 without visibly warming.
             rack_lost_idxs_scratch: RefCell::new(Vec::with_capacity(64)),
             rx_drop_nomem_prev: std::cell::Cell::new(0),
+            // Phase 6 (bench instrumentation): logging disabled by default.
+            // `enable_send_ack_logging` switches it on for bench tooling.
+            send_ack_log_default_cap: std::cell::Cell::new(0),
             tx_cksum_offload_active: outcome.tx_cksum_offload_active,
             rx_cksum_offload_active: outcome.rx_cksum_offload_active,
             rss_hash_offload_active: outcome.rss_hash_offload_active,
@@ -1694,9 +1576,6 @@ impl Engine {
             listen_slots: std::cell::RefCell::new(Vec::new()),
             #[cfg(feature = "test-server")]
             next_listen_id: std::cell::Cell::new(1),
-            // C1: scratch begins empty; drain_events() pushes events into
-            // it and poll_once() clears it at the top of every iteration.
-            drained_events_scratch: RefCell::new(Vec::new()),
         })
     }
 
@@ -2119,16 +1998,6 @@ impl Engine {
         self.tx_data_mempool_size
     }
 
-    /// A11.0 pressure-test (T1 review I-1, I-2): resolved TX **header**
-    /// mempool capacity (in mbufs). Sentinel `0` on
-    /// `EngineConfig.tx_hdr_mempool_size` → production default 2048 in
-    /// `Engine::new`; non-zero → caller value verbatim. Exposed for
-    /// pressure-test consumers (and diagnostic logging) so callers can
-    /// confirm the engine actually resolved the override they passed.
-    pub fn tx_hdr_mempool_size(&self) -> u32 {
-        self.tx_hdr_mempool_size
-    }
-
     /// A6.6-7 Task 13: raw pointer to the RX mempool for integration-test
     /// pool-occupancy assertions (see `rx_close_drains_mbufs`). Not a
     /// production API — tests call `shim_rte_mempool_avail_count` on
@@ -2148,6 +2017,24 @@ impl Engine {
     /// `mempool_avail` despite RX-side balance.
     pub fn tx_data_mempool_ptr(&self) -> *mut dpdk_net_sys::rte_mempool {
         self.tx_data_mempool.as_ptr()
+    }
+
+    /// Bench-arm diagnostic: available mbufs in the TX data mempool.
+    /// Slow-path (calls into DPDK mempool internals); safe to call
+    /// from the measurement thread between `poll_once` calls.
+    pub fn tx_data_mempool_avail(&self) -> u32 {
+        unsafe { sys::shim_rte_mempool_avail_count(self.tx_data_mempool.as_ptr()) }
+    }
+
+    /// Bench-arm diagnostic: available mbufs in the TX header mempool.
+    pub fn tx_hdr_mempool_avail(&self) -> u32 {
+        unsafe { sys::shim_rte_mempool_avail_count(self.tx_hdr_mempool.as_ptr()) }
+    }
+
+    /// Bench-arm diagnostic: current TCP state for a connection handle.
+    /// Returns `None` if the handle is not in the flow table.
+    pub fn conn_state(&self, h: crate::flow_table::ConnHandle) -> Option<crate::tcp_state::TcpState> {
+        self.flow_table.borrow().get(h).map(|c| c.state)
     }
 
     /// A10 deferred-fix follow-up: TX-header mempool pointer for sustained
@@ -2541,16 +2428,7 @@ impl Engine {
                 self.cfg.recv_buffer_bytes,
             )
         };
-        let syn_opts = build_connect_syn_opts(
-            recv_buffer_bytes,
-            our_mss,
-            now_ns,
-            self.cfg.tcp_timestamps,
-            self.cfg.tcp_sack,
-        );
-        // tcp_ecn — read at connect path so the C-ABI dead-field audit
-        // counts the field as wired; ECN SYN negotiation lands in Stage 2.
-        let _ecn = self.cfg.tcp_ecn;
+        let syn_opts = build_connect_syn_opts(recv_buffer_bytes, our_mss, now_ns);
         let seg = SegmentTx {
             src_mac: self.our_mac,
             dst_mac: self.gateway_mac.get(),
@@ -2650,18 +2528,6 @@ impl Engine {
         use crate::counters::{add, inc};
         use std::sync::atomic::Ordering;
         inc(&self.counters.poll.iters);
-
-        // C1: release events accumulated by the previous poll's
-        // `drain_events` call. Clearing here drops every
-        // `InternalEvent::Readable`'s `owned_mbufs` (releasing its mbuf
-        // refcounts) and `segs` Vec (freeing the iovec backing store)
-        // before any new RX dispatches can re-allocate from the same
-        // mempools. Satisfies the C ABI "valid until next dpdk_net_poll"
-        // contract for `events_out[i].readable.segs` set during the
-        // PREVIOUS poll: those pointers stayed valid through the entire
-        // inter-poll window, and only become invalid here as the new
-        // iteration begins.
-        self.drained_events_scratch.borrow_mut().clear();
 
         // A10 Stage A: at most once per second, sample the RX mempool's
         // free-mbuf count. Cliff hypothesis: a steady drain across many
@@ -2900,6 +2766,27 @@ impl Engine {
         use crate::counters::{add, inc};
         let mut ring = self.tx_pending_data.borrow_mut();
         if ring.is_empty() {
+            // Even with no new data to enqueue, call rte_eth_tx_done_cleanup
+            // to process pending NIC TX completions.  Without this, mbufs
+            // whose ACK-prune path ran before the ENA driver's ena_tx_cleanup
+            // fired stay at refcnt=1 in the driver's completion queue and
+            // never return to the pool — observable as permanent pool
+            // depletion when the tx_pending_data ring stays empty for an
+            // extended period (e.g., after pool exhaustion during warmup,
+            // across the entire measurement window and close sequence).
+            // rte_eth_tx_done_cleanup(port, queue, 0) calls ena_tx_cleanup
+            // with cleanup_budget=ring_size, processing all completed
+            // descriptors.  ENA implements tx_done_cleanup_fn so this is
+            // supported; drivers that don't return -ENOTSUP (harmless).
+            // Not compiled in test-server mode (no real NIC present).
+            #[cfg(not(feature = "test-server"))]
+            unsafe {
+                sys::rte_eth_tx_done_cleanup(
+                    self.cfg.port_id as u16,
+                    self.cfg.tx_queue_id,
+                    0,
+                );
+            }
             return;
         }
         #[cfg_attr(feature = "test-server", allow(unused_variables))]
@@ -3067,6 +2954,9 @@ impl Engine {
                     }
                     crate::counters::inc(&self.counters.tcp.tx_api_timers_fired);
                 }
+                crate::tcp_timer_wheel::TimerKind::Persist => {
+                    self.on_persist_fire(node.owner_handle, id);
+                }
             }
         }
         count
@@ -3163,15 +3053,20 @@ impl Engine {
         }
 
         // Phase 3: retransmit every §6.3-eligible in-flight entry.
-        // `retransmit()` bumps `tx_retrans` per call (N total), and
-        // clears `entry.lost` on success so sub-sequent RACK-detect
-        // passes don't see stale flags. `tx_rto` bumps exactly once
-        // per fire — preserves A5 one-RTO-fire-counter semantics
-        // (one `tx_rto` + N `tx_retrans`).
+        // `retransmit()` is the primitive — Phase 11 (C-E2) makes it the
+        // caller's job to bump the aggregate + per-trigger sub-counter
+        // (here: `inc_tx_retrans_rto` for both the aggregate `tx_retrans`
+        // and the RTO-trigger sub-counter `tx_retrans_rto`). Clears
+        // `entry.lost` on success so subsequent RACK-detect passes don't
+        // see stale flags. `tx_rto` bumps exactly once per fire —
+        // preserves A5 one-RTO-fire-counter semantics (one `tx_rto` per
+        // fire + N `tx_retrans` + N `tx_retrans_rto` for N retransmitted
+        // segments).
         let lost_is_empty = self.rack_lost_idxs_scratch.borrow().is_empty();
         if lost_is_empty {
             // Defensive fallback — helper should always pick the front.
             self.retransmit(handle, 0);
+            crate::counters::inc_tx_retrans_rto(&self.counters.tcp);
         } else {
             // Clone indexes into a small local so `retransmit` (which
             // re-borrows the engine) doesn't conflict with the scratch
@@ -3187,6 +3082,7 @@ impl Engine {
                 .collect();
             for &idx in indexes.iter() {
                 self.retransmit(handle, idx as usize);
+                crate::counters::inc_tx_retrans_rto(&self.counters.tcp);
             }
         }
         crate::counters::inc(&self.counters.tcp.tx_rto);
@@ -3314,6 +3210,142 @@ impl Engine {
         }
     }
 
+    /// RFC 9293 §3.8.6.1 persist-timer fire. Sends a 1-byte zero-window
+    /// probe at `snd_nxt` to solicit a window update from the peer. If the
+    /// peer's window is still zero, re-arms with exponential backoff (capped
+    /// at 64× RTO). If the window has opened, cancels the persist timer and
+    /// lets the normal send path resume.
+    ///
+    /// Borrow ordering matches `on_rto_fire`: Phase 1 shared-borrow for
+    /// validation, Phase 2 mut-borrow to clear timer_id, Phase 3 TX (no
+    /// borrow), Phase 4 mut-borrow to write snd_nxt + arm next timer.
+    pub(crate) fn on_persist_fire(
+        &self,
+        handle: ConnHandle,
+        fired_id: crate::tcp_timer_wheel::TimerId,
+    ) {
+        use crate::tcp_output::{build_segment, SegmentTx, TCP_ACK, TCP_PSH};
+
+        // Phase 1: validate fired_id + snapshot TX fields.
+        let snap = {
+            let ft = self.flow_table.borrow();
+            let Some(c) = ft.get(handle) else { return };
+            if c.persist_timer_id != Some(fired_id) {
+                // Stale or already cancelled.
+                return;
+            }
+            if c.snd_wnd > 0 {
+                // Window reopened between arming and fire (rare race).
+                // The cancel-on-ACK path will clean up; just bail.
+                return;
+            }
+            (
+                c.four_tuple(),
+                c.snd_nxt,
+                c.rcv_nxt,
+                c.ws_shift_out,
+                c.ts_enabled,
+                c.ts_recent,
+                c.recv.free_space_total(),
+                c.persist_backoff_shift,
+                c.rtt_est.rto_us(),
+            )
+        };
+        let (tuple, snd_nxt, rcv_nxt, ws_shift_out, ts_enabled, ts_recent,
+             free_space, backoff_shift, rto_us) = snap;
+
+        // Phase 2: clear persist_timer_id so a racing cancel is idempotent.
+        {
+            let mut ft = self.flow_table.borrow_mut();
+            if let Some(c) = ft.get_mut(handle) {
+                c.persist_timer_id = None;
+                c.timer_ids.retain(|t| *t != fired_id);
+            }
+        }
+
+        // Phase 3: build and send the 1-byte probe.
+        // The probe byte is 0x00 — its value is irrelevant; the probe
+        // serves only to make the peer respond with an ACK carrying its
+        // current window advertisement. snd_nxt advances by 1 on success
+        // so the next probe (or real data, if the window opens) starts at
+        // the correct seq. The probe is NOT added to snd_retrans — the
+        // persist timer IS the retransmit mechanism for zero-window stalls.
+        let probe_payload = [0u8; 1];
+        let now_us = (crate::clock::now_ns() / 1_000) as u32;
+        let opts = if ts_enabled {
+            build_ack_outcome(
+                ws_shift_out, true, ts_recent, now_us, false, &[], None, free_space,
+            ).opts
+        } else {
+            build_ack_outcome(
+                ws_shift_out, false, 0, 0, false, &[], None, free_space,
+            ).opts
+        };
+        // Encode the advertised window using the same ws_shift_out scaling
+        // the normal ACK path uses: free_space >> ws_shift_out, clamped to
+        // 16-bit. Matches the `build_ack_outcome` wire window field.
+        let adv_wnd = (free_space >> ws_shift_out) as u16;
+        let seg = SegmentTx {
+            src_mac: self.our_mac,
+            dst_mac: self.gateway_mac.get(),
+            src_ip: tuple.local_ip,
+            dst_ip: tuple.peer_ip,
+            src_port: tuple.local_port,
+            dst_port: tuple.peer_port,
+            seq: snd_nxt,
+            ack: rcv_nxt,
+            flags: TCP_ACK | TCP_PSH,
+            window: adv_wnd,
+            options: opts,
+            payload: &probe_payload,
+        };
+        let mut buf = [0u8; 160]; // 14+20+20+40 opts + 1 payload; 160 is safe
+        let Some(n) = build_segment(&seg, &mut buf) else { return };
+        let sent = self.tx_tcp_frame(&buf[..n], &seg);
+        if sent {
+            crate::counters::inc(&self.counters.tcp.tx_persist);
+            // Advance snd_nxt past the probe byte.
+            // Phase 11+ TODO: persist-probe segments are not recorded in
+            // send_ack_log; out-of-scope for the bench-tx-maxtp
+            // measurement window which runs in ESTABLISHED only. See
+            // docs/superpowers/plans/2026-05-09-bench-suite-overhaul.md.
+            let mut ft = self.flow_table.borrow_mut();
+            if let Some(c) = ft.get_mut(handle) {
+                c.snd_nxt = c.snd_nxt.wrapping_add(1);
+            }
+        }
+
+        // Phase 4: re-arm with exponential backoff regardless of TX outcome.
+        // Backoff: interval = rto_us << min(backoff_shift, 6) (cap at 64×).
+        let new_shift = backoff_shift.saturating_add(1).min(6);
+        let interval_us = if rto_us > 0 {
+            (rto_us as u64) << (new_shift as u64)
+        } else {
+            200_000 // 200 ms floor if RTO estimator not seeded yet
+        };
+        let now_ns = crate::clock::now_ns();
+        let fire_at_ns = now_ns + interval_us * 1_000;
+        let new_id = self.timer_wheel.borrow_mut().add(
+            now_ns,
+            crate::tcp_timer_wheel::TimerNode {
+                fire_at_ns,
+                owner_handle: handle,
+                kind: crate::tcp_timer_wheel::TimerKind::Persist,
+                user_data: 0,
+                generation: 0,
+                cancelled: false,
+            },
+        );
+        {
+            let mut ft = self.flow_table.borrow_mut();
+            if let Some(c) = ft.get_mut(handle) {
+                c.persist_timer_id = Some(new_id);
+                c.persist_backoff_shift = new_shift;
+                c.timer_ids.push(new_id);
+            }
+        }
+    }
+
     /// A5 Task 17: TLP fire (RFC 8985 §7.3). Retransmits the last
     /// `snd_retrans` entry as a probe, soliciting a SACK that may reveal a
     /// tail loss not discoverable by RACK alone. Silent no-op when the
@@ -3369,6 +3401,10 @@ impl Engine {
         if crate::tcp_tlp::select_probe(!pending_empty, retrans_len > 0).is_some() {
             let probe_idx = retrans_len - 1;
             self.retransmit(handle, probe_idx);
+            // Phase 11 (C-E2): bump aggregate `tx_retrans` + the TLP
+            // sub-counter `tx_retrans_tlp`. `tx_tlp` (probe-fire counter)
+            // remains a separate per-fire bump.
+            crate::counters::inc_tx_retrans_tlp(&self.counters.tcp);
             crate::counters::inc(&self.counters.tcp.tx_tlp);
 
             // A5.5 Task 11: record the probe in the recent-probes ring,
@@ -3676,6 +3712,9 @@ impl Engine {
             if let Some(id) = conn.syn_retrans_timer_id.take() {
                 ids.push(id);
             }
+            if let Some(id) = conn.persist_timer_id.take() {
+                ids.push(id);
+            }
             conn.timer_ids.clear();
             let entries: Vec<crate::tcp_retrans::RetransEntry> =
                 conn.snd_retrans.entries.drain(..).collect();
@@ -3835,6 +3874,20 @@ impl Engine {
                 }
             }
             drop(to_cancel);
+            // Drain any residual snd_retrans mbufs (Mbuf has no Drop impl).
+            // TIME_WAIT connections should have empty snd_retrans (all data
+            // ACKed before 4-way FIN completes), but drain defensively.
+            let retrans_to_free: Vec<crate::tcp_retrans::RetransEntry> = {
+                let mut ft = self.flow_table.borrow_mut();
+                if let Some(conn) = ft.get_mut(h) {
+                    conn.snd_retrans.entries.drain(..).collect()
+                } else {
+                    vec![]
+                }
+            };
+            for entry in retrans_to_free {
+                unsafe { sys::shim_rte_pktmbuf_free(entry.mbuf.as_ptr()); }
+            }
             self.flow_table.borrow_mut().remove(h);
         }
     }
@@ -3842,52 +3895,14 @@ impl Engine {
     /// Drain up to `max` events from the internal queue. Returns the
     /// number of events drained. Callers in the C ABI layer translate
     /// the `InternalEvent` enum to the public union-tagged form.
-    ///
-    /// C1: drained events are accumulated into
-    /// `drained_events_scratch` BEFORE the sink is invoked, so the
-    /// per-event payload (`Readable::segs` Vec, `owned_mbufs`
-    /// SmallVec — the latter pinning each `MbufHandle` refcount) stays
-    /// alive for the entire inter-poll window. The C ABI sink writes
-    /// `events_out[i].readable.segs = ev.segs.as_ptr()`; the contract
-    /// says those pointers must stay valid until the next
-    /// `dpdk_net_poll`, not merely until the next `drain_events` loop
-    /// iteration. The next `poll_once` clears the scratch (and only
-    /// then), atomically releasing the previous poll's drained events.
-    ///
-    /// # Re-entrancy contract
-    ///
-    /// The sink receives `&Engine` but MUST NOT call `drain_events` or
-    /// `poll_once` (or any function that borrows `drained_events_scratch`
-    /// mutably) while the sink is executing. Phase 2 holds an immutable
-    /// borrow of the scratch for the duration of the sink calls; a
-    /// nested `borrow_mut()` would panic with `BorrowMutError`. The
-    /// expected pattern is observation-only: read the event, write to
-    /// an output buffer, return.
     pub fn drain_events<F: FnMut(&InternalEvent, &Engine)>(&self, max: u32, mut sink: F) -> u32 {
         let mut n = 0u32;
-        // Phase 1: pop up to `max` events out of the queue and into the
-        // scratch. Two RefCell borrows (events / scratch) are taken back-
-        // to-back, never overlapping, so neither nests.
         while n < max {
             let Some(ev) = self.events.borrow_mut().pop() else {
                 break;
             };
-            self.drained_events_scratch.borrow_mut().push(ev);
+            sink(&ev, self);
             n += 1;
-        }
-        // Phase 2: invoke the sink against the freshly-pushed events,
-        // borrowing the scratch immutably so the events stay in place
-        // for the lifetime of each `&InternalEvent` reference passed
-        // to `sink`. `start` covers the case where the scratch already
-        // held events from earlier `drain_events` calls within the
-        // SAME poll cycle (`max` was smaller than the queue depth and
-        // the application drains in multiple chunks).
-        {
-            let scratch = self.drained_events_scratch.borrow();
-            let start = scratch.len().saturating_sub(n as usize);
-            for ev in &scratch[start..] {
-                sink(ev, self);
-            }
         }
         n
     }
@@ -3948,21 +3963,6 @@ impl Engine {
     ///
     /// Always frees the mbuf before returning — the caller MUST NOT
     /// touch the pointer afterwards.
-    ///
-    /// **C2 cross-phase retro fix.** The byte slice handed to the
-    /// L2/L3/L4 decoders comes from [`crate::mbuf_data_slice_for_rx`]
-    /// which linearizes multi-segment mbuf chains into a scratch buffer
-    /// before decode. Pre-C2 the dispatch path called the legacy
-    /// [`crate::mbuf_data_slice`] which exposed only the head segment's
-    /// `data_len` — a real-NIC RX_OFFLOAD_SCATTER frame whose IPv4
-    /// `total_length` exceeded the head's `data_len` would be silently
-    /// rejected at the L3 decoder as `BadTotalLen`. The linearized
-    /// slice covers `pkt_len` bytes, so the L3 / L4 decoders see the
-    /// full datagram.
-    ///
-    /// `eth.rx_bytes` accounts the full linearized length on multi-seg
-    /// (matching the bytes the NIC delivered), not just the head's
-    /// `data_len` as before C2.
     #[inline]
     fn dispatch_one_real_mbuf(
         &self,
@@ -3970,9 +3970,7 @@ impl Engine {
     ) -> u32 {
         use crate::counters::add;
         let m = mbuf.as_ptr();
-        let bytes_cow =
-            unsafe { crate::mbuf_data_slice_for_rx(m, &self.counters.eth) };
-        let bytes: &[u8] = &bytes_cow;
+        let bytes = unsafe { crate::mbuf_data_slice(m) };
         // Task 8: read ol_flags once per mbuf at the RX boundary;
         // threaded through rx_frame -> handle_ipv4 -> tcp_input so
         // the IP + L4 offload classifications can gate on the bits
@@ -4372,17 +4370,7 @@ impl Engine {
         // mbuf handle (shouldn't happen on the real RX path but keeps
         // the signature flexible for non-mbuf callers).
         let mbuf_ctx = if let Some(mb) = rx_mbuf {
-            // C2 review fix: gate the zero-copy MbufInsertCtx on
-            // `nb_segs == 1`. Multi-seg frames were linearized into a
-            // scratch buffer at the L2 boundary; the linearized-buffer
-            // `payload_offset` is not valid as a per-segment offset for
-            // zero-copy `MbufInsertCtx`. `InOrderSegment::data_ptr()`
-            // (and the OOO equivalent) compute `head_data + offset`,
-            // which would read past the head segment's `data_len` for
-            // any chain. Fall through to the copy path on multi-seg by
-            // setting `mbuf_ctx = None`.
-            let nb_segs = unsafe { sys::shim_rte_pktmbuf_nb_segs(mb.as_ptr()) };
-            if !parsed.payload.is_empty() && nb_segs == 1 {
+            if !parsed.payload.is_empty() {
                 let payload_offset =
                     tcp_bytes_offset_in_mbuf.saturating_add(parsed.header_len as u16);
                 // SAFETY: `mb` came from the active rx_burst iteration in
@@ -4468,6 +4456,73 @@ impl Engine {
         // hot-path stays straight-line.
         apply_tcp_input_counters(&outcome, &self.counters.tcp);
 
+        // RFC 9293 §3.8.6.1 persist-timer arm: when the peer advertises a
+        // zero window AND snd_retrans is empty (no outstanding segments that
+        // the RTO will already retransmit), arm the persist timer so we
+        // periodically probe the peer for a window update. If a persist
+        // timer is already running we leave it untouched — one timer
+        // suffices and re-arming on every zero-window ACK would reset the
+        // backoff. Only arm in Established state; SynSent / CloseWait /
+        // etc. don't need zero-window probing.
+        if outcome.rx_zero_window {
+            let (should_arm, rto_us) = {
+                let ft = self.flow_table.borrow();
+                if let Some(c) = ft.get(handle) {
+                    let ok = c.state == crate::tcp_state::TcpState::Established
+                        && c.persist_timer_id.is_none()
+                        && c.snd_retrans.is_empty();
+                    (ok, c.rtt_est.rto_us())
+                } else {
+                    (false, 0)
+                }
+            };
+            if should_arm {
+                let now_ns = crate::clock::now_ns();
+                let interval_us = if rto_us > 0 { rto_us as u64 } else { 200_000 };
+                let fire_at_ns = now_ns + interval_us * 1_000;
+                let id = self.timer_wheel.borrow_mut().add(
+                    now_ns,
+                    crate::tcp_timer_wheel::TimerNode {
+                        fire_at_ns,
+                        owner_handle: handle,
+                        kind: crate::tcp_timer_wheel::TimerKind::Persist,
+                        user_data: 0,
+                        generation: 0,
+                        cancelled: false,
+                    },
+                );
+                let mut ft = self.flow_table.borrow_mut();
+                if let Some(c) = ft.get_mut(handle) {
+                    c.persist_timer_id = Some(id);
+                    c.persist_backoff_shift = 0;
+                    c.timer_ids.push(id);
+                }
+            }
+        }
+
+        // RFC 9293 §3.8.6.1: cancel the persist timer when the peer
+        // reopens its window (snd_wnd > 0 after ACK processing). The
+        // outcome flag `rx_zero_window` covers the zero→nonzero case
+        // implicitly via absence: if the ACK carries a nonzero window and
+        // a persist timer is running, cancel it.
+        if !outcome.rx_zero_window {
+            let id_to_cancel = {
+                let ft = self.flow_table.borrow();
+                ft.get(handle).and_then(|c| {
+                    if c.snd_wnd > 0 { c.persist_timer_id } else { None }
+                })
+            };
+            if let Some(id) = id_to_cancel {
+                self.timer_wheel.borrow_mut().cancel(id);
+                let mut ft = self.flow_table.borrow_mut();
+                if let Some(c) = ft.get_mut(handle) {
+                    c.persist_timer_id = None;
+                    c.persist_backoff_shift = 0;
+                    c.timer_ids.retain(|t| *t != id);
+                }
+            }
+        }
+
         // A6 Task 16 (spec §3.3): WRITABLE hysteresis emission. The
         // ACK-prune site inside `handle_established` flipped
         // `writable_hysteresis_fired` (and cleared
@@ -4514,6 +4569,10 @@ impl Engine {
         if !outcome.rack_lost_indexes.is_empty() {
             for i in &outcome.rack_lost_indexes {
                 self.retransmit(handle, *i as usize);
+                // Phase 11 (C-E2): bump aggregate `tx_retrans` + the RACK
+                // sub-counter `tx_retrans_rack`. `tx_rack_loss` (loss-
+                // detection counter) remains a separate per-detection bump.
+                crate::counters::inc_tx_retrans_rack(&self.counters.tcp);
                 crate::counters::inc(&self.counters.tcp.tx_rack_loss);
                 // A10 D4 (G1+G2): obs-none compiles the per-packet
                 // TcpRetrans + TcpLossDetected pair away; the retransmit
@@ -4576,6 +4635,18 @@ impl Engine {
                 if let Some(c) = ft.get_mut(handle) {
                     c.snd_retrans
                         .prune_below_into_mbufs(new_snd_una, &mut scratch);
+                    // Phase 6 (bench instrumentation): pop send→ACK
+                    // samples for every segment fully covered by the
+                    // new snd_una. Disabled-path is a single early-
+                    // return on `cap == 0`. Bench tools drain the
+                    // resulting samples via `Engine::drain_send_ack_samples`.
+                    if c.send_ack_log.is_enabled() {
+                        let now_ack_ns = crate::clock::now_ns();
+                        let samples = c
+                            .send_ack_log
+                            .observe_cumulative_ack(new_snd_una, now_ack_ns);
+                        c.send_ack_samples_pending.extend(samples);
+                    }
                 }
             }
             {
@@ -4707,10 +4778,7 @@ impl Engine {
         {
             let mut ft = self.flow_table.borrow_mut();
             if let Some(conn) = ft.get_mut(handle) {
-                if conn.state == TcpState::TimeWait
-                    && outcome.tx == TxAction::Ack
-                    && !outcome.bad_seq
-                {
+                if conn.state == TcpState::TimeWait && outcome.tx == TxAction::Ack {
                     let msl_ns = (self.cfg.tcp_msl_ms as u64) * 1_000_000;
                     conn.time_wait_deadline_ns =
                         Some(crate::clock::now_ns().saturating_add(2 * msl_ns));
@@ -4880,6 +4948,29 @@ impl Engine {
                     }
                 }
                 drop(to_cancel);
+                // Drain snd_retrans mbufs before dropping TcpConn.
+                // `Mbuf` is Copy with no Drop impl: simply removing the conn
+                // from the flow table silently drops the raw mbuf pointers
+                // without calling shim_rte_pktmbuf_free → permanent pool
+                // depletion on every normal-close bucket (mbufs stay at
+                // rc=1/rc=2, never returned).  Mirror the drain in
+                // force_close_etimedout: at normal-close time the data was
+                // sent long ago so NIC TX completion has fired (rc=1); our
+                // free takes rc 1→0 → pool.  If NIC completion hasn't fired
+                // yet (rc=2), our free leaves rc=1; the NIC completion will
+                // take rc 1→0 — tx_done_cleanup or the next send burst
+                // handles that path.
+                let retrans_to_free: Vec<crate::tcp_retrans::RetransEntry> = {
+                    let mut ft = self.flow_table.borrow_mut();
+                    if let Some(conn) = ft.get_mut(handle) {
+                        conn.snd_retrans.entries.drain(..).collect()
+                    } else {
+                        vec![]
+                    }
+                };
+                for entry in retrans_to_free {
+                    unsafe { sys::shim_rte_pktmbuf_free(entry.mbuf.as_ptr()); }
+                }
                 self.flow_table.borrow_mut().remove(handle);
             }
         }
@@ -4925,6 +5016,36 @@ impl Engine {
             },
             &self.counters,
         );
+    }
+
+    /// Discard all buffered received data for `handle` and clear
+    /// `delivered_segments`.
+    ///
+    /// Used by the close drain loop before `send_window_update`: the
+    /// echo-server fills `recv.bytes` to capacity during the measurement
+    /// window (rwnd → 0), then stalls on `write()`. No new packets arrive
+    /// so `poll_once` never calls `deliver_readable` and the window stays
+    /// zero. Explicitly clearing `recv.bytes` frees the space so the next
+    /// `send_window_update` can advertise the full buffer, unblocking the
+    /// echo-server's stalled write and letting the drain complete.
+    ///
+    /// Safety: correct only inside a controlled close path where the
+    /// application has already discarded its interest in receive data.
+    pub fn discard_received(&self, handle: ConnHandle) {
+        let mut ft = self.flow_table.borrow_mut();
+        if let Some(conn) = ft.get_mut(handle) {
+            conn.delivered_segments.clear();
+            conn.recv.bytes.clear();
+        }
+    }
+
+    /// Send a window update ACK for `handle`.
+    ///
+    /// Used by the close drain loop after `discard_received` to advertise
+    /// the now-open receive window to the peer, unblocking its stalled
+    /// `write()` so the FIN can arrive and the close can complete.
+    pub fn send_window_update(&self, handle: ConnHandle) {
+        self.emit_ack(handle);
     }
 
     /// Emit a bare ACK for `handle`. Post-handshake ACKs carry the full
@@ -5045,22 +5166,13 @@ impl Engine {
 
     fn emit_rst(&self, handle: ConnHandle, incoming: &crate::tcp_input::ParsedSegment) {
         use crate::counters::inc;
-        use crate::tcp_output::{build_segment, SegmentTx, TCP_ACK, TCP_FIN, TCP_RST, TCP_SYN};
+        use crate::tcp_output::{build_segment, SegmentTx, TCP_ACK, TCP_RST};
         let ft = self.flow_table.borrow();
         let Some(conn) = ft.get(handle) else {
             return;
         };
         let t = conn.four_tuple();
-        // RFC 9293 §3.10.7.4 ("Other states"): RST ACK must advance past all
-        // consumed sequence space; SEG.LEN (§3.4 glossary) counts SYN/FIN
-        // flags as 1 seq number each in addition to data bytes.
-        let syn_len = ((incoming.flags & TCP_SYN) != 0) as u32;
-        let fin_len = ((incoming.flags & TCP_FIN) != 0) as u32;
-        let ack = incoming
-            .seq
-            .wrapping_add(incoming.payload.len() as u32)
-            .wrapping_add(syn_len)
-            .wrapping_add(fin_len);
+        let ack = incoming.seq.wrapping_add(incoming.payload.len() as u32);
         let seg = SegmentTx {
             src_mac: self.our_mac,
             dst_mac: self.gateway_mac.get(),
@@ -5265,52 +5377,33 @@ impl Engine {
             }
         }
 
-        // A6.6 T8 / C1: build the event's iovec Vec directly, sized to
-        // the delivered-segment count. Earlier C1 code went through
-        // `conn.readable_scratch_iovecs` and then `std::mem::take`'d
-        // the scratch into the event — but `std::mem::take` substitutes
-        // `Vec::default()` (zero capacity), so the next
-        // `deliver_readable` on the same conn would re-allocate from
-        // scratch. The doc-comment claimed "capacity retained" but the
-        // implementation regressed to a per-event allocation. We now
-        // build the event's Vec locally and only `clear()` (not take)
-        // the per-conn scratch, preserving its capacity for §7.6 reuse.
-        let seg_count = conn.delivered_segments.len() as u32;
-        let mut event_segs: Vec<crate::iovec::DpdkNetIovec> =
-            Vec::with_capacity(conn.delivered_segments.len());
+        // A6.6 T8: materialize the iovec array for this READABLE event
+        // into the per-conn scratch. Capacity is retained across polls
+        // (§7.6 scratch-reuse policy); `.clear()` keeps it but discards
+        // stale pointers from the previous event's emission.
+        conn.readable_scratch_iovecs.clear();
         let mut total_len: u32 = 0;
         for seg in &conn.delivered_segments {
-            event_segs.push(crate::iovec::DpdkNetIovec {
+            conn.readable_scratch_iovecs.push(crate::iovec::DpdkNetIovec {
                 base: seg.data_ptr(),
                 len: seg.len as u32,
                 _pad: 0,
             });
             total_len = total_len.saturating_add(seg.len as u32);
         }
-        // §7.6 scratch-reuse policy: retain capacity (heap or inline)
-        // across polls. `clear()` keeps capacity; `std::mem::take`
-        // would not.
-        conn.readable_scratch_iovecs.clear();
+        let seg_count = conn.readable_scratch_iovecs.len() as u32;
 
-        // C1: move ownership of the InOrderSegment refcount holders into
-        // the event. `drain(..).collect()` iterates the SmallVec out
-        // element-by-element, leaving `conn.delivered_segments` empty
-        // but with its existing buffer (inline-4 capacity, plus any
-        // heap-spill grown at this conn's high-water mark) intact. The
-        // pre-fix `std::mem::take` substituted a fresh
-        // `SmallVec::default()` that lost the heap-spill on every emit.
-        let event_owned_mbufs: smallvec::SmallVec<[crate::tcp_conn::InOrderSegment; 4]> =
-            conn.delivered_segments.drain(..).collect();
-
-        // A6.6 T9 / C1: single READABLE event covers the full iovec
-        // slice. The event now owns both the iovec Vec and the mbuf
-        // refcounts; lifetime no longer depends on the per-conn scratch.
+        // A6.6 T9: single READABLE event covers the full iovec slice.
+        // `seg_idx_start` is always 0 — scratch is cleared at the top
+        // of this call and we only emit one event per deliver_readable
+        // invocation.
         // A10 D4 (G1+G2): obs-none compiles the READABLE push + now_ns
         // + per-event observability counter bumps away. The pop loop
-        // above and the iovec materialization stay — those are the
-        // application-visible delivery primitives, not observability.
-        // The `recv_buf_delivered` bump is kept as a slow-path counter
-        // (cumulative byte throughput, not per-event observability).
+        // above and the `readable_scratch_iovecs` materialization stay
+        // — those are the application-visible delivery primitives,
+        // not observability. The `recv_buf_delivered` bump is kept as
+        // a slow-path counter (cumulative byte throughput, not per-
+        // event observability).
         #[cfg(not(feature = "obs-none"))]
         {
             let mut events = self.events.borrow_mut();
@@ -5335,8 +5428,8 @@ impl Engine {
                 events.push(
                     InternalEvent::Readable {
                         conn: handle,
-                        segs: event_segs,
-                        owned_mbufs: event_owned_mbufs,
+                        seg_idx_start: 0,
+                        seg_count,
                         total_len,
                         rx_hw_ts_ns,
                         emitted_ts_ns: crate::clock::now_ns(),
@@ -5348,13 +5441,7 @@ impl Engine {
         }
         #[cfg(feature = "obs-none")]
         {
-            // Under obs-none the event is dropped at the queue boundary
-            // (push is a no-op), which drops `event_owned_mbufs` here
-            // and returns each refcount unit. Bind the locals so the
-            // drop runs at the end of this scope (matches the default
-            // path's drop ordering: refcounts drop just after the push,
-            // not before the `recv_buf_delivered` bump).
-            let _ = (seg_count, total_len, rx_hw_ts_ns, event_segs, event_owned_mbufs);
+            let _ = (seg_count, total_len, rx_hw_ts_ns);
         }
         drop(ft);
         add(&self.counters.tcp.recv_buf_delivered, total_delivered as u64);
@@ -5482,6 +5569,14 @@ impl Engine {
                 c.tlp_skip_flight_size_gate = opts.tlp_skip_flight_size_gate;
                 c.tlp_max_consecutive_probes = tlp_max_probes;
                 c.tlp_skip_rtt_sample_gate = opts.tlp_skip_rtt_sample_gate;
+                // Phase 6 (bench instrumentation): inherit the engine-wide
+                // default send_ack_log capacity. `0` (the default) leaves
+                // the conn's log at `disabled()` so the hot-path branch
+                // is a single early-return.
+                let cap = self.send_ack_log_default_cap.get();
+                if cap > 0 {
+                    c.send_ack_log.set_capacity(cap);
+                }
             }
         }
         if opts.rack_aggressive {
@@ -5552,14 +5647,11 @@ impl Engine {
     }
 
     /// Enqueue `bytes` on the connection's send path. Returns the number
-    /// of bytes accepted (could be < bytes.len() under send-buffer or
-    /// peer-window backpressure). On `tx_data_mempool` exhaustion mid-send,
-    /// returns `Err(Error::SendBufferFull)` (mapped to `-ENOMEM` at the
-    /// public-API layer). After A6 Task 12, NIC TX-ring saturation no
-    /// longer surfaces as `SendBufferFull` — `send_bytes` pushes segments
-    /// onto the engine-scope `tx_pending_data` batch ring and the
-    /// end-of-poll drain retries via `rte_eth_tx_burst`, so only
-    /// `tx_data_mempool` alloc failure produces this error now.
+    /// of bytes accepted (0..=bytes.len()). Returns 0 under send-buffer
+    /// backpressure, peer-window backpressure, or `tx_data_mempool`
+    /// exhaustion — all three cases are treated as transient backpressure.
+    /// Callers spin on `poll_once()` which drains ACKs and retires
+    /// `snd_retrans` mbufs back to the pool.
     pub fn send_bytes(&self, handle: ConnHandle, bytes: &[u8]) -> Result<u32, Error> {
         use crate::counters::inc;
         use crate::tcp_output::{build_segment, SegmentTx, TCP_ACK, TCP_PSH};
@@ -5692,18 +5784,15 @@ impl Engine {
             let m = unsafe { sys::shim_rte_pktmbuf_alloc(self.tx_data_mempool.as_ptr()) };
             if m.is_null() {
                 inc(&self.counters.eth.tx_drop_nomem);
-                if accepted == 0 {
-                    return Err(Error::SendBufferFull);
-                }
+                // Pool exhaustion is backpressure, not a hard error. Return Ok(accepted)
+                // (Ok(0) on first alloc) so the caller spins on poll_once() until ACKs
+                // retire snd_retrans mbufs and the pool refills.
                 break;
             }
             let dst = unsafe { sys::shim_rte_pktmbuf_append(m, n as u16) };
             if dst.is_null() {
                 unsafe { sys::shim_rte_pktmbuf_free(m) };
                 inc(&self.counters.eth.tx_drop_nomem);
-                if accepted == 0 {
-                    return Err(Error::SendBufferFull);
-                }
                 break;
             }
             // Safety: `dst` points to `n` writable bytes inside the freshly
@@ -5805,6 +5894,16 @@ impl Engine {
                 let arm_rto = if let Some(c) = ft.get_mut(handle) {
                     let was_empty = c.snd_retrans.is_empty();
                     c.snd_retrans.push_after_tx(new_entry);
+                    // Phase 6 (bench instrumentation): record per-segment
+                    // send timestamp. Disabled by default — record_send is
+                    // a single early-return when send_ack_log is disabled.
+                    c.send_ack_log.record_send(
+                        crate::tcp_send_ack_log::SeqRange {
+                            begin: cur_seq,
+                            end: cur_seq.wrapping_add(take as u32),
+                        },
+                        first_tx_ts_ns,
+                    );
                     was_empty && c.rto_timer_id.is_none()
                 } else {
                     false
@@ -5933,6 +6032,64 @@ impl Engine {
         if let Some(c) = ft.get_mut(handle) {
             c.tlp_timer_id = Some(id);
             c.timer_ids.push(id);
+        }
+    }
+
+    /// Immediately remove a connection from the flow table, free its TX mbufs,
+    /// and cancel its timers — without waiting for the peer to cooperate.
+    /// Use only when graceful close has timed out; this is a thin public
+    /// wrapper over `force_close_etimedout` (same cleanup, same diagnostic).
+    pub fn abort_conn(&self, handle: ConnHandle) {
+        self.force_close_etimedout(handle);
+    }
+
+    /// Phase 6 (bench instrumentation): enable per-segment send→ACK
+    /// latency tracking on this engine.
+    ///
+    /// * Sets the engine-wide default capacity so newly-created conns
+    ///   (`connect_with_opts` / passive accept) initialize their
+    ///   `send_ack_log` to the given size.
+    /// * Walks every connection currently in the flow table and applies
+    ///   the same capacity so already-running conns start recording
+    ///   immediately.
+    ///
+    /// `cap` is the per-conn ringbuffer slot count. A typical bench-mode
+    /// value is 4096 — comfortably above the in-flight burst depth between
+    /// cumulative-ACK arrivals at a 1 Gbit/s+ wire rate. Pass `0` to
+    /// disable (resets every conn's log to `disabled()`).
+    ///
+    /// Slow-path; only intended to be called once at bench-arm setup.
+    pub fn enable_send_ack_logging(&self, cap: usize) {
+        self.send_ack_log_default_cap.set(cap);
+        let mut ft = self.flow_table.borrow_mut();
+        let handles: Vec<ConnHandle> = ft.iter_handles().collect();
+        for h in handles {
+            if let Some(c) = ft.get_mut(h) {
+                c.send_ack_log.set_capacity(cap);
+                if cap == 0 {
+                    c.send_ack_samples_pending.clear();
+                }
+            }
+        }
+    }
+
+    /// Phase 6 (bench instrumentation): drain the per-conn pending
+    /// send→ACK samples queue. Returns an owned `Vec` of every sample
+    /// produced since the last drain (typically since the last
+    /// `poll_once` iteration). Empty when `send_ack_log` is disabled
+    /// or no ACKs have advanced `snd_una` since the last drain.
+    ///
+    /// Bench tools call this once per pump-loop iteration, after
+    /// `poll_once`, to convert the per-segment samples into raw-CSV rows.
+    /// Slow-path: bench instrumentation only.
+    pub fn drain_send_ack_samples(
+        &self,
+        handle: ConnHandle,
+    ) -> Vec<crate::tcp_send_ack_log::SendAckSample> {
+        let mut ft = self.flow_table.borrow_mut();
+        match ft.get_mut(handle) {
+            Some(c) => std::mem::take(&mut c.send_ack_samples_pending),
+            None => Vec::new(),
         }
     }
 
@@ -6080,8 +6237,16 @@ impl Engine {
     /// at drain time, the drain walks the chain via `rte_pktmbuf_free(head)`
     /// per DPDK semantics and bumps `eth.tx_drop_full_ring`.
     ///
-    /// Bumps `xmit_count` + `xmit_ts_ns` on the entry and `tcp.tx_retrans` on
-    /// success. Does NOT decide whether to retransmit — that's the caller's
+    /// Bumps `xmit_count` + `xmit_ts_ns` on the entry. Per-trigger
+    /// counter bumping is the caller's responsibility — pair every
+    /// `engine.retransmit(...)` with one of:
+    ///   - `inc_tx_retrans_rto(&self.counters.tcp)` for RTO-driven retransmits
+    ///   - `inc_tx_retrans_rack(&self.counters.tcp)` for RACK-driven retransmits
+    ///   - `inc_tx_retrans_tlp(&self.counters.tcp)` for TLP-driven retransmits
+    /// Each helper bumps both its specific sub-counter AND the aggregate
+    /// `tcp.tx_retrans`. SYN-retrans paths use a different emit primitive
+    /// and bump `tcp.tx_retrans` directly (no per-trigger attribution).
+    /// Does NOT decide whether to retransmit — that's the caller's
     /// responsibility (Tasks 12 RTO / 15 RACK / 17 TLP / 18 SYN).
     ///
     /// Spec §6.5 "retransmit primitive": fresh header mbuf chained to the
@@ -6098,9 +6263,17 @@ impl Engine {
     /// exercise the multi-segment retrans path (and the `data_len ==
     /// hdrs_len + len` invariant assertion). Hidden from the public API
     /// surface — production callers must use the timer-driven paths.
+    ///
+    /// Phase 11 (C-E2) note: bumps `tcp.tx_retrans` (the aggregate) but NOT
+    /// any per-trigger sub-counter — the synthetic call doesn't represent
+    /// a production RTO/RACK/TLP trigger. Keeps `multiseg_retrans_tap`'s
+    /// "delta tx_retrans by N" assertion working unchanged. Aggregate
+    /// minus (tx_retrans_rto + tx_retrans_rack + tx_retrans_tlp) gives the
+    /// non-attributed retransmit count (SYN-retrans + this debug path).
     #[doc(hidden)]
     pub fn debug_retransmit_for_test(&self, conn_handle: ConnHandle, entry_index: usize) {
-        self.retransmit_inner(conn_handle, entry_index)
+        self.retransmit_inner(conn_handle, entry_index);
+        crate::counters::inc(&self.counters.tcp.tx_retrans);
     }
 
     fn retransmit_inner(&self, conn_handle: ConnHandle, entry_index: usize) {
@@ -6483,18 +6656,45 @@ impl Engine {
         {
             let mut ft = self.flow_table.borrow_mut();
             if let Some(conn) = ft.get_mut(conn_handle) {
+                // Phase 6 follow-up: take ONE TSC read for both
+                // `entry.xmit_ts_ns` and `send_ack_log.record_send` —
+                // they describe the same emission instant, and TSC
+                // reads in the retransmit hot path add up. Hoisted out
+                // of the inner `if let` so both consumers see it.
+                let now_ns_xmit = crate::clock::now_ns();
                 if let Some(entry) = conn.snd_retrans.entries.get_mut(entry_index) {
                     entry.xmit_count = entry.xmit_count.saturating_add(1);
-                    entry.xmit_ts_ns = crate::clock::now_ns();
+                    entry.xmit_ts_ns = now_ns_xmit;
                     entry.lost = false;
                     let _ = did_adj;
                 }
+                // Phase 6 (bench instrumentation): retransmit re-emits
+                // `seg_seq..seg_seq+entry_len`. SendAckLog::record_send
+                // detects the duplicate seq range and updates the stored
+                // t_send_ns rather than pushing a duplicate, so the
+                // sample reported on cum-ACK reflects the most recent
+                // (re-)send→ACK time. No-op when send_ack_log disabled.
+                conn.send_ack_log.record_send(
+                    crate::tcp_send_ack_log::SeqRange {
+                        begin: seg_seq,
+                        end: seg_seq.wrapping_add(entry_len as u32),
+                    },
+                    now_ns_xmit,
+                );
             }
         }
-        // Per-retransmit-occurrence counter — NOT per-tx-burst. `eth.tx_pkts`
-        // is owned by `drain_tx_pending_data` (Task 5); `eth.tx_bytes` stays
+        // Phase 11 (C-E2): the aggregate `tcp.tx_retrans` and the per-
+        // trigger sub-counter (`tx_retrans_rto` / `tx_retrans_rack` /
+        // `tx_retrans_tlp`) are bumped TOGETHER by the caller via the
+        // `inc_tx_retrans_{rto,rack,tlp}` helpers in `crate::counters`.
+        // The primitive has no trigger-attribution context, so attribution
+        // happens at the call site (every `engine.retransmit()` invocation
+        // is paired with one helper call). The synthetic-retransmit test
+        // path `debug_retransmit_for_test` bumps the aggregate directly
+        // (with no sub-counter attribution, since it doesn't represent a
+        // production trigger). `eth.tx_pkts` is owned by
+        // `drain_tx_pending_data` (Task 5); `eth.tx_bytes` stays
         // per-segment to mirror `send_bytes` accepted-byte accounting.
-        inc(&self.counters.tcp.tx_retrans);
         crate::counters::add(
             &self.counters.eth.tx_bytes,
             (hdr_n + entry_len as usize) as u64,
@@ -6556,16 +6756,6 @@ impl Engine {
     #[cfg(feature = "test-inject")]
     pub fn test_inject_pool_ptr(&self) -> *mut dpdk_net_sys::rte_mempool {
         self.test_inject_pool().as_ptr()
-    }
-
-    /// Returns the runtime value of the `rx_cksum_offload_active` latch.
-    ///
-    /// TAP vdevs always report no hardware checksum-offload capability so this
-    /// returns `false` there. NIC-offload rows in pressure_counter_parity.rs
-    /// use this to skip gracefully rather than asserting zero-delta counters.
-    #[cfg(feature = "test-inject")]
-    pub fn rx_cksum_offload_active(&self) -> bool {
-        self.rx_cksum_offload_active
     }
 
     /// Inject a synthetic Ethernet frame as if it came from PMD RX.
@@ -6635,82 +6825,6 @@ impl Engine {
         // `cargo test --workspace`) silently skip `eth.rx_pkts` and
         // break `cover_eth_rx_pkts` counter-coverage (A8.5 T10
         // follow-up regression).
-        crate::counters::inc(&self.counters.eth.rx_pkts);
-
-        // Dispatch through the same per-mbuf RX path `poll_once` uses;
-        // `dispatch_one_rx_mbuf` frees the mbuf before returning.
-        let _accepted = self.dispatch_one_rx_mbuf(mbuf);
-        Ok(())
-    }
-
-    /// Like [`Engine::inject_rx_frame`] but also OR-s `extra_ol_flags`
-    /// into the mbuf's `ol_flags` before dispatching. Used by
-    /// `pressure_counter_parity` (Suite 3) to simulate NIC-reported bad
-    /// checksums (`RTE_MBUF_F_RX_IP_CKSUM_BAD`,
-    /// `RTE_MBUF_F_RX_L4_CKSUM_BAD`) without a real hardware offload
-    /// path. The body mirrors `inject_rx_frame` verbatim except for the
-    /// extra `shim_rte_mbuf_or_ol_flags` call inserted between the
-    /// frame copy and the dispatch — every error path therefore matches
-    /// `inject_rx_frame` byte-for-byte.
-    #[cfg(feature = "test-inject")]
-    pub fn inject_rx_frame_with_ol_flags(
-        &self,
-        frame: &[u8],
-        extra_ol_flags: u64,
-    ) -> Result<(), InjectErr> {
-        // Reject pathologically large frames before the alloc so the
-        // caller gets a typed error instead of a cryptic append-NULL
-        // from DPDK. `elt_size()` returns the pool's `data_room_size`
-        // (including headroom — slightly over-permissive, but errs on
-        // the side of letting the append decide the final boundary).
-        let pool = self.test_inject_pool();
-        let seg_size = pool.elt_size() as usize;
-        if frame.len() > seg_size {
-            return Err(InjectErr::FrameTooLarge {
-                frame_len: frame.len(),
-                seg_size,
-            });
-        }
-
-        // SAFETY: `pool.as_ptr()` is a live, non-null `rte_mempool*` (RAII
-        // wrapper holds `NonNull`). `shim_rte_pktmbuf_alloc` is the
-        // re-exported static-inline `rte_pktmbuf_alloc`; returns NULL
-        // iff the pool is exhausted.
-        let m_raw = unsafe { sys::shim_rte_pktmbuf_alloc(pool.as_ptr()) };
-        let mbuf = std::ptr::NonNull::new(m_raw).ok_or(InjectErr::MempoolExhausted)?;
-
-        // SAFETY: frame length was bounded against `elt_size()` above,
-        // so `append` cannot fail on a non-corrupt mbuf; the NULL
-        // branch below is pure belt-and-suspenders for the
-        // headroom-ate-the-payload edge case.
-        let dst = unsafe {
-            sys::shim_rte_pktmbuf_append(mbuf.as_ptr(), frame.len() as u16)
-        };
-        if dst.is_null() {
-            // SAFETY: we own the mbuf; free returns it to its pool.
-            unsafe { sys::shim_rte_pktmbuf_free(mbuf.as_ptr()) };
-            return Err(InjectErr::FrameTooLarge {
-                frame_len: frame.len(),
-                seg_size,
-            });
-        }
-        // SAFETY: `dst` points to `frame.len()` writable bytes inside
-        // the mbuf's data room (append just reserved them). `frame` is
-        // a caller-owned slice; the regions cannot overlap.
-        unsafe {
-            std::ptr::copy_nonoverlapping(frame.as_ptr(), dst as *mut u8, frame.len());
-        }
-
-        if extra_ol_flags != 0 {
-            // SAFETY: `mbuf` is a live, owned mbuf pointer. `or_ol_flags`
-            // ORs the caller-supplied flags into `m->ol_flags`; the mbuf
-            // remains valid afterwards and is consumed by
-            // `dispatch_one_rx_mbuf` below.
-            unsafe { sys::shim_rte_mbuf_or_ol_flags(mbuf.as_ptr(), extra_ol_flags); }
-        }
-
-        // Mirror poll_once's per-burst per-mbuf RX counter bump on the
-        // injection path (same justification as `inject_rx_frame`).
         crate::counters::inc(&self.counters.eth.rx_pkts);
 
         // Dispatch through the same per-mbuf RX path `poll_once` uses;
@@ -6905,29 +7019,6 @@ impl Drop for Engine {
         // SmallVec → TcpConn → FlowTable → Engine, dereffing an mbuf
         // address inside a memzone marked `(deleted)` in /proc/maps.
         //
-        // C1: clear the drained-events scratch FIRST. Each
-        // `InternalEvent::Readable` in the scratch owns
-        // `InOrderSegment` mbuf-refcount holders via its `owned_mbufs`
-        // SmallVec; dropping after the mempools have been freed would
-        // crash inside `shim_rte_mbuf_refcnt_update`. We clear before
-        // the EventQueue drain (and before the FlowTable clear) for
-        // the same reason — strict mbuf-owner-then-mempool teardown
-        // ordering.
-        self.drained_events_scratch.get_mut().clear();
-
-        // C1: clear EventQueue next. Post-C1 `InternalEvent::Readable`
-        // owns `InOrderSegment` mbuf-refcount holders directly; any
-        // queued-but-not-drained Readable event would, on its drop,
-        // call `shim_rte_mbuf_refcnt_update(-1)` against an mbuf whose
-        // mempool is about to be freed. Drain and let each event drop
-        // here while the mempools are still alive. Pre-C1 this step
-        // was unnecessary because `Readable` only carried indices into
-        // per-conn scratch (no refcount ownership).
-        {
-            let q = self.events.get_mut();
-            while q.pop().is_some() {}
-        }
-
         // Step 1: clear FlowTable. Drops every TcpConn, which drops
         // recv-segment + reorder + snd_retrans + delivered_segments
         // mbufs back into still-alive mempools.
@@ -6996,6 +7087,16 @@ impl Drop for Engine {
     }
 }
 
+impl Engine {
+    /// Snapshot a conn's TCP state; `None` if the handle is unknown.
+    pub fn state_of(
+        &self,
+        h: crate::flow_table::ConnHandle,
+    ) -> Option<crate::tcp_state::TcpState> {
+        self.flow_table.borrow().get(h).map(|c| c.state)
+    }
+}
+
 // A7 Task 5: test-server-only Engine API surface. All methods behind
 // `feature = "test-server"` so the default build has NO server-side
 // passive-open code. Mirror pattern to `test_tx_intercept` (T4).
@@ -7030,22 +7131,10 @@ impl Engine {
         slot.1.accept_queue.take()
     }
 
-    /// Snapshot a conn's TCP state; `None` if the handle is unknown.
-    pub fn state_of(
-        &self,
-        h: crate::flow_table::ConnHandle,
-    ) -> Option<crate::tcp_state::TcpState> {
-        self.flow_table.borrow().get(h).map(|c| c.state)
-    }
-
     /// A8 T19: snapshot a conn's negotiated `peer_mss`. Consumed by
     /// `tcpreq-runner`'s MissingMSS probe (RFC 9293 §3.7.1 MUST-15) to
     /// verify the 536-byte fallback applies when the peer's SYN omits
-    /// the MSS option. `None` if the handle is unknown. Mirrors
-    /// `state_of` — a thin read-only accessor on internal conn state
-    /// exposed only under the test-server feature so the production
-    /// build keeps `FlowTable` fully private.
-    #[cfg(feature = "test-server")]
+    /// the MSS option. `None` if the handle is unknown.
     pub fn conn_peer_mss(&self, h: crate::flow_table::ConnHandle) -> Option<u16> {
         self.flow_table.borrow().get(h).map(|c| c.peer_mss)
     }
@@ -7198,6 +7287,23 @@ impl Engine {
                 .find(|(k, _)| *k == listen_h)
                 .expect("listen slot disappeared between lookups");
             slot.1.in_progress = Some(h);
+        }
+        // Mirror the active-open path (engine.rs ~5068): set ws_shift_out so
+        // ACKs encode the advertised window correctly after wscale negotiation.
+        // SYN-ACK carries wscale=compute_ws_shift_for(recv_buffer_bytes); the
+        // conn must use the same shift when writing the window field on wire.
+        {
+            let mut ft = self.flow_table.borrow_mut();
+            if let Some(c) = ft.get_mut(h) {
+                c.ws_shift_out = compute_ws_shift_for(self.cfg.recv_buffer_bytes);
+                // Phase 6 (bench instrumentation): inherit engine-wide
+                // default send_ack_log capacity. `0` (default) leaves
+                // log disabled; non-zero opt-in by bench tooling.
+                let cap = self.send_ack_log_default_cap.get();
+                if cap > 0 {
+                    c.send_ack_log.set_capacity(cap);
+                }
+            }
         }
         self.emit_syn_ack_for_passive(h);
         // SYN-ACK consumes one seq space; bump snd_nxt now so the final
@@ -7506,22 +7612,6 @@ impl Engine {
     /// No-op when no conn holds pinned mbuf refs. Cheap — one pass over
     /// the flow table.
     pub fn test_clear_pinned_rx_mbufs(&self) {
-        // C1: clear the drained-events scratch first. Same rationale as
-        // in `Engine::drop` — every `InternalEvent::Readable` in the
-        // scratch holds `InOrderSegment` mbuf-refcount handles via
-        // `owned_mbufs`. Releasing them here while the mempools (and
-        // every conn-side mbuf-owner) are still alive keeps the test
-        // shim's mbuf-leak invariant clean.
-        self.drained_events_scratch.borrow_mut().clear();
-        // C1: drain the EventQueue next. Post-C1 `InternalEvent::Readable`
-        // owns `InOrderSegment` mbuf refs; queued-but-not-drained events
-        // would otherwise fire `MbufHandle::Drop` after the mempool
-        // teardown. Pre-C1 the events only carried indices and were
-        // safe to leave queued at engine drop.
-        {
-            let mut q = self.events.borrow_mut();
-            while q.pop().is_some() {}
-        }
         let mut ft = self.flow_table.borrow_mut();
         let handles: Vec<_> = ft.iter_handles().collect();
         for h in handles {
@@ -7891,7 +7981,7 @@ mod tests {
         let our_mss: u16 = 1460;
         let recv_buffer_bytes: u32 = 256 * 1024;
         let now_ns: u64 = 1_234_567_000; // ~1.2s since epoch; tsval will be 1_234_567 µs
-        let opts = super::build_connect_syn_opts(recv_buffer_bytes, our_mss, now_ns, true, true);
+        let opts = super::build_connect_syn_opts(recv_buffer_bytes, our_mss, now_ns);
         assert_eq!(opts.mss, Some(our_mss));
         assert!(opts.sack_permitted);
         assert_eq!(opts.wscale, Some(3));
@@ -7905,7 +7995,7 @@ mod tests {
     fn build_connect_syn_opts_tsval_nonzero_for_nonzero_clock() {
         // Sanity: we truncate `now_ns / 1000` to u32; a realistic
         // engine-uptime reading produces a nonzero TSval.
-        let opts = super::build_connect_syn_opts(65_536, 1460, 1_000, true, true);
+        let opts = super::build_connect_syn_opts(65_536, 1460, 1_000);
         let (tsval, _) = opts.timestamps.expect("timestamps set");
         assert_eq!(tsval, 1);
     }

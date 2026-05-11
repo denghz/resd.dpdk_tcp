@@ -7,10 +7,6 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 bash scripts/scapy-corpus.sh
-# A7 / Pattern P1: scapy-fuzz-runner gates its `dpdk-net-core` dep behind
-# its own `test-inject` feature so workspace builds don't unify the
-# forbidden `dpdk-net-core/test-inject` feature into production binaries.
-# `--features test-inject` is required to actually build the binary.
-cargo run --release -p scapy-fuzz-runner --features test-inject -- --corpus tools/scapy-corpus/out/
+cargo run --release -p scapy-fuzz-runner -- --corpus tools/scapy-corpus/out/
 
 echo "=== ci-scapy-replay: PASS ==="

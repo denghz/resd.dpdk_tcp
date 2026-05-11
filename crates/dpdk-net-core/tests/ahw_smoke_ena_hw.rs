@@ -314,17 +314,25 @@ fn ahw_ena_hw_path_banner_and_counters() {
             all_events.push(ev.clone());
             if let InternalEvent::Readable {
                 conn,
-                segs,
+                seg_idx_start,
+                seg_count,
                 ..
             } = ev
             {
                 if *conn == handle {
-                    // C1: iovec slice owned by the event itself.
-                    for iovec in segs {
-                        let slice = unsafe {
-                            std::slice::from_raw_parts(iovec.base, iovec.len as usize)
-                        };
-                        echoed.extend_from_slice(slice);
+                    let ft = engine.flow_table();
+                    if let Some(c) = ft.get(handle) {
+                        // A6.6 T7/T8: iovec slice lives in the conn's
+                        // `readable_scratch_iovecs`; each entry's
+                        // `base`/`len` is the delivered payload window.
+                        let start = *seg_idx_start as usize;
+                        let end = start + *seg_count as usize;
+                        for iovec in &c.readable_scratch_iovecs[start..end] {
+                            let slice = unsafe {
+                                std::slice::from_raw_parts(iovec.base, iovec.len as usize)
+                            };
+                            echoed.extend_from_slice(slice);
+                        }
                     }
                 }
             }

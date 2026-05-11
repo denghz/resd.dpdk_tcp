@@ -9,7 +9,7 @@
 //! Pipeline:
 //!
 //! 1. [`aggregate_by_config`] — group rows by `feature_set` and pick
-//!    out p50 / p99 / p999. The `bench-ab-runner` emits seven rows
+//!    out p50 / p99 / p999. The `bench-rtt` runner emits seven rows
 //!    per config (p50 / p99 / p999 / mean / stddev / ci95_lo / ci95_hi);
 //!    we keep the three percentiles.
 //! 2. [`compute_deltas`] — for every non-baseline config, compute
@@ -464,6 +464,8 @@ mod tests {
             dpdk_version_pkgconfig: None,
             worktree_branch: None,
             uprof_session_id: None,
+            raw_samples_path: None,
+            failed_iter_count: 0,
         }
     }
 

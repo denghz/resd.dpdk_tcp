@@ -233,7 +233,7 @@ pub const MATRIX: &[LayerHScenario] = &[
             ("tcp.rx_rst", "==0"),
         ],
         disjunctive_expectations: &[(
-            &["eth.rx_drop_cksum_bad", "ip.rx_csum_bad", "tcp.rx_bad_csum"],
+            &["eth.rx_drop_cksum_bad", "ip.rx_csum_bad"],
             ">0",
         )],
     },

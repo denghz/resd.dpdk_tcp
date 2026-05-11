@@ -5,6 +5,9 @@
 //! list. This crate is pure data + math: no DPDK FFI, no engine state.
 
 pub mod csv_row;
+pub mod peer_introspect;
 pub mod percentile;
 pub mod preconditions;
+pub mod preflight;
+pub mod raw_samples;
 pub mod run_metadata;
