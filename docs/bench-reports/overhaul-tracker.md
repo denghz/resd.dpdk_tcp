@@ -54,7 +54,12 @@ Baseline: T50 report at `docs/bench-reports/t50-bench-pair-2026-05-08.md` and T5
     iter-count expansion).
 - [x] Phase 8 — bench-rx-burst tool
 - [x] Phase 9 — HW-TS attribution validation on c7i (code-validated; live c7i
-  validation deferred to operator — see t51 §c7i validation)
+  validation **permanently deferred** 2026-05-11 — HW-TS not supported in
+  ap-south-1 for any EC2 instance type incl. c7i. Empirical confirmation:
+  bench-rtt's DPDK init logs `RX timestamp dynfield/dynflag unavailable on
+  port 0 (ENA steady state)`. Code path remains correct + tested; live
+  validation would require region or NIC family migration. See t51 §c7i
+  validation.)
 - [x] Phase 10 — Nightly script rewire + scenario expansion
   - Task 10.1 done 2026-05-09: bench-rtt invocations now sweep
     `$BENCH_RTT_PAYLOADS` (default `64,128,256,1024`) instead of the
