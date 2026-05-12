@@ -1,23 +1,29 @@
 //! bench-micro::tsc_read — spec §11.2 targets 3 + 4.
 //!
-//! `bench_tsc_read_ffi` measures the FFI call cost of `dpdk_net_now_ns`
-//! (the public C ABI entry point). `bench_tsc_read_inline` measures the
-//! fastest possible TSC-read path (`clock::rdtsc` — raw RDTSC with no
-//! conversion).
+//! Three targets, ordered by descending FFI/abstraction cost:
 //!
-//! # Stubbing note — `bench_tsc_read_inline`
+//! - `bench_tsc_read_ffi` — calls `dpdk_net_now_ns` across the C ABI.
+//!   Measures FFI hop + rdtsc + scaled-multiply ns conversion. This is
+//!   what C-side consumers actually pay.
 //!
-//! The spec targets `dpdk_net_now_ns_inline` (header-inline). No such
-//! C-header-inline FFI exists today — `dpdk_net_now_ns` is the only
-//! public entry point for TSC reads. The closest pure-Rust proxy is
-//! `dpdk_net_core::clock::rdtsc()` (raw RDTSC, ~1 ns on modern x86_64),
-//! which is what a future `dpdk_net_now_ns_inline` would wrap before
-//! the ns-per-tsc conversion. We measure `rdtsc` + conversion
-//! (`clock::now_ns`) under the inline name as the closest no-FFI-boundary
-//! analog. When a future task adds a true header-inline FFI variant,
-//! swap in `dpdk_net_now_ns_inline` here.
-// TODO(T5): `dpdk_net_now_ns_inline` does not exist today — bench uses
-// `clock::now_ns` (pure Rust, no FFI boundary) as the closest proxy.
+//! - `bench_now_ns` — calls `dpdk_net_core::clock::now_ns()` directly
+//!   in Rust. Same work as the FFI variant (rdtsc + ns conversion) but
+//!   without the C ABI boundary. Renamed from the older
+//!   `bench_tsc_read_inline` for honesty — the original name implied
+//!   raw inline rdtsc, but the function performs a ns conversion.
+//!
+//! - `bench_rdtsc_raw` — calls `dpdk_net_core::clock::rdtsc()`. This
+//!   is the truly minimum-cost variant: a single `_rdtsc` intrinsic
+//!   with no conversion. Returns raw TSC ticks, not nanoseconds.
+//!
+//! # Note on the §11.2 §4 spec target
+//!
+//! The spec lists `dpdk_net_now_ns_inline` (header-inline FFI). No
+//! such C-header-inline FFI exists today — `dpdk_net_now_ns` is the
+//! only public entry point for TSC reads. `bench_rdtsc_raw` is the
+//! closest pure-rdtsc proxy that a future `dpdk_net_now_ns_inline`
+//! would wrap before the ns conversion; `bench_now_ns` is the
+//! closest no-FFI-boundary analog that performs the full ns conversion.
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use std::time::{Duration, Instant};
@@ -59,18 +65,15 @@ fn bench_tsc_read_ffi(c: &mut Criterion) {
     });
 }
 
-fn bench_tsc_read_inline(c: &mut Criterion) {
-    c.bench_function("bench_tsc_read_inline", |b| {
+fn bench_now_ns(c: &mut Criterion) {
+    c.bench_function("bench_now_ns", |b| {
         // `clock::now_ns` is a pure Rust call — no FFI boundary, no
-        // function-pointer indirection. rustc with LTO may inline
-        // rdtsc + the scaled-multiply conversion. This is the
-        // closest analog to a future header-inline FFI variant.
+        // function-pointer indirection. Performs `rdtsc` + the scaled-
+        // multiply ns conversion (see `clock.rs::now_ns`). Renamed from
+        // the older `bench_tsc_read_inline` because that name implied a
+        // raw TSC read; this target measures full ns conversion.
         //
         // `iter_custom`: see `bench_tsc_read_ffi` for batching rationale.
-        // To probe H2 (black_box stack roundtrip overhead), accumulate the
-        // results into a single XOR-folded sum and consume it with a single
-        // `black_box` at the end of the batch. This eliminates BATCH-1 of
-        // the per-call store/load pairs.
         b.iter_custom(|iters| {
             let start = Instant::now();
             for _ in 0..iters {
@@ -85,12 +88,36 @@ fn bench_tsc_read_inline(c: &mut Criterion) {
     });
 }
 
+fn bench_rdtsc_raw(c: &mut Criterion) {
+    c.bench_function("bench_rdtsc_raw", |b| {
+        // `clock::rdtsc` is `#[inline(always)]` and wraps the
+        // `core::arch::x86_64::_rdtsc` intrinsic — no conversion, no
+        // FFI. Reports the absolute floor: a single TSC read in cycles
+        // (~7-25 cycles on modern x86_64). Returns raw TSC ticks, not
+        // nanoseconds; downstream code that needs ns pays the
+        // additional scaled-multiply in `now_ns`.
+        //
+        // `iter_custom`: see `bench_tsc_read_ffi` for batching rationale.
+        b.iter_custom(|iters| {
+            let start = Instant::now();
+            for _ in 0..iters {
+                let mut acc: u64 = 0;
+                for _ in 0..BATCH {
+                    acc ^= dpdk_net_core::clock::rdtsc();
+                }
+                black_box(acc);
+            }
+            start.elapsed() / (BATCH as u32)
+        });
+    });
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default()
         .warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(5))
         .sample_size(100);
-    targets = bench_tsc_read_ffi, bench_tsc_read_inline
+    targets = bench_tsc_read_ffi, bench_now_ns, bench_rdtsc_raw
 }
 criterion_main!(benches);
