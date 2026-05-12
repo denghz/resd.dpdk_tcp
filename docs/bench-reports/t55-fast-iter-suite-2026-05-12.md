@@ -129,15 +129,23 @@ just for that single scenario on this AWS network path).
 
 ## Open follow-ups
 
-1. **bench-rtt linux_kernel hang** — the host's data NIC `0000:28:00.0` is
+1. **bench-rtt linux_kernel hang** — ~~the host's data NIC `0000:28:00.0` is
    bound to vfio-pci so kernel TCP traffic goes via the host bridge through
    `vethpxtn0` (`10.99.1.2`) and NAT-translates to `10.2.1.11` from the
-   peer's perspective. The TCP handshake completes but `read_exact()` of
-   the echo response stalls indefinitely. Plain `nc | peer | nc` works
-   (verified). Root cause likely a path-MTU / SACK / reordering edge case
-   in this sandboxed network setup. Workaround: run linux_kernel arm from a
-   host that has direct (non-NAT'd) routing to the peer NIC, OR add a
-   timeout-and-skip path inside the bench's `run_rtt_workload`.
+   peer's perspective.~~ **RESOLVED 2026-05-12.** The TCP path isn't NAT'd
+   — it's *transparent-SOCKS5-proxied* via iptables REDIRECT to
+   `redsocks:127.0.0.1:12345` → `127.0.0.1:1080`. Per-iter RTT inflates
+   from ~75 µs to ~250 ms, blowing the 300 s `RUN_ONE_TIMEOUT` on the
+   10 k-iter sweeps. Full investigation in
+   `docs/bench-reports/linux-nat-investigation-2026-05-12.md`. Fix landed
+   in `scripts/fast-iter-suite.sh`: the linux_kernel arms now talk to a
+   local echo-server on `127.0.0.1:10002` and a local burst-echo-server
+   on `127.0.0.1:19003`, both spawned in `preflight()` and torn down in
+   `on_exit()`. Smoke run: bench-rtt linux completes 4 × 10 k payloads
+   in **1.7 s** at p50 ~38 µs; bench-rx-burst linux completes
+   9 buckets × 200 bursts in **<1 s** at p50 ~8 µs; bench-tx-maxtp
+   linux completes the 9-bucket grid in **108 s** with 4-17 Gbps
+   results (vs. the T55 0.00 Gbps). dpdk_net + fstack arms unchanged.
 
 2. **bench-rtt fstack SIGSEGV** — F-Stack inits cleanly (DPDK port comes
    up, FreeBSD bind succeeds, "f-stack-0: Successed to register dpdk

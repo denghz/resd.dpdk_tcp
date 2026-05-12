@@ -20,20 +20,37 @@
 # every dpdk_net / fstack arm runs sequentially. Inter-arm gaps are kept tight
 # (the peer can serve all three stacks back-to-back without resetting).
 #
+# linux_kernel arms run against a local 127.0.0.1 echo / burst-echo server
+# spawned on the DUT, NOT against the remote peer. See
+# docs/bench-reports/linux-nat-investigation-2026-05-12.md — the dev-host
+# container has a transparent SOCKS5 proxy (REDSOCKS) intercepting all
+# outbound TCP, which inflates per-iter RTT from ~75 µs to ~250 ms and times
+# out the 10 k-iter bench arms. Local-loopback kernel TCP is the meaningful
+# baseline anyway (the linux-vs-dpdk delta is socket-call overhead, not wire
+# trip), so this avoids the proxy + measures the right thing.
+#
 # Usage:
 #   ./scripts/fast-iter-suite.sh
 #
 # Overrides (env):
-#   RESULTS_DIR_OVERRIDE   Absolute path to use instead of the default
-#                          target/bench-results/fast-iter-<UTC>/. Useful when
-#                          re-running into an existing directory.
-#   DUT_PCI                Default 0000:28:00.0 (a10 perf host).
-#   DUT_LOCAL_IP           Default 10.4.1.141.
-#   DUT_GATEWAY            Default 10.4.1.1.
-#   DUT_LCORE              Default 2.
-#   PEER_NIC               Default ens5 (peer data NIC, passed to verify-rack-tlp).
-#   SKIP_VERIFY_RACK_TLP   Set non-empty to skip the netem matrix.
-#   VERIFY_RACK_ITERS      Default 50000 (override for verify-rack-tlp's ITERS).
+#   RESULTS_DIR_OVERRIDE       Absolute path to use instead of the default
+#                              target/bench-results/fast-iter-<UTC>/. Useful when
+#                              re-running into an existing directory.
+#   DUT_PCI                    Default 0000:28:00.0 (a10 perf host).
+#   DUT_LOCAL_IP               Default 10.4.1.141.
+#   DUT_GATEWAY                Default 10.4.1.1.
+#   DUT_LCORE                  Default 2.
+#   PEER_NIC                   Default ens5 (peer data NIC, passed to verify-rack-tlp).
+#   SKIP_VERIFY_RACK_TLP       Set non-empty to skip the netem matrix.
+#   VERIFY_RACK_ITERS          Default 50000 (override for verify-rack-tlp's ITERS).
+#   LOCAL_LINUX_ECHO_PORT      Default 10002 (loopback port for linux_kernel echo;
+#                              MUST be 10002 because bench-tx-maxtp's linux arm
+#                              hard-asserts peer_port=10002, see tools/bench-tx-maxtp/
+#                              src/linux.rs::assert_peer_is_sink).
+#   LOCAL_LINUX_BURST_PORT     Default 19003 (loopback port for linux_kernel burst).
+#   LINUX_KERNEL_PEER_IP       Default 127.0.0.1 (override to force the kernel arm
+#                              to talk to the remote peer instead — only useful on
+#                              hosts WITHOUT the REDSOCKS proxy in the OUTPUT chain).
 #
 # Exit code: 0 if at least one bench arm produced a non-empty CSV per stack +
 # tool combination. Non-zero only on catastrophic failure (missing binaries,
@@ -72,6 +89,24 @@ EAL_ARGS="-l 2-3 -n 4 --in-memory --huge-unlink -a ${DUT_PCI},large_llq_hdr=1,mi
 
 VERIFY_RACK_ITERS="${VERIFY_RACK_ITERS:-50000}"
 
+# Local echo/burst-echo servers for the linux_kernel arms — see header
+# comment + docs/bench-reports/linux-nat-investigation-2026-05-12.md.
+#
+# LOCAL_LINUX_ECHO_PORT defaults to 10002 because bench-tx-maxtp's linux
+# arm hard-asserts `peer_port == 10002` (`assert_peer_is_sink` in
+# `tools/bench-tx-maxtp/src/linux.rs`). 10002 on 127.0.0.1 does NOT
+# conflict with the remote peer's 10.4.1.228:10002 — different
+# (address, port) tuples — but it does avoid having to spawn two
+# separate local echo-servers (one for bench-tx-maxtp at :10002, one
+# for the others at e.g. :19001).
+LOCAL_LINUX_PEER_IP="${LINUX_KERNEL_PEER_IP:-127.0.0.1}"
+LOCAL_LINUX_ECHO_PORT="${LOCAL_LINUX_ECHO_PORT:-10002}"
+LOCAL_LINUX_BURST_PORT="${LOCAL_LINUX_BURST_PORT:-19003}"
+LOCAL_ECHO_SERVER_BIN="$WORKDIR/tools/bench-e2e/peer/echo-server"
+LOCAL_BURST_ECHO_SERVER_BIN="$WORKDIR/tools/bench-e2e/peer/burst-echo-server"
+LOCAL_ECHO_SERVER_PID=""
+LOCAL_BURST_ECHO_SERVER_PID=""
+
 UTC_TS="$(date -u +%Y-%m-%dT%H-%M-%SZ)"
 RESULTS_DIR="${RESULTS_DIR_OVERRIDE:-$WORKDIR/target/bench-results/fast-iter-$UTC_TS}"
 mkdir -p "$RESULTS_DIR"
@@ -92,6 +127,19 @@ for bin in "$BENCH_RTT" "$BENCH_TX_BURST" "$BENCH_TX_MAXTP" "$BENCH_RX_BURST"; d
     [ -x "$bin" ] || { printf 'fast-iter-suite: missing binary %s\n' "$bin" >&2; exit 2; }
 done
 [ -x "$VERIFY_RACK_TLP" ] || { printf 'fast-iter-suite: missing %s\n' "$VERIFY_RACK_TLP" >&2; exit 2; }
+
+# Peer C binaries used in-process on the DUT for the linux_kernel arms.
+# Both are pure C stdlib + pthread (see tools/bench-e2e/peer/Makefile).
+[ -x "$LOCAL_ECHO_SERVER_BIN" ] || {
+    printf 'fast-iter-suite: missing %s — run `make -C tools/bench-e2e/peer` to build\n' \
+        "$LOCAL_ECHO_SERVER_BIN" >&2
+    exit 2
+}
+[ -x "$LOCAL_BURST_ECHO_SERVER_BIN" ] || {
+    printf 'fast-iter-suite: missing %s — run `make -C tools/bench-e2e/peer` to build\n' \
+        "$LOCAL_BURST_ECHO_SERVER_BIN" >&2
+    exit 2
+}
 
 # Verify fstack symbols are present in all four binaries.
 for bin in "$BENCH_RTT" "$BENCH_TX_BURST" "$BENCH_TX_MAXTP" "$BENCH_RX_BURST"; do
@@ -198,6 +246,64 @@ run_one() {
 }
 
 # ---------------------------------------------------------------------------
+# Local-loopback servers for linux_kernel arms.
+#
+# Why local: the dev-host container intercepts every outbound TCP packet via a
+# transparent SOCKS5 proxy (REDSOCKS, see iptables OUTPUT chain). Direct
+# kernel-TCP to the remote peer ends up tunneled and runs at ~250 ms/iter,
+# blowing the per-arm RUN_ONE_TIMEOUT. Local 127.0.0.1 traffic is on the
+# REDSOCKS RETURN allowlist, so the loopback path stays unproxied and the
+# kernel-TCP arm completes in microseconds-per-iter. Comparison value to
+# dpdk_net is preserved — the linux-vs-dpdk delta is socket-call overhead,
+# not wire trip.
+# ---------------------------------------------------------------------------
+
+start_local_linux_servers() {
+    log "spawn local linux servers: echo on $LOCAL_LINUX_PEER_IP:$LOCAL_LINUX_ECHO_PORT, burst on $LOCAL_LINUX_PEER_IP:$LOCAL_LINUX_BURST_PORT"
+
+    # Kill any stale instances from a previous run on the same ports.
+    pkill -KILL -f "echo-server $LOCAL_LINUX_ECHO_PORT" 2>/dev/null || true
+    pkill -KILL -f "burst-echo-server $LOCAL_LINUX_BURST_PORT" 2>/dev/null || true
+    sleep 0.2
+
+    "$LOCAL_ECHO_SERVER_BIN" "$LOCAL_LINUX_ECHO_PORT" \
+        >"$RESULTS_DIR/local-echo-server.log" 2>&1 &
+    LOCAL_ECHO_SERVER_PID=$!
+    disown $LOCAL_ECHO_SERVER_PID 2>/dev/null || true
+
+    "$LOCAL_BURST_ECHO_SERVER_BIN" "$LOCAL_LINUX_BURST_PORT" \
+        >"$RESULTS_DIR/local-burst-echo-server.log" 2>&1 &
+    LOCAL_BURST_ECHO_SERVER_PID=$!
+    disown $LOCAL_BURST_ECHO_SERVER_PID 2>/dev/null || true
+
+    sleep 0.3
+    if ! kill -0 "$LOCAL_ECHO_SERVER_PID" 2>/dev/null; then
+        log "FATAL: local echo-server failed to start — see $RESULTS_DIR/local-echo-server.log"
+        exit 2
+    fi
+    if ! kill -0 "$LOCAL_BURST_ECHO_SERVER_PID" 2>/dev/null; then
+        log "FATAL: local burst-echo-server failed to start — see $RESULTS_DIR/local-burst-echo-server.log"
+        exit 2
+    fi
+    log "    local servers up: echo pid=$LOCAL_ECHO_SERVER_PID burst pid=$LOCAL_BURST_ECHO_SERVER_PID"
+}
+
+stop_local_linux_servers() {
+    if [ -n "$LOCAL_ECHO_SERVER_PID" ]; then
+        kill -KILL "$LOCAL_ECHO_SERVER_PID" 2>/dev/null || true
+        LOCAL_ECHO_SERVER_PID=""
+    fi
+    if [ -n "$LOCAL_BURST_ECHO_SERVER_PID" ]; then
+        kill -KILL "$LOCAL_BURST_ECHO_SERVER_PID" 2>/dev/null || true
+        LOCAL_BURST_ECHO_SERVER_PID=""
+    fi
+    # Defensive sweep in case the PID variables were lost (e.g. set -e abort
+    # between spawn and assignment).
+    pkill -KILL -f "echo-server $LOCAL_LINUX_ECHO_PORT" 2>/dev/null || true
+    pkill -KILL -f "burst-echo-server $LOCAL_LINUX_BURST_PORT" 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
 # Pre-flight peer reachability check.
 # ---------------------------------------------------------------------------
 preflight() {
@@ -221,6 +327,10 @@ preflight() {
     # Reset the peer's :10001 echo-server so we start with no stale ESTAB
     # connections holding worker slots.
     peer_restart_echo_server
+
+    # Spawn local echo-server + burst-echo-server for the linux_kernel arms.
+    # See the "Local-loopback servers" comment block above for the rationale.
+    start_local_linux_servers
 }
 
 # ---------------------------------------------------------------------------
@@ -250,12 +360,14 @@ run_bench_rtt() {
                 --iterations 10000 --warmup 100
     peer_restart_echo_server
 
+    # linux_kernel → local loopback echo-server (NOT the remote peer); see
+    # the "Local-loopback servers" comment block above.
     run_one "bench-rtt linux_kernel" \
         "$RESULTS_DIR/bench-rtt-linux_kernel.csv" \
         "$BENCH_RTT" \
             --stack linux_kernel \
-            --peer-ip "$PEER_IP" \
-            --peer-port "$PEER_ECHO_PORT" \
+            --peer-ip "$LOCAL_LINUX_PEER_IP" \
+            --peer-port "$LOCAL_LINUX_ECHO_PORT" \
             --tool fast-iter-suite \
             --feature-set linux_kernel \
             --precondition-mode lenient \
@@ -308,12 +420,18 @@ run_bench_tx_burst() {
                 --bursts-per-bucket 200 --warmup 20
     peer_restart_echo_server
 
+    # linux_kernel → local loopback echo-server (NOT the remote peer); see
+    # the "Local-loopback servers" comment block above. Measures kernel-TCP
+    # send-buffer-fill rate, not wire rate — the local-vs-remote distinction
+    # doesn't matter because write_all is non-blocking until the kernel
+    # send buffer fills, and the proxy in the way of the remote path just
+    # adds RTT noise without changing the measurement semantics.
     run_one "bench-tx-burst linux_kernel" \
         "$RESULTS_DIR/bench-tx-burst-linux_kernel.csv" \
         "$BENCH_TX_BURST" \
             --stack linux_kernel \
-            --peer-ip "$PEER_IP" \
-            --peer-port "$PEER_ECHO_PORT" \
+            --peer-ip "$LOCAL_LINUX_PEER_IP" \
+            --peer-port "$LOCAL_LINUX_ECHO_PORT" \
             --tool fast-iter-suite \
             --feature-set linux_kernel \
             --precondition-mode lenient \
@@ -368,8 +486,14 @@ run_bench_tx_maxtp() {
                 --warmup-secs 2 --duration-secs 10
     peer_restart_echo_server
 
-    # linux_kernel arm — note PEER_SINK_PORT (10002), not ECHO_PORT. The
-    # `--local-ip` flag is documented as dpdk-only but bench-tx-maxtp's
+    # linux_kernel arm — points at the local 127.0.0.1 echo-server (NOT the
+    # remote peer's :10002 linux-tcp-sink). See the "Local-loopback servers"
+    # comment block at the top of this script. The local echo-server behaves
+    # the same as linux-tcp-sink (both just read+write back), so the sink
+    # vs. echo distinction doesn't matter for bench-tx-maxtp's
+    # write-into-send-buffer measurement.
+    #
+    # The `--local-ip` flag is documented as dpdk-only but bench-tx-maxtp's
     # peer-rwnd probe path still parses it as IPv4 for every stack, so we
     # pass DUT_LOCAL_IP here too — it's a no-op for the linux arm itself.
     run_one "bench-tx-maxtp linux_kernel" \
@@ -377,8 +501,8 @@ run_bench_tx_maxtp() {
         "$BENCH_TX_MAXTP" \
             --stack linux_kernel \
             --local-ip "$DUT_LOCAL_IP" \
-            --peer-ip "$PEER_IP" \
-            --peer-port "$PEER_SINK_PORT" \
+            --peer-ip "$LOCAL_LINUX_PEER_IP" \
+            --peer-port "$LOCAL_LINUX_ECHO_PORT" \
             --tool fast-iter-suite \
             --feature-set linux_kernel \
             --precondition-mode lenient \
@@ -432,12 +556,14 @@ run_bench_rx_burst() {
                 --burst-counts 16,64,256 \
                 --measure-bursts 200 --warmup-bursts 20
 
+    # linux_kernel → local loopback burst-echo-server (NOT the remote peer);
+    # see the "Local-loopback servers" comment block above.
     run_one "bench-rx-burst linux_kernel" \
         "$RESULTS_DIR/bench-rx-burst-linux_kernel.csv" \
         "$BENCH_RX_BURST" \
             --stack linux_kernel \
-            --peer-ip "$PEER_IP" \
-            --peer-control-port "$PEER_BURST_PORT" \
+            --peer-ip "$LOCAL_LINUX_PEER_IP" \
+            --peer-control-port "$LOCAL_LINUX_BURST_PORT" \
             --tool fast-iter-suite \
             --feature-set linux_kernel \
             --precondition-mode lenient \
@@ -661,6 +787,8 @@ WALLCLOCK_START_HUMAN="$(date -u -Iseconds)"
 
 on_exit() {
     local rc=$?
+    # Always tear down the local linux servers we spawned in preflight.
+    stop_local_linux_servers
     WALLCLOCK_END=$(ts_now)
     WALLCLOCK_END_HUMAN="$(date -u -Iseconds)"
     local elapsed=$((WALLCLOCK_END - WALLCLOCK_START))
