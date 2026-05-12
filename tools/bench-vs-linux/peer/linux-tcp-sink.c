@@ -12,8 +12,8 @@
  * delta in measured RTT is strictly client-side (kernel socket path
  * vs. dpdk-net engine) — peer-side timing noise cancels.
  *
- * Build: gcc -O2 -o linux-tcp-sink linux-tcp-sink.c -lpthread
- * (or: clang-22 -O2 -o linux-tcp-sink linux-tcp-sink.c -lpthread)
+ * Build: gcc -O2 -pthread -o linux-tcp-sink linux-tcp-sink.c
+ * (or: clang-22 -O2 -pthread -o linux-tcp-sink linux-tcp-sink.c)
  *
  * Correctness + discipline notes (mirrors echo-server.c):
  * - SO_REUSEADDR on the listen socket so a crashed run can re-bind
@@ -24,6 +24,9 @@
  *   EPIPE on the offending thread instead of terminating the server.
  * - One pthread per connection, detached. Main loop re-accepts
  *   indefinitely; SIGTERM to stop.
+ *
+ * Robustness (T56 v4, 2026-05-12): TCP_USER_TIMEOUT=5s + 4 MiB sock
+ * buffers, identical rationale to echo-server.c.
  */
 
 #include <errno.h>
@@ -37,8 +40,16 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#ifndef TCP_USER_TIMEOUT
+#define TCP_USER_TIMEOUT 18
+#endif
+
+#define SINK_SOCK_BUF_BYTES (4 * 1024 * 1024)
+#define SINK_USER_TIMEOUT_MS 5000u
+
 static void *handle(void *arg) {
-    int fd = (int)(long)arg;
+    int fd = *(int *)arg;
+    free(arg);
     char buf[8192];
     while (1) {
         ssize_t n = read(fd, buf, sizeof buf);
@@ -74,6 +85,9 @@ int main(int argc, char **argv) {
     int one = 1;
     setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
     setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+    int sock_buf = SINK_SOCK_BUF_BYTES;
+    setsockopt(s, SOL_SOCKET, SO_SNDBUF, &sock_buf, sizeof sock_buf);
+    setsockopt(s, SOL_SOCKET, SO_RCVBUF, &sock_buf, sizeof sock_buf);
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof addr);
     addr.sin_family = AF_INET;
@@ -95,9 +109,24 @@ int main(int argc, char **argv) {
             continue;
         }
         setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+        setsockopt(c, SOL_SOCKET, SO_SNDBUF, &sock_buf, sizeof sock_buf);
+        setsockopt(c, SOL_SOCKET, SO_RCVBUF, &sock_buf, sizeof sock_buf);
+        unsigned int user_timeout_ms = SINK_USER_TIMEOUT_MS;
+        if (setsockopt(c, IPPROTO_TCP, TCP_USER_TIMEOUT,
+                       &user_timeout_ms, sizeof user_timeout_ms) < 0) {
+            perror("setsockopt TCP_USER_TIMEOUT");
+        }
+        int *cli_p = malloc(sizeof *cli_p);
+        if (!cli_p) {
+            perror("malloc");
+            close(c);
+            continue;
+        }
+        *cli_p = c;
         pthread_t t;
-        if (pthread_create(&t, NULL, handle, (void *)(long)c) != 0) {
+        if (pthread_create(&t, NULL, handle, cli_p) != 0) {
             perror("pthread_create");
+            free(cli_p);
             close(c);
             continue;
         }

@@ -6,12 +6,14 @@
 # peer host against that host's libc.
 
 CC ?= gcc
-CFLAGS ?= -O2 -Wall -Wextra
+CFLAGS ?= -O2 -Wall -Wextra -pthread
+
+all: linux-tcp-sink
 
 linux-tcp-sink: linux-tcp-sink.c
-	$(CC) $(CFLAGS) -o $@ $< -lpthread
+	$(CC) $(CFLAGS) -o $@ $<
 
 clean:
 	rm -f linux-tcp-sink
 
-.PHONY: clean
+.PHONY: all clean
