@@ -54,6 +54,10 @@ name = "parse_options"
 harness = false
 
 [[bench]]
+name = "build_segment"
+harness = false
+
+[[bench]]
 name = "throughput"
 harness = false
 
