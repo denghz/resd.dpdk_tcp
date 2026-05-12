@@ -10,7 +10,14 @@
 //! `bench_tcp_input_pure_ack` below.
 //!
 //! `bench_tcp_input_ooo_segment` measures the same for an OOO segment
-//! that queues into the reassembly buffer.
+//! that queues into the reassembly buffer. TS + SACK stay enabled on
+//! the conn AND on the incoming segment, matching production OOO
+//! traffic shape (handshake-negotiated TS means every subsequent
+//! segment carries a Timestamps option). The measurement covers PAWS
+//! validation plus the reassembly-queue enqueue — both are real
+//! production overhead. RFC 7323 §4.3 MUST-25 means an OOO segment
+//! (`seq > rcv_nxt`) does NOT update `ts_recent`, so the PAWS-accept
+//! branch fires without the ts_recent write.
 //!
 //! `bench_tcp_input_pure_ack` measures the pure-ACK left-edge advance
 //! path: no payload, `seq == rcv_nxt`, `ack > snd_una`. The dispatch
@@ -56,9 +63,9 @@ const TEST_SEND_BUF_BYTES: u32 = 256 * 1024;
 
 /// Shared ESTABLISHED-state conn construction. Mirrors the in-tree
 /// `tcp_input::tests::est_conn` shape; TS + SACK are opt-in per caller
-/// so the OOO bench (target 8) can measure reassembly-queue enqueue
-/// without PAWS early-rejecting segments that arrive without a
-/// Timestamps option.
+/// so the pure-ACK bench can drop SACK from the segment shape while
+/// the data and OOO benches keep TS+SACK enabled to match production
+/// traffic on a TS-negotiated connection.
 fn make_est_conn(
     iss: u32,
     irs: u32,
@@ -151,15 +158,28 @@ fn bench_tcp_input_data_segment(c: &mut Criterion) {
 fn bench_tcp_input_ooo_segment(c: &mut Criterion) {
     c.bench_function("bench_tcp_input_ooo_segment", |b| {
         // OOO segment: seq > rcv_nxt, so it queues into the reorder
-        // buffer. No options payload (matches the in-tree OOO test's
-        // minimalism at tcp_input.rs:1866).
+        // buffer. The conn has TS + SACK negotiated (matches a
+        // production handshake), and the incoming segment carries a
+        // Timestamps option with `tsval > ts_recent` so PAWS accepts.
         //
-        // IMPORTANT: TS stays disabled here. If `conn.ts_enabled` were
-        // true, `dispatch` would PAWS-early-reject any segment lacking
-        // a Timestamps option (tcp_input.rs:606-614), returning before
-        // touching the reassembly queue. The point of this target is
-        // to measure reassembly-queue enqueue cost (~200-400 ns per
-        // spec §11.2), not PAWS rejection (~27 ns).
+        // The measured cost on this path therefore includes both the
+        // PAWS validation (parse_options + the seq_lt(tsval,
+        // ts_recent) compare — ~27 ns in isolation per the data_segment
+        // target's accounting) AND the reassembly-queue enqueue. Both
+        // are real production overhead: a TS-negotiated connection runs
+        // PAWS on every received segment regardless of whether it's
+        // in-order or out-of-order.
+        //
+        // Note RFC 7323 §4.3 MUST-25: ts_recent only updates when
+        // `seq <= rcv_nxt`. With seq=5100 > rcv_nxt=5001, the
+        // ts_recent write at tcp_input.rs:858 is skipped — the
+        // PAWS-accept fast path runs without the write.
+        let peer_opts = TcpOpts {
+            timestamps: Some((0x0000_1000, 0xCAFEBABE)),
+            ..Default::default()
+        };
+        let mut opts_buf = [0u8; 40];
+        let opts_len = peer_opts.encode(&mut opts_buf).expect("encode opts");
         let payload = [0x42u8; 64];
 
         let mut fake_storage: Box<[u8; 256]> = Box::new([0u8; 256]);
@@ -173,7 +193,9 @@ fn bench_tcp_input_ooo_segment(c: &mut Criterion) {
         };
 
         b.iter_batched_ref(
-            || make_est_conn(1000, 5000, 1024, None, false),
+            // TS enabled (ts_recent=200) and SACK enabled to mirror
+            // production. PAWS accepts because tsval=0x1000 > 200.
+            || make_est_conn(1000, 5000, 1024, Some(200), true),
             |c| {
                 // seq=5100 > rcv_nxt=5001 → reassembly queue path.
                 let seg = ParsedSegment {
@@ -183,9 +205,9 @@ fn bench_tcp_input_ooo_segment(c: &mut Criterion) {
                     ack: 1001,
                     flags: TCP_ACK,
                     window: 65535,
-                    header_len: 20,
+                    header_len: 20 + opts_len,
                     payload: &payload,
-                    options: &[],
+                    options: &opts_buf[..opts_len],
                 };
                 let out = dispatch(
                     black_box(c),
