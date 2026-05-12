@@ -56,15 +56,16 @@
 //!   `snd_una` past 2 of them so the prune-write loop drops 2 entries
 //!   and rewrites the array head (tcp_sack.rs:82-101). Call site:
 //!   tcp_input.rs:982 (every advancing cumulative ACK).
-//! * `bench_retrans_push_after_tx` — `SendRetrans::with_capacity(192)`
-//!   pre-pushed to 16 entries, then one `push_after_tx` of a
-//!   `RetransEntry` literal. The deque is in steady-state (well past
-//!   first-push, well below capacity) so the timed push is a true
-//!   `VecDeque::push_back` amortized-O(1) with NO `reserve` or
-//!   realloc — mirrors the production construction at
-//!   tcp_conn.rs:448. Isolates the deque-push cost from T1's bundled
-//!   per-segment build path. Call site: engine.rs send loop (every
-//!   TX'd segment).
+//! * `bench_retrans_push_after_tx` — `SendRetrans::with_capacity(384)`
+//!   pre-pushed to 16 entries, then a BATCH=128 push loop measured via
+//!   `iter_custom` (PUSH_CAPACITY 384 = 16 pre-pushed + 128 batch + headroom,
+//!   so no realloc inside the timed region). Per outer iter the queue
+//!   resets to the 16-pre-pushed state — the deque is in steady-state
+//!   (well past first-push, well below capacity) so the timed push is a
+//!   true `VecDeque::push_back` amortized-O(1) with NO `reserve` or
+//!   realloc — mirrors the production construction at tcp_conn.rs:448.
+//!   Isolates the deque-push cost from T1's bundled per-segment build
+//!   path. Call site: engine.rs send loop (every TX'd segment).
 //! * `bench_retrans_prune_below_into_mbufs` — `SendRetrans` with 8
 //!   in-flight entries; advance `snd_una` past the first 4 so the
 //!   hot-path drain loop pops 4 entries into the engine scratch
