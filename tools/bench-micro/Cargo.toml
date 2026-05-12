@@ -47,6 +47,10 @@ name = "timer"
 harness = false
 
 [[bench]]
+name = "timer_advanced"
+harness = false
+
+[[bench]]
 name = "counters"
 harness = false
 
