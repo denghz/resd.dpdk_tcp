@@ -66,10 +66,12 @@
 //! # `black_box` discipline
 //!
 //! - Lookups: `black_box(&tuple)` on input prevents the optimizer from
-//!   constant-folding the HashMap probe against a setup-time-known key;
-//!   `black_box(result)` on the returned `Option<ConnHandle>` prevents
-//!   DCE of the call. The accumulator XOR-fold inside `iter_custom`
-//!   batches also forces the per-lookup result to be observed.
+//!   constant-folding the HashMap probe against a setup-time-known key.
+//!   The per-call return value is then XOR-folded into a u64 accumulator
+//!   (`acc ^= h.unwrap_or(0) as u64`) inside the `iter_custom` BATCH loop,
+//!   and the accumulator is `black_box`'d once per outer-iter — this
+//!   makes every per-call lookup observable to LLVM without paying a
+//!   `black_box(result)` round-trip on the closure stack per call.
 //! - Inserts: `iter_batched_ref` rebuilds the table state per iter; the
 //!   inserted `TcpConn` and `black_box` on the table reference defeat
 //!   constant-folding of the `iter().position` scan.
@@ -96,12 +98,15 @@
 //!   fires when the rotation index hits a cold bucket.
 //! - `miss` ~10-30 ns. HashMap bucket walk for absent key; std's
 //!   RandomState typically keeps the probe chain short.
-//! - `insert_empty` ~0.5-2 µs. One-slot scan + HashMap insert + the
-//!   per-iter FlowTable drop (64-slot Vec + HashMap) — the
-//!   `iter_batched_ref` setup+drop pair runs within the measurement
-//!   window per sample.
-//! - `insert_half_full_4k` ~2-10 µs. 2048-slot `Option::is_none` scan
-//!   + HashMap insert + the half-full table's drop.
+//! - `insert_empty` ~0.5-2 µs. One-slot scan + HashMap insert. Criterion's
+//!   `iter_batched_ref` times only the routine call between
+//!   `measurement.start()` and `measurement.end()` (criterion 0.5
+//!   `bencher.rs:341-343`); the per-iter `FlowTable` setup and the
+//!   post-call drop run OUTSIDE the timed window. The reported number is
+//!   the per-insert cost, not setup+insert+drop.
+//! - `insert_half_full_4k` ~2-10 µs. 2048-slot `Option::is_none` scan +
+//!   HashMap insert. Same setup-and-drop-outside-timed-region semantics
+//!   as `insert_empty`.
 //!
 //! The exact numbers vary across runs because std `RandomState` re-seeds
 //! the HashMap per process. The shape comparison (varied_16 ≈ hot at
@@ -203,9 +208,13 @@ fn bench_flow_lookup_varied_16(c: &mut Criterion) {
     bench_varied_lookup(c, "bench_flow_lookup_varied_16", &ft, &tuples);
 }
 
-/// 256 populated entries. At ~40 B per HashMap entry + ~16 B per
-/// `Option<TcpConn>` slot pointer surface, 256 entries spill out of L1d
-/// on most server cores (Zen4 L1d = 32 KiB). Still L2-resident.
+/// 256 populated entries. `FlowTable::slots` is a `Vec<Option<TcpConn>>`
+/// (flow_table.rs:102-104) where each slot is an inline `Option<TcpConn>`
+/// (TcpConn ~128 B + Option discriminant) — 256 entries occupy ~32 KiB
+/// of slot storage alone, which is the full Zen4 L1d. The HashMap's
+/// per-bucket footprint is smaller (entry pointers, not whole conns).
+/// Lookup touches only one bucket + one slot, so cache effects vary
+/// with index rotation rather than table size.
 fn bench_flow_lookup_varied_256(c: &mut Criterion) {
     let (ft, tuples) = populate_table(512, 256);
     bench_varied_lookup(c, "bench_flow_lookup_varied_256", &ft, &tuples);
