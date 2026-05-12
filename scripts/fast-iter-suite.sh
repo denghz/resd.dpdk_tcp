@@ -433,9 +433,16 @@ preflight() {
     fi
     log "preflight: DUT $DUT_PCI bound to vfio-pci OK"
 
-    # Reset the peer's :10001 echo-server so we start with no stale ESTAB
-    # connections holding worker slots.
+    # Reset the peer's :10001 echo-server + :10003 burst-echo-server so we
+    # start with no stale ESTAB connections holding worker slots. These are
+    # the ONLY preemptive restarts in the suite — the hardened servers
+    # (T56 v4, 2026-05-12: pthread-per-conn + TCP_USER_TIMEOUT=5s) self-
+    # recover from a DUT-side SIGKILL within ~5 s, so we no longer restart
+    # between every arm. The pre-suite restart remains as a defensive
+    # safety net in case the peer is still running the un-hardened
+    # binaries.
     peer_restart_echo_server
+    peer_restart_burst_echo_server
 
     # linux_kernel arm routing — see header.
     if [ "$LINUX_KERNEL_VIA_NSENTER" = "1" ]; then
@@ -472,7 +479,6 @@ run_bench_rtt() {
                 --payload-bytes-sweep 64,128,256,1024 \
                 --iterations 10000 --warmup 100
     reset_dpdk_state
-    peer_restart_echo_server
 
     # linux_kernel → host-netns wrapper + real peer (default) OR local-loopback (fallback).
     run_one "bench-rtt linux_kernel" \
@@ -507,7 +513,6 @@ run_bench_rtt() {
                 --payload-bytes-sweep 64,128,256,1024 \
                 --iterations 10000 --warmup 100
     reset_dpdk_state
-    peer_restart_echo_server
 }
 
 # bench-tx-burst
@@ -533,7 +538,6 @@ run_bench_tx_burst() {
                 --gap-mss 0,10 \
                 --bursts-per-bucket 200 --warmup 20
     reset_dpdk_state
-    peer_restart_echo_server
 
     # linux_kernel → host-netns wrapper + real peer (default) OR local-loopback (fallback).
     run_one "bench-tx-burst linux_kernel" \
@@ -570,7 +574,6 @@ run_bench_tx_burst() {
                 --gap-mss 0,10 \
                 --bursts-per-bucket 200 --warmup 20
     reset_dpdk_state
-    peer_restart_echo_server
 }
 
 # bench-tx-maxtp
@@ -596,7 +599,6 @@ run_bench_tx_maxtp() {
                 --conn-counts 1,4,16 \
                 --warmup-secs 2 --duration-secs 10
     reset_dpdk_state
-    peer_restart_echo_server
 
     # linux_kernel → host-netns wrapper + real peer's :10002 linux-tcp-sink
     # (default) OR local-loopback fallback. The `--local-ip` flag is
@@ -638,18 +640,16 @@ run_bench_tx_maxtp() {
                 --conn-counts 1,4,16 \
                 --warmup-secs 2 --duration-secs 10
     reset_dpdk_state
-    peer_restart_echo_server
 }
 
 # bench-rx-burst
 run_bench_rx_burst() {
     log "=== bench-rx-burst — W x N grid (W={64,128,256}, N={16,64,256}) ==="
 
-    # Restart the peer's burst-echo-server before EACH rx-burst arm: a
-    # SIGKILLed prior arm (timeout/crash) leaves the peer's single-threaded
-    # burst-echo-server stuck in write() to a dead DUT, blocking the next
-    # arm's BURST command. Mirror of the echo-server restart pattern.
-    peer_restart_burst_echo_server
+    # T56 v4 (2026-05-12): preflight already restarted burst-echo-server.
+    # The hardened server (pthread-per-conn + TCP_USER_TIMEOUT=5s) clears
+    # wedged worker threads within 5 s, so we no longer need to restart it
+    # between arms.
 
     run_one "bench-rx-burst dpdk_net" \
         "$RESULTS_DIR/bench-rx-burst-dpdk_net.csv" \
@@ -670,7 +670,6 @@ run_bench_rx_burst() {
                 --burst-counts 16,64,256 \
                 --measure-bursts 200 --warmup-bursts 20
     reset_dpdk_state
-    peer_restart_burst_echo_server
 
     # linux_kernel → host-netns wrapper + real peer (default) OR local-loopback (fallback).
     run_one "bench-rx-burst linux_kernel" \
@@ -686,8 +685,6 @@ run_bench_rx_burst() {
             --segment-sizes 64,128,256 \
             --burst-counts 16,64,256 \
             --measure-bursts 200 --warmup-bursts 20
-
-    peer_restart_burst_echo_server
 
     run_one "bench-rx-burst fstack" \
         "$RESULTS_DIR/bench-rx-burst-fstack.csv" \
