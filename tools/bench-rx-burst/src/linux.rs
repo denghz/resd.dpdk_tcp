@@ -16,6 +16,23 @@
 //! captured immediately on return. Non-blocking + epoll would add
 //! poll overhead to the very thing we're measuring.
 //!
+//! # No SO_RCVTIMEO on the read path
+//!
+//! Crucially, the stream is left with `read_timeout() == None`. A
+//! prior version set `set_read_timeout(Some(BURST_TIMEOUT))` to bound
+//! a wedged peer; that turned `read()` into a timed-block which
+//! surfaces `ErrorKind::WouldBlock` (EAGAIN, errno 11) when the
+//! kernel buffer is empty at the timeout. Live verification on
+//! 2026-05-12 hit this on warmup burst 0: with `BURST_TIMEOUT=60s`
+//! the failure was a peer-initialization race, but ANY transient
+//! peer slowness would surface as a spurious EAGAIN. The trading-
+//! latency contract is "blocking sockets either succeed or block";
+//! a wedged peer is the operator's signal to ctrl-C, NOT a bench
+//! arm error. The dpdk arm uses a wall-clock `STALL_TIMEOUT`
+//! watchdog instead; the linux arm leans on the operator since
+//! kernel `read()` does not have an out-of-band cancel path that
+//! doesn't risk EAGAIN.
+//!
 //! # Clock model
 //!
 //! All three arms anchor on CLOCK_REALTIME on both peer and DUT:
@@ -51,8 +68,13 @@ use crate::segment::{parse_burst_chunk, SegmentRecord};
 /// as `bench-rtt::linux_kernel::CONNECT_TIMEOUT`.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Per-burst RX deadline against wedge.
-const BURST_TIMEOUT: Duration = Duration::from_secs(60);
+/// Per-burst write-side deadline. Writes a small BURST command with
+/// TCP_NODELAY enabled — should never block long, but a wedged peer
+/// kernel could swallow the write into a full socket buffer; the
+/// deadline surfaces that as a visible error rather than letting the
+/// bench hang in `write()`. The read path is INTENTIONALLY left with
+/// no SO_RCVTIMEO — see the module-level "No SO_RCVTIMEO" note.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Per-bucket configuration. Caller owns `stream`.
 pub struct LinuxRxBurstCfg<'a> {
@@ -83,11 +105,15 @@ pub fn open_control_connection(
     stream
         .set_nodelay(true)
         .context("set_nodelay on linux burst-echo control stream")?;
+    // DO NOT call set_read_timeout here. SO_RCVTIMEO turns `read()`
+    // into a timed-block that surfaces ErrorKind::WouldBlock (EAGAIN,
+    // errno 11) when the kernel buffer is empty at the deadline. The
+    // RX-burst arm must be deterministic-blocking: succeed or block,
+    // never EAGAIN. See the module-level "No SO_RCVTIMEO" note and the
+    // `open_control_connection_leaves_read_timeout_unset` regression
+    // test for the 2026-05-12 bug history.
     stream
-        .set_read_timeout(Some(BURST_TIMEOUT))
-        .context("set_read_timeout pre-bucket")?;
-    stream
-        .set_write_timeout(Some(BURST_TIMEOUT))
+        .set_write_timeout(Some(WRITE_TIMEOUT))
         .context("set_write_timeout pre-bucket")?;
     Ok(stream)
 }
@@ -272,6 +298,67 @@ mod tests {
         (0x7F00_0001u32, port)
     }
 
+    /// Spawn a peer that delays the burst response by `delay`, so the
+    /// DUT-side read() blocks for `delay` before seeing data. Used to
+    /// prove the socket is truly blocking and EAGAIN is not surfaced.
+    fn spawn_slow_burst_peer(delay: Duration) -> (u32, u16) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                s.set_nodelay(true).ok();
+                let mut line = Vec::with_capacity(64);
+                let mut byte = [0u8; 1];
+                'cmd_loop: loop {
+                    line.clear();
+                    loop {
+                        match s.read(&mut byte) {
+                            Ok(0) => break 'cmd_loop,
+                            Ok(_) => {
+                                line.push(byte[0]);
+                                if byte[0] == b'\n' {
+                                    break;
+                                }
+                            }
+                            Err(_) => break 'cmd_loop,
+                        }
+                    }
+                    let cmd = String::from_utf8_lossy(&line).into_owned();
+                    if cmd.starts_with("BURST ") {
+                        let parts: Vec<&str> = cmd.trim().split_whitespace().collect();
+                        if parts.len() != 3 {
+                            continue;
+                        }
+                        let n: u64 = parts[1].parse().unwrap_or(0);
+                        let w: usize = parts[2].parse().unwrap_or(0);
+                        if w < 16 {
+                            continue;
+                        }
+                        // Inject the delay BEFORE any byte hits the
+                        // wire — this is what stalls the DUT's read().
+                        thread::sleep(delay);
+                        let mut buf = vec![0u8; w];
+                        for i in 0..n {
+                            buf[..8].copy_from_slice(&i.to_be_bytes());
+                            let peer_ns = 1_000_000u64 + i * 1_000;
+                            buf[8..16].copy_from_slice(&peer_ns.to_be_bytes());
+                            for k in 16..w {
+                                buf[k] = 0;
+                            }
+                            if s.write_all(&buf).is_err() {
+                                break 'cmd_loop;
+                            }
+                        }
+                    } else if cmd.starts_with("QUIT") {
+                        break;
+                    }
+                }
+            }
+        });
+        (0x7F00_0001u32, port)
+    }
+
     #[test]
     fn run_bucket_against_in_process_peer_emits_expected_record_count() {
         let (ip, port) = spawn_burst_peer();
@@ -293,5 +380,62 @@ mod tests {
             assert_eq!(rec.seg_idx, (i as u64) % 8);
             assert!(rec.peer_send_ns > 0);
         }
+    }
+
+    /// Regression test for the 2026-05-12 EAGAIN bug: the linux arm
+    /// must use deterministically blocking I/O. A `read_timeout` set
+    /// on the kernel TcpStream causes `read()` to surface
+    /// `ErrorKind::WouldBlock` (errno EAGAIN, os error 11) when the
+    /// timeout fires before any data arrives — which the burst-echo-
+    /// server protocol can hit if the peer is briefly slow on the
+    /// first response (cold-cache effects, NIC IRQ coalescing, peer
+    /// initialization race, etc.). Asserting `read_timeout() == None`
+    /// post-`open_control_connection` pins the contract: the linux
+    /// arm is deterministic-blocking, never EAGAIN-on-timeout.
+    ///
+    /// This test fails on the buggy code (which set
+    /// `set_read_timeout(Some(BURST_TIMEOUT))`) and passes after the
+    /// timeout is removed.
+    #[test]
+    fn open_control_connection_leaves_read_timeout_unset() {
+        let (ip, port) = spawn_burst_peer();
+        let stream = open_control_connection(ip, port).unwrap();
+        assert_eq!(
+            stream.read_timeout().expect("read_timeout() syscall"),
+            None,
+            "linux arm must use deterministically blocking reads — \
+             set_read_timeout(Some(_)) on the kernel TcpStream causes \
+             read() to surface EAGAIN on timeout, which the bench then \
+             reports as 'burst N read: Resource temporarily unavailable'"
+        );
+    }
+
+    /// End-to-end check that the linux arm tolerates a peer that is
+    /// briefly slow to respond (200ms). With the buggy
+    /// `set_read_timeout(Some(BURST_TIMEOUT))` the 60-second deadline
+    /// is huge so this test wouldn't surface the EAGAIN per se — the
+    /// failure mode in the field is the SAME read_timeout firing on
+    /// a hung peer. The companion contract test above
+    /// (`open_control_connection_leaves_read_timeout_unset`) is the
+    /// one that fails on the buggy code; this test asserts the run
+    /// still completes correctly with a real delay on the wire, so
+    /// the fix doesn't accidentally regress the happy path.
+    #[test]
+    fn run_bucket_tolerates_slow_peer_response_without_eagain() {
+        let (ip, port) = spawn_slow_burst_peer(Duration::from_millis(200));
+        let mut stream = open_control_connection(ip, port).unwrap();
+        let mut cfg = LinuxRxBurstCfg {
+            stream: &mut stream,
+            bucket_id: 0,
+            segment_size: 64,
+            burst_count: 16,
+            warmup_bursts: 1,
+            measure_bursts: 1,
+        };
+        let run = run_bucket(&mut cfg).expect(
+            "run_bucket against slow peer must not surface EAGAIN — \
+             blocking sockets either succeed or block",
+        );
+        assert_eq!(run.samples.len(), 16);
     }
 }
