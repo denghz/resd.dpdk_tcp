@@ -102,25 +102,44 @@
 //! mileage will vary, especially for `_fires_64` which depends on
 //! system allocator behavior under sustained 1-per-iter heap pressure):
 //!
-//! - `add_only` ~100 ns. Includes per-iter `EngineNoEalHarness::new`
-//!   cold-cache effect plus the harness `&mut self.timer_wheel` indirection
-//!   ahead of the wheel call. The wheel's own work: free-list pop (or
-//!   slots-grow on cold wheel) + level/bucket math + `Vec::push` of one u32
-//!   + slot Option write.
+//! Important: criterion's `iter_batched_ref` times ONLY the routine call
+//! (between `measurement.start()` and `measurement.end()`, criterion 0.5
+//! bencher.rs:355,358-360); the per-iter `EngineNoEalHarness::new` setup
+//! and the post-call drop run OUTSIDE the timed window. So the numbers
+//! below are wheel-operation costs against a freshly-prepared but
+//! possibly-cold-cache wheel state, NOT setup amortization.
+//!
+//! - `add_only` ~100 ns. The wheel's add work against an empty wheel:
+//!   harness `&mut self.timer_wheel` indirection + free-list pop (or
+//!   slots-grow on cold wheel) + level/bucket math + `Vec::push` of one
+//!   u32 + slot Option write.
 //! - `cancel_only` ~60 ns. `slots.get_mut` + generation compare +
-//!   tombstone bit flip; no bucket touch. Less work than add but
-//!   the per-iter setup adds one timer first, so cold-cache effects
-//!   still inflate the absolute number vs the spec's pure-cancel
-//!   theoretical floor of ~10-30 ns.
+//!   tombstone bit flip; no bucket touch. Setup pre-adds one timer
+//!   (outside the timed region), so the measured region cancels exactly
+//!   one timer per iter. Less work than add — the asymmetry the existing
+//!   `bench_timer_add_cancel` round-trip hides.
 //! - `advance_fires_1` ~300 ns. 1-tick cursor advance + level-0
 //!   bucket walk of 1 entry + slot.take + SmallVec push (inline). The
 //!   first cursor tick of a fresh wheel also pays a one-time `last_tick`
 //!   write.
-//! - `advance_fires_8` ~480 ns. Same per-bucket walk shape, 8
-//!   slot.take + 8 SmallVec pushes (all inline). Inline storage means
-//!   no heap allocation in the timed region.
-//! - `advance_fires_64` ~1.3 µs. 64 slot.take + 64 SmallVec pushes
-//!   (first ~56 force heap-spill) + one allocation for the spill.
+//! - `advance_fires_8` ~480 ns. Same per-bucket walk shape, 8 slot.take
+//!   + 8 SmallVec pushes (all inline — SmallVec capacity is exactly 8).
+//!   No heap allocation in the timed region.
+//! - `advance_fires_64` ~1.3 µs. 64 slot.take + 64 SmallVec pushes;
+//!   the 9th push exceeds inline capacity and triggers one heap
+//!   allocation, and the remaining 55 pushes write into the heap
+//!   backing. The ~2.5x jump vs `_fires_8` is dominated by the
+//!   allocation + the 56 extra slot.take+push operations.
+//!
+//! Production realism caveat: the advance variants put all N firing
+//! timers in a SINGLE level-0 bucket, so `advance` walks one bucket and
+//! drains N entries. Production timers are typically spread across many
+//! buckets (one RTO timer per active conn, scheduled at different
+//! deadlines) — production `advance` typically walks N buckets each
+//! holding ~1 timer, not 1 bucket holding N timers. The bench's
+//! one-bucket-burst shape is a worst-case-per-bucket measurement,
+//! useful for surfacing the per-fire cost in isolation; it is NOT the
+//! shape of typical production `advance` per tick.
 //!
 //! These are shape expectations; the comparison `_fires_8` (~480 ns)
 //! vs `_fires_64` (~1.3 µs) exposing a ~2.5x jump that includes the
