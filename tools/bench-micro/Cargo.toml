@@ -50,6 +50,10 @@ name = "counters"
 harness = false
 
 [[bench]]
+name = "parse_options"
+harness = false
+
+[[bench]]
 name = "throughput"
 harness = false
 
