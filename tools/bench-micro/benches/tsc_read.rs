@@ -92,10 +92,17 @@ fn bench_rdtsc_raw(c: &mut Criterion) {
     c.bench_function("bench_rdtsc_raw", |b| {
         // `clock::rdtsc` is `#[inline(always)]` and wraps the
         // `core::arch::x86_64::_rdtsc` intrinsic — no conversion, no
-        // FFI. Reports the absolute floor: a single TSC read in cycles
-        // (~7-25 cycles on modern x86_64). Returns raw TSC ticks, not
-        // nanoseconds; downstream code that needs ns pays the
-        // additional scaled-multiply in `now_ns`.
+        // FFI. Returns raw TSC ticks, not nanoseconds; downstream code
+        // that needs ns pays the additional scaled-multiply in `now_ns`.
+        //
+        // Caveat on absolute number: with `iter_custom` + `Instant::now()`
+        // + BATCH=128 loop overhead, the reported ns/call is
+        // harness-influenced — the underlying `_rdtsc` intrinsic is
+        // ~25-30 cycles on modern x86_64, but `Instant::now()` resolution
+        // (~1-3 ns on this host) plus loop-overhead inflate the observed
+        // number to ~15 ns. The bench bounds the per-call cost and lets
+        // us compare `bench_rdtsc_raw` vs `bench_now_ns` vs
+        // `bench_tsc_read_ffi`; it is NOT a tight floor on raw _rdtsc.
         //
         // `iter_custom`: see `bench_tsc_read_ffi` for batching rationale.
         b.iter_custom(|iters| {

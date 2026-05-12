@@ -11,7 +11,8 @@
 //!    them surfaces which half dominates.
 //!
 //! 2. The **`advance` path with FIRING timers.** The existing idle-poll
-//!    bench (`bench_poll_idle_with_timers` in poll.rs) pre-populates with
+//!    bench (`bench_poll_scheduler_tick_idle_with_timers` in poll.rs,
+//!    renamed from `bench_poll_idle_with_timers` in T11) pre-populates with
 //!    256 timers scheduled at `u64::MAX / 2` so `advance` walks an empty
 //!    level-0 chain on every iter (the timers never fire). T10 adds three
 //!    variants where the level-0 bucket contains N firing timers and
