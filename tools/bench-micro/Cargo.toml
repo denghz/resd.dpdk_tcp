@@ -58,6 +58,10 @@ name = "build_segment"
 harness = false
 
 [[bench]]
+name = "rx_prelude"
+harness = false
+
+[[bench]]
 name = "throughput"
 harness = false
 
