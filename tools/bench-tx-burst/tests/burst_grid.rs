@@ -309,6 +309,175 @@ fn emit_bucket_rows_dimensions_json_matches_spec_11_3_shape() {
     assert!(seen_steady, "burst_steady_bps row missing");
 }
 
+// ---------------------------------------------------------------------------
+// T57 follow-up #2: per-arm metric-name labelling.
+//
+// Misleading-metric bug: `throughput_per_burst_bps` was emitted on EVERY
+// arm, but the linux_kernel and fstack arms capture t1 after
+// `write()` / `ff_write()` returns — i.e. when bytes are accepted into
+// the kernel/F-Stack send buffer, NOT when bytes leave the NIC. The
+// dpdk_net arm captures t1 at `rte_eth_tx_burst`-return which IS a
+// wire-rate proxy. Emitting the same metric_name on both arms led
+// readers to compare buffer-fill rates against wire rates (linux/fstack
+// "65 Gbps" vs dpdk_net "1 Gbps" on a 10 Gbps line).
+//
+// Fix: emit `write_acceptance_rate_bps` on linux_kernel + fstack rows;
+// keep `throughput_per_burst_bps` on dpdk_net rows. Same `bits_per_sec`
+// unit; same per-bucket aggregation count (7 rows × 3 metrics = 21).
+// ---------------------------------------------------------------------------
+
+fn emit_one_bucket_and_collect_metric_names(stack: Stack) -> Vec<String> {
+    let bucket = Bucket::new(64 * 1024, 0);
+    let samples: Vec<BurstSample> = (0..100)
+        .map(|i| {
+            let t0 = (i as u64) * 1_000;
+            BurstSample::from_timestamps(64 * 1024, t0, t0 + 100, t0 + 1_000)
+        })
+        .collect();
+    // Linux + fstack rows historically carry no tx_ts_mode; dpdk_net
+    // rows carry one. Both shapes are valid for this test.
+    let tx_ts_mode = match stack {
+        Stack::DpdkNet => Some(TxTsMode::TscFallback),
+        _ => None,
+    };
+    let agg = BucketAggregate::from_samples(bucket, stack, &samples, BucketVerdict::Ok, tx_ts_mode);
+    let metadata = sample_metadata();
+    let mut buf = Vec::new();
+    {
+        let mut w = csv::Writer::from_writer(&mut buf);
+        bench_tx_burst::burst::emit_bucket_rows(
+            &mut w,
+            &metadata,
+            "bench-tx-burst",
+            "trading-latency",
+            &agg,
+        )
+        .unwrap();
+        w.flush().unwrap();
+    }
+    let mut reader = csv::Reader::from_reader(buf.as_slice());
+    let headers = reader.headers().unwrap().clone();
+    let metric_name_idx = headers.iter().position(|h| h == "metric_name").unwrap();
+    let mut metric_names = Vec::new();
+    for rec in reader.records() {
+        let rec = rec.unwrap();
+        metric_names.push(rec.get(metric_name_idx).unwrap().to_string());
+    }
+    metric_names
+}
+
+#[test]
+fn linux_arm_emits_write_acceptance_rate_not_throughput() {
+    // T57 follow-up #2: linux_kernel rows MUST NOT carry
+    // `throughput_per_burst_bps` (that name claims wire-rate
+    // calibration the linux arm doesn't have). Instead, the linux
+    // arm's primary metric is `write_acceptance_rate_bps`.
+    let names = emit_one_bucket_and_collect_metric_names(Stack::LinuxKernel);
+    assert!(
+        !names.iter().any(|n| n == "throughput_per_burst_bps"),
+        "linux_kernel row should NOT emit throughput_per_burst_bps; got names: {names:?}"
+    );
+    let primary_count = names
+        .iter()
+        .filter(|n| *n == "write_acceptance_rate_bps")
+        .count();
+    assert_eq!(
+        primary_count, 7,
+        "linux_kernel row should emit 7 write_acceptance_rate_bps rows (p50/p99/p999/mean/stddev/ci95_lo/ci95_hi); got names: {names:?}"
+    );
+    // Secondary metrics keep their historical names — the
+    // initiation/steady decomposition is the same shape across arms.
+    assert!(
+        names.iter().any(|n| n == "burst_initiation_ns"),
+        "linux_kernel row should still emit burst_initiation_ns; got names: {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n == "burst_steady_bps"),
+        "linux_kernel row should still emit burst_steady_bps; got names: {names:?}"
+    );
+}
+
+#[test]
+fn fstack_arm_emits_write_acceptance_rate_not_throughput() {
+    // Same shape as the linux assertion: fstack captures t1 after
+    // `ff_write` returns → buffer-fill rate → same metric label
+    // `write_acceptance_rate_bps`.
+    let names = emit_one_bucket_and_collect_metric_names(Stack::Fstack);
+    assert!(
+        !names.iter().any(|n| n == "throughput_per_burst_bps"),
+        "fstack row should NOT emit throughput_per_burst_bps; got names: {names:?}"
+    );
+    let primary_count = names
+        .iter()
+        .filter(|n| *n == "write_acceptance_rate_bps")
+        .count();
+    assert_eq!(
+        primary_count, 7,
+        "fstack row should emit 7 write_acceptance_rate_bps rows; got names: {names:?}"
+    );
+}
+
+#[test]
+fn dpdk_arm_still_emits_throughput_per_burst_bps() {
+    // dpdk_net's t1 is captured at `rte_eth_tx_burst`-return → wire-
+    // rate proxy → keeps the historical `throughput_per_burst_bps`
+    // label. Asymmetric on purpose: same physical metric concept,
+    // different completion semantics, different name. Readers can
+    // grep on metric_name to tell them apart.
+    let names = emit_one_bucket_and_collect_metric_names(Stack::DpdkNet);
+    assert!(
+        !names.iter().any(|n| n == "write_acceptance_rate_bps"),
+        "dpdk_net row should NOT emit write_acceptance_rate_bps; got names: {names:?}"
+    );
+    let primary_count = names
+        .iter()
+        .filter(|n| *n == "throughput_per_burst_bps")
+        .count();
+    assert_eq!(
+        primary_count, 7,
+        "dpdk_net row should emit 7 throughput_per_burst_bps rows; got names: {names:?}"
+    );
+}
+
+#[test]
+fn invalid_bucket_marker_row_uses_per_arm_metric_name() {
+    // The invalid-verdict marker row also picks up the per-arm
+    // metric name — otherwise the linux/fstack invalid markers would
+    // still claim wire-rate calibration even though they record
+    // metric_value=0.0.
+    let bucket = Bucket::new(16 << 20, 100);
+    let agg = BucketAggregate::from_samples(
+        bucket,
+        Stack::LinuxKernel,
+        &[],
+        BucketVerdict::Invalid("NIC-bound".to_string()),
+        None,
+    );
+    let metadata = sample_metadata();
+    let mut buf = Vec::new();
+    {
+        let mut w = csv::Writer::from_writer(&mut buf);
+        bench_tx_burst::burst::emit_bucket_rows(
+            &mut w,
+            &metadata,
+            "bench-tx-burst",
+            "trading-latency",
+            &agg,
+        )
+        .unwrap();
+        w.flush().unwrap();
+    }
+    let mut reader = csv::Reader::from_reader(buf.as_slice());
+    let headers = reader.headers().unwrap().clone();
+    let metric_name_idx = headers.iter().position(|h| h == "metric_name").unwrap();
+    let rec = reader.records().next().unwrap().unwrap();
+    assert_eq!(
+        rec.get(metric_name_idx).unwrap(),
+        "write_acceptance_rate_bps",
+        "linux_kernel invalid-bucket marker row should use the buffer-fill metric name"
+    );
+}
+
 fn sample_metadata() -> bench_common::run_metadata::RunMetadata {
     use bench_common::preconditions::{PreconditionMode, Preconditions};
     bench_common::run_metadata::RunMetadata {

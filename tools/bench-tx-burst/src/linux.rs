@@ -29,13 +29,21 @@
 //!
 //! Linux kernel TCP doesn't expose NIC HW TX timestamps to user-space
 //! through the `TcpStream` API — we mark `tx_ts_mode = "n/a"` on the
-//! resulting CSV rows. The primary metric is still
-//! `throughput_per_burst_bps = K / (t1 - t0)` measured with
-//! `Instant::now()`; secondary `burst_initiation_ns` and
-//! `burst_steady_bps` mirror the dpdk arm but use the same
-//! `Instant::now()` clock for `t_first_wire` (right after the first
-//! `write` call returns) — the asymmetry vs the dpdk arm's TSC-at-
-//! NIC capture is documented in the bucket's `dimensions_json`.
+//! resulting CSV rows. The primary metric on this arm is
+//! `write_acceptance_rate_bps = K / (t1 - t0)` measured with
+//! `Instant::now()` — t1 is captured right after the final
+//! `write_all` returns, when the kernel has accepted all K bytes into
+//! its send buffer but has NOT necessarily put them on the wire. We
+//! deliberately use a DIFFERENT metric name from the dpdk_net arm's
+//! `throughput_per_burst_bps` (which captures t1 at
+//! `rte_eth_tx_burst`-return ≈ wire-rate) so downstream readers don't
+//! conflate buffer-fill rate with wire rate; see
+//! `Stack::throughput_metric_name` (T57 follow-up #2). Secondary
+//! `burst_initiation_ns` and `burst_steady_bps` mirror the dpdk arm
+//! but use the same `Instant::now()` clock for `t_first_wire` (right
+//! after the first `write` call returns) — the asymmetry vs the dpdk
+//! arm's TSC-at-NIC capture is documented in the bucket's
+//! `dimensions_json`.
 //!
 //! # Per-conn contract
 //!

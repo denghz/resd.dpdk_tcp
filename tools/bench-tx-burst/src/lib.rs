@@ -57,6 +57,45 @@ impl Stack {
         }
     }
 
+    /// CSV `metric_name` for the per-burst throughput sample on this
+    /// stack. Per-arm completion semantics diverge in a way that
+    /// matters for downstream readers (T57 follow-up #2):
+    ///
+    /// - `dpdk_net` captures `t1` at `rte_eth_tx_burst` return — the
+    ///   closest user-space-observable point to "segment N hit the
+    ///   wire". K / (t1 − t0) approximates wire rate. We emit
+    ///   `throughput_per_burst_bps` on dpdk_net rows.
+    /// - `linux_kernel` captures `t1` after `write_all` returns —
+    ///   `write()` accepts bytes into the kernel send buffer and
+    ///   returns long before the bytes leave the NIC. K / (t1 − t0)
+    ///   is the rate the kernel ingests payload, NOT wire rate. We
+    ///   emit `write_acceptance_rate_bps` to make this explicit and
+    ///   prevent the misleading "linux is 60× faster than dpdk_net"
+    ///   reading that the legacy unified metric name produced.
+    /// - `fstack` is the same shape as linux_kernel — `ff_write`
+    ///   accepts into F-Stack's BSD-shaped send buffer, returns
+    ///   before the segment hits the wire. Same `write_acceptance_rate_bps`
+    ///   label.
+    ///
+    /// Once `Engine::last_tx_hw_ts` lands (or F-Stack exposes a HW-TS
+    /// hook), the linux/fstack rows can flip back to wire-rate-
+    /// calibrated by capturing t1 from the NIC HW timestamp instead.
+    /// Until then, the metric name advertises the measurement gap.
+    pub const fn throughput_metric_name(self) -> &'static str {
+        match self {
+            Stack::DpdkNet => "throughput_per_burst_bps",
+            Stack::LinuxKernel | Stack::Fstack => "write_acceptance_rate_bps",
+        }
+    }
+
+    /// True iff this stack's `throughput_metric_name()` value
+    /// approximates wire rate (t1 captured at NIC-egress proxy).
+    /// False for stacks where t1 is captured after `write()`-accepts
+    /// into a software send buffer.
+    pub const fn throughput_is_wire_rate_calibrated(self) -> bool {
+        matches!(self, Stack::DpdkNet)
+    }
+
     /// Parse a single token from CLI input. Accepts both kebab-case
     /// and snake_case forms for the operator's convenience.
     pub fn parse(s: &str) -> Result<Self, String> {
@@ -96,5 +135,36 @@ mod tests {
         assert_eq!(Stack::DpdkNet.as_dimension(), "dpdk_net");
         assert_eq!(Stack::LinuxKernel.as_dimension(), "linux_kernel");
         assert_eq!(Stack::Fstack.as_dimension(), "fstack");
+    }
+
+    // T57 follow-up #2: per-arm metric-name + calibration accessors so
+    // downstream readers can tell wire-rate (dpdk_net) apart from
+    // buffer-fill rate (linux_kernel, fstack).
+    #[test]
+    fn stack_throughput_metric_name_distinguishes_wire_from_buffer() {
+        // dpdk_net captures t1 at rte_eth_tx_burst-return → wire-rate
+        // proxy → keeps the historical name.
+        assert_eq!(
+            Stack::DpdkNet.throughput_metric_name(),
+            "throughput_per_burst_bps"
+        );
+        // linux_kernel and fstack capture t1 after write()/ff_write()
+        // returns → measures buffer-acceptance rate, NOT wire rate →
+        // emits write_acceptance_rate_bps.
+        assert_eq!(
+            Stack::LinuxKernel.throughput_metric_name(),
+            "write_acceptance_rate_bps"
+        );
+        assert_eq!(
+            Stack::Fstack.throughput_metric_name(),
+            "write_acceptance_rate_bps"
+        );
+    }
+
+    #[test]
+    fn stack_throughput_is_wire_rate_calibrated_only_for_dpdk_net() {
+        assert!(Stack::DpdkNet.throughput_is_wire_rate_calibrated());
+        assert!(!Stack::LinuxKernel.throughput_is_wire_rate_calibrated());
+        assert!(!Stack::Fstack.throughput_is_wire_rate_calibrated());
     }
 }

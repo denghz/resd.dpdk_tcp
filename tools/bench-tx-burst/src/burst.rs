@@ -376,6 +376,14 @@ pub fn emit_bucket_rows<W: std::io::Write>(
         aggregate.tx_ts_mode.map(|m| m.as_str()),
     );
 
+    // T57 follow-up #2: per-arm metric name. dpdk_net keeps the
+    // historical `throughput_per_burst_bps` (t1 captured at
+    // rte_eth_tx_burst-return ≈ wire rate); linux_kernel and fstack
+    // emit `write_acceptance_rate_bps` because their t1 is captured
+    // after `write()` / `ff_write()` returns — measuring the rate the
+    // stack ingests payload into its send buffer, NOT wire rate. See
+    // `Stack::throughput_metric_name` for the rationale.
+    let throughput_metric_name = aggregate.stack.throughput_metric_name();
     match &aggregate.throughput_bps {
         Some(summary) => {
             emit_summary_rows(
@@ -384,7 +392,7 @@ pub fn emit_bucket_rows<W: std::io::Write>(
                 tool,
                 feature_set,
                 &dims,
-                "throughput_per_burst_bps",
+                throughput_metric_name,
                 "bits_per_sec",
                 summary,
             )?;
@@ -400,7 +408,7 @@ pub fn emit_bucket_rows<W: std::io::Write>(
                 test_case: "burst".to_string(),
                 feature_set: feature_set.to_string(),
                 dimensions_json: dims.clone(),
-                metric_name: "throughput_per_burst_bps".to_string(),
+                metric_name: throughput_metric_name.to_string(),
                 metric_unit: "bits_per_sec".to_string(),
                 metric_value: 0.0,
                 metric_aggregation: MetricAggregation::Mean,
