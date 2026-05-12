@@ -72,7 +72,7 @@
 //! owns a `TcpOpts` struct (NOT a pre-encoded options blob); the
 //! options are reconstructed by setup, but `build_segment` calls
 //! `seg.options.encode(...)` into the on-the-wire bytes on every
-//! invocation (tcp_output.rs:155). This is faithful to production,
+//! invocation (tcp_output.rs:157). This is faithful to production,
 //! where each segment in `Engine::send_bytes` builds a fresh
 //! `SegmentTx` literal that bundles a freshly-constructed `TcpOpts`
 //! and `build_segment` runs its `encode` on every segment. So this
