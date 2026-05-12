@@ -354,12 +354,16 @@ fn bench_ip_decode_offload_ok(c: &mut Criterion) {
 /// not compile this bench. The bench-micro Cargo.toml's `dpdk-net-core`
 /// dep uses default features, so the gate is satisfied.
 fn bench_classify_rx_cksum(c: &mut Criterion) {
-    // Hand-mirrored from `dpdk_net_core::dpdk_consts`:
-    //   RTE_MBUF_F_RX_IP_CKSUM_GOOD = 1<<7  (= 0x80)
-    //   RTE_MBUF_F_RX_L4_CKSUM_GOOD = 1<<8  (= 0x100)
+    // Use the production constants from `dpdk_net_core::dpdk_consts`
+    // so flag-value drift in the rebuilt FFI bindings (or DPDK upgrade)
+    // is automatically picked up rather than silently miscategorizing
+    // the bench input.
+    use dpdk_net_core::dpdk_consts::{
+        RTE_MBUF_F_RX_IP_CKSUM_GOOD, RTE_MBUF_F_RX_L4_CKSUM_GOOD,
+    };
     // The combined "PMD reported GOOD for both IP + L4" pattern is
     // what the steady-state ENA RX path delivers.
-    const OL_FLAGS_BOTH_GOOD: u64 = (1u64 << 7) | (1u64 << 8);
+    let ol_flags_both_good: u64 = RTE_MBUF_F_RX_IP_CKSUM_GOOD | RTE_MBUF_F_RX_L4_CKSUM_GOOD;
 
     c.bench_function("bench_classify_rx_cksum", |b| {
         b.iter_custom(|iters| {
@@ -367,13 +371,14 @@ fn bench_classify_rx_cksum(c: &mut Criterion) {
             for _ in 0..iters {
                 let mut acc: u64 = 0;
                 for _ in 0..BATCH {
-                    let ip = classify_ip_rx_cksum(black_box(OL_FLAGS_BOTH_GOOD));
-                    let l4 = classify_l4_rx_cksum(black_box(OL_FLAGS_BOTH_GOOD));
-                    // Map the CksumOutcome enums onto u8 discriminants
-                    // so the values are observable to LLVM. We assert
-                    // the expected variant in a sentinel debug check
-                    // below to catch bench-setup drift if the flag
-                    // mapping ever changes.
+                    let ip = classify_ip_rx_cksum(black_box(ol_flags_both_good));
+                    let l4 = classify_l4_rx_cksum(black_box(ol_flags_both_good));
+                    // Map the CksumOutcome enums onto u8 discriminants so
+                    // the values are observable to LLVM and the matched
+                    // arm is preserved through DCE. No separate sentinel
+                    // assertion is made: setup-drift would show up as a
+                    // CksumOutcome::Unknown/None branch in the fold,
+                    // changing the accumulator bits.
                     acc ^= match ip {
                         CksumOutcome::Good => 1,
                         CksumOutcome::Bad => 2,
