@@ -1,7 +1,7 @@
 //! bench-micro::deliver_readable — application-visible read latency.
 //!
 //! These benches measure the **iovec materialization step** from
-//! `Engine::deliver_readable` (engine.rs:5585-5724). That body is the
+//! `Engine::deliver_readable` (engine.rs:5768-5907). That body is the
 //! last hop in the receive path: `tcp_input::dispatch` enqueues
 //! mbuf-backed `InOrderSegment`s into `conn.recv.bytes`, then the
 //! engine calls `deliver_readable` which pops them into
@@ -25,7 +25,7 @@
 //! feature gate inside `dpdk-net-core` and is covered by
 //! `deliver_readable_step_drift_guard` unit tests in `engine.rs`.
 //! The helper mirrors the body of `Engine::deliver_readable` at
-//! engine.rs:5585-5724.
+//! engine.rs:5768-5907.
 //!
 //! The drift-guard tests assert **helper-internal** shape, NOT
 //! production-vs-helper equivalence — production
@@ -43,33 +43,33 @@
 //! mirrored from `Engine::deliver_readable` (line numbers in parens):
 //!
 //!   * Per-call `flow_table.get_mut(handle)` lookup, mirroring the
-//!     production `borrow_mut() + get_mut(handle)` pattern (5593-5601).
+//!     production `borrow_mut() + get_mut(handle)` pattern (5776-5784).
 //!     The Stage-1 harness uses `&mut FlowTable` directly, omitting
 //!     `RefCell::borrow_mut` tracking that production pays.
-//!   * `conn.delivered_segments.clear()` (5607)
+//!   * `conn.delivered_segments.clear()` (5790)
 //!   * Pop loop from `conn.recv.bytes` into `delivered_segments`
-//!     under a `total_delivered` byte budget (5609-5654) — full-pop
+//!     under a `total_delivered` byte budget (5792-5837) — full-pop
 //!     branch only for these two targets (no split).
-//!   * `conn.readable_scratch_iovecs.clear()` (5660)
-//!   * The iovec-materialization loop (5662-5669): for each segment,
+//!   * `conn.readable_scratch_iovecs.clear()` (5843)
+//!   * The iovec-materialization loop (5845-5852): for each segment,
 //!     push a `DpdkNetIovec { base: seg.data_ptr(), len, _pad: 0 }`
 //!     onto the scratch + accumulate `total_len`. `data_ptr()` reads
 //!     `buf_addr + data_off` through the `shim_rte_pktmbuf_data` shim
 //!     on a fake-mbuf-backed segment (see below).
 //!   * `recv_buf_delivered` cumulative byte-throughput counter bump
-//!     (5723).
+//!     (5906).
 //!
 //! # What this bench DELIBERATELY SKIPS
 //!
 //! Three pieces of the production body are out of scope for the
 //! application-visible read-latency bench, each with a one-line reason:
 //!
-//!   * `events.push(InternalEvent::Readable { .. })` (5704-5715) —
+//!   * `events.push(InternalEvent::Readable { .. })` (5887-5897) —
 //!     the event-queue push and its per-event observability counter
 //!     bumps (`rx_iovec_segs_total`, `rx_multi_seg_events`) are gated
 //!     by `obs-none` in production and represent the observability
 //!     surface, not the application-visible delivery primitive.
-//!   * `crate::clock::now_ns()` for `emitted_ts_ns` (5711) — same
+//!   * `crate::clock::now_ns()` for `emitted_ts_ns` (5894) — same
 //!     `obs-none` gate, ~7 ns at 5 GHz on Zen4 with cached TSC.
 //!   * `dpdk_net_poll` API marshalling — the public translation from
 //!     `InternalEvent::Readable` to the C-ABI `dpdk_net_event_t` plus
@@ -78,11 +78,12 @@
 //!
 //! Actual mbuf-data-pointer dereferences are also not exercised:
 //! the helper writes a `seg.data_ptr()` pointer into each iovec, but
-//! the bench's fake mbufs have zeroed `buf_addr` (NULL) — the
-//! resulting iovec base is NULL, which is fine because the bench
-//! never reads through it. The cost being measured is the *pointer
-//! arithmetic* (`buf_addr + data_off`), not a cache-line load from
-//! the user's payload.
+//! the bench never reads through that pointer. With the fake-mbuf
+//! initialization documented below the produced iovec `base` is a
+//! valid pointer into our Box-backed heap storage, not user payload
+//! arriving off a DPDK port. The cost being measured is the *pointer
+//! arithmetic* (`buf_addr + data_off + seg.offset`) plus the iovec
+//! struct write, not a cache-line load from the user's payload.
 //!
 //! # Cross-crate inlining boundary (codex carryover from T1/T3)
 //!
@@ -104,28 +105,58 @@
 //!   * Conn input handle is `black_box`-ed pre-call (forces a re-
 //!     read on each iter so LLVM cannot hoist `flow_table.get_mut`).
 //!   * Outcome fields (`seg_count`, `total_len`, `partial_split`) +
-//!     the resulting `iovec.len` sum are XOR-folded into an
-//!     accumulator that is `black_box`-ed at end of iter. This
-//!     keeps the iovec push observable: a 3-field fold lets LLVM
-//!     reduce per-iovec writes to nothing if it sees no downstream
-//!     consumer, so we fold every produced iovec's `len` (the
-//!     `_pad` and `base` fields are constant per fixture and
-//!     contribute zero entropy).
+//!     **every** produced iovec's three fields (`base` cast to
+//!     `usize`, `len`, `_pad`) are XOR-folded into an accumulator
+//!     that is `black_box`-ed at end of iter. Folding all three
+//!     iovec fields (not just `len`) prevents LLVM from constant-
+//!     folding any portion of the `DpdkNetIovec { base, len, _pad }`
+//!     struct write when it sees no downstream consumer for the
+//!     other fields. The added cost is ~5 ns/iter — acceptable.
+//!
+//! # Counter-contention caveat (T1/T8 standard wording)
+//!
+//! The bench constructs a per-iter local `Counters::new()` and bumps
+//! its TCP counters from the single iter thread. There is zero
+//! cross-core contention on those atomics. The Stage-1 single-lcore
+//! engine has no cross-core contention either (one lcore owns the
+//! engine + its `Counters`), so the per-counter delta between
+//! "thread-local bench atomic" and "production lcore-local atomic"
+//! is within ±2 ns at 3 GHz — within the bench's own measurement
+//! noise. A multi-lcore future would need the per-core-counter +
+//! reader-aggregation shape called out in the project's counter
+//! policy, not this bench's shape.
 //!
 //! # Fake-mbuf setup
 //!
 //! Each `InOrderSegment` holds a `MbufHandle` pointing at a
-//! `Box<[u8; 256]>` cast to `*mut rte_mbuf`. The helper's
-//! `seg.data_ptr()` reads `buf_addr + data_off` (both zero in our
-//! fake — `data_ptr() == NULL`); no DPDK code reads through the
-//! returned pointer. `MbufHandle::Drop` calls
-//! `shim_rte_pktmbuf_free_seg`, which guards on `m->pool == NULL`
-//! and falls back to a refcnt-only decrement for fake-mbuf storage
-//! (shim.c:122-130) — safe for our use. We bump the refcount once
-//! at construction so the Drop's pre-dec read is non-zero (avoids
-//! the leak-diagnostic counter bump). Same convention as
-//! `bench_tcp_input_data_segment` (tcp_input.rs:78-86) and the
-//! `deliver_readable_step` drift-guard tests in engine.rs.
+//! `Box<[u8; 256]>` cast to `*mut rte_mbuf`. Before constructing the
+//! `MbufHandle` we write the rte_mbuf cacheline-0 fields the helper
+//! reads via `shim_rte_pktmbuf_data`:
+//!
+//!   * `buf_addr` (offset 0, `void *`) — set to `storage_ptr + 64`,
+//!     i.e. a pointer into the second half of the Box-backed storage
+//!     itself. With `data_off = 0` (left zero) and the segment's
+//!     `offset = 54` (TCP-payload offset), `seg.data_ptr()` resolves
+//!     to `storage_ptr + 64 + 0 + 54 = storage_ptr + 118` — a valid,
+//!     well-defined pointer inside the 256 B storage block. The
+//!     bench never reads through the resulting iovec base, so the
+//!     bytes there are uninitialized (zeroed at Box construction);
+//!     we measure the pointer-arithmetic + iovec-write cost only.
+//!     This is **strategy B** of the C1 fix: a clean fixture that
+//!     produces a well-defined data pointer instead of the prior
+//!     `null + offset = UB` shape.
+//!   * `data_off` (offset 16, `u16`) — left zero. The segment's own
+//!     `offset` field contributes the post-header skip.
+//!   * `refcnt` (offset 18, `u16`) — bumped once via
+//!     `shim_rte_mbuf_refcnt_update(+1)` so the `MbufHandle::Drop`
+//!     pre-dec read sees a non-zero count (avoids the leak-
+//!     diagnostic counter bump). Same convention as
+//!     `bench_tcp_input_data_segment` (tcp_input.rs:78-86) and the
+//!     `deliver_readable_step` drift-guard tests in engine.rs.
+//!   * `pool` (somewhere later on the cacheline, left NULL) — the
+//!     `shim_rte_pktmbuf_free_seg` shim guards on `m->pool == NULL`
+//!     and falls back to a refcnt-only decrement for fake-mbuf
+//!     storage (shim.c:122-130) — safe for our use.
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use dpdk_net_core::counters::Counters;
@@ -139,11 +170,21 @@ use std::time::Duration;
 
 /// Per-segment payload length used for both bench targets. 128 B is
 /// representative of a small trading message (post-TCP-header). The
-/// per-iovec cost is dominated by the `data_ptr()` pointer arithmetic
+/// per-iovec cost scales with the `data_ptr()` pointer arithmetic
 /// plus the iovec push; segment length only feeds the `total_len`
 /// accumulator and the `recv_buf_delivered` counter, so payload size
 /// has marginal effect at this bench's resolution.
 const SEG_LEN: u16 = 128;
+
+/// Byte offset inside each fake `Box<[u8; 256]>` where the rte_mbuf's
+/// `buf_addr` field will point. Chosen at 64 to clear the rte_mbuf
+/// cacheline-0 fields (`buf_addr`, `buf_iova`/`next`, `data_off`,
+/// `refcnt`, `nb_segs`, `port`, `ol_flags`, …) that live in the first
+/// ~64 bytes of `struct rte_mbuf`. With `offset = 54` on the segment
+/// and `data_off = 0`, the produced iovec base resolves to
+/// `storage_ptr + 64 + 54 = storage_ptr + 118`, well within the
+/// 256 B allocation. The bench never reads through this pointer.
+const FAKE_BUF_ADDR_OFFSET: usize = 64;
 
 /// Build an ESTABLISHED-state TcpConn. Same shape as the
 /// `deliver_readable_step` drift-guard tests in engine.rs.
@@ -169,6 +210,14 @@ type FakeMbuf = Box<[u8; 256]>;
 /// at offset 54 (the TCP-payload offset shape mirroring the
 /// `bench_tcp_input_data_segment` fixture).
 ///
+/// Before constructing the `MbufHandle` we write the rte_mbuf's
+/// `buf_addr` field (offset 0 of the struct) to point inside the same
+/// Box-backed storage at `FAKE_BUF_ADDR_OFFSET`. This gives
+/// `seg.data_ptr()` a well-defined return value (C1 fix, strategy B);
+/// the prior shape left `buf_addr = NULL` so `data_ptr()` returned
+/// `null + 54` — undefined behavior. `data_off` (offset 16) stays
+/// zero; the segment's `offset` field carries the post-header skip.
+///
 /// SAFETY: each `MbufHandle::from_raw` takes one refcount unit; we
 /// bump refcount immediately before construction so the handle's
 /// `Drop` pre-dec read is non-zero (otherwise the
@@ -176,13 +225,31 @@ type FakeMbuf = Box<[u8; 256]>;
 fn seed_recv_bytes(conn: &mut TcpConn, fake_mbufs: &mut [FakeMbuf]) {
     for slot in fake_mbufs.iter_mut() {
         // SAFETY: slot is a live Box<[u8; 256]>; pointer is non-null.
-        let nn: NonNull<dpdk_net_sys::rte_mbuf> = unsafe {
-            NonNull::new_unchecked(slot.as_mut_ptr() as *mut dpdk_net_sys::rte_mbuf)
-        };
+        let storage_ptr: *mut u8 = slot.as_mut_ptr();
+        let nn: NonNull<dpdk_net_sys::rte_mbuf> =
+            unsafe { NonNull::new_unchecked(storage_ptr as *mut dpdk_net_sys::rte_mbuf) };
+        // C1 fix (strategy B): write `buf_addr` so `shim_rte_pktmbuf_data`
+        // returns a valid pointer into the storage. `buf_addr` is the
+        // very first field of `struct rte_mbuf` (offset 0, void *,
+        // 8 bytes on 64-bit). FAKE_BUF_ADDR_OFFSET (64) is well past
+        // the cacheline-0 fields the helper / Drop path reads
+        // (`buf_addr`, `data_off`, `refcnt`, `pool`) and well inside
+        // the 256 B allocation. We use volatile_write to guarantee
+        // the compiler doesn't elide the store before the cast
+        // (the helper accesses this via FFI through a different
+        // pointer type, so without volatile the optimizer could in
+        // principle reorder).
+        //
+        // SAFETY: storage_ptr is valid for at least 256 B (Box-backed);
+        // the write is 8 bytes aligned-to-8 at offset 0.
+        unsafe {
+            let buf_addr_field = storage_ptr as *mut *mut u8;
+            std::ptr::write_volatile(buf_addr_field, storage_ptr.add(FAKE_BUF_ADDR_OFFSET));
+        }
         // Bump refcount so MbufHandle::Drop's pre-dec read is non-zero.
         // SAFETY: nn points at a Box<[u8; 256]>; the refcnt field lies
-        // within the first cacheline (16 B in for x86_64), well within
-        // the 256-byte allocation.
+        // within the first cacheline (18 B in for x86_64 layout), well
+        // within the 256-byte allocation.
         unsafe {
             dpdk_net_sys::shim_rte_mbuf_refcnt_update(nn.as_ptr(), 1);
         }
@@ -219,9 +286,14 @@ fn make_seeded_state(seg_count: usize) -> (FlowTable, ConnHandle, Vec<FakeMbuf>)
 /// We fold:
 ///   - `seg_count`, `total_len`, `partial_split` from the outcome
 ///     (forces LLVM to materialize the helper's return).
-///   - Every produced iovec's `len` field (forces the iovec push to
-///     have an observable consumer, so LLVM cannot collapse the
-///     push loop's writes).
+///   - **All three fields** of every produced iovec (`base` cast to
+///     `usize`, `len`, `_pad`). I1 fix: folding only `len` previously
+///     allowed LLVM to constant-fold the `DpdkNetIovec.base` /
+///     `_pad` writes when it saw no downstream consumer. Folding
+///     all three keeps the full struct write observable. `base` and
+///     `_pad` are constant per fixture, so they contribute zero
+///     additional per-iter signal — but they DO prevent the
+///     optimizer from eliding the struct write. ~5 ns/iter cost.
 #[inline(always)]
 fn run_deliver_readable_step(
     flow_table: &mut FlowTable,
@@ -238,15 +310,17 @@ fn run_deliver_readable_step(
     let mut acc: u64 = outcome.seg_count as u64;
     acc ^= outcome.total_len as u64;
     acc ^= outcome.partial_split as u64;
-    // Fold every iovec's len so the per-segment push has an
-    // observable consumer. The iovecs live on the conn's scratch
-    // Vec; we walk them after the helper returns. `_pad` is always
-    // zero per the helper contract, and `base` is constant per
-    // fixture (zeroed fake mbuf), so folding `len` is the field
-    // that carries the per-iter signal.
+    // Fold every iovec's full struct (base, len, _pad) so the per-
+    // segment push has an observable consumer for all three fields.
+    // The iovecs live on the conn's scratch Vec; we walk them after
+    // the helper returns. Folding `base` as `usize` keeps the
+    // pointer-write observable; folding `_pad` keeps the
+    // zero-initializer observable.
     if let Some(conn) = flow_table.get(handle) {
         for iov in &conn.readable_scratch_iovecs {
+            acc ^= iov.base as usize as u64;
             acc ^= iov.len as u64;
+            acc ^= iov._pad as u64;
         }
     }
     acc

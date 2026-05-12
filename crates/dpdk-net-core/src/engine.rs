@@ -304,10 +304,10 @@ pub mod test_support {
         pub seg_count: u32,
         /// Sum of `seg.len` across the materialized iovecs. Mirrors the
         /// `total_len` field on the production `InternalEvent::Readable`
-        /// event (engine.rs:5708).
+        /// event (engine.rs:5892).
         pub total_len: u32,
         /// `true` when the pop loop hit the partial-pop branch
-        /// (engine.rs:5624-5652) — i.e. `total_delivered` fell between
+        /// (engine.rs:5807-5835) — i.e. `total_delivered` fell between
         /// segment boundaries so the front segment was split via
         /// `try_clone`. Mirrors the `rx_partial_read_splits` counter
         /// bump site.
@@ -518,7 +518,7 @@ pub mod test_support {
         }
 
         /// One call's worth of `Engine::deliver_readable`'s observable
-        /// body (engine.rs:5585-5724), minus the EAL-bound event push
+        /// body (engine.rs:5768-5907), minus the EAL-bound event push
         /// and clock read. Lives here so any future drift in the
         /// production body either updates this helper or breaks
         /// `helper_emits_expected_iovec_shape_for_4_segments` below —
@@ -538,36 +538,36 @@ pub mod test_support {
         ///
         ///   * Per-call `flow_table.get_mut(handle)` lookup mirroring
         ///     production's `borrow_mut() + get_mut(handle)` pattern
-        ///     (5593-5601). The harness uses `&mut FlowTable` directly,
+        ///     (5776-5784). The harness uses `&mut FlowTable` directly,
         ///     omitting `RefCell::borrow_mut` overhead.
-        ///   * `conn.delivered_segments.clear()` (5607)
+        ///   * `conn.delivered_segments.clear()` (5790)
         ///   * Pop loop from `conn.recv.bytes` into `delivered_segments`
         ///     with a `total_delivered` byte budget. Covers the
-        ///     full-pop branch (5619-5623) and the partial-pop /
-        ///     split-via-`try_clone` branch (5624-5652).
+        ///     full-pop branch (5802-5806) and the partial-pop /
+        ///     split-via-`try_clone` branch (5807-5835).
         ///   * `rx_partial_read_splits` counter bump on the split
-        ///     branch (5647-5650).
-        ///   * `conn.readable_scratch_iovecs.clear()` (5660)
+        ///     branch (5830-5833).
+        ///   * `conn.readable_scratch_iovecs.clear()` (5843)
         ///   * The iovec-materialization loop building
         ///     `DpdkNetIovec { base: seg.data_ptr(), len: seg.len, _pad: 0 }`
-        ///     entries from `delivered_segments` (5662-5669). This is
+        ///     entries from `delivered_segments` (5845-5852). This is
         ///     the application-visible side: `data_ptr()` reads
         ///     `buf_addr + offset` through the `shim_rte_pktmbuf_data`
         ///     shim.
         ///   * `recv_buf_delivered` cumulative-byte-throughput counter
-        ///     bump (5723).
+        ///     bump (5906).
         ///
         /// What this DOES NOT mirror (deliberately — out of scope
         /// without EAL or because the gate compiles it out):
         ///
-        ///   * The `InternalEvent::Readable` push (5704-5715) and its
+        ///   * The `InternalEvent::Readable` push (5887-5897) and its
         ///     `rx_iovec_segs_total` / `rx_multi_seg_events` counter
-        ///     bumps (5693-5703) — gated by `obs-none` in production
+        ///     bumps (5876-5885) — gated by `obs-none` in production
         ///     and represent the *observability* surface, not the
         ///     application-visible delivery primitive. Per the project's
         ///     observability policy this is the right scope for the
         ///     iovec-materialization bench.
-        ///   * `crate::clock::now_ns()` for `emitted_ts_ns` (5711) —
+        ///   * `crate::clock::now_ns()` for `emitted_ts_ns` (5894) —
         ///     same `obs-none` gate.
         ///
         /// `total_delivered` is the byte budget the caller passes (in
@@ -583,7 +583,7 @@ pub mod test_support {
         ) -> DeliverReadableOutcome {
             use std::sync::atomic::Ordering;
             let Some(conn) = flow_table.get_mut(handle) else {
-                // Same early-return as production (engine.rs:5594-5600):
+                // Same early-return as production (engine.rs:5777-5783):
                 // segments in the gone slot already dropped their own
                 // refcounts; nothing owed here.
                 return DeliverReadableOutcome {
@@ -593,12 +593,12 @@ pub mod test_support {
                 };
             };
 
-            // engine.rs:5607 — clear delivered_segments before popping
+            // engine.rs:5790 — clear delivered_segments before popping
             // the new event's window.
             conn.delivered_segments.clear();
             let mut remaining = total_delivered;
             let mut partial_split = false;
-            // engine.rs:5609-5654 — pop loop. Mirror of the production
+            // engine.rs:5792-5837 — pop loop. Mirror of the production
             // match-shape: full-pop on `seg.len <= remaining`, partial-
             // pop with `try_clone` on the front otherwise.
             while remaining > 0 {
@@ -606,7 +606,7 @@ pub mod test_support {
                     None => {
                         // Invariant break — total_delivered exceeded
                         // what's buffered. Stop quietly (production
-                        // does the same at 5611-5618).
+                        // does the same at 5794-5800).
                         break;
                     }
                     Some(seg) if seg.len as u32 <= remaining => {
@@ -615,7 +615,7 @@ pub mod test_support {
                         conn.delivered_segments.push(popped);
                     }
                     Some(_seg) => {
-                        // engine.rs:5624-5652 — partial-pop branch:
+                        // engine.rs:5807-5835 — partial-pop branch:
                         // split via `try_clone`, push the delivered
                         // portion, shrink the front in-queue portion.
                         let split_off = remaining as u16;
@@ -629,7 +629,7 @@ pub mod test_support {
                             offset: delivered_offset,
                             len: split_off,
                         });
-                        // engine.rs:5647-5650 — slow-path counter bump
+                        // engine.rs:5830-5833 — slow-path counter bump
                         // (at most once per call; the split branch
                         // sets remaining = 0 and exits).
                         counters
@@ -642,7 +642,7 @@ pub mod test_support {
                 }
             }
 
-            // engine.rs:5660-5669 — iovec materialization. The
+            // engine.rs:5843-5852 — iovec materialization. The
             // application-visible surface: every iovec is the
             // `{ base, len, _pad }` tuple the user reads through the
             // READABLE event payload. `seg.data_ptr()` calls
@@ -662,7 +662,7 @@ pub mod test_support {
             }
             let seg_count = conn.readable_scratch_iovecs.len() as u32;
 
-            // engine.rs:5723 — cumulative-byte-throughput counter.
+            // engine.rs:5906 — cumulative-byte-throughput counter.
             // Kept here because it's the *delivery* primitive's slow-
             // path counter, not the per-event observability bump
             // (which is gated under obs-none and skipped above).
@@ -9357,7 +9357,7 @@ mod send_bytes_segment_build_step_drift_guard {
 /// a10-perf-23.11 T8: drift guard for the bench-internals
 /// deliver-readable helper. The helper at `test_support::EngineNoEalHarness::
 /// deliver_readable_step` mirrors the observable body of
-/// `Engine::deliver_readable` (engine.rs:5585-5724). If `deliver_readable`
+/// `Engine::deliver_readable` (engine.rs:5768-5907). If `deliver_readable`
 /// changes shape (new pop branch, iovec field reordering, counter
 /// retiming) and the helper is not updated in lock-step, this test
 /// breaks — surfacing the divergence at PR time rather than years
@@ -9387,19 +9387,31 @@ mod deliver_readable_step_drift_guard {
     const PEER_PORT: u16 = 5_000;
 
     /// Fake rte_mbuf backing storage. The mbuf struct's `buf_addr` is at
-    /// offset 0; the helper's `seg.data_ptr()` invokes
-    /// `shim_rte_pktmbuf_data` which reads `buf_addr + data_off`. Zeroed
-    /// storage makes `buf_addr == NULL` + `data_off == 0`, so
-    /// `data_ptr() == NULL`. The drift-guard test asserts iovec shape
-    /// (`base`, `len`, count) only — it does NOT dereference the iovec
-    /// base pointers. The mbuf's `pool` field is also zero, which makes
-    /// `shim_rte_pktmbuf_free_seg` fall back to the test-only refcnt-
-    /// only decrement on Drop (shim.c:122-130).
+    /// offset 0 (`void *`); the helper's `seg.data_ptr()` invokes
+    /// `shim_rte_pktmbuf_data` which reads `buf_addr + data_off`. To
+    /// give `data_ptr()` a well-defined return value we write
+    /// `buf_addr = storage_ptr + 64` at fixture-seed time (see
+    /// `seed_recv_bytes` below). With `data_off = 0` and the
+    /// segment's `offset = 54` the produced iovec base lands at
+    /// `storage_ptr + 118`, a valid pointer inside the Box-backed
+    /// 256-byte allocation. The drift-guard tests assert iovec shape
+    /// (`len`, count, counters) only — they do NOT dereference the
+    /// iovec base pointers. The mbuf's `pool` field is also zero,
+    /// which makes `shim_rte_pktmbuf_free_seg` fall back to the
+    /// test-only refcnt-only decrement on Drop (shim.c:122-130).
     ///
     /// 256 bytes covers the first cacheline of `struct rte_mbuf` where
     /// `buf_addr`, `data_off`, `refcnt`, `pool` live; the helper never
     /// reads past that.
     type FakeMbuf = Box<[u8; 256]>;
+
+    /// Offset inside each `FakeMbuf` at which the rte_mbuf's
+    /// `buf_addr` will point. 64 clears the cacheline-0 fields the
+    /// helper / Drop path reads (`buf_addr`, `buf_iova`/`next`,
+    /// `data_off`, `refcnt`, `nb_segs`, `port`, `ol_flags`) and
+    /// leaves room inside the 256 B allocation for `data_ptr() =
+    /// buf_addr + 0 + 54 = storage_ptr + 118` to be valid.
+    const FAKE_BUF_ADDR_OFFSET: usize = 64;
 
     /// Build an ESTABLISHED conn ready to receive an iovec emission.
     fn fixture_conn() -> TcpConn {
@@ -9419,11 +9431,28 @@ mod deliver_readable_step_drift_guard {
     /// `offset = 54` (matching the data_segment bench's TCP payload
     /// offset shape) and each carries the same `len` for the
     /// 1-iovec / N-iovec drift-guard tests.
+    ///
+    /// Writes `buf_addr` (offset 0 of `struct rte_mbuf`) to point at
+    /// `storage_ptr + FAKE_BUF_ADDR_OFFSET` so `data_ptr()` resolves
+    /// to a well-defined pointer instead of `null + 54` (the prior
+    /// UB shape). The test still never dereferences that pointer.
     fn seed_recv_bytes(conn: &mut TcpConn, fake_mbufs: &mut [FakeMbuf], seg_len: u16) {
         for slot in fake_mbufs.iter_mut() {
-            let nn: NonNull<dpdk_net_sys::rte_mbuf> = unsafe {
-                NonNull::new_unchecked(slot.as_mut_ptr() as *mut dpdk_net_sys::rte_mbuf)
-            };
+            let storage_ptr: *mut u8 = slot.as_mut_ptr();
+            let nn: NonNull<dpdk_net_sys::rte_mbuf> =
+                unsafe { NonNull::new_unchecked(storage_ptr as *mut dpdk_net_sys::rte_mbuf) };
+            // Set buf_addr (offset 0 of struct rte_mbuf, void *) to a
+            // valid in-storage pointer so `shim_rte_pktmbuf_data` ==
+            // `buf_addr + data_off` resolves to a real heap address.
+            // SAFETY: storage_ptr is valid for 256 B (Box-backed); the
+            // 8-byte aligned write at offset 0 is in-bounds.
+            unsafe {
+                let buf_addr_field = storage_ptr as *mut *mut u8;
+                std::ptr::write_volatile(
+                    buf_addr_field,
+                    storage_ptr.add(FAKE_BUF_ADDR_OFFSET),
+                );
+            }
             // Bump refcount so the MbufHandle's Drop has a non-zero
             // pre-dec count (avoids the leak-diagnostic counter bump).
             unsafe {
