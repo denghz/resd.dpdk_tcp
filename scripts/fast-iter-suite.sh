@@ -65,6 +65,115 @@ set -euo pipefail
 WORKDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$WORKDIR"
 
+# --self-test: run the python summarizer pivot against a synthetic CSV that
+# replicates the T57 follow-up #3 shape (mixed-dim rows where `bucket_invalid`
+# only appears on a subset). Asserts every cell with a valid CSV value renders
+# in the SUMMARY table (i.e. the dim_keys_order grow-mid-stream pivot bug
+# does NOT regress). Exits 0 on pass, 1 on regression. No peer / NIC required.
+if [ "${1:-}" = "--self-test" ]; then
+    python3 - "$WORKDIR/scripts/fast-iter-suite.sh" <<'PY'
+import csv, json, os, re, subprocess, sys, tempfile
+
+script_path = sys.argv[1]
+src = open(script_path).read()
+# Extract the python block between `python3 - "$csv" <<'PY' 2>&1 || true`
+# and the trailing `PY` (the heredoc body) so we can exec the summarizer
+# in-process on a fixture CSV. The ` 2>&1 || true` suffix is what
+# distinguishes the actual heredoc opener from the documentation marker
+# above (which appears inside a comment).
+m = re.search(r"python3 - \"\$csv\" <<'PY' 2>&1 \|\| true\n(.*?)\nPY\n", src, re.DOTALL)
+if not m:
+    print("self-test: cannot locate summarize_one_csv python block", file=sys.stderr)
+    sys.exit(1)
+summarizer_src = m.group(1)
+
+# Build synthetic CSV matching the T57 follow-up #3 shape (fstack maxtp):
+# bucket_invalid surfaces only on the W=65536 C=1/C=4 rows, growing
+# dim_keys_order mid-iteration. Pre-fix: first 6 rows render as `—`. Post-fix:
+# all rows render their CSV values.
+cols = [
+    "dimensions_json", "metric_name", "metric_unit",
+    "metric_value", "metric_aggregation",
+]
+fixture = [
+    ({"C": 1,  "W_bytes": 4096,  "tx_ts_mode": "tsc_fallback", "workload": "maxtp"},
+        "sustained_goodput_bps", "mean", "2004778818.3479238"),
+    ({"C": 4,  "W_bytes": 4096,  "tx_ts_mode": "tsc_fallback", "workload": "maxtp"},
+        "sustained_goodput_bps", "mean", "3010245220.249125"),
+    ({"C": 16, "W_bytes": 4096,  "tx_ts_mode": "tsc_fallback", "workload": "maxtp"},
+        "sustained_goodput_bps", "mean", "2627077244.311063"),
+    ({"C": 1,  "W_bytes": 16384, "tx_ts_mode": "tsc_fallback", "workload": "maxtp"},
+        "sustained_goodput_bps", "mean", "2717615814.7228184"),
+    ({"C": 4,  "W_bytes": 16384, "tx_ts_mode": "tsc_fallback", "workload": "maxtp"},
+        "sustained_goodput_bps", "mean", "2716357792.638736"),
+    ({"C": 16, "W_bytes": 16384, "tx_ts_mode": "tsc_fallback", "workload": "maxtp"},
+        "sustained_goodput_bps", "mean", "1712376277.6851037"),
+    ({"C": 1,  "W_bytes": 65536, "tx_ts_mode": "tsc_fallback", "workload": "maxtp",
+      "bucket_invalid": "connect timeout"},
+        "sustained_goodput_bps", "mean", "0.0"),
+    ({"C": 4,  "W_bytes": 65536, "tx_ts_mode": "tsc_fallback", "workload": "maxtp",
+      "bucket_invalid": "connect timeout"},
+        "sustained_goodput_bps", "mean", "0.0"),
+    ({"C": 16, "W_bytes": 65536, "tx_ts_mode": "tsc_fallback", "workload": "maxtp"},
+        "sustained_goodput_bps", "mean", "0.0"),
+]
+fd, csv_path = tempfile.mkstemp(prefix="fast-iter-selftest-", suffix=".csv")
+try:
+    with os.fdopen(fd, "w") as f:
+        w = csv.DictWriter(f, fieldnames=cols)
+        w.writeheader()
+        for dims, metric, agg, val in fixture:
+            w.writerow({
+                "dimensions_json": json.dumps(dims),
+                "metric_name": metric,
+                "metric_unit": "bits_per_sec",
+                "metric_value": val,
+                "metric_aggregation": agg,
+            })
+    # Run the extracted summarizer in a subprocess so its module-level
+    # sys.argv handling matches the production path.
+    r = subprocess.run(
+        ["python3", "-c", summarizer_src, csv_path],
+        capture_output=True, text=True, check=False,
+    )
+    if r.returncode != 0:
+        print(f"self-test: summarizer crashed rc={r.returncode}\nstderr:\n{r.stderr}", file=sys.stderr)
+        sys.exit(1)
+    out = r.stdout
+finally:
+    os.unlink(csv_path)
+
+# Each expected value MUST appear in the rendered table — pre-fix the first
+# six rows lost their values entirely.
+expected_values = [
+    "2004778818.3479238",
+    "3010245220.249125",
+    "2627077244.311063",
+    "2717615814.7228184",
+    "2716357792.638736",
+    "1712376277.6851037",
+]
+missing = [v for v in expected_values if v not in out]
+if missing:
+    print("self-test FAIL: summarizer dropped values for mixed-dim rows.", file=sys.stderr)
+    print(f"  missing values: {missing}", file=sys.stderr)
+    print("  full output:\n" + out, file=sys.stderr)
+    sys.exit(1)
+
+# And the row that lacks bucket_invalid AFTER the dim grew (the
+# `C=16, W_bytes=65536` row) must still render its 0.0 value, not be lost.
+# Look for the literal markdown row with the C=16 W=65536 cell.
+final_row_re = re.compile(r"\|\s*16\s*\|\s*65536\s*\|.*\|\s*0\.0\s*\|")
+if not final_row_re.search(out):
+    print("self-test FAIL: C=16 W=65536 row missing or value lost.", file=sys.stderr)
+    print("  full output:\n" + out, file=sys.stderr)
+    sys.exit(1)
+
+print("fast-iter-suite --self-test: OK (pivot handles mixed dim shapes)")
+PY
+    exit 0
+fi
+
 ENV_FILE="$WORKDIR/.fast-iter.env"
 if [ ! -f "$ENV_FILE" ]; then
     printf 'fast-iter-suite: %s not found — run ./scripts/fast-iter-setup.sh up --with-fstack first\n' "$ENV_FILE" >&2
@@ -775,6 +884,15 @@ if not rows:
     sys.exit(0)
 
 # (dim_tuple, metric_name, aggregation) → (value, unit)
+#
+# Pivot bug history: a single-pass build of `data` and `buckets` keyed on
+# `dim_keys_order` (which can GROW as new dims like `bucket_invalid` appear
+# mid-stream) produced length-mismatched tuple keys — earlier rows stored
+# short tuples, later lookups used padded long tuples, so early cells
+# silently rendered as `—` even with valid CSV values (T57 follow-up #3,
+# observed on bench-tx-maxtp fstack where bucket_invalid surfaced only on
+# the W=64K rows). Fix: two-pass — first pass discovers all dim keys, second
+# pass keys `data`/`buckets` with the final dim_keys_order shape.
 data = {}
 metrics = []
 seen_metrics = set()
@@ -782,6 +900,9 @@ buckets = []
 seen_buckets = set()
 dim_keys_order = []
 
+# Pass 1: discover the full dim_keys_order across ALL rows. Required so that
+# the per-row dim_tup constructed in pass 2 already matches the final shape.
+parsed_dims = []
 for r in rows:
     try:
         dims = json.loads(r.get("dimensions_json", "{}") or "{}")
@@ -792,6 +913,10 @@ for r in rows:
     for k in dims:
         if k not in dim_keys_order:
             dim_keys_order.append(k)
+    parsed_dims.append(dims)
+
+# Pass 2: build data/buckets with tuples shaped by the FINAL dim_keys_order.
+for r, dims in zip(rows, parsed_dims):
     dim_tup = tuple(str(dims.get(k, "")) for k in dim_keys_order)
     metric = r.get("metric_name", "")
     unit = r.get("metric_unit", "")
@@ -804,9 +929,6 @@ for r in rows:
     if dim_tup not in seen_buckets:
         buckets.append(dim_tup)
         seen_buckets.add(dim_tup)
-
-# Re-normalize bucket tuples to the final dim_keys_order length.
-buckets = [b + ("",) * (len(dim_keys_order) - len(b)) for b in buckets]
 
 for metric in metrics:
     # Pick the unit from the first matching row.
