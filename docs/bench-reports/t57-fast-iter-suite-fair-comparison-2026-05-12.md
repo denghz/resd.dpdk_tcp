@@ -31,6 +31,18 @@
 - fstack: ~100 µs — FreeBSD socket layer on top of DPDK; consistent across payloads.
 - linux_kernel: ~104-109 µs — kernel TCP stack syscall + context-switch path; grows slightly with payload.
 
+> **Note — all three stacks tested at `--connections 1` only.** fstack's
+> RTT arm currently lacks multi-conn support
+> (`tools/bench-rtt/src/main.rs:207` bails on `--connections > 1`, since
+> the per-conn `ff_socket` + `ff_poll` multiplexing inside a
+> request/response inner loop is a known limitation tracked as Phase 6+
+> future work — see follow-up #6 below); `dpdk_net` and `linux_kernel`
+> arms support `--connections > 1` directly but T57's published
+> comparison constrains all three to C=1 for parity. The `bench-rtt`
+> invocation in `scripts/fast-iter-suite.sh` omits `--connections` so it
+> defaults to `1` across all three stacks — the comparison is honest
+> within that constraint.
+
 ## bench-rx-burst — per-segment RX latency p50 (ns)
 
 | burst | W | dpdk_net | fstack | linux_kernel |
@@ -153,5 +165,7 @@ For the first time across the entire bench-overhaul:
 4. **verify-rack-tlp wallclock 27 min** still dominates suite time. The 3%-loss scenarios are RTO-bound; further iter reduction would speed things up but risk losing the `>0` floor.
 
 5. ~~`low_loss_1pct_corr` scenario is stochastically flaky~~ **DONE 2026-05-12** (T57 follow-up #5). The `loss 1% 25%` correlated-drop spec produced `agg=6` on T55/T56 v3 / T57 v5 and `agg=0` on T56 v4 across 200 k iters — netem's burst-clustering algorithm randomly mis-aligns with the bench's iter rate, so the ANY-of assertion (`rack | tlp`) could false-fail. Renamed scenario to `low_loss_1pct` with spec `loss 1%` (uniform per-packet drop, no correlation). Same iter count (200 k) now yields thousands of recovery events because drops distribute uniformly across iters instead of clustering. Verified by code-path inspection; smoke-test deferred to next fast-iter run. Rationale + change recorded inline in `scripts/verify-rack-tlp.sh` (SPECS map comment) and `docs/bench-reports/verify-rack-tlp.md` (assertion-set v2 table + `low_loss_1pct` bullet).
+
+6. ~~bench-rtt fstack multi-conn gap silent in fair-comparison~~ **DONE 2026-05-12** (T57 follow-up #6). `tools/bench-rtt/src/main.rs:207` (early-exit in `main()`, before the precondition governor / EAL spin-up) bails on `--connections > 1` for the fstack arm; a defense-in-depth bail at `run_fstack` (~line 675) backs it up. The underlying gap: per-conn `ff_socket` + `ff_poll` multiplexing inside a request/response inner loop is a Phase 6+ implementation gap — the shape exists in `tools/bench-tx-maxtp/src/fstack.rs` for sustained writes but bench-rtt's request/response loop needs the same callback restructure. The T57 fair-comparison is published at `--connections 1` for all three stacks (`scripts/fast-iter-suite.sh run_bench_rtt` omits `--connections` → default 1), which is apples-to-apples within that constraint but does NOT measure multi-conn behaviour. **Option B (documentation) chosen** for the publication round: (a) the bench-rtt bail message now spells out the gap + the C=1-for-parity-across-all-three-stacks framing; (b) a NOTE block directly under the bench-rtt p50 RTT table in this report makes the constraint visible to anyone reading the comparison; (c) the `fast-iter-suite.sh` SUMMARY.md generator emits the same disclaimer above every per-stack bench-rtt section in every future suite run (`scripts/fast-iter-suite.sh::write_summary`). Implementation (Option A — per-conn `ff_socket` + `ff_poll` multiplexing inside one `ff_run` invocation, mirroring `tools/bench-tx-maxtp/src/fstack.rs`) is a future-phase follow-up if/when a multi-conn comparison is needed.
 
 Closing the most actively-iterated section of T55/T56 follow-ups. Suite is now reliable + repeatable.

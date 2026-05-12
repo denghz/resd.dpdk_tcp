@@ -198,6 +198,33 @@ fn main() -> anyhow::Result<()> {
     if args.connections == 0 {
         anyhow::bail!("--connections must be at least 1");
     }
+    // Stack-specific arg validation that needs to run BEFORE the
+    // precondition governor (so the operator sees a clean "feature
+    // gap" message instead of a misleading precondition failure or
+    // EAL-init error). The fstack arm of bench-rtt does not yet
+    // support multi-conn — see `run_fstack` for the full rationale +
+    // T57 follow-up #6.
+    if matches!(args.stack, Stack::Fstack) && args.connections > 1 {
+        anyhow::bail!(
+            "--connections > 1 is not yet supported on the fstack arm of \
+             bench-rtt (single ff_run invocation per process; per-conn \
+             ff_socket + ff_poll multiplexing inside a request/response \
+             inner loop is a known limitation, tracked as Phase 6+ \
+             future work, T57 follow-up #6). dpdk_net and linux_kernel \
+             bench-rtt arms do support --connections > 1, but the T57 \
+             fast-iter-suite fair-comparison invocation \
+             (scripts/fast-iter-suite.sh run_bench_rtt) omits \
+             --connections so ALL THREE stacks default to \
+             --connections 1 for parity. To repro the published \
+             comparison, use --connections 1 (the default); to \
+             exercise multi-conn behaviour on dpdk_net / linux_kernel, \
+             pass --connections N directly to bench-rtt outside the \
+             suite. Multi-conn fstack RTT must wait until the inner \
+             loop is restructured the same way bench-tx-maxtp's fstack \
+             arm (tools/bench-tx-maxtp/src/fstack.rs) drives \
+             multi-conn sustained writes."
+        );
+    }
     let mode = parse_mode(&args.precondition_mode)?;
 
     // 1. Precondition check.
@@ -626,26 +653,46 @@ fn run_linux_kernel(args: &Args) -> anyhow::Result<Vec<BucketResult>> {
 
 #[cfg(feature = "fstack")]
 fn run_fstack(args: &Args) -> anyhow::Result<Vec<BucketResult>> {
-    validate_fstack_args(args)?;
-    init_fstack(args)?;
-    // fstack's `run_rtt_grid` drives the ENTIRE sweep inside one
-    // ff_run invocation. `ff_run` calls `rte_eal_cleanup` on exit and
-    // is therefore one-shot per process — pre-T55 we looped per bucket
-    // and the second iteration of that loop SIGSEGV'd inside the
-    // F-Stack poll loop on the fast-iter-suite 4-payload sweep
-    // (64/128/256/1024). The state machine in
-    // `bench_rtt::fstack::imp` now threads `bucket_idx` through so all
-    // buckets complete before ff_stop_run() fires. Single connection
-    // per bucket; multi-conn fstack RTT (the `--connections > 1`
-    // path) remains Phase 6+ future work — see the early-bail below.
+    // Multi-conn gap on the fstack arm: bail BEFORE we ff_init / spin up
+    // EAL so the operator gets a clean arg-validation error instead of
+    // a misleading EAL-init failure. fstack's `run_rtt_grid` drives the
+    // ENTIRE sweep inside one ff_run invocation. `ff_run` calls
+    // `rte_eal_cleanup` on exit and is therefore one-shot per process —
+    // pre-T55 we looped per bucket and the second iteration of that
+    // loop SIGSEGV'd inside the F-Stack poll loop on the
+    // fast-iter-suite 4-payload sweep (64/128/256/1024). The state
+    // machine in `bench_rtt::fstack::imp` now threads `bucket_idx`
+    // through so all buckets complete before ff_stop_run() fires.
+    // Single connection per bucket; multi-conn fstack RTT (the
+    // `--connections > 1` path) remains Phase 6+ future work.
+    // The T57 fair-comparison fast-iter-suite invocation does not pass
+    // --connections (defaults to 1 on ALL three stacks), so this gap
+    // does not affect published parity — dpdk_net and linux_kernel
+    // arms can run --connections > 1 ad-hoc but are constrained to
+    // C=1 by the suite for apples-to-apples comparison.
     if args.connections > 1 {
         anyhow::bail!(
-            "--connections > 1 is not yet supported on the fstack arm \
-             (single ff_run invocation per process; multi-conn fstack \
-             RTT is Phase 6+ future work). Use --connections 1 or pick \
-             another stack."
+            "--connections > 1 is not yet supported on the fstack arm of \
+             bench-rtt (single ff_run invocation per process; per-conn \
+             ff_socket + ff_poll multiplexing inside a request/response \
+             inner loop is a known limitation, tracked as Phase 6+ \
+             future work). dpdk_net and linux_kernel bench-rtt arms do \
+             support --connections > 1, but the T57 fast-iter-suite \
+             fair-comparison invocation (scripts/fast-iter-suite.sh \
+             run_bench_rtt) omits --connections so ALL THREE stacks \
+             default to --connections 1 for parity. To repro the \
+             published comparison, use --connections 1 (the default); \
+             to exercise multi-conn behaviour on dpdk_net / \
+             linux_kernel, pass --connections N directly to bench-rtt \
+             outside the suite. Multi-conn fstack RTT must wait until \
+             the inner loop is restructured the same way \
+             bench-tx-maxtp's fstack arm \
+             (tools/bench-tx-maxtp/src/fstack.rs) drives multi-conn \
+             sustained writes."
         );
     }
+    validate_fstack_args(args)?;
+    init_fstack(args)?;
     let peer_ip = parse_ip_host_order(&args.peer_ip)?;
     let grid = fstack::imp::enumerate_rtt_grid(
         &args.payload_bytes_sweep,

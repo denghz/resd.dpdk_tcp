@@ -959,6 +959,16 @@ write_summary() {
         printf '**Outcome:** %d OK, %d FAIL\n\n' "$OK_COUNT" "$FAIL_COUNT"
 
         printf '## bench-rtt — RTT (ns), payload sweep\n\n'
+        printf '> **Note — all three stacks tested at `--connections 1` only.**\n'
+        printf '> fstack RTT arm currently lacks multi-conn support\n'
+        printf '> (`tools/bench-rtt/src/main.rs` bails on `--connections > 1`;\n'
+        printf '> per-conn `ff_socket` + `ff_poll` multiplexing inside a\n'
+        printf '> request/response inner loop is tracked as a Phase 6+\n'
+        printf '> follow-up — see T57 follow-up #6). dpdk_net and linux_kernel\n'
+        printf '> arms do support `--connections > 1`, but this suite invocation\n'
+        printf '> (`run_bench_rtt` above) omits `--connections` so it defaults\n'
+        printf '> to `1` across all three stacks — fair comparison within that\n'
+        printf '> constraint, not a multi-conn comparison.\n\n'
         for stack in dpdk_net linux_kernel fstack; do
             printf '### %s\n\n' "$stack"
             summarize_one_csv "$RESULTS_DIR/bench-rtt-$stack.csv"
