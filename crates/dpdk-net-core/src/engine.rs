@@ -254,11 +254,11 @@ pub mod test_support {
     /// arguments).
     ///
     /// * `frame` is the engine's `tx_frame_scratch` analogue
-    ///   (engine.rs:5723) — reused across segments, never shrunk.
+    ///   (engine.rs:5999) — reused across segments, never shrunk.
     /// * `mbuf_data` simulates the `dst` region inside the buffer that
-    ///   `rte_pktmbuf_append` returns at engine.rs:5792. The helper
+    ///   `rte_pktmbuf_append` returns at engine.rs:6068. The helper
     ///   copies the built frame here exactly as the production code
-    ///   does at engine.rs:5800-5802. Must be at least
+    ///   does at engine.rs:6076-6078. Must be at least
     ///   `FRAME_HDRS_MIN + 40 + payload.len()` bytes (one segment's worth).
     /// * `wheel` accepts the first-segment RTO arm.
     /// * `counters` receives the `eth.tx_bytes` + `tcp.tx_data` updates.
