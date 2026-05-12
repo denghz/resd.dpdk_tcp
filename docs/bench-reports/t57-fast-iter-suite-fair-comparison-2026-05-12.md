@@ -68,9 +68,19 @@ in 8 of 9 cells and dpdk_net consistently above it. Full audit notes at
 [`docs/bench-reports/fstack-vs-dpdk-rx-timing-audit-2026-05-12.md`](./fstack-vs-dpdk-rx-timing-audit-2026-05-12.md);
 no code fix required — the existing measurement positions are correct.
 
-## bench-tx-burst — throughput Gbps + initiation latency
+## bench-tx-burst — per-arm metric labels
 
-dpdk_net (real wire):
+Follow-up #2 from the original T57 list is now closed. The CSV `metric_name`
+column now distinguishes wire-rate from buffer-fill-rate so readers don't
+conflate the two:
+
+| arm | metric_name | what `K / (t1 − t0)` actually measures |
+|---|---|---|
+| `dpdk_net` | `throughput_per_burst_bps` | wire-rate proxy — `t1` captured at `rte_eth_tx_burst`-return |
+| `linux_kernel` | `write_acceptance_rate_bps` | buffer-fill — `t1` captured after `write_all` returns (bytes accepted into kernel send buffer, NOT on wire) |
+| `fstack` | `write_acceptance_rate_bps` | buffer-fill — `t1` captured after `ff_write` returns (bytes accepted into F-Stack BSD-shaped send buffer, NOT on wire) |
+
+dpdk_net (real wire, throughput_per_burst_bps):
 | K | G | throughput Gbps | initiation p50 |
 |---:|---:|---:|---:|
 | 64 KiB | 0 ms | 1.00 | 30.8 µs |
@@ -78,7 +88,16 @@ dpdk_net (real wire):
 | 1 MiB | 0 ms | 1.00 | 24.7 µs |
 | 1 MiB | 10 ms | 1.14 | 133.0 µs |
 
-linux + fstack throughput numbers are buffer-fill artifacts (8-78 Gbps) — they measure write-into-send-buffer rate, not wire rate. dpdk_net's ~1 Gbps reflects the actual ENA line rate.
+linux + fstack rows in the T57 SUMMARY.md showed 8–78 Gbps under the legacy
+unified `throughput_per_burst_bps` label — 8× over ENA's 10 Gbps line rate.
+Those rows now emit `write_acceptance_rate_bps`, so the label itself tells
+the reader that the figure is a software-buffer-ingest rate. The numeric
+value did NOT change; the wire-rate calibration on those arms is still
+gated on a HW-TS hook (`Engine::last_tx_hw_ts` for fstack-on-DPDK, ENA
+TX timestamp dynfield once advertised).
+
+Per-arm rationale + the `Stack::throughput_metric_name` helper:
+`tools/bench-tx-burst/src/lib.rs`.
 
 ## verify-rack-tlp — ALL 5 scenarios PASS
 
@@ -127,7 +146,7 @@ For the first time across the entire bench-overhaul:
 
 1. **SUMMARY.md verify-rack-tlp section is empty** (parser stub from T55). Add a Python parser that reads `verify-rack-tlp.log.log` and pivots the per-scenario PASS/FAIL + counter deltas into a table.
 
-2. **bench-tx-burst linux + fstack throughput numbers are buffer-fill artifacts**. Need an explicit "this is buffer-fill not wire-rate" annotation in the summary OR a different metric for non-dpdk arms.
+2. ~~bench-tx-burst linux + fstack throughput numbers are buffer-fill artifacts~~ **DONE 2026-05-12** (follow-up #2). Rename: linux_kernel and fstack arms now emit `write_acceptance_rate_bps` in the CSV `metric_name` column; dpdk_net keeps `throughput_per_burst_bps`. Label asymmetry is intentional — completion semantics differ across arms (`rte_eth_tx_burst`-return vs `write()`-return), so the metric name advertises which thing was measured. Per-arm rationale + helper in `tools/bench-tx-burst/src/lib.rs::Stack::throughput_metric_name`; failing-test coverage in `tools/bench-tx-burst/tests/burst_grid.rs`. The fast-iter SUMMARY.md pivot already dispatches on `metric_name` so renders both labels with no summarizer changes needed.
 
 3. **bench-tx-maxtp linux empty row in SUMMARY.md** at W=64K C=16 (last row showed `0.0`). Spot — but the other cells produced real data. Likely a CSV pivot bug in the summarizer, not a bench-tool bug.
 
