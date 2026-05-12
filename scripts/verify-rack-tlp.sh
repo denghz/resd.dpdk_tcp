@@ -24,6 +24,18 @@
 # expires; RTO absorbs the recovery. RACK fast-retransmit therefore needs
 # a *low-loss* scenario with no induced delay (dense ACK stream).
 #
+# Iter-count trade-off (calibrated 2026-05-12 for fast-iter wallclock):
+# High-loss scenarios use deliberately low iter counts because the
+# assertion is `> 0` — once 1k+ recovery events fire, the assertion is
+# saturated. Adding more iters only burns wallclock under the 200 ms RTO
+# floor (each lost iter ≈ +200 ms scenario time). The per-scenario
+# defaults below are tuned so the full suite completes in ~25 min on
+# AWS c6a fast-iter hardware; statistical depth for percentile reporting
+# is NOT a goal of this verifier and should be obtained from
+# bench-nightly's netem matrix instead. Operators wanting nightly-grade
+# depth on a physical-lab DUT can globally override every scenario via
+# the `FORCE_ITERS` env var (e.g. `FORCE_ITERS=1000000`).
+#
 #   scenario              netem spec            ALL non-zero           ANY non-zero          rationale
 #   ─────────────────     ─────────────────     ───────────────────    ──────────────────    ─────────
 #   low_loss_05pct        loss 0.5%             tcp.tx_retrans         tx_retrans_rack,      Dense ACKs → RACK fires
@@ -94,7 +106,18 @@
 #                            scripts/bench-quick.sh DUT_EAL_ARGS)
 #   ITERS                    bench-rtt --iterations FALLBACK if the
 #                            per-scenario SCENARIO_ITERS map has no entry
-#                            (default: 200000)
+#                            (default: 200000). Note: every scenario in
+#                            SCENARIOS[] currently has a SCENARIO_ITERS
+#                            entry, so this only fires if a new scenario
+#                            is added without one. To globally override
+#                            every scenario (e.g. for nightly-grade
+#                            depth), use FORCE_ITERS — not ITERS.
+#   FORCE_ITERS              If set to a positive integer, globally
+#                            overrides every scenario's iter count
+#                            (bypasses SCENARIO_ITERS entirely). Use to
+#                            crank up to nightly-grade depth on a
+#                            physical-lab DUT, e.g. FORCE_ITERS=1000000.
+#                            (default: unset — per-scenario map wins)
 #   WARMUP                   bench-rtt --warmup (default: 1000)
 #   PAYLOAD_BYTES            request/response size (default: 128)
 #   ARTIFACTS_DIR            where to drop CSVs + log (default:
@@ -140,6 +163,11 @@ DUT_LCORE="${DUT_LCORE:-2}"
 DUT_EAL_ARGS="${DUT_EAL_ARGS:--l 2-3 -n 4 --in-memory --huge-unlink -a ${DUT_PCI},large_llq_hdr=1,miss_txc_to=3}"
 
 ITERS="${ITERS:-200000}"
+# FORCE_ITERS is the global-override knob (kept separate from ITERS so
+# that fast-iter-suite.sh and other callers that pass ITERS=N for
+# fallback purposes don't inadvertently override the per-scenario map).
+# Empty / unset → per-scenario SCENARIO_ITERS defaults apply.
+FORCE_ITERS="${FORCE_ITERS:-}"
 WARMUP="${WARMUP:-1000}"
 PAYLOAD_BYTES="${PAYLOAD_BYTES:-128}"
 ARTIFACTS_DIR="${ARTIFACTS_DIR:-/tmp/verify-rack-tlp}"
@@ -166,8 +194,9 @@ declare -A SPECS=(
 #
 # REQUIRED_NONZERO: every counter listed MUST have delta > 0 (ALL-of). Use
 # this for deterministic triggers — e.g. at ≥3% loss the 200 ms RTO floor
-# is essentially guaranteed to fire on a 200 k-iter RPC workload, and the
-# RPC tail-loss probability is high enough that TLP fires too.
+# is essentially guaranteed to fire even on a small (~30-50 k-iter) RPC
+# workload, and the RPC tail-loss probability is high enough that TLP
+# fires too.
 #
 # REQUIRED_NONZERO_ANY: at least ONE counter listed MUST have delta > 0
 # (ANY-of). Use this for scenarios where the trigger varies with packet
@@ -192,16 +221,32 @@ declare -A REQUIRED_NONZERO_ANY=(
   [low_loss_1pct_corr]="tcp.tx_retrans_rack tcp.tx_retrans_tlp"
 )
 
-# Per-scenario iter override. Low-loss scenarios need more iterations to
-# accumulate enough lossy events for RACK/TLP to fire statistically (rule
-# of thumb from Phase 10's SCENARIO_ITERS: aim for ~1k lossy events).
-# Scenarios not listed fall back to $ITERS.
+# Per-scenario iter defaults — tuned for fast-iter wallclock (≤25 min
+# for the full 5-scenario suite on AWS c6a fast-iter hardware).
+#
+# Sizing rationale:
+#   - low-loss cells (0.5% / 1%-correlated) need enough iters that at
+#     least one TLP probe lands in a tail-loss iter, so the ANY-of
+#     `tx_retrans_rack | tx_retrans_tlp` assertion is satisfied. T55's
+#     2026-05-12 fast-iter run showed `low_loss_1pct_corr` at 200k
+#     iters produced exactly 1 TLP event — dropping any lower risks a
+#     false-negative ANY-of failure.
+#   - high-loss cells (3% / 5%) are dominated by the 200 ms RTO floor
+#     (each lost iter adds ~200 ms to scenario wallclock). T55 showed
+#     200k iters at 3% loss took 10-15 min on this fast-iter host. At
+#     50k iters the same scenario fires ~1500 retransmit events — far
+#     more than the `> 0` assertion needs — and completes in ~3 min.
+#     The high-loss iter counts here are deliberately small.
+#
+# To override: export FORCE_ITERS=N for a global override across all
+# scenarios (see FORCE_ITERS handling in the per-scenario loop below).
+# Scenarios not listed in this map fall back to $ITERS.
 declare -A SCENARIO_ITERS=(
   [low_loss_05pct]=500000
   [low_loss_1pct_corr]=200000
-  [high_loss_3pct]=200000
-  [symmetric_3pct]=200000
-  [high_loss_5pct]=100000
+  [high_loss_3pct]=50000
+  [symmetric_3pct]=50000
+  [high_loss_5pct]=30000
 )
 
 # Order matters for the summary table — ascending by loss severity so the
@@ -285,7 +330,14 @@ for scenario in "${SCENARIOS[@]}"; do
     # is skipped (treated as vacuously satisfied).
     read -r -a expected_nonzero <<<"${REQUIRED_NONZERO[$scenario]:-}"
     read -r -a expected_nonzero_any <<<"${REQUIRED_NONZERO_ANY[$scenario]:-}"
-    scenario_iters="${SCENARIO_ITERS[$scenario]:-$ITERS}"
+    # Precedence: FORCE_ITERS (explicit global override) > per-scenario
+    # SCENARIO_ITERS default > $ITERS fallback default. See the
+    # FORCE_ITERS init block + the env-overrides docstring above.
+    if [ -n "$FORCE_ITERS" ]; then
+        scenario_iters="$FORCE_ITERS"
+    else
+        scenario_iters="${SCENARIO_ITERS[$scenario]:-$ITERS}"
+    fi
     counters_csv="$ARTIFACTS_DIR/${scenario}-counters.csv"
     rtt_csv="$ARTIFACTS_DIR/${scenario}-rtt.csv"
 

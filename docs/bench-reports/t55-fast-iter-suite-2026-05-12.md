@@ -168,12 +168,18 @@ just for that single scenario on this AWS network path).
    burst-echo-server between rx-burst arms (currently only echo-server is
    restarted between dpdk/fstack arms).
 
-5. **verify-rack-tlp wallclock at high loss** — at 3% loss with 200k iters,
-   the run takes 10-15 minutes on this AWS network path (RTO-driven). The
-   script's `SCENARIO_ITERS[high_loss_3pct]=200000` is calibrated for a
-   higher-throughput physical lab. Either drop the override here to use the
-   suite's `ITERS=50000`, or split verify-rack-tlp out of the main suite
-   into its own slow-track invocation.
+5. **CLOSED (2026-05-12) — verify-rack-tlp wallclock at high loss**.
+   `scripts/verify-rack-tlp.sh` `SCENARIO_ITERS` map retuned for fast-iter:
+   `high_loss_3pct` 200k→50k, `symmetric_3pct` 200k→50k,
+   `high_loss_5pct` 100k→30k. Low-loss cells unchanged (500k / 200k —
+   needed to ensure ≥1 RACK/TLP event for ANY-of assertion; T55's
+   `low_loss_1pct_corr` at 200k iters fired exactly 1 TLP event, so
+   smaller would risk a false negative). New estimated suite wallclock:
+   ≤25 min on AWS c6a hardware. The fast-iter-suite's `ITERS=$VERIFY_RACK_ITERS`
+   passthrough is now redundant (all 5 scenarios are in `SCENARIO_ITERS`,
+   so the ITERS fallback is unused). Operators wanting nightly-grade
+   depth on a physical-lab DUT can override every scenario via
+   `FORCE_ITERS=1000000`.
 
 6. **DPDK zombie cleanup** — when fstack rx-burst was killed with `SIGKILL`,
    it left 23 hugepages locked + a zombie process still spinning at 99% CPU

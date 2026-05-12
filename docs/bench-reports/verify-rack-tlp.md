@@ -49,9 +49,25 @@ matches that empirical reality.
 |----------------------|---------------------|------:|----------------------------------------------|----------------------------------------------|
 | `low_loss_05pct`     | `loss 0.5%`         |  500k | `tcp.tx_retrans`                             | `tcp.tx_retrans_rack` `tcp.tx_retrans_tlp`   |
 | `low_loss_1pct_corr` | `loss 1% 25%`       |  200k | `tcp.tx_retrans`                             | `tcp.tx_retrans_rack` `tcp.tx_retrans_tlp`   |
-| `high_loss_3pct`     | `loss 3% delay 5ms` |  200k | `tcp.tx_retrans_rto` `tcp.tx_retrans_tlp`    | —                                            |
-| `symmetric_3pct`     | `loss 3%`           |  200k | `tcp.tx_retrans_rto` `tcp.tx_retrans_tlp`    | —                                            |
-| `high_loss_5pct`     | `loss 5% 25%`       |  100k | `tcp.tx_retrans_rto`                         | —                                            |
+| `high_loss_3pct`     | `loss 3% delay 5ms` |   50k | `tcp.tx_retrans_rto` `tcp.tx_retrans_tlp`    | —                                            |
+| `symmetric_3pct`     | `loss 3%`           |   50k | `tcp.tx_retrans_rto` `tcp.tx_retrans_tlp`    | —                                            |
+| `high_loss_5pct`     | `loss 5% 25%`       |   30k | `tcp.tx_retrans_rto`                         | —                                            |
+
+The iter counts are tuned for **fast-iter wallclock** (≤25 min for the
+full 5-scenario suite on AWS c6a fast-iter hardware). High-loss cells
+use deliberately small iter counts because the assertion is `> 0`:
+once 1k+ recovery events fire, the assertion is saturated, and each
+additional lost iter adds ~200 ms (one RTO floor) to scenario
+wallclock. Low-loss cells stay at 500 k / 200 k because the recovery
+events are rare enough that smaller iter counts risk a false-negative
+ANY-of failure (T55's `low_loss_1pct_corr` at 200 k iters produced
+exactly 1 TLP event — dropping any lower starts hitting 0).
+
+Operators wanting **nightly-grade statistical depth** on a physical-lab
+DUT can override every scenario via the `FORCE_ITERS` env var
+(`FORCE_ITERS=1000000 ./scripts/verify-rack-tlp.sh`). The fallback
+`ITERS` env var is kept for scenarios not present in the
+`SCENARIO_ITERS` map; it does NOT globally override.
 
 Theoretical rationale (per RFC 8985 §6 and the historical
 `bench-stress::scenarios.rs:67-83` design block preserved in commit
@@ -134,12 +150,26 @@ source ./.fast-iter.env                   # exports PEER_IP / PEER_SSH / PEER_EC
 ./scripts/fast-iter-setup.sh down         # tear down (~30 s)
 ```
 
-Default per-scenario wallclock varies with iter count: low-loss cells
-run 500 k iters (~30-50 s each), high-loss cells run 100-200 k iters
-(~10-20 s each) plus engine boot/teardown. Override via the env
-fallbacks (`ITERS=...`, `WARMUP=...`, `PAYLOAD_BYTES=...`) to shrink
-the cycle for plumbing checks; `ITERS` only applies to scenarios
-without an entry in the script's `SCENARIO_ITERS` map.
+Default per-scenario wallclock on the AWS c6a fast-iter DUT:
+
+| scenario             | iters | expected wallclock |
+|----------------------|------:|--------------------|
+| `low_loss_05pct`     |  500k | ~7-9 min  |
+| `low_loss_1pct_corr` |  200k | ~4-6 min  |
+| `high_loss_3pct`     |   50k | ~2-3 min  |
+| `symmetric_3pct`     |   50k | ~2-3 min  |
+| `high_loss_5pct`     |   30k | ~1-2 min  |
+| **Total**            |       | **≤25 min** |
+
+Low-loss wallclock is dominated by the bench-rtt's request/response
+cycle (~75 µs/iter base RTT); high-loss wallclock is dominated by the
+200 ms RTO floor (each lost iter ≈ +200 ms). On a physical-lab DUT
+with line-rate links, each row is roughly 2× faster.
+
+To override iter counts for plumbing checks (everything at e.g. 1000
+iters): set `FORCE_ITERS=1000`. The `ITERS` env var is only the
+fallback for scenarios missing from `SCENARIO_ITERS`; it does NOT
+globally override.
 
 ## Interpreting failures
 

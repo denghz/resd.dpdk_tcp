@@ -148,6 +148,28 @@ The script now distinguishes two assertion semantics: `REQUIRED_NONZERO`
 for trigger-varies-with-timing scenarios). The full Scenario × counter
 table is documented in the script header.
 
+**Wallclock recalibration (DONE, 2026-05-12)**: T55's fast-iter run
+showed `high_loss_3pct` at 200k iters projects past the 1500s outer
+timeout on AWS c6a hardware (each lost iter adds ~200 ms under the
+RTO floor). High-loss iter counts cut to fit the fast-iter budget,
+since the assertion is `> 0` and ~1500 retrans events is plenty:
+
+| scenario            | was iters | now iters | est. wallclock (fast-iter) |
+|---------------------|----------:|----------:|---------------------------:|
+| `low_loss_05pct`    |     500k  |     500k  |             ~7-9 min       |
+| `low_loss_1pct_corr`|     200k  |     200k  |             ~4-6 min       |
+| `high_loss_3pct`    |     200k  |      50k  |             ~2-3 min       |
+| `symmetric_3pct`    |     200k  |      50k  |             ~2-3 min       |
+| `high_loss_5pct`    |     100k  |      30k  |             ~1-2 min       |
+| **Total**           |           |           |        **~16-23 min**      |
+
+Low-loss iters preserved at 500k/200k because the recovery events
+(rack/tlp) are rare enough that smaller iter counts risk a false
+negative on the ANY-of assertion — T55 showed `low_loss_1pct_corr`
+at 200k iters produced exactly 1 TLP event. Operators wanting
+nightly-grade depth on a physical-lab DUT can pass
+`FORCE_ITERS=1000000` for a global override.
+
 **bench-tx-burst** dpdk_net arm: WORKS. K=64 KiB,G=0 ms,50 bursts
 emits burst_initiation_ns p50=28 µs / p99=37.8 µs / mean=29 µs.
 
@@ -281,21 +303,29 @@ no measurable wallclock.
    check confirms 118 `ff_*` text symbols in each fstack-built binary, identical
    across all four. A separate crate (rather than extending bench-fstack-ffi)
    keeps build-time deps from bleeding into the runtime crate's feature surface.
-3. **CLOSED** (2026-05-10, operator-runnable): the RACK / TLP / RTO trigger paths
-   under Phase 10's high-loss scenarios now have an operator-runnable verification
-   harness at `scripts/verify-rack-tlp.sh`, paired with documentation at
+3. **CLOSED** (2026-05-10, operator-runnable; assertion + iter calibration
+   refined 2026-05-12): the RACK / TLP / RTO trigger paths under Phase 10's
+   netem scenarios now have an operator-runnable verification harness at
+   `scripts/verify-rack-tlp.sh`, paired with documentation at
    `docs/bench-reports/verify-rack-tlp.md`. The script applies each scenario's
-   netem spec on the peer (egress), runs `bench-rtt` with the new `--counters-csv`
-   flag (lifted into `tools/bench-rtt/src/main.rs` — pre/post snapshots over
-   `dpdk_net_core::counters::ALL_COUNTER_NAMES`), parses the resulting
-   `name,pre,post,delta` CSV, and asserts `delta > 0` per scenario:
-   `high_loss_3pct` requires non-zero `tcp.tx_retrans_rto` and `tcp.tx_retrans_rack`,
-   `high_loss_5pct` requires non-zero `tcp.tx_retrans_rto`, and `symmetric_3pct`
-   requires non-zero `tcp.tx_retrans_rack` and `tcp.tx_retrans_tlp`. Auto-running
-   it in CI is out of scope (needs a real DUT+peer), so the closure is
-   "operator-runnable, not nightly-wired". Any future regression in retransmit
-   plumbing surfaces as a FAIL row in the script's summary table; the doc covers
-   the diagnostic path for each common FAIL shape.
+   netem spec on the peer (egress), runs `bench-rtt` with the new
+   `--counters-csv` flag (lifted into `tools/bench-rtt/src/main.rs` —
+   pre/post snapshots over `dpdk_net_core::counters::ALL_COUNTER_NAMES`),
+   parses the resulting `name,pre,post,delta` CSV, and asserts both an
+   ALL-of (`REQUIRED_NONZERO`) and an ANY-of (`REQUIRED_NONZERO_ANY`)
+   constraint per scenario. The current 5-scenario map (assertion-set v2,
+   2026-05-12) covers: `low_loss_05pct` and `low_loss_1pct_corr` (low-loss
+   RACK/TLP exercise, ANY-of `rack | tlp`); `high_loss_3pct` and
+   `symmetric_3pct` (ALL-of `rto, tlp`); `high_loss_5pct` (ALL-of `rto`).
+   See the script header table for the full per-scenario rationale.
+   Iter counts are tuned for fast-iter wallclock (≤25 min total): low-loss
+   cells at 500 k / 200 k (to ensure ≥1 RACK/TLP event), high-loss cells
+   at 50 k / 50 k / 30 k (≥1500 retransmit events, plenty for `> 0`).
+   Auto-running in CI is out of scope (needs a real DUT+peer), so the
+   closure is "operator-runnable, not nightly-wired". Any future
+   regression in retransmit plumbing surfaces as a FAIL row in the
+   script's summary table; the doc covers the diagnostic path for each
+   common FAIL shape.
 4. **CLOSED** (2026-05-09, commit `f05b114`): bench-rtt's
    `--attribution-csv` sidecar now emits one row per measurement iteration with
    the 14-column schema (`bucket_id, iter, mode, rtt_ns, rx_hw_ts_ns,` 5 Hw-bucket
