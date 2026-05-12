@@ -49,6 +49,25 @@
 
 The dpdk_net numeric corruption from T56 is GONE — all 9 cells produce stable p50 with no 1e18 outliers (sentinel filter at `tools/bench-rx-burst/src/dpdk.rs::PEER_SEND_NS_FLOOR` working).
 
+**2026-05-12 audit — finding confirmed.** Per-arm `dut_recv_ns` capture sites
+(dpdk_net `tools/bench-rx-burst/src/dpdk.rs:272`, fstack
+`tools/bench-rx-burst/src/fstack.rs:588`) were audited for semantic
+comparability: both arms anchor on `CLOCK_REALTIME` via `SystemTime::now()`
+and capture at the same pipeline point — "first user-space buffer post-stack
+is populated, recv_buf not yet extended." The work timed inside each arm's
+measurement window differs by ~50 ns (dpdk_net's `drain_readable_bytes`
+includes an iovec→Vec copy + event-queue + flow-table-lookup overhead that
+fstack's `ff_read` doesn't carry), which **disadvantages dpdk_net** by that
+margin — i.e. makes dpdk_net look slower than its "true" stack overhead, in
+the same direction as the headline. The asymmetry is 40-300× smaller than
+the µs-scale gaps observed and is dwarfed by NTP-skew effects (~100 µs
+same-AZ); the qualitative finding survives. Live-wire validation against
+the same peer (10.4.1.228) re-confirmed fstack p50 ≤ dpdk_net p50 in all 9
+cells, with fstack saturating to 0 (true latency below the NTP skew floor)
+in 8 of 9 cells and dpdk_net consistently above it. Full audit notes at
+[`docs/bench-reports/fstack-vs-dpdk-rx-timing-audit-2026-05-12.md`](./fstack-vs-dpdk-rx-timing-audit-2026-05-12.md);
+no code fix required — the existing measurement positions are correct.
+
 ## bench-tx-burst — throughput Gbps + initiation latency
 
 dpdk_net (real wire):
