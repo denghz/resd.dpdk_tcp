@@ -132,11 +132,20 @@ struct Args {
 
 /// One bucket's measurement product. Carries the per-segment records
 /// and the bucket's (W, N) coordinates for CSV emit.
+///
+/// `invalid_reason` is `Some(msg)` when the per-stack arm bailed the
+/// bucket (e.g. fstack stall watchdog, connect timeout) so `samples`
+/// is empty by construction. `emit_csv` then renders a single marker
+/// row carrying the reason in `dimensions_json.bucket_invalid` —
+/// mirrors bench-tx-burst's `BucketVerdict::Invalid` pattern so
+/// downstream `bench-report` / `fast-iter-suite.sh` see "bucket
+/// stalled" instead of "no data — CSV missing or empty".
 struct BucketResult {
     bucket_id: u32,
     segment_size: usize,
     burst_count: usize,
     samples: Vec<SegmentRecord>,
+    invalid_reason: Option<String>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -268,6 +277,7 @@ fn run_dpdk_net(args: &Args) -> anyhow::Result<Vec<BucketResult>> {
                 segment_size,
                 burst_count,
                 samples: run.samples,
+                invalid_reason: None,
             });
             bucket_id += 1;
         }
@@ -308,6 +318,7 @@ fn run_linux_kernel(args: &Args) -> anyhow::Result<Vec<BucketResult>> {
                 segment_size,
                 burst_count,
                 samples: run.samples,
+                invalid_reason: None,
             });
             bucket_id += 1;
         }
@@ -360,6 +371,7 @@ fn run_fstack(args: &Args) -> anyhow::Result<Vec<BucketResult>> {
                 segment_size: *segment_size,
                 burst_count: *burst_count,
                 samples: run.samples,
+                invalid_reason: None,
             }),
             Err(e) => {
                 eprintln!(
@@ -371,11 +383,47 @@ fn run_fstack(args: &Args) -> anyhow::Result<Vec<BucketResult>> {
                     segment_size: *segment_size,
                     burst_count: *burst_count,
                     samples: Vec::new(),
+                    invalid_reason: Some(classify_fstack_bucket_error(&e)),
                 });
             }
         }
     }
     Ok(buckets)
+}
+
+/// Map an fstack BucketError message to a stable short reason tag the
+/// downstream report can group on. `fstack.rs` emits free-form prose
+/// (`"fstack_rx_burst: connect handshake stalled after 10s ..."`) which
+/// is great for the operator log but bad for a CSV cell — `bench-report`
+/// pivots on `dimensions_json` exactly, so two semantically-equal but
+/// textually-different rows would split into two columns. The mapping
+/// here keeps the operator log noise (full message still printed to
+/// stderr in `run_fstack`) but reduces the CSV cell to a stable tag.
+///
+/// Tags (kept short, snake_case to match bench-tx-burst's
+/// `bucket_invalid` convention):
+///
+/// - `connect_timeout` — `connect handshake stalled` (CONNECT_TIMEOUT).
+/// - `send_cmd_stall`  — `send-cmd stalled` (STALL_TIMEOUT in phase_send_cmd).
+/// - `read_burst_stall` — `read-burst stalled` (STALL_TIMEOUT in phase_read_burst).
+/// - `connect_failed`  — `SO_ERROR=` (peer refused, no listener, etc.).
+/// - `ffi_error`       — bare `ff_socket`, `ff_ioctl`, `ff_poll`, etc.
+/// - `unknown`         — fallback so the marker row still parses cleanly.
+#[cfg(feature = "fstack")]
+fn classify_fstack_bucket_error(msg: &str) -> String {
+    if msg.contains("connect handshake stalled") {
+        "connect_timeout".to_string()
+    } else if msg.contains("send-cmd stalled") {
+        "send_cmd_stall".to_string()
+    } else if msg.contains("read-burst stalled") {
+        "read_burst_stall".to_string()
+    } else if msg.contains("SO_ERROR=") {
+        "connect_failed".to_string()
+    } else if msg.starts_with("ff_") {
+        "ffi_error".to_string()
+    } else {
+        "unknown".to_string()
+    }
 }
 
 #[cfg(not(feature = "fstack"))]
@@ -664,9 +712,37 @@ fn run_capture(argv: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// Build `dimensions_json` for one bucket row. Carries `{stack,
+/// segment_size_bytes, burst_count}`; when `invalid_reason` is `Some(..)`
+/// (fstack arm bailed the bucket via the watchdog), the reason is
+/// appended under `bucket_invalid` so `fast-iter-suite.sh`'s summarizer
+/// renders it as a column (it walks dimensions_json keys generically).
+/// Mirrors `bench-tx-burst::burst::build_dimensions_json`.
+fn build_dimensions_json(
+    stack: Stack,
+    segment_size: usize,
+    burst_count: usize,
+    invalid_reason: Option<&str>,
+) -> String {
+    let mut v = serde_json::json!({
+        "stack": stack.as_dimension(),
+        "segment_size_bytes": segment_size,
+        "burst_count": burst_count,
+    });
+    if let Some(reason) = invalid_reason {
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert(
+                "bucket_invalid".to_string(),
+                serde_json::Value::String(reason.to_string()),
+            );
+        }
+    }
+    v.to_string()
+}
+
 /// Emit the summary CSV — one set of 7 aggregation rows per
-/// (W, N) bucket. `dimensions_json` carries `{stack, segment_size,
-/// burst_count}` so bench-report can group by any axis.
+/// (W, N) bucket, or a single `bucket_invalid` marker row when the
+/// bucket bailed (fstack arm only — see `BucketResult::invalid_reason`).
 fn emit_csv(args: &Args, meta: &RunMetadata, buckets: &[BucketResult]) -> anyhow::Result<()> {
     if buckets.is_empty() {
         anyhow::bail!("emit_csv: no buckets to summarise");
@@ -681,65 +757,123 @@ fn emit_csv(args: &Args, meta: &RunMetadata, buckets: &[BucketResult]) -> anyhow
         .map(|p| p.display().to_string());
 
     for bucket in buckets {
-        if bucket.samples.is_empty() {
-            // Empty bucket — emit a stub row so downstream report sees
-            // a marker. Use NaN-like 0 with `failed_iter_count` not
-            // applicable here; we just skip the percentile rows.
-            eprintln!(
-                "bench-rx-burst: WARN bucket id={} (W={} N={}) produced no samples",
-                bucket.bucket_id, bucket.segment_size, bucket.burst_count
-            );
-            continue;
-        }
-        let lat_ns: Vec<f64> = bucket.samples.iter().map(|r| r.latency_ns as f64).collect();
-        let summary: Summary = summarize(&lat_ns);
-
-        let dims = serde_json::json!({
-            "stack": args.stack.as_dimension(),
-            "segment_size_bytes": bucket.segment_size,
-            "burst_count": bucket.burst_count,
-        })
-        .to_string();
-
-        let rows: [(MetricAggregation, f64); 7] = [
-            (MetricAggregation::P50, summary.p50),
-            (MetricAggregation::P99, summary.p99),
-            (MetricAggregation::P999, summary.p999),
-            (MetricAggregation::Mean, summary.mean),
-            (MetricAggregation::Stddev, summary.stddev),
-            (MetricAggregation::Ci95Lower, summary.ci95_lower),
-            (MetricAggregation::Ci95Upper, summary.ci95_upper),
-        ];
-
-        for (agg, value) in rows {
-            let row = CsvRow {
-                run_metadata: meta.clone(),
-                tool: args.tool.clone(),
-                test_case: "rx_burst_segment_latency".to_string(),
-                feature_set: args.feature_set.clone(),
-                dimensions_json: dims.clone(),
-                metric_name: "latency_ns".to_string(),
-                metric_unit: "ns".to_string(),
-                metric_value: value,
-                metric_aggregation: agg,
-                cpu_family: None,
-                cpu_model_name: None,
-                dpdk_version_pkgconfig: None,
-                worktree_branch: None,
-                uprof_session_id: None,
-                raw_samples_path: raw_samples_path.clone(),
-                failed_iter_count: 0,
-            };
-            wtr.serialize(&row)?;
-        }
+        emit_one_bucket(
+            &mut wtr,
+            args.stack,
+            &args.tool,
+            &args.feature_set,
+            meta,
+            bucket,
+            raw_samples_path.as_deref(),
+        )?;
     }
     wtr.flush()?;
+    Ok(())
+}
+
+/// Emit either the 7-row aggregation tuple (happy path) or the
+/// 1-row marker (bucket invalidated, no samples). Factored out so the
+/// in-process tests can drive it directly without spinning up the full
+/// `emit_csv` filesystem-bound path.
+fn emit_one_bucket<W: std::io::Write>(
+    wtr: &mut csv::Writer<W>,
+    stack: Stack,
+    tool: &str,
+    feature_set: &str,
+    meta: &RunMetadata,
+    bucket: &BucketResult,
+    raw_samples_path: Option<&str>,
+) -> anyhow::Result<()> {
+    // Empty-samples branch: emit a single marker row whose
+    // `dimensions_json.bucket_invalid` carries the reason. Skip
+    // entirely when `invalid_reason` is `None` (legacy soft-fail —
+    // shouldn't happen on the current grid arms but kept for
+    // defence-in-depth: dropping a row silently is better than
+    // emitting a `metric_value=0` marker with no reason at all).
+    if bucket.samples.is_empty() {
+        let Some(reason) = bucket.invalid_reason.as_deref() else {
+            eprintln!(
+                "bench-rx-burst: WARN bucket id={} (W={} N={}) produced no samples \
+                 and no invalid_reason — dropping (legacy soft-fail path)",
+                bucket.bucket_id, bucket.segment_size, bucket.burst_count
+            );
+            return Ok(());
+        };
+        eprintln!(
+            "bench-rx-burst: bucket id={} (W={} N={}) invalidated: {}",
+            bucket.bucket_id, bucket.segment_size, bucket.burst_count, reason
+        );
+        let dims = build_dimensions_json(
+            stack,
+            bucket.segment_size,
+            bucket.burst_count,
+            Some(reason),
+        );
+        let row = CsvRow {
+            run_metadata: meta.clone(),
+            tool: tool.to_string(),
+            test_case: "rx_burst_segment_latency".to_string(),
+            feature_set: feature_set.to_string(),
+            dimensions_json: dims,
+            metric_name: "latency_ns".to_string(),
+            metric_unit: "ns".to_string(),
+            metric_value: 0.0,
+            metric_aggregation: MetricAggregation::Mean,
+            cpu_family: None,
+            cpu_model_name: None,
+            dpdk_version_pkgconfig: None,
+            worktree_branch: None,
+            uprof_session_id: None,
+            raw_samples_path: raw_samples_path.map(str::to_string),
+            failed_iter_count: 0,
+        };
+        wtr.serialize(&row)?;
+        return Ok(());
+    }
+
+    let lat_ns: Vec<f64> = bucket.samples.iter().map(|r| r.latency_ns as f64).collect();
+    let summary: Summary = summarize(&lat_ns);
+
+    let dims = build_dimensions_json(stack, bucket.segment_size, bucket.burst_count, None);
+
+    let rows: [(MetricAggregation, f64); 7] = [
+        (MetricAggregation::P50, summary.p50),
+        (MetricAggregation::P99, summary.p99),
+        (MetricAggregation::P999, summary.p999),
+        (MetricAggregation::Mean, summary.mean),
+        (MetricAggregation::Stddev, summary.stddev),
+        (MetricAggregation::Ci95Lower, summary.ci95_lower),
+        (MetricAggregation::Ci95Upper, summary.ci95_upper),
+    ];
+
+    for (agg, value) in rows {
+        let row = CsvRow {
+            run_metadata: meta.clone(),
+            tool: tool.to_string(),
+            test_case: "rx_burst_segment_latency".to_string(),
+            feature_set: feature_set.to_string(),
+            dimensions_json: dims.clone(),
+            metric_name: "latency_ns".to_string(),
+            metric_unit: "ns".to_string(),
+            metric_value: value,
+            metric_aggregation: agg,
+            cpu_family: None,
+            cpu_model_name: None,
+            dpdk_version_pkgconfig: None,
+            worktree_branch: None,
+            uprof_session_id: None,
+            raw_samples_path: raw_samples_path.map(str::to_string),
+            failed_iter_count: 0,
+        };
+        wtr.serialize(&row)?;
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bench_common::preconditions::{PreconditionMode, Preconditions};
 
     #[test]
     fn parse_mode_accepts_strict_and_lenient() {
@@ -756,5 +890,345 @@ mod tests {
     fn parse_ip_host_order_roundtrip() {
         assert_eq!(parse_ip_host_order("10.0.0.42").unwrap(), 0x0A00_002A);
         assert!(parse_ip_host_order("not.an.ip.addr").is_err());
+    }
+
+    // ----------------------------------------------------------------
+    // T56 follow-up #3 — bucket_invalid marker rows.
+    //
+    // When the fstack arm's STALL_TIMEOUT / CONNECT_TIMEOUT watchdog
+    // (commit a034d67) bails a bucket, no SegmentRecords land in
+    // `BucketResult::samples` — the legacy emit_csv path silently
+    // skipped that bucket, leaving an empty CSV. fast-iter-suite.sh
+    // then rendered the per-stack section as `_(no data — CSV missing
+    // or empty)_` even though the bench gave up gracefully.
+    //
+    // The fix below propagates the BucketError reason into
+    // `BucketResult::invalid_reason` and `emit_one_bucket` renders a
+    // single marker row whose `dimensions_json.bucket_invalid` carries
+    // the reason. Mirrors bench-tx-burst's `BucketVerdict::Invalid`
+    // convention so downstream `bench-report` / summarizers can group
+    // on the same key across both tools.
+    // ----------------------------------------------------------------
+
+    fn sample_metadata() -> RunMetadata {
+        RunMetadata {
+            run_id: uuid::Uuid::nil(),
+            run_started_at: "2026-05-12T00:00:00Z".to_string(),
+            commit_sha: "0".repeat(40),
+            branch: "a10-perf-23.11".to_string(),
+            host: "test-host".to_string(),
+            instance_type: "c6in.metal".to_string(),
+            cpu_model: "test-cpu".to_string(),
+            dpdk_version: "23.11.2".to_string(),
+            kernel: "6.8.0".to_string(),
+            nic_model: "ENA".to_string(),
+            nic_fw: String::new(),
+            ami_id: String::new(),
+            precondition_mode: PreconditionMode::Strict,
+            preconditions: Preconditions::default(),
+        }
+    }
+
+    /// Drive `emit_one_bucket` against an in-memory `csv::Writer` and
+    /// return `(data_row_count, parsed_rows)`. `parsed_rows` carries
+    /// `(metric_aggregation, metric_value, dimensions_json_string)`
+    /// tuples so each test can assert on shape without re-parsing.
+    fn drive_emit_one_bucket(
+        bucket: &BucketResult,
+        stack: Stack,
+    ) -> (usize, Vec<(String, String, String)>) {
+        let mut buf: Vec<u8> = Vec::new();
+        let meta = sample_metadata();
+        {
+            let mut wtr = csv::Writer::from_writer(&mut buf);
+            emit_one_bucket(
+                &mut wtr,
+                stack,
+                "bench-rx-burst",
+                "trading-latency",
+                &meta,
+                bucket,
+                None,
+            )
+            .expect("emit_one_bucket");
+            wtr.flush().expect("flush");
+        }
+        // csv::Writer doesn't emit a header until something is
+        // serialized, so an empty bucket → empty buffer → no rows.
+        if buf.is_empty() {
+            return (0, Vec::new());
+        }
+        let mut reader = csv::Reader::from_reader(&buf[..]);
+        let headers = reader.headers().expect("headers").clone();
+        let agg_idx = headers
+            .iter()
+            .position(|h| h == "metric_aggregation")
+            .expect("metric_aggregation column");
+        let val_idx = headers
+            .iter()
+            .position(|h| h == "metric_value")
+            .expect("metric_value column");
+        let dims_idx = headers
+            .iter()
+            .position(|h| h == "dimensions_json")
+            .expect("dimensions_json column");
+        let mut rows: Vec<(String, String, String)> = Vec::new();
+        for record in reader.records() {
+            let record = record.expect("csv row");
+            rows.push((
+                record.get(agg_idx).unwrap().to_string(),
+                record.get(val_idx).unwrap().to_string(),
+                record.get(dims_idx).unwrap().to_string(),
+            ));
+        }
+        (rows.len(), rows)
+    }
+
+    #[test]
+    fn build_dimensions_json_omits_bucket_invalid_on_happy_path() {
+        let dims = build_dimensions_json(Stack::DpdkNet, 64, 16, None);
+        let v: serde_json::Value = serde_json::from_str(&dims).unwrap();
+        assert_eq!(v["stack"], "dpdk_net");
+        assert_eq!(v["segment_size_bytes"], 64);
+        assert_eq!(v["burst_count"], 16);
+        // The `bucket_invalid` key MUST be absent on the happy path so
+        // existing operators reading the CSV see the same schema they
+        // always did. Adding the column to the happy-path JSON would
+        // make the summarizer pivot create an extra "bucket_invalid"
+        // column populated with empty strings — ugly but not breaking.
+        assert!(
+            v.get("bucket_invalid").is_none(),
+            "bucket_invalid must be absent on happy-path rows"
+        );
+    }
+
+    #[test]
+    fn build_dimensions_json_attaches_bucket_invalid_reason() {
+        let dims = build_dimensions_json(
+            Stack::Fstack,
+            128,
+            64,
+            Some("read_burst_stall"),
+        );
+        let v: serde_json::Value = serde_json::from_str(&dims).unwrap();
+        assert_eq!(v["stack"], "fstack");
+        assert_eq!(v["segment_size_bytes"], 128);
+        assert_eq!(v["burst_count"], 64);
+        assert_eq!(v["bucket_invalid"], "read_burst_stall");
+    }
+
+    #[test]
+    fn emit_one_bucket_invalid_emits_single_marker_row() {
+        let bucket = BucketResult {
+            bucket_id: 3,
+            segment_size: 128,
+            burst_count: 64,
+            samples: Vec::new(),
+            invalid_reason: Some("read_burst_stall".to_string()),
+        };
+        let (count, rows) = drive_emit_one_bucket(&bucket, Stack::Fstack);
+        assert_eq!(count, 1, "exactly one marker row per stalled bucket");
+        let (agg, val, dims) = &rows[0];
+        // Marker row uses Mean aggregation + metric_value=0 — same
+        // convention as bench-tx-burst's bucket-invalid marker. Picking
+        // Mean (not P99 / P50 / Stddev) means a downstream summarizer
+        // that pivots on metric_aggregation=mean can render the row in
+        // the mean column with a value of 0 and the bucket_invalid
+        // reason in dimensions_json — clearly distinguishable from a
+        // real 0 ns mean (impossible in practice).
+        assert_eq!(agg, "mean");
+        assert_eq!(val, "0.0");
+        let v: serde_json::Value = serde_json::from_str(dims).unwrap();
+        assert_eq!(v["stack"], "fstack");
+        assert_eq!(v["segment_size_bytes"], 128);
+        assert_eq!(v["burst_count"], 64);
+        assert_eq!(v["bucket_invalid"], "read_burst_stall");
+    }
+
+    #[test]
+    fn emit_one_bucket_happy_path_emits_seven_aggregation_rows() {
+        let samples: Vec<SegmentRecord> = (0..16)
+            .map(|i| SegmentRecord {
+                bucket_id: 0,
+                burst_idx: 0,
+                seg_idx: i,
+                peer_send_ns: 1_000_000 + i * 1_000,
+                dut_recv_ns: 1_500_000 + i * 1_000,
+                latency_ns: 500_000,
+            })
+            .collect();
+        let bucket = BucketResult {
+            bucket_id: 0,
+            segment_size: 64,
+            burst_count: 16,
+            samples,
+            invalid_reason: None,
+        };
+        let (count, rows) = drive_emit_one_bucket(&bucket, Stack::DpdkNet);
+        assert_eq!(count, 7, "p50/p99/p999/mean/stddev/ci95_lower/ci95_upper");
+        let aggs: Vec<&str> = rows.iter().map(|(a, _, _)| a.as_str()).collect();
+        assert_eq!(
+            aggs,
+            vec!["p50", "p99", "p999", "mean", "stddev", "ci95_lower", "ci95_upper"],
+        );
+        // Happy-path rows must NOT carry the `bucket_invalid` key —
+        // the regression guard for the schema-stability constraint.
+        for (_, _, dims) in &rows {
+            let v: serde_json::Value = serde_json::from_str(dims).unwrap();
+            assert!(
+                v.get("bucket_invalid").is_none(),
+                "happy-path row leaked bucket_invalid: {dims}"
+            );
+        }
+    }
+
+    #[test]
+    fn emit_one_bucket_empty_no_reason_drops_row_legacy_soft_fail() {
+        // Belt-and-braces: if a future stack arm forgets to set
+        // `invalid_reason` on an empty bucket, we drop the row (legacy
+        // behavior) rather than emit a marker with no reason. Better
+        // an empty CSV row than a row with `bucket_invalid: ""` that
+        // the summarizer would render as an empty column.
+        let bucket = BucketResult {
+            bucket_id: 0,
+            segment_size: 64,
+            burst_count: 16,
+            samples: Vec::new(),
+            invalid_reason: None,
+        };
+        let (count, _) = drive_emit_one_bucket(&bucket, Stack::DpdkNet);
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn emit_csv_three_invalid_buckets_emits_three_marker_rows() {
+        // Simulates the T56 fstack scenario: peer wedged, all three
+        // buckets time out via the watchdog. Each lands in `buckets`
+        // with samples.is_empty() && invalid_reason=Some(reason). The
+        // resulting CSV must carry exactly 3 data rows so the
+        // summarizer doesn't render `_(no data — CSV missing or empty)_`.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let csv_path = tmp.path().join("rx-burst-fstack.csv");
+        let args = Args::parse_from([
+            "bench-rx-burst",
+            "--stack",
+            "fstack",
+            "--peer-ip",
+            "127.0.0.1",
+            "--output-csv",
+            csv_path.to_str().unwrap(),
+            "--segment-sizes",
+            "64,128",
+            "--burst-counts",
+            "16",
+            "--feature-set",
+            "trading-latency",
+        ]);
+        let meta = sample_metadata();
+        let buckets = vec![
+            BucketResult {
+                bucket_id: 0,
+                segment_size: 64,
+                burst_count: 16,
+                samples: Vec::new(),
+                invalid_reason: Some("connect_timeout".to_string()),
+            },
+            BucketResult {
+                bucket_id: 1,
+                segment_size: 128,
+                burst_count: 16,
+                samples: Vec::new(),
+                invalid_reason: Some("read_burst_stall".to_string()),
+            },
+            BucketResult {
+                bucket_id: 2,
+                segment_size: 256,
+                burst_count: 64,
+                samples: Vec::new(),
+                invalid_reason: Some("send_cmd_stall".to_string()),
+            },
+        ];
+        emit_csv(&args, &meta, &buckets).expect("emit_csv");
+
+        // Read back and parse.
+        let mut reader = csv::Reader::from_path(&csv_path).expect("open csv");
+        let headers = reader.headers().expect("headers").clone();
+        let dims_idx = headers
+            .iter()
+            .position(|h| h == "dimensions_json")
+            .expect("dimensions_json column");
+        let agg_idx = headers
+            .iter()
+            .position(|h| h == "metric_aggregation")
+            .expect("metric_aggregation column");
+        let val_idx = headers
+            .iter()
+            .position(|h| h == "metric_value")
+            .expect("metric_value column");
+
+        let records: Vec<csv::StringRecord> = reader.records().map(|r| r.unwrap()).collect();
+        assert_eq!(
+            records.len(),
+            3,
+            "exactly one marker row per stalled bucket (none silently dropped)"
+        );
+
+        let reasons: Vec<String> = records
+            .iter()
+            .map(|r| {
+                let dims: serde_json::Value =
+                    serde_json::from_str(r.get(dims_idx).unwrap()).unwrap();
+                dims["bucket_invalid"].as_str().unwrap().to_string()
+            })
+            .collect();
+        assert_eq!(
+            reasons,
+            vec!["connect_timeout", "read_burst_stall", "send_cmd_stall"],
+        );
+
+        // Each row uses Mean aggregation + value 0.0.
+        for r in &records {
+            assert_eq!(r.get(agg_idx).unwrap(), "mean");
+            assert_eq!(r.get(val_idx).unwrap(), "0.0");
+        }
+    }
+
+    #[cfg(feature = "fstack")]
+    #[test]
+    fn classify_fstack_bucket_error_maps_known_messages() {
+        // Pin the message → tag mapping. The fstack arm's free-form
+        // messages must continue to map to these short tags so the
+        // downstream summarizer's `bucket_invalid` column stays stable
+        // across the per-phase prose tweaks landing in fstack.rs.
+        assert_eq!(
+            classify_fstack_bucket_error(
+                "fstack_rx_burst: connect handshake stalled after 10s ..."
+            ),
+            "connect_timeout"
+        );
+        assert_eq!(
+            classify_fstack_bucket_error(
+                "fstack_rx_burst: send-cmd stalled after 30s on burst 0 ..."
+            ),
+            "send_cmd_stall"
+        );
+        assert_eq!(
+            classify_fstack_bucket_error(
+                "fstack_rx_burst: read-burst stalled after 30s on burst 0 ..."
+            ),
+            "read_burst_stall"
+        );
+        assert_eq!(
+            classify_fstack_bucket_error("connect SO_ERROR=111"),
+            "connect_failed"
+        );
+        assert_eq!(
+            classify_fstack_bucket_error("ff_socket failed: errno=24"),
+            "ffi_error"
+        );
+        assert_eq!(
+            classify_fstack_bucket_error("something completely new"),
+            "unknown"
+        );
     }
 }
