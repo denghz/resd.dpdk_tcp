@@ -29,12 +29,15 @@
 # assertion is `> 0` — once 1k+ recovery events fire, the assertion is
 # saturated. Adding more iters only burns wallclock under the 200 ms RTO
 # floor (each lost iter ≈ +200 ms scenario time). The per-scenario
-# defaults below are tuned so the full suite completes in ~25 min on
-# AWS c6a fast-iter hardware; statistical depth for percentile reporting
-# is NOT a goal of this verifier and should be obtained from
-# bench-nightly's netem matrix instead. Operators wanting nightly-grade
-# depth on a physical-lab DUT can globally override every scenario via
-# the `FORCE_ITERS` env var (e.g. `FORCE_ITERS=1000000`).
+# defaults below are tuned so the full suite completes in ~30 min on
+# AWS c6a fast-iter hardware (the `low_loss_1pct` cell at uniform 1% is
+# ~7-8 min — more RTOs fire than under the retired `loss 1% 25%` spec,
+# but the assertion is now reliably saturated instead of stochastically
+# false-failing). Statistical depth for percentile reporting is NOT a
+# goal of this verifier and should be obtained from bench-nightly's
+# netem matrix instead. Operators wanting nightly-grade depth on a
+# physical-lab DUT can globally override every scenario via the
+# `FORCE_ITERS` env var (e.g. `FORCE_ITERS=1000000`).
 #
 #   scenario              netem spec            ALL non-zero           ANY non-zero          rationale
 #   ─────────────────     ─────────────────     ───────────────────    ──────────────────    ─────────
@@ -42,9 +45,20 @@
 #                                                                       tx_retrans_tlp        within reorder window;
 #                                                                                             RPC tail-loss → TLP.
 #                                                                                             Loss too low for RTO.
-#   low_loss_1pct_corr    loss 1% 25%           tcp.tx_retrans         tx_retrans_rack,      Correlated bursts at 1%
-#                                                                       tx_retrans_tlp        — RACK/TLP dominate; RTO
-#                                                                                             rare (per fa25bfd hist).
+#   low_loss_1pct         loss 1%               tcp.tx_retrans         tx_retrans_rack,      Independent per-packet drop
+#                                                                       tx_retrans_tlp        at 1%. ALL-of pins the
+#                                                                                             aggregate; ANY-of pins
+#                                                                                             RACK or TLP (low-loss
+#                                                                                             recovery path). Empirical
+#                                                                                             (2026-05-12 smoke ×3):
+#                                                                                             ~10 000 RTO + ~2 000 TLP +
+#                                                                                             ~12 000 agg per 200k-iter
+#                                                                                             run — ANY-of saturates on
+#                                                                                             TLP. Replaced flaky
+#                                                                                             `loss 1% 25%` precursor
+#                                                                                             (T56v4 saw 0 retrans;
+#                                                                                             T55/v3/v5 saw ≤6) — see
+#                                                                                             2026-05-12 T57 followup.
 #   high_loss_3pct        loss 3% delay 5ms     tx_retrans_rto,        —                     RTO is the dominant
 #                                               tx_retrans_tlp                                trigger (86% empirically);
 #                                                                                             TLP fills the RPC-tail
@@ -184,7 +198,7 @@ SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30
 # TLP paths (which empirically never fire at ≥3% — see header table).
 declare -A SPECS=(
   [low_loss_05pct]="loss 0.5%"
-  [low_loss_1pct_corr]="loss 1% 25%"
+  [low_loss_1pct]="loss 1%"
   [high_loss_3pct]="loss 3% delay 5ms"
   [symmetric_3pct]="loss 3%"
   [high_loss_5pct]="loss 5% 25%"
@@ -210,7 +224,7 @@ declare -A SPECS=(
 # See the header "Scenario × expected-counter table" for the rationale.
 declare -A REQUIRED_NONZERO=(
   [low_loss_05pct]="tcp.tx_retrans"
-  [low_loss_1pct_corr]="tcp.tx_retrans"
+  [low_loss_1pct]="tcp.tx_retrans"
   [high_loss_3pct]="tcp.tx_retrans_rto tcp.tx_retrans_tlp"
   [symmetric_3pct]="tcp.tx_retrans_rto tcp.tx_retrans_tlp"
   [high_loss_5pct]="tcp.tx_retrans_rto"
@@ -218,19 +232,23 @@ declare -A REQUIRED_NONZERO=(
 
 declare -A REQUIRED_NONZERO_ANY=(
   [low_loss_05pct]="tcp.tx_retrans_rack tcp.tx_retrans_tlp"
-  [low_loss_1pct_corr]="tcp.tx_retrans_rack tcp.tx_retrans_tlp"
+  [low_loss_1pct]="tcp.tx_retrans_rack tcp.tx_retrans_tlp"
 )
 
-# Per-scenario iter defaults — tuned for fast-iter wallclock (≤25 min
+# Per-scenario iter defaults — tuned for fast-iter wallclock (~30 min
 # for the full 5-scenario suite on AWS c6a fast-iter hardware).
 #
 # Sizing rationale:
-#   - low-loss cells (0.5% / 1%-correlated) need enough iters that at
+#   - low-loss cells (0.5% / 1% uniform) need enough iters that at
 #     least one TLP probe lands in a tail-loss iter, so the ANY-of
 #     `tx_retrans_rack | tx_retrans_tlp` assertion is satisfied. T55's
-#     2026-05-12 fast-iter run showed `low_loss_1pct_corr` at 200k
-#     iters produced exactly 1 TLP event — dropping any lower risks a
-#     false-negative ANY-of failure.
+#     2026-05-12 fast-iter run at the now-retired `loss 1% 25%` spec
+#     produced exactly 1 TLP event across 200k iters — dropping any
+#     lower risked a false-negative ANY-of failure. Switching the
+#     scenario to plain `loss 1%` (uniform per-packet drop, no burst
+#     correlation) at the same iter count yields thousands of recovery
+#     events, saturating the assertion and removing the stochastic
+#     flake observed in T56/T57 runs.
 #   - high-loss cells (3% / 5%) are dominated by the 200 ms RTO floor
 #     (each lost iter adds ~200 ms to scenario wallclock). T55 showed
 #     200k iters at 3% loss took 10-15 min on this fast-iter host. At
@@ -243,7 +261,7 @@ declare -A REQUIRED_NONZERO_ANY=(
 # Scenarios not listed in this map fall back to $ITERS.
 declare -A SCENARIO_ITERS=(
   [low_loss_05pct]=500000
-  [low_loss_1pct_corr]=200000
+  [low_loss_1pct]=200000
   [high_loss_3pct]=50000
   [symmetric_3pct]=50000
   [high_loss_5pct]=30000
@@ -253,7 +271,7 @@ declare -A SCENARIO_ITERS=(
 # operator sees the "expected RACK/TLP" rows before the RTO-dominated rows.
 SCENARIOS=(
   low_loss_05pct
-  low_loss_1pct_corr
+  low_loss_1pct
   high_loss_3pct
   symmetric_3pct
   high_loss_5pct

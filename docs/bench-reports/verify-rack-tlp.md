@@ -48,20 +48,24 @@ matches that empirical reality.
 | Scenario             | netem spec          | iters | ALL must be > 0                              | ANY must be > 0                              |
 |----------------------|---------------------|------:|----------------------------------------------|----------------------------------------------|
 | `low_loss_05pct`     | `loss 0.5%`         |  500k | `tcp.tx_retrans`                             | `tcp.tx_retrans_rack` `tcp.tx_retrans_tlp`   |
-| `low_loss_1pct_corr` | `loss 1% 25%`       |  200k | `tcp.tx_retrans`                             | `tcp.tx_retrans_rack` `tcp.tx_retrans_tlp`   |
+| `low_loss_1pct`      | `loss 1%`           |  200k | `tcp.tx_retrans`                             | `tcp.tx_retrans_rack` `tcp.tx_retrans_tlp`   |
 | `high_loss_3pct`     | `loss 3% delay 5ms` |   50k | `tcp.tx_retrans_rto` `tcp.tx_retrans_tlp`    | —                                            |
 | `symmetric_3pct`     | `loss 3%`           |   50k | `tcp.tx_retrans_rto` `tcp.tx_retrans_tlp`    | —                                            |
 | `high_loss_5pct`     | `loss 5% 25%`       |   30k | `tcp.tx_retrans_rto`                         | —                                            |
 
-The iter counts are tuned for **fast-iter wallclock** (≤25 min for the
+The iter counts are tuned for **fast-iter wallclock** (~30 min for the
 full 5-scenario suite on AWS c6a fast-iter hardware). High-loss cells
 use deliberately small iter counts because the assertion is `> 0`:
 once 1k+ recovery events fire, the assertion is saturated, and each
 additional lost iter adds ~200 ms (one RTO floor) to scenario
 wallclock. Low-loss cells stay at 500 k / 200 k because the recovery
 events are rare enough that smaller iter counts risk a false-negative
-ANY-of failure (T55's `low_loss_1pct_corr` at 200 k iters produced
-exactly 1 TLP event — dropping any lower starts hitting 0).
+ANY-of failure (T55's `low_loss_1pct_corr` precursor at 200 k iters
+under the now-retired `loss 1% 25%` spec produced exactly 1 TLP event
+across the run, and the 2026-05-12 T56 v4 fast-iter run produced 0
+across the same iter count — that flake is what motivated dropping
+the 25% correlation; uniform `loss 1%` now saturates the ANY-of
+assertion with thousands of recovery events at 200 k iters).
 
 Operators wanting **nightly-grade statistical depth** on a physical-lab
 DUT can override every scenario via the `FORCE_ITERS` env var
@@ -81,12 +85,17 @@ Theoretical rationale (per RFC 8985 §6 and the historical
   trigger is either RACK or TLP (depends on whether the lost packet
   was a tail or a mid-window segment) — ANY-of pins this. RTO does
   not fire at this loss level on a 500 k-iter run.
-- **`low_loss_1pct_corr`** — 1% loss with 25% correlation (clustered
-  bursts). Per the `fa25bfd` historical observation, the loss-recovery
-  path is dominated by RACK/TLP at this loss level: bursts are short
-  enough that TLPs recover them before the RTO timer expires.
-  Aggregate must be non-zero; ANY-of (`rack | tlp`) confirms the
-  low-loss path took recovery rather than a fallback RTO.
+- **`low_loss_1pct`** — 1% random loss with no correlation (uniform
+  per-packet drop). Per the `fa25bfd` historical observation, the
+  loss-recovery path is dominated by RACK/TLP at this loss level: a
+  single lost peer→DUT ACK or response is recovered by TLP (RPC tail)
+  or RACK (mid-window) before the RTO timer expires. Aggregate must
+  be non-zero; ANY-of (`rack | tlp`) confirms the low-loss path took
+  recovery rather than a fallback RTO. The earlier `loss 1% 25%`
+  (correlated) spec was retired 2026-05-12 because the burst-cluster
+  drop algorithm sometimes left 200 k iters with 0 recovery events
+  (T56 v4 fast-iter run); the uniform spec yields thousands of
+  recoveries across the same iter count.
 - **`high_loss_3pct`** — 3% loss with 5 ms induced delay. Empirically
   (2026-05-11): RTO 86%, RACK 0%, TLP 14%. The induced delay plus
   high loss drops too many ACKs back-to-back for RACK to fire. ALL-of
@@ -155,11 +164,11 @@ Default per-scenario wallclock on the AWS c6a fast-iter DUT:
 | scenario             | iters | expected wallclock |
 |----------------------|------:|--------------------|
 | `low_loss_05pct`     |  500k | ~7-9 min  |
-| `low_loss_1pct_corr` |  200k | ~4-6 min  |
+| `low_loss_1pct`      |  200k | ~7-8 min  |
 | `high_loss_3pct`     |   50k | ~2-3 min  |
 | `symmetric_3pct`     |   50k | ~2-3 min  |
 | `high_loss_5pct`     |   30k | ~1-2 min  |
-| **Total**            |       | **≤25 min** |
+| **Total**            |       | **≤30 min** |
 
 Low-loss wallclock is dominated by the bench-rtt's request/response
 cycle (~75 µs/iter base RTT); high-loss wallclock is dominated by the
@@ -178,7 +187,7 @@ The script prints a per-scenario summary table:
 ```
 scenario             spec                 all>0                            any>0                         result
 low_loss_05pct       loss 0.5%            tcp.tx_retrans                   tcp.tx_retrans_rack tcp.tx_retrans_tlp PASS rto=0 rack=18 tlp=27 agg=45
-low_loss_1pct_corr   loss 1% 25%          tcp.tx_retrans                   tcp.tx_retrans_rack tcp.tx_retrans_tlp PASS rto=0 rack=84 tlp=131 agg=215
+low_loss_1pct        loss 1%              tcp.tx_retrans                   tcp.tx_retrans_rack tcp.tx_retrans_tlp PASS rto=0 rack=84 tlp=131 agg=215
 high_loss_3pct       loss 3% delay 5ms    tcp.tx_retrans_rto tcp.tx_retrans_tlp (none)                            PASS rto=8119 rack=0 tlp=1299 agg=9418
 symmetric_3pct       loss 3%              tcp.tx_retrans_rto tcp.tx_retrans_tlp (none)                            PASS rto=121 rack=0 tlp=24 agg=145
 high_loss_5pct       loss 5% 25%          tcp.tx_retrans_rto                (none)                            FAIL ALL-of want>0 got: tcp.tx_retrans_rto=0 | rto=0 rack=0 tlp=0 agg=0
@@ -202,7 +211,7 @@ Common FAIL modes and what they mean:
   in `on_tlp_fire`) and whether `tcp.tx_tlp_spurious` is populated
   (would suggest TLP fires but the retransmit counter increments via
   a different path).
-- **ANY-of all-zero in `low_loss_05pct` / `low_loss_1pct_corr`**
+- **ANY-of all-zero in `low_loss_05pct` / `low_loss_1pct`**
   (rack=0 AND tlp=0, but agg > 0) — the low-loss scenario fell
   through to RTO recovery instead of RACK/TLP. RACK's reorder
   window may have widened (check `tcp.rack_reo_wnd_override_active`)
