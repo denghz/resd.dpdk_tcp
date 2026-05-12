@@ -265,6 +265,25 @@ peer_restart_echo_server() {
     " >>"$LOG_FILE" 2>&1 || log "    WARN: peer echo-server restart failed (see $LOG_FILE)"
 }
 
+# Restart the peer's burst-echo-server on :$PEER_BURST_PORT — mirror of
+# peer_restart_echo_server but for the rx-burst tests. A wedged
+# burst-echo-server (stuck in write() to a SIGKILLed DUT) is the
+# canonical cause of bench-rx-burst per-bucket stalls.
+peer_restart_burst_echo_server() {
+    log "    peer: restart burst-echo-server :$PEER_BURST_PORT (clear stale ESTAB)"
+    ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "$PEER_SSH" "
+        pids=\$(pgrep -fx '/tmp/burst-echo-server $PEER_BURST_PORT' 2>/dev/null || true)
+        if [ -n \"\$pids\" ]; then
+            kill -KILL \$pids 2>/dev/null || true
+            sleep 0.3
+        fi
+        nohup /tmp/burst-echo-server $PEER_BURST_PORT >/tmp/burst-echo-server.log 2>&1 </dev/null &
+        disown
+        sleep $PEER_RESTART_DELAY
+        pgrep -fx '/tmp/burst-echo-server $PEER_BURST_PORT' >/dev/null
+    " >>"$LOG_FILE" 2>&1 || log "    WARN: peer burst-echo-server restart failed (see $LOG_FILE)"
+}
+
 # run_one <desc> <output-csv> <command...>
 #
 # Runs the bench command under `timeout $RUN_ONE_TIMEOUT`, appending stdout+stderr
@@ -626,6 +645,12 @@ run_bench_tx_maxtp() {
 run_bench_rx_burst() {
     log "=== bench-rx-burst — W x N grid (W={64,128,256}, N={16,64,256}) ==="
 
+    # Restart the peer's burst-echo-server before EACH rx-burst arm: a
+    # SIGKILLed prior arm (timeout/crash) leaves the peer's single-threaded
+    # burst-echo-server stuck in write() to a dead DUT, blocking the next
+    # arm's BURST command. Mirror of the echo-server restart pattern.
+    peer_restart_burst_echo_server
+
     run_one "bench-rx-burst dpdk_net" \
         "$RESULTS_DIR/bench-rx-burst-dpdk_net.csv" \
         sudo -E env "PATH=$PATH" PEER_IP="$PEER_IP" \
@@ -645,6 +670,7 @@ run_bench_rx_burst() {
                 --burst-counts 16,64,256 \
                 --measure-bursts 200 --warmup-bursts 20
     reset_dpdk_state
+    peer_restart_burst_echo_server
 
     # linux_kernel → host-netns wrapper + real peer (default) OR local-loopback (fallback).
     run_one "bench-rx-burst linux_kernel" \
@@ -660,6 +686,8 @@ run_bench_rx_burst() {
             --segment-sizes 64,128,256 \
             --burst-counts 16,64,256 \
             --measure-bursts 200 --warmup-bursts 20
+
+    peer_restart_burst_echo_server
 
     run_one "bench-rx-burst fstack" \
         "$RESULTS_DIR/bench-rx-burst-fstack.csv" \
