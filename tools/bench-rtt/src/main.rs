@@ -21,6 +21,7 @@ use bench_common::run_metadata::RunMetadata;
 
 use bench_rtt::attribution::AttributionMode;
 use bench_rtt::attribution_csv::{attribution_csv_header, attribution_row_cols};
+#[cfg(feature = "fstack")]
 use bench_rtt::fstack;
 use bench_rtt::hw_task_18::{
     assert_all_events_rx_hw_ts_ns_zero, assert_hw_task_18_post_run, HwTask18Expectations,
@@ -152,6 +153,14 @@ struct Args {
     /// Feature-set label emitted as the `feature_set` CSV column.
     #[arg(long, default_value = "trading-latency")]
     feature_set: String,
+
+    /// F-Stack startup config file path (`--conf` forwarded to
+    /// `ff_init`). Required when `--stack fstack` is selected.
+    /// Mirrors the same flag on bench-tx-burst / bench-tx-maxtp /
+    /// bench-rx-burst — fast-iter passes the auto-generated DUT-
+    /// specific conf written by `fast-iter-setup.sh up --with-fstack`.
+    #[arg(long, default_value = "/etc/f-stack.conf")]
+    fstack_conf: String,
 }
 
 /// One bucket's measurement product: aggregated samples + counters
@@ -615,7 +624,10 @@ fn run_linux_kernel(args: &Args) -> anyhow::Result<Vec<BucketResult>> {
 // at the imp::run_rtt_workload entry point.
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "fstack")]
 fn run_fstack(args: &Args) -> anyhow::Result<Vec<BucketResult>> {
+    validate_fstack_args(args)?;
+    init_fstack(args)?;
     let peer_ip = parse_ip_host_order(&args.peer_ip)?;
     let mut buckets: Vec<BucketResult> = Vec::with_capacity(args.payload_bytes_sweep.len());
     for &payload_bytes in &args.payload_bytes_sweep {
@@ -654,6 +666,40 @@ fn run_fstack(args: &Args) -> anyhow::Result<Vec<BucketResult>> {
         });
     }
     Ok(buckets)
+}
+
+#[cfg(not(feature = "fstack"))]
+fn run_fstack(_args: &Args) -> anyhow::Result<Vec<BucketResult>> {
+    anyhow::bail!(
+        "bench-rtt built without `fstack` feature; rebuild with \
+         `--features fstack` (libfstack.a required at /opt/f-stack/lib/)."
+    )
+}
+
+#[cfg(feature = "fstack")]
+fn validate_fstack_args(args: &Args) -> anyhow::Result<()> {
+    if !std::path::Path::new(&args.fstack_conf).exists() {
+        anyhow::bail!(
+            "--fstack-conf path `{}` does not exist; create it with the \
+             [dpdk] lcore_mask + allow=<PCI> + [port0] sections for the DUT, \
+             e.g. via `scripts/fast-iter-setup.sh up --with-fstack` which \
+             auto-generates one at $HOME/.fast-iter-fstack.conf",
+            args.fstack_conf
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "fstack")]
+fn init_fstack(args: &Args) -> anyhow::Result<()> {
+    let argv: Vec<String> = vec![
+        "bench-rtt".to_string(),
+        format!("--conf={}", args.fstack_conf),
+        "--proc-id=0".to_string(),
+    ];
+    eprintln!("bench-rtt: ff_init argv={:?}", argv);
+    bench_rtt::fstack_ffi::ff_init_from_args(&argv)
+        .map_err(|e| anyhow::anyhow!("ff_init failed: {e}"))
 }
 
 // ---------------------------------------------------------------------------
