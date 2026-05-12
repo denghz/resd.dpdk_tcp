@@ -53,12 +53,15 @@
 //! socket's send buffer + in-flight cap is small relative to the
 //! window.
 //!
-//! Packet rate (`pps`) is harder to read from user-space without
-//! `getsockopt(TCP_INFO)` parsing; we leave it at 0.0 in the sample
-//! and document this in the `tx_ts_mode` field as `n/a`. bench-report
-//! filters by mode so the missing pps column doesn't pollute
-//! cross-stack pivots — see `dimensions_json.tx_ts_mode = "n/a"` for
-//! Linux maxtp rows.
+//! Packet rate (`pps`) is read from `getsockopt(TCP_INFO).tcpi_segs_out`
+//! snapshots at the start + end of the measurement window — closes T56
+//! open follow-up #1 (linux arm's `tx_pps` previously hardcoded to 0.0
+//! made the SUMMARY.md `tx_pps` table show 0.0 for every (W,C) cell,
+//! which was easy to misread as "the linux arm is broken"). The pps
+//! reported is segments (NOT bytes) per second summed across all
+//! conns — matches the dpdk arm's `eth.tx_pkts / T` shape per spec
+//! §11.2. We still emit `tx_ts_mode = "n/a"` because the kernel doesn't
+//! expose per-segment HW TX timestamps.
 //!
 //! # Multi-connection pump loop
 //!
@@ -93,10 +96,11 @@ const TCP_INFO_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 /// truncated to fit, with `optlen` returning the actual write count.
 ///
 /// Layout matches `linux/tcp.h::tcp_info` (linux 5.10+) for the prefix
-/// up through `tcpi_unacked`. Since we read only the listed three fields
-/// and rely on the offsets, the prefix layout is what matters — any
-/// future kernel additions appending past `tcpi_unacked` are absorbed
-/// into the remaining bytes of our larger buffer.
+/// up through `tcpi_segs_out` (T56 follow-up #1: needed for the
+/// segments-per-second metric). Since we read only the listed fields and
+/// rely on the offsets, the prefix layout is what matters — any future
+/// kernel additions appending past `tcpi_segs_in` are absorbed into the
+/// remaining bytes of our larger buffer.
 #[repr(C)]
 #[derive(Default, Copy, Clone, Debug)]
 struct LinuxTcpInfoMinimal {
@@ -140,6 +144,28 @@ struct LinuxTcpInfoMinimal {
     tcpi_rcv_space: u32,
 
     tcpi_total_retrans: u32,
+
+    // T56 follow-up #1: extend the layout past `tcpi_total_retrans` to
+    // reach `tcpi_segs_out`. The intervening fields are kernel-aligned
+    // u64s (linux/tcp.h "Metrics" continued); we DON'T read them, but
+    // their offsets must match so `tcpi_segs_out` lands in the right
+    // place. Rust's #[repr(C)] guarantees natural u64 alignment, which
+    // matches the kernel struct's layout on x86_64 + aarch64.
+    /// `tcpi_pacing_rate` (u64, RFC4898 reserved).
+    tcpi_pacing_rate: u64,
+    /// `tcpi_max_pacing_rate` (u64, app-set cap).
+    tcpi_max_pacing_rate: u64,
+    /// `tcpi_bytes_acked` (u64, RFC4898 tcpEStatsAppHCThruOctetsAcked).
+    tcpi_bytes_acked: u64,
+    /// `tcpi_bytes_received` (u64, RFC4898 tcpEStatsAppHCThruOctetsReceived).
+    tcpi_bytes_received: u64,
+    /// `tcpi_segs_out` (u32, RFC4898 tcpEStatsPerfSegsOut) — closes T56
+    /// follow-up #1 by giving the linux arm a real pps numerator instead
+    /// of the previous hardcoded 0.
+    tcpi_segs_out: u32,
+    /// `tcpi_segs_in` (u32, RFC4898 tcpEStatsPerfSegsIn) — included so
+    /// the struct's trailing alignment matches the kernel's; not read.
+    tcpi_segs_in: u32,
 }
 
 /// Connect deadline for the initial kernel-TCP handshake. Same shape
@@ -167,15 +193,26 @@ pub struct LinuxMaxtpCfg {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BucketRun {
     /// Sustained-rate sample over the measurement window (bps + pps).
-    /// `pps` is 0.0 — we don't read `getsockopt(TCP_INFO).tcpi_segs_out`
-    /// in this version; bench-report can filter Linux rows out of pps
-    /// pivots via `dimensions_json.tx_ts_mode == "n/a"`.
+    /// `pps` is the sum of `tcpi_segs_out` deltas across every conn in
+    /// the bucket, divided by the window duration in seconds. T56
+    /// follow-up #1: previously pps was hardcoded to 0.0, which made the
+    /// linux arm's `tx_pps` row in the maxtp CSV easy to misread as a
+    /// broken bench. The dpdk arm uses `eth.tx_pkts`; the linux arm uses
+    /// the kernel's per-conn segment counter — semantically the same
+    /// segment-rate metric, just sourced from the kernel.
     pub sample: MaxtpSample,
     /// Bytes that the kernel accepted across the measurement window
     /// (sum of successful write return values). The "goodput" of this
     /// run before T-normalisation; surfaced separately for assertion
     /// in tests.
     pub bytes_sent_in_window: u64,
+    /// Total `tcpi_segs_out` delta across the measurement window summed
+    /// across every conn. Surfaced separately from `sample.pps` for unit
+    /// tests that assert the metric computation path. Zero only when
+    /// every conn's `getsockopt(TCP_INFO)` snapshot failed (closed
+    /// socket etc.) — in which case the runner still emits the bps row
+    /// but pps falls back to 0.0.
+    pub segs_out_in_window: u64,
 }
 
 /// Open `C` persistent connections to the peer. Each carries
@@ -242,8 +279,13 @@ pub fn assert_peer_is_sink(peer_port: u16) -> anyhow::Result<()> {
 
 /// Sequence (parity with `dpdk_maxtp::run_bucket`):
 /// 1. Pump writes for `warmup`, no sampling.
-/// 2. Pump writes for `duration`, accumulating bytes-sent.
-/// 3. Return `MaxtpSample::from_window(bytes_sent, 0, elapsed_ns)`.
+/// 2. Snapshot per-conn `tcpi_segs_out` (T56 follow-up #1 — the start
+///    of the pps numerator), then capture `t_measure_start`.
+/// 3. Pump writes for `duration`, accumulating bytes-sent.
+/// 4. Capture `t_measure_end`, then snapshot per-conn `tcpi_segs_out`
+///    a second time; sum the deltas to get total segments across all
+///    conns.
+/// 5. Return `MaxtpSample::from_window(bytes_sent, total_segs, elapsed_ns)`.
 pub fn run_bucket(
     cfg: &LinuxMaxtpCfg,
     conns: &mut [TcpStream],
@@ -277,7 +319,17 @@ pub fn run_bucket(
 
     // Measurement window — capture (t_start, t_end) tightly around the
     // pump call so the elapsed-ns denominator matches the byte
-    // numerator's window exactly.
+    // numerator's window exactly. T56 follow-up #1: the per-conn
+    // `tcpi_segs_out` snapshots bracket the pump (start snapshot ⇒
+    // pump ⇒ end snapshot), and `t_measure_start` / `t_measure_end`
+    // are read at the corresponding boundaries so elapsed-ns and the
+    // segment delta describe the same wallclock window. Syscall budget
+    // for snapshotting C conns is on the order of microseconds — well
+    // inside the noise floor for a 60 s window.
+    let segs_out_start: Vec<Option<u32>> = conns
+        .iter()
+        .map(|s| getsockopt_tcp_info(s.as_raw_fd()).map(|info| info.tcpi_segs_out))
+        .collect();
     let t_measure_start = Instant::now();
     let measure_deadline = t_measure_start + cfg.duration;
     // Phase 6 Task 6.2: build the linux send-ack sink only if the caller
@@ -294,18 +346,61 @@ pub fn run_bucket(
         pump_round_robin(conns, &cfg.payload, measure_deadline, sink.as_mut())
             .context("linux_maxtp measurement phase")?;
     let t_measure_end = Instant::now();
+    // T56 follow-up #1: end-of-window `tcpi_segs_out` snapshot,
+    // symmetric with the pre-pump snapshot. Counters that wrapped
+    // (u32 monotonic) are still safe — `u32::wrapping_sub` handles
+    // the wrap, and a 60 s window cannot emit more than ~2^32
+    // segments at ENA line rate.
+    let segs_out_end: Vec<Option<u32>> = conns
+        .iter()
+        .map(|s| getsockopt_tcp_info(s.as_raw_fd()).map(|info| info.tcpi_segs_out))
+        .collect();
+    let segs_out_in_window = sum_segs_out_deltas(&segs_out_start, &segs_out_end);
 
     let elapsed_ns = t_measure_end
         .saturating_duration_since(t_measure_start)
         .as_nanos() as u64;
     // 60 s window in ns < 2^36, comfortably inside u64.
 
-    let sample = MaxtpSample::from_window(bytes_sent_in_window, 0, elapsed_ns);
+    let sample = MaxtpSample::from_window(bytes_sent_in_window, segs_out_in_window, elapsed_ns);
 
     Ok(BucketRun {
         sample,
         bytes_sent_in_window,
+        segs_out_in_window,
     })
+}
+
+/// T56 follow-up #1: sum `tcpi_segs_out` deltas across every conn in the
+/// bucket. Conns where either snapshot failed (`None`) contribute 0 — we
+/// don't have a defensible delta for them, so we'd rather under-count
+/// than guess. `u32::wrapping_sub` handles the kernel's u32-wrapping
+/// counter; the per-bucket window is bounded to 60 s and the kernel
+/// would have to emit 2^32 ≈ 4 G segments in that time, i.e. ~70 G
+/// packets per second — far above any plausible line rate, so a single
+/// wrap is the worst the math has to absorb.
+fn sum_segs_out_deltas(start: &[Option<u32>], end: &[Option<u32>]) -> u64 {
+    assert_eq!(
+        start.len(),
+        end.len(),
+        "linux_maxtp: sum_segs_out_deltas length mismatch — start={}, end={}",
+        start.len(),
+        end.len()
+    );
+    let mut total: u64 = 0;
+    for (s, e) in start.iter().zip(end.iter()) {
+        match (s, e) {
+            (Some(s_val), Some(e_val)) => {
+                // u32 wrapping diff — kernel counter is u32-monotonic.
+                let delta = e_val.wrapping_sub(*s_val);
+                total = total.saturating_add(delta as u64);
+            }
+            _ => {
+                // One side missing — skip this conn's contribution.
+            }
+        }
+    }
+    total
 }
 
 /// Phase 6 Task 6.2 sink: per-conn TCP_INFO snapshots emitted once per
@@ -739,12 +834,129 @@ mod tests {
             "expected non-zero goodput, got {}",
             run.sample.goodput_bps
         );
-        assert_eq!(run.sample.pps, 0.0, "Linux arm leaves pps at 0.0");
+        // T56 follow-up #1: linux arm now populates pps from
+        // `tcpi_segs_out` deltas. On loopback with a 50 ms window the
+        // kernel emits >> 1 segment, so the metric must be non-zero.
+        // (The bucket pumps W=64 bytes at line rate; even a 1 ms window
+        // would land hundreds of segments.)
+        assert!(
+            run.segs_out_in_window > 0,
+            "expected non-zero tcpi_segs_out delta, got {}",
+            run.segs_out_in_window
+        );
+        assert!(
+            run.sample.pps > 0.0,
+            "expected non-zero pps from TCP_INFO snapshots, got {}",
+            run.sample.pps
+        );
 
         // Tear down — drop conns + signal bg drain thread to exit.
         drop(conns);
         done.store(true, Ordering::Relaxed);
         // Best-effort join (give it 1 s).
         let _ = bg.join();
+    }
+
+    /// T56 follow-up #1: pure synthetic unit test for the segment-rate
+    /// metric path. Drives `sum_segs_out_deltas` with hand-constructed
+    /// per-conn snapshots so the test is deterministic and doesn't need
+    /// a live socket / `getsockopt` syscall — closes the testing gap
+    /// the task spec flagged ("Add a unit test that exercises the metric
+    /// computation path with synthetic data, asserting non-zero output").
+    #[test]
+    fn sum_segs_out_deltas_sums_across_conns() {
+        // 3 conns; each emitted 100 segments during the window.
+        let start = vec![Some(1_000u32), Some(2_000u32), Some(3_000u32)];
+        let end = vec![Some(1_100u32), Some(2_100u32), Some(3_100u32)];
+        let total = sum_segs_out_deltas(&start, &end);
+        assert_eq!(total, 300, "expected 100 segs/conn × 3 conns");
+    }
+
+    /// `sum_segs_out_deltas` handles the kernel's u32-wrapping counter.
+    /// A start of `u32::MAX - 10` and end of `5` is a +16-segment delta.
+    #[test]
+    fn sum_segs_out_deltas_wraps_around_u32() {
+        let start = vec![Some(u32::MAX - 10)];
+        let end = vec![Some(5u32)];
+        let total = sum_segs_out_deltas(&start, &end);
+        // Wrapping diff: 5 - (u32::MAX - 10) wraps to 16 (5 + 11).
+        assert_eq!(total, 16, "wrap-around delta = 11 + 5 = 16, got {total}");
+    }
+
+    /// A conn whose `getsockopt(TCP_INFO)` failed at either end of the
+    /// window contributes 0 to the bucket total — closed sockets are
+    /// silently ignored rather than poisoning the whole bucket.
+    #[test]
+    fn sum_segs_out_deltas_skips_failed_snapshots() {
+        let start = vec![Some(0u32), None, Some(500u32)];
+        let end = vec![Some(100u32), Some(200u32), None];
+        // Only the first conn has both snapshots → 100 - 0 = 100. The
+        // other two contribute 0.
+        let total = sum_segs_out_deltas(&start, &end);
+        assert_eq!(total, 100);
+    }
+
+    /// Both inputs empty (zero conns) → zero delta. Edge case kept
+    /// explicit so a future refactor that changes the iteration shape
+    /// can't silently regress.
+    #[test]
+    fn sum_segs_out_deltas_empty_inputs_is_zero() {
+        let total = sum_segs_out_deltas(&[], &[]);
+        assert_eq!(total, 0);
+    }
+
+    /// Mismatched start / end lengths is a caller bug — assert-panic
+    /// rather than silently produce a wrong number.
+    #[test]
+    #[should_panic(expected = "length mismatch")]
+    fn sum_segs_out_deltas_panics_on_length_mismatch() {
+        let start = vec![Some(0u32), Some(100u32)];
+        let end = vec![Some(50u32)];
+        let _ = sum_segs_out_deltas(&start, &end);
+    }
+
+    /// T56 follow-up #1: the `tcpi_segs_out` field of `LinuxTcpInfoMinimal`
+    /// must land at the right offset for `getsockopt(TCP_INFO)` to populate
+    /// it correctly. The kernel struct's layout on x86_64 + aarch64
+    /// (linux 5.10+; verified against `/usr/include/linux/tcp.h`):
+    ///
+    /// | field                 | offset |
+    /// |-----------------------|-------:|
+    /// | `tcpi_total_retrans`  |    100 |
+    /// | `tcpi_pacing_rate`    |    104 |
+    /// | `tcpi_max_pacing_rate`|    112 |
+    /// | `tcpi_bytes_acked`    |    120 |
+    /// | `tcpi_bytes_received` |    128 |
+    /// | `tcpi_segs_out`       |    136 |
+    /// | `tcpi_segs_in`        |    140 |
+    ///
+    /// `tcpi_total_retrans` (u32, 4 bytes) ends at offset 104, and
+    /// `tcpi_pacing_rate` (u64) is already 8-aligned at offset 104 — so
+    /// no padding is inserted by the C compiler. Rust's `#[repr(C)]`
+    /// produces the same layout, which we assert here to guard against
+    /// future kernels reordering fields (rare) or Rust changing its
+    /// `#[repr(C)]` layout rules (extremely rare).
+    #[test]
+    fn tcpi_segs_out_offset_matches_kernel_layout() {
+        // Use ptr arithmetic instead of `offset_of!` to keep the test
+        // ergonomic on older toolchains where the macro is gated.
+        let info = LinuxTcpInfoMinimal::default();
+        let base = &info as *const LinuxTcpInfoMinimal as usize;
+        let segs_out_addr = &info.tcpi_segs_out as *const u32 as usize;
+        let segs_out_offset = segs_out_addr - base;
+        let total_retrans_addr = &info.tcpi_total_retrans as *const u32 as usize;
+        let total_retrans_offset = total_retrans_addr - base;
+        // tcpi_segs_out follows tcpi_total_retrans (offset 100) by:
+        //   4 bytes (tcpi_total_retrans u32) +
+        //   4 × 8 = 32 bytes (4 × u64 metric fields)
+        // = 36-byte gap → segs_out at offset 136.
+        assert_eq!(
+            total_retrans_offset, 100,
+            "tcpi_total_retrans expected at offset 100 (kernel layout), got {total_retrans_offset}"
+        );
+        assert_eq!(
+            segs_out_offset, 136,
+            "tcpi_segs_out expected at offset 136 (kernel layout), got {segs_out_offset}"
+        );
     }
 }
