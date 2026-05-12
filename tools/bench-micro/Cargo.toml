@@ -70,6 +70,10 @@ harness = false
 name = "loss_detection"
 harness = false
 
+[[bench]]
+name = "deliver_readable"
+harness = false
+
 [[bin]]
 name = "summarize"
 path = "src/bin/summarize.rs"
