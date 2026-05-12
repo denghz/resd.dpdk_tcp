@@ -89,16 +89,26 @@ EAL_ARGS="-l 2-3 -n 4 --in-memory --huge-unlink -a ${DUT_PCI},large_llq_hdr=1,mi
 
 VERIFY_RACK_ITERS="${VERIFY_RACK_ITERS:-50000}"
 
-# Local echo/burst-echo servers for the linux_kernel arms — see header
-# comment + docs/bench-reports/linux-nat-investigation-2026-05-12.md.
+# linux_kernel arm routing — see header + docs/bench-reports/linux-nat-investigation-2026-05-12.md.
 #
+# Two modes:
+# - "nsenter" (DEFAULT when available): wrap linux_kernel invocations with
+#   `sudo nsenter -t 1 -n` to escape the proxied netns. linux TCP then
+#   exits the host's kernel-bound NIC (ens5 / 10.4.1.139) and reaches the
+#   REAL peer at $PEER_IP:10001/10002/10003 — fair comparison with
+#   dpdk_net (vfio-pci) and fstack (DPDK on the same NIC).
+# - "loopback" (fallback): spawn local echo-server + burst-echo-server on
+#   127.0.0.1 and point linux at them. Used only when `sudo nsenter -t 1
+#   -n true` fails (e.g., on a host that doesn't have nsenter or denies
+#   passwordless sudo).
+#
+# Override via LINUX_KERNEL_VIA_NSENTER=1|0|auto (default auto).
+LINUX_KERNEL_VIA_NSENTER="${LINUX_KERNEL_VIA_NSENTER:-auto}"
+
+# Local-loopback fallback config (only used if VIA_NSENTER resolves to 0).
 # LOCAL_LINUX_ECHO_PORT defaults to 10002 because bench-tx-maxtp's linux
-# arm hard-asserts `peer_port == 10002` (`assert_peer_is_sink` in
-# `tools/bench-tx-maxtp/src/linux.rs`). 10002 on 127.0.0.1 does NOT
-# conflict with the remote peer's 10.4.1.228:10002 — different
-# (address, port) tuples — but it does avoid having to spawn two
-# separate local echo-servers (one for bench-tx-maxtp at :10002, one
-# for the others at e.g. :19001).
+# arm hard-asserts `peer_port == 10002` (assert_peer_is_sink in
+# tools/bench-tx-maxtp/src/linux.rs).
 LOCAL_LINUX_PEER_IP="${LINUX_KERNEL_PEER_IP:-127.0.0.1}"
 LOCAL_LINUX_ECHO_PORT="${LOCAL_LINUX_ECHO_PORT:-10002}"
 LOCAL_LINUX_BURST_PORT="${LOCAL_LINUX_BURST_PORT:-19003}"
@@ -128,8 +138,9 @@ for bin in "$BENCH_RTT" "$BENCH_TX_BURST" "$BENCH_TX_MAXTP" "$BENCH_RX_BURST"; d
 done
 [ -x "$VERIFY_RACK_TLP" ] || { printf 'fast-iter-suite: missing %s\n' "$VERIFY_RACK_TLP" >&2; exit 2; }
 
-# Peer C binaries used in-process on the DUT for the linux_kernel arms.
-# Both are pure C stdlib + pthread (see tools/bench-e2e/peer/Makefile).
+# Peer C binaries — only needed in loopback fallback mode. Auto-detected
+# below; we still require the binaries on disk in case the operator
+# explicitly sets LINUX_KERNEL_VIA_NSENTER=0.
 [ -x "$LOCAL_ECHO_SERVER_BIN" ] || {
     printf 'fast-iter-suite: missing %s — run `make -C tools/bench-e2e/peer` to build\n' \
         "$LOCAL_ECHO_SERVER_BIN" >&2
@@ -140,6 +151,30 @@ done
         "$LOCAL_BURST_ECHO_SERVER_BIN" >&2
     exit 2
 }
+
+# Resolve LINUX_KERNEL_VIA_NSENTER=auto by probing sudo nsenter.
+if [ "$LINUX_KERNEL_VIA_NSENTER" = "auto" ]; then
+    if sudo -n nsenter -t 1 -n true >/dev/null 2>&1; then
+        LINUX_KERNEL_VIA_NSENTER=1
+    else
+        LINUX_KERNEL_VIA_NSENTER=0
+    fi
+fi
+
+# Bind the linux_kernel-arm command-prefix array + peer ip/ports.
+if [ "$LINUX_KERNEL_VIA_NSENTER" = "1" ]; then
+    LINUX_NETNS_WRAPPER=(sudo nsenter -t 1 -n)
+    LINUX_PEER_IP="${PEER_IP:-}"
+    LINUX_ECHO_PORT="${PEER_ECHO_PORT:-10001}"
+    LINUX_SINK_PORT="${PEER_SINK_PORT:-10002}"
+    LINUX_BURST_PORT="${PEER_BURST_PORT:-10003}"
+else
+    LINUX_NETNS_WRAPPER=()
+    LINUX_PEER_IP="$LOCAL_LINUX_PEER_IP"
+    LINUX_ECHO_PORT="$LOCAL_LINUX_ECHO_PORT"
+    LINUX_SINK_PORT="$LOCAL_LINUX_ECHO_PORT"  # local echo-server serves sink semantics too
+    LINUX_BURST_PORT="$LOCAL_LINUX_BURST_PORT"
+fi
 
 # Verify fstack symbols are present in all four binaries.
 for bin in "$BENCH_RTT" "$BENCH_TX_BURST" "$BENCH_TX_MAXTP" "$BENCH_RX_BURST"; do
@@ -383,9 +418,13 @@ preflight() {
     # connections holding worker slots.
     peer_restart_echo_server
 
-    # Spawn local echo-server + burst-echo-server for the linux_kernel arms.
-    # See the "Local-loopback servers" comment block above for the rationale.
-    start_local_linux_servers
+    # linux_kernel arm routing — see header.
+    if [ "$LINUX_KERNEL_VIA_NSENTER" = "1" ]; then
+        log "linux_kernel routing: nsenter → host netns → real peer $PEER_IP:10001/10002/10003 (fair-comparison mode)"
+    else
+        log "linux_kernel routing: local-loopback fallback (sudo nsenter unavailable)"
+        start_local_linux_servers
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -416,14 +455,13 @@ run_bench_rtt() {
     reset_dpdk_state
     peer_restart_echo_server
 
-    # linux_kernel → local loopback echo-server (NOT the remote peer); see
-    # the "Local-loopback servers" comment block above.
+    # linux_kernel → host-netns wrapper + real peer (default) OR local-loopback (fallback).
     run_one "bench-rtt linux_kernel" \
         "$RESULTS_DIR/bench-rtt-linux_kernel.csv" \
-        "$BENCH_RTT" \
+        "${LINUX_NETNS_WRAPPER[@]}" "$BENCH_RTT" \
             --stack linux_kernel \
-            --peer-ip "$LOCAL_LINUX_PEER_IP" \
-            --peer-port "$LOCAL_LINUX_ECHO_PORT" \
+            --peer-ip "$LINUX_PEER_IP" \
+            --peer-port "$LINUX_ECHO_PORT" \
             --tool fast-iter-suite \
             --feature-set linux_kernel \
             --precondition-mode lenient \
@@ -478,18 +516,13 @@ run_bench_tx_burst() {
     reset_dpdk_state
     peer_restart_echo_server
 
-    # linux_kernel → local loopback echo-server (NOT the remote peer); see
-    # the "Local-loopback servers" comment block above. Measures kernel-TCP
-    # send-buffer-fill rate, not wire rate — the local-vs-remote distinction
-    # doesn't matter because write_all is non-blocking until the kernel
-    # send buffer fills, and the proxy in the way of the remote path just
-    # adds RTT noise without changing the measurement semantics.
+    # linux_kernel → host-netns wrapper + real peer (default) OR local-loopback (fallback).
     run_one "bench-tx-burst linux_kernel" \
         "$RESULTS_DIR/bench-tx-burst-linux_kernel.csv" \
-        "$BENCH_TX_BURST" \
+        "${LINUX_NETNS_WRAPPER[@]}" "$BENCH_TX_BURST" \
             --stack linux_kernel \
-            --peer-ip "$LOCAL_LINUX_PEER_IP" \
-            --peer-port "$LOCAL_LINUX_ECHO_PORT" \
+            --peer-ip "$LINUX_PEER_IP" \
+            --peer-port "$LINUX_ECHO_PORT" \
             --tool fast-iter-suite \
             --feature-set linux_kernel \
             --precondition-mode lenient \
@@ -546,23 +579,18 @@ run_bench_tx_maxtp() {
     reset_dpdk_state
     peer_restart_echo_server
 
-    # linux_kernel arm — points at the local 127.0.0.1 echo-server (NOT the
-    # remote peer's :10002 linux-tcp-sink). See the "Local-loopback servers"
-    # comment block at the top of this script. The local echo-server behaves
-    # the same as linux-tcp-sink (both just read+write back), so the sink
-    # vs. echo distinction doesn't matter for bench-tx-maxtp's
-    # write-into-send-buffer measurement.
-    #
-    # The `--local-ip` flag is documented as dpdk-only but bench-tx-maxtp's
-    # peer-rwnd probe path still parses it as IPv4 for every stack, so we
-    # pass DUT_LOCAL_IP here too — it's a no-op for the linux arm itself.
+    # linux_kernel → host-netns wrapper + real peer's :10002 linux-tcp-sink
+    # (default) OR local-loopback fallback. The `--local-ip` flag is
+    # documented as dpdk-only but bench-tx-maxtp's peer-rwnd probe path
+    # still parses it as IPv4 for every stack, so we pass DUT_LOCAL_IP here
+    # too — it's a no-op for the linux arm itself.
     run_one "bench-tx-maxtp linux_kernel" \
         "$RESULTS_DIR/bench-tx-maxtp-linux_kernel.csv" \
-        "$BENCH_TX_MAXTP" \
+        "${LINUX_NETNS_WRAPPER[@]}" "$BENCH_TX_MAXTP" \
             --stack linux_kernel \
             --local-ip "$DUT_LOCAL_IP" \
-            --peer-ip "$LOCAL_LINUX_PEER_IP" \
-            --peer-port "$LOCAL_LINUX_ECHO_PORT" \
+            --peer-ip "$LINUX_PEER_IP" \
+            --peer-port "$LINUX_SINK_PORT" \
             --tool fast-iter-suite \
             --feature-set linux_kernel \
             --precondition-mode lenient \
@@ -618,14 +646,13 @@ run_bench_rx_burst() {
                 --measure-bursts 200 --warmup-bursts 20
     reset_dpdk_state
 
-    # linux_kernel → local loopback burst-echo-server (NOT the remote peer);
-    # see the "Local-loopback servers" comment block above.
+    # linux_kernel → host-netns wrapper + real peer (default) OR local-loopback (fallback).
     run_one "bench-rx-burst linux_kernel" \
         "$RESULTS_DIR/bench-rx-burst-linux_kernel.csv" \
-        "$BENCH_RX_BURST" \
+        "${LINUX_NETNS_WRAPPER[@]}" "$BENCH_RX_BURST" \
             --stack linux_kernel \
-            --peer-ip "$LOCAL_LINUX_PEER_IP" \
-            --peer-control-port "$LOCAL_LINUX_BURST_PORT" \
+            --peer-ip "$LINUX_PEER_IP" \
+            --peer-control-port "$LINUX_BURST_PORT" \
             --tool fast-iter-suite \
             --feature-set linux_kernel \
             --precondition-mode lenient \
@@ -853,8 +880,10 @@ WALLCLOCK_START_HUMAN="$(date -u -Iseconds)"
 
 on_exit() {
     local rc=$?
-    # Always tear down the local linux servers we spawned in preflight.
-    stop_local_linux_servers
+    # Tear down local linux servers iff loopback mode is active.
+    if [ "$LINUX_KERNEL_VIA_NSENTER" != "1" ]; then
+        stop_local_linux_servers
+    fi
     # Final DPDK reset: if the suite was killed mid-DPDK-arm (Ctrl-C,
     # outer timeout), leave the host in a clean state for the next run.
     # No-op when the suite exited cleanly (idempotent + bounded by sleep 2).
