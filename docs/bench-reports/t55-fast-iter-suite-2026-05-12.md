@@ -181,12 +181,31 @@ just for that single scenario on this AWS network path).
    depth on a physical-lab DUT can override every scenario via
    `FORCE_ITERS=1000000`.
 
-6. **DPDK zombie cleanup** — when fstack rx-burst was killed with `SIGKILL`,
-   it left 23 hugepages locked + a zombie process still spinning at 99% CPU
-   that prevented `umount /dev/hugepages` and broke subsequent DPDK init
-   ("Invalid port_id=0, PortInfo(0, -19)"). The orphan was visible only
-   via `ps auxf`. Suite should explicitly clean up the bench subprocess
-   tree on timeout (e.g. via `pkill -KILL -P <pid>` or process-group send).
+6. **CLOSED (2026-05-12) — DPDK zombie cleanup**. After the T55 v2 run
+   (2026-05-12 06:10) reproduced this — `bench-rx-burst fstack` TIMEOUT at
+   331 s left a zombie at 99% CPU + 23 stale `/dev/hugepages/rtemap_*`
+   files, then every `verify-rack-tlp` scenario failed identically with
+   `Invalid port_id=0 / Engine::new failed: PortInfo(0, -19)` — added
+   `reset_dpdk_state()` to `scripts/fast-iter-suite.sh`:
+   - sweeps zombie `bench-(rtt|tx-burst|tx-maxtp|rx-burst)` via
+     `sudo pkill -9 -f '/target/release/bench-…'`,
+   - sleeps 2 s for kernel DMA / IOMMU release,
+   - clears `/dev/hugepages/*` (`--huge-unlink` is supposed to but a
+     SIGKILL'd process leaves them behind),
+   - logs `dpdk-devbind.py --status` to `suite.log` for the post-reset
+     binding state.
+
+   Called once defensively at start of `preflight`, after every dpdk_net
+   and fstack `run_one`, and in the `on_exit` trap. `run_one` also
+   gained an inline `sudo pkill -9 -f /target/release/bench-…` on the
+   TIMEOUT path (rc=124/137) so the post-arm `reset_dpdk_state` doesn't
+   race a still-exiting zombie. Smoke test (2026-05-12 06:18) confirms
+   the fix: with the reset, fresh `dpdk_net` after a killed `fstack`
+   completes 100 iters cleanly; without the reset, the same sequence
+   fails immediately with `PortInfo(0, -19)`. Also fixed a printf
+   `'- %s\n'` invocation in `write_summary`'s failed-runs loop that
+   bash interpreted as an option (`printf: - : invalid option`); now
+   uses `printf -- '- %s\n'`.
 
 ## Reproducer
 

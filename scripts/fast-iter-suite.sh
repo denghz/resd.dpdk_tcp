@@ -174,6 +174,40 @@ log() { printf '[suite %s] %s\n' "$(date -u +%H:%M:%S)" "$*" | tee -a "$LOG_FILE
 
 ts_now() { date -u +%s; }
 
+# Reset DPDK / F-Stack state on the DUT. Used after every DPDK/fstack arm
+# (success or failure) and especially after TIMEOUT/FAIL paths where the
+# bench process may have been SIGKILL'd while still holding hugepage maps,
+# vfio-pci DMA mappings, or running F-Stack callout threads.
+#
+# Failure mode this guards against (T55 follow-up #6, 2026-05-12 06:10
+# fast-iter run): after `bench-rx-burst fstack` timed out at 331 s and was
+# SIGKILL'd by the outer `timeout`, every subsequent dpdk_net engine init
+# failed with `Invalid port_id=0 / Engine::new failed: PortInfo(0, -19)`
+# — DPDK enumerated zero ports because vfio-pci was in a half-released
+# state and `/dev/hugepages/` retained 23 stale `rtemap_*` files from the
+# killed process.
+#
+# Sequence:
+#   1. SIGKILL any leftover bench-* processes (covers the timeout path
+#      where the outer `timeout` killed only the foreground command and
+#      the EAL worker thread / F-Stack callout thread kept spinning).
+#   2. Sleep 2 s for the kernel to release DMA mappings + IOMMU bindings.
+#   3. Clear `/dev/hugepages/*` — `--huge-unlink` is supposed to remove
+#      these at startup, but a killed process can leave them behind.
+#   4. Log `dpdk-devbind.py --status` so the suite log captures the post-
+#      reset vfio-pci binding state (purely diagnostic; non-fatal).
+#
+# Idempotent + safe to call repeatedly. Never aborts the suite.
+reset_dpdk_state() {
+    log "    reset_dpdk_state: sweep zombie bench-* + clear stale hugepages"
+    sudo pkill -9 -f '/target/release/bench-(rtt|tx-burst|tx-maxtp|rx-burst)' 2>/dev/null || true
+    # Brief settle window for kernel to fully release DMA mappings / IOMMU.
+    sleep 2
+    sudo rm -f /dev/hugepages/* 2>/dev/null || true
+    sudo /usr/local/bin/dpdk-devbind.py --status 2>&1 \
+        | grep -A 1 'DPDK-compatible' >>"$LOG_FILE" 2>&1 || true
+}
+
 # Restart the peer's :10001 echo-server. Used between dpdk_net/fstack arms
 # to clear leaked TCP connections that pin all echo-server worker threads.
 #
@@ -241,6 +275,18 @@ run_one() {
         FAILS+=("$desc ($tag rc=$rc, log=$arm_log)")
         FAIL_COUNT=$((FAIL_COUNT + 1))
         printf '%s rc=%d %s elapsed=%ds\n' "$tag" "$rc" "$desc" "$elapsed" >>"$arm_log"
+
+        # TIMEOUT path: the outer `timeout` SIGKILLed only the foreground
+        # process; EAL worker / F-Stack callout threads may still be running
+        # and holding hugepage maps + DMA mappings. Sweep the entire bench-*
+        # process tree before returning to caller. The post-run
+        # reset_dpdk_state() in run_bench_* handles the hugepage cleanup,
+        # but the kill here closes the race where reset_dpdk_state() runs
+        # before the zombie has had a chance to exit.
+        if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+            sudo pkill -9 -f '/target/release/bench-(rtt|tx-burst|tx-maxtp|rx-burst)' 2>/dev/null || true
+            sleep 1
+        fi
         return 0  # don't abort the suite
     fi
 }
@@ -308,6 +354,15 @@ stop_local_linux_servers() {
 # ---------------------------------------------------------------------------
 preflight() {
     log "preflight: peer=$PEER_IP fstack_conf=$FSTACK_CONF"
+
+    # Defensive DPDK reset at suite start: clears zombie bench processes
+    # and stale `/dev/hugepages/rtemap_*` files left behind by a prior
+    # crashed run. Cheap (≤3 s) and idempotent. Without this, an operator
+    # who Ctrl-C'd a previous run mid-DPDK-arm sees the first dpdk_net
+    # init of the new run fail with `PortInfo(0, -19)` because
+    # /dev/hugepages still has the old run's rtemap files mapped.
+    reset_dpdk_state
+
     if ! ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "$PEER_SSH" \
             "pgrep -af '/tmp/echo-server' >/dev/null && pgrep -af '/tmp/linux-tcp-sink' >/dev/null && pgrep -af '/tmp/burst-echo-server' >/dev/null"; then
         log "FATAL: one or more peer servers not running — abort"
@@ -358,6 +413,7 @@ run_bench_rtt() {
                 --output-csv "$RESULTS_DIR/bench-rtt-dpdk_net.csv" \
                 --payload-bytes-sweep 64,128,256,1024 \
                 --iterations 10000 --warmup 100
+    reset_dpdk_state
     peer_restart_echo_server
 
     # linux_kernel → local loopback echo-server (NOT the remote peer); see
@@ -393,6 +449,7 @@ run_bench_rtt() {
                 --output-csv "$RESULTS_DIR/bench-rtt-fstack.csv" \
                 --payload-bytes-sweep 64,128,256,1024 \
                 --iterations 10000 --warmup 100
+    reset_dpdk_state
     peer_restart_echo_server
 }
 
@@ -418,6 +475,7 @@ run_bench_tx_burst() {
                 --burst-sizes 65536,1048576 \
                 --gap-mss 0,10 \
                 --bursts-per-bucket 200 --warmup 20
+    reset_dpdk_state
     peer_restart_echo_server
 
     # linux_kernel → local loopback echo-server (NOT the remote peer); see
@@ -459,6 +517,7 @@ run_bench_tx_burst() {
                 --burst-sizes 65536,1048576 \
                 --gap-mss 0,10 \
                 --bursts-per-bucket 200 --warmup 20
+    reset_dpdk_state
     peer_restart_echo_server
 }
 
@@ -484,6 +543,7 @@ run_bench_tx_maxtp() {
                 --write-sizes 4096,16384,65536 \
                 --conn-counts 1,4,16 \
                 --warmup-secs 2 --duration-secs 10
+    reset_dpdk_state
     peer_restart_echo_server
 
     # linux_kernel arm — points at the local 127.0.0.1 echo-server (NOT the
@@ -530,6 +590,7 @@ run_bench_tx_maxtp() {
                 --write-sizes 4096,16384,65536 \
                 --conn-counts 1,4,16 \
                 --warmup-secs 2 --duration-secs 10
+    reset_dpdk_state
     peer_restart_echo_server
 }
 
@@ -555,6 +616,7 @@ run_bench_rx_burst() {
                 --segment-sizes 64,128,256 \
                 --burst-counts 16,64,256 \
                 --measure-bursts 200 --warmup-bursts 20
+    reset_dpdk_state
 
     # linux_kernel → local loopback burst-echo-server (NOT the remote peer);
     # see the "Local-loopback servers" comment block above.
@@ -591,6 +653,7 @@ run_bench_rx_burst() {
                 --segment-sizes 64,128,256 \
                 --burst-counts 16,64,256 \
                 --measure-bursts 200 --warmup-bursts 20
+    reset_dpdk_state
 }
 
 # verify-rack-tlp
@@ -766,7 +829,10 @@ write_summary() {
         if [ "$FAIL_COUNT" -gt 0 ]; then
             printf '## Failed runs (%d)\n\n' "$FAIL_COUNT"
             for f in "${FAILS[@]}"; do
-                printf '- %s\n' "$f"
+                # `--` ends printf option parsing so the leading `-` in the
+                # format isn't interpreted as a flag (`printf: - : invalid
+                # option`).
+                printf -- '- %s\n' "$f"
             done
             printf '\n'
         fi
@@ -789,6 +855,10 @@ on_exit() {
     local rc=$?
     # Always tear down the local linux servers we spawned in preflight.
     stop_local_linux_servers
+    # Final DPDK reset: if the suite was killed mid-DPDK-arm (Ctrl-C,
+    # outer timeout), leave the host in a clean state for the next run.
+    # No-op when the suite exited cleanly (idempotent + bounded by sleep 2).
+    reset_dpdk_state 2>/dev/null || true
     WALLCLOCK_END=$(ts_now)
     WALLCLOCK_END_HUMAN="$(date -u -Iseconds)"
     local elapsed=$((WALLCLOCK_END - WALLCLOCK_START))
