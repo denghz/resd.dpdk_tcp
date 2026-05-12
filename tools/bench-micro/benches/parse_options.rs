@@ -15,11 +15,13 @@
 //!
 //! # Blob construction
 //!
-//! All three blobs are built via `TcpOpts::encode` at setup time
-//! (outside the timed region). That is the same byte-for-byte shape our
-//! own peer (and Linux kernel) emits on the wire: Linux canonical order
-//! per `net/ipv4/tcp_output.c::tcp_options_write`. Encoder source is at
-//! tcp_options.rs:148-228.
+//! All three blobs are built via `TcpOpts::encode` at setup time (outside
+//! the timed region). For TS-only and TS+SACK the encoder emits the
+//! Linux-canonical NOP+NOP+TS leading shape (per RFC 7323 Appendix A);
+//! for SYN-shape the encoder emits MSS + NOP+WS + SACKP + TS — the
+//! corpus-compat WSCALE-second order our stack deliberately picks per
+//! `AD-A8.5-tx-wscale-position` (modern Linux emits WSCALE last instead,
+//! see tcp_options.rs:5-12). Encoder source is at tcp_options.rs:148-228.
 //!
 //! Note: the T9-H7 fast-path inside `parse_options`
 //! (tcp_options.rs:274-288) matches a different 12-byte shape —
@@ -81,11 +83,20 @@ use std::time::{Duration, Instant};
 const BATCH: u64 = 128;
 
 /// Run `parse_options(blob)` `BATCH` times per closure invocation, XOR-folding
-/// the parsed Timestamps + SACK-block-count into a single accumulator so
-/// LLVM cannot DCE the parse. `black_box` is applied to the input slice on
-/// every call (preventing constant-folding the parse output) and to the
-/// accumulator at end-of-batch (preventing dead-store elimination of the
-/// accumulated parse results).
+/// the parsed Timestamps + every decoded SACK block's `left`/`right` seqs +
+/// MSS/WS into a single accumulator so LLVM cannot DCE the parse. `black_box`
+/// is applied to the input slice on every call (preventing constant-folding
+/// the parse output) and to the accumulator at end-of-batch (preventing
+/// dead-store elimination of the accumulated parse results).
+///
+/// Why per-block fold (not just `sack_block_count`): `parse_options` decodes
+/// each block's `u32 left` + `u32 right` via `u32::from_be_bytes`
+/// (tcp_options.rs:371-383) and writes them into `opts.sack_blocks[..]`. The
+/// function is `#[inline]` (tcp_options.rs:269), so LLVM can inline it into
+/// this batch loop; if we fold only `sack_block_count`, the optimizer can
+/// prove the per-block seq values are never read and elide the block-decode
+/// work, under-reporting the real RX-path cost. Folding every block's
+/// seqs forces the decode loop to actually be observed.
 fn bench_parse_blob(c: &mut Criterion, name: &str, blob: &[u8]) {
     c.bench_function(name, |b| {
         b.iter_custom(|iters| {
@@ -99,14 +110,20 @@ fn bench_parse_blob(c: &mut Criterion, name: &str, blob: &[u8]) {
                     let r = parse_options(black_box(blob));
                     match r {
                         Ok(opts) => {
-                            // Fold the parse result into `acc`. Including
-                            // `sack_block_count` covers the SACK-bearing
-                            // variants; the TS fold covers both TS-bearing
-                            // and TS-absent (None → 0) variants.
+                            // Fold the parse result into `acc`. Folding
+                            // every decoded SACK block's `left`/`right`
+                            // forces LLVM to keep the per-block decode
+                            // work (tcp_options.rs:371-383); folding
+                            // `timestamps` + `mss` + `wscale` covers the
+                            // other branches of the state-machine loop.
                             if let Some((tsval, tsecr)) = opts.timestamps {
                                 acc ^= (tsval as u64) ^ ((tsecr as u64) << 32);
                             }
-                            acc ^= opts.sack_block_count as u64;
+                            let n = opts.sack_block_count as usize;
+                            acc ^= n as u64;
+                            for b in &opts.sack_blocks[..n] {
+                                acc ^= (b.left as u64) ^ ((b.right as u64) << 32);
+                            }
                             acc ^= opts.mss.unwrap_or(0) as u64;
                             acc ^= opts.wscale.unwrap_or(0) as u64;
                         }
@@ -127,9 +144,19 @@ fn bench_parse_blob(c: &mut Criterion, name: &str, blob: &[u8]) {
 }
 
 fn bench_parse_options_ts_only(c: &mut Criterion) {
-    // Canonical TS-only ACK buffer: encoder emits NOP+NOP+TS(10) = 12 bytes
-    // when only `timestamps` is set (tcp_options.rs:124-127, also the
-    // T9-H7 fast-path shape at tcp_options.rs:271-288).
+    // Linux-canonical TS-only ACK buffer: encoder emits NOP+NOP+TS(10)
+    // = 12 bytes when only `timestamps` is set (tcp_options.rs:124-127).
+    // This is the RFC 7323 Appendix A recommendation (leading NOPs for
+    // 4-byte alignment) and is what every modern Linux peer emits on
+    // steady-state data ACKs.
+    //
+    // Important: this shape does NOT fire the T9-H7 fast-path at
+    // tcp_options.rs:274-275. That fast-path requires `opts[0] ==
+    // OPT_TIMESTAMP` (TS first, trailing NOPs); on NOP+NOP+TS we have
+    // `opts[0] == OPT_NOP` and fall through to the general state-machine
+    // loop. This bench therefore measures the general-loop path on the
+    // canonical Linux-peer TS-only shape. The fast-path is effectively
+    // dead code in production for any Linux-peer traffic.
     let opts = TcpOpts {
         timestamps: Some((0x0000_1000, 0xCAFE_BABE)),
         ..Default::default()
@@ -156,9 +183,24 @@ fn bench_parse_options_ts_sack(c: &mut Criterion) {
 }
 
 fn bench_parse_options_mss_ws_ts_sackperm(c: &mut Criterion) {
-    // Full SYN/SYN-ACK shape: MSS + WS + SACK-permitted + TS encoded as
-    // MSS(4) + NOP+WS(4) + SACKP(2) + TS(10) = 20 bytes (Linux canonical;
-    // see tcp_options.rs:412-413 unit test).
+    // Our encoder's SYN-shape (MSS + WS + SACK-permitted + TS) encoded as
+    // MSS(4) + NOP+WS(4) + SACKP(2) + TS(10) = 20 bytes. Note: this is the
+    // corpus-compat WSCALE-second order our stack deliberately emits (see
+    // tcp_options.rs:5-12); modern Linux `tcp_options_write` emits
+    // MSS + SACK_PERMITTED + TS + NOP+WS (WSCALE last) instead. Both
+    // orderings are RFC 9293 §3.2 compliant; we choose WSCALE-second to
+    // match the shivansh + ligurio packetdrill corpus byte-for-byte
+    // (tcp_options.rs:412-413 unit test).
+    //
+    // Why this bench measures comparably to (or faster than) the TS+SACK
+    // variant despite having more options: SYN-shape decodes are all
+    // fixed-size single-value arms (MSS/WS/SACK_PERMITTED/TS at
+    // tcp_options.rs:310-355), while the TS+SACK bench's SACK arm runs a
+    // per-block u32-pair decode loop (tcp_options.rs:357-385) over 2
+    // blocks plus a NOP+NOP pre-pad. Per-byte the SACK loop costs more
+    // cycles than the SYN-shape's straight-line single-value branches,
+    // so the SYN-shape's larger byte count does not necessarily translate
+    // into a higher parse cost.
     let opts = TcpOpts {
         mss: Some(1460),
         wscale: Some(7),
