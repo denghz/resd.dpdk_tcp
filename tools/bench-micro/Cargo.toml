@@ -74,6 +74,10 @@ harness = false
 name = "deliver_readable"
 harness = false
 
+[[bench]]
+name = "flow_scale"
+harness = false
+
 [[bin]]
 name = "summarize"
 path = "src/bin/summarize.rs"
