@@ -453,15 +453,22 @@ pub mod imp {
             return Step::Continue;
         }
 
-        // Drive send phase if not yet complete.
-        let request = state.payload_for_bucket[state.bucket_idx].clone();
-        // Clone is cheap relative to the actual ff_write hot path
-        // (request is allocated once per bucket, ≤ 1 MiB), and avoids
-        // borrowing state.payload_for_bucket immutably while we
-        // mutate state.phase below. Cargo-clippy::large_type_pass-by-
-        // value is not a concern here.
-        if sent < request.len() {
-            match pump_write(state.fd, &request, &mut sent) {
+        // Drive send phase if not yet complete. Pump via a split-borrow:
+        // `fd` is Copy, `payload_for_bucket[i]` is a read-only borrow,
+        // `sent` is on the stack. `pump_write` doesn't touch `state` so
+        // there's no borrow-check conflict with the later `state.phase`
+        // write — we collect the result first and write the phase
+        // afterwards. Avoids the per-iter Vec::clone() that would
+        // otherwise show up as ~1.2 GB of alloc churn on the
+        // 4 × 100k-iter default sweep.
+        let pump_outcome = if sent < bucket.payload_bytes {
+            let payload = state.payload_for_bucket[state.bucket_idx].as_slice();
+            Some(pump_write(state.fd, payload, &mut sent))
+        } else {
+            None
+        };
+        if let Some(outcome) = pump_outcome {
+            match outcome {
                 PumpStep::Progress => {
                     state.phase = Phase::Warmup {
                         iter_done,
@@ -552,10 +559,18 @@ pub mod imp {
             ));
             return Step::Continue;
         }
-        let request = state.payload_for_bucket[state.bucket_idx].clone();
-        match pump_write(state.fd, &request, &mut sent) {
+        // Split-borrow: same shape as phase_warmup above — pump_write
+        // is called against an immutable borrow of payload_for_bucket;
+        // the result is captured and state.phase updated afterwards so
+        // the borrows don't overlap. Keeps the hot path alloc-free.
+        let payload_len = state.payload_for_bucket[state.bucket_idx].len();
+        let outcome = {
+            let payload = state.payload_for_bucket[state.bucket_idx].as_slice();
+            pump_write(state.fd, payload, &mut sent)
+        };
+        match outcome {
             PumpStep::Progress => {
-                if sent >= request.len() {
+                if sent >= payload_len {
                     state.phase = Phase::MeasureRead {
                         iter_done,
                         recvd: 0,
