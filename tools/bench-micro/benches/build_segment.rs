@@ -18,6 +18,29 @@
 //! separate number across three payload shapes plus an isolated
 //! pseudo-header-only measurement.
 //!
+//! # T1/T3 numerical bridge
+//!
+//! T3's `bench_build_segment_data_mss` (~833 ns observed) measures
+//! `build_segment` alone for a 1526-byte MSS frame. T1's
+//! `bench_send_large_segment_build_warm` (~5.4 µs / 6 segments
+//! ≈ 900 ns/seg observed) bundles the same `build_segment` call plus
+//! the per-segment overheads listed below. The ~50-150 ns gap between
+//! T3-alone and T1-per-segment is consistent with:
+//!   * `SendRetrans::push_after_tx` entry construction + Vec push
+//!     (engine.rs ~6155-6172).
+//!   * `Counters` atomic bumps for `eth.tx_bytes` and `tcp.tx_data`
+//!     (engine.rs ~6131-6132).
+//!   * `FlowTable::get_mut(handle)` lookup mirroring the production
+//!     `flow_table.borrow_mut() + get_mut(handle)` pattern
+//!     (engine.rs ~6167-6170) — ~30-50 ns at sub-128-flow scale.
+//!   * `SegmentTx` struct construction with a fresh `TcpOpts` each
+//!     segment (see "What this bench measures vs. what production
+//!     callers pay" below for the encode-on-every-call note).
+//!
+//! So when looking at T3 alone vs. T1 large-warm, attribute the
+//! delta to the bundled retrans/counter/flow-table overhead, not to
+//! a discrepancy in the underlying build_segment cost.
+//!
 //! # Variants
 //!
 //! * `bench_build_segment_bare_ack` — ACK only (no payload), TS options
@@ -31,22 +54,36 @@
 //!   representative of a full-MSS data segment in a bulk burst.
 //! * `bench_pseudo_header_checksum` — isolates
 //!   `tcp_output::tcp_pseudo_header_checksum` (tcp_output.rs:223). Pure
-//!   compute, no allocation; ~5 cycles target. Measured with
-//!   `iter_custom` + BATCH=128 (same pattern as `bench_tsc_read_*` and
-//!   `bench_parse_options`) since the workload is sub-10 ns per call.
+//!   compute, no allocation. Measured ~7-8 ns on this host (~35-40
+//!   cycles at 5 GHz). The work is: build a 12-byte stack
+//!   pseudo-header buffer (src_ip || dst_ip || zero || proto ||
+//!   tcp_seg_len) then call `internet_checksum` to fold it — a
+//!   multi-load + 16-bit ones-complement fold loop, not a 5-instruction
+//!   sequence. Measured with `iter_custom` + BATCH=128 (same pattern as
+//!   `bench_tsc_read_*` and `bench_parse_options`) since the workload
+//!   is sub-10 ns per call and criterion's per-iter overhead would
+//!   otherwise dominate.
 //!
 //! # What this bench measures vs. what production callers pay
 //!
 //! This bench measures `build_segment` in isolation: a pre-built
 //! `SegmentTx` literal is reused across iterations and the function is
-//! invoked against a stack/heap `out` buffer. Production callers pay
-//! additional per-segment costs that are NOT in this number:
+//! invoked against a stack/heap `out` buffer. Note that `SegmentTx`
+//! owns a `TcpOpts` struct (NOT a pre-encoded options blob); the
+//! options are reconstructed by setup, but `build_segment` calls
+//! `seg.options.encode(...)` into the on-the-wire bytes on every
+//! invocation (tcp_output.rs:155). This is faithful to production,
+//! where each segment in `Engine::send_bytes` builds a fresh
+//! `SegmentTx` literal that bundles a freshly-constructed `TcpOpts`
+//! and `build_segment` runs its `encode` on every segment. So this
+//! bench DOES pay the per-call options encode; what it does NOT
+//! exercise are the additional per-segment costs production pays:
 //!
 //!   * `tx_frame_scratch` `RefCell::borrow_mut` to access the
 //!     engine-owned reusable frame buffer.
-//!   * `SegmentTx { .. }` struct construction with the per-segment
-//!     `seq`, `ack`, `payload` slice and a freshly-encoded
-//!     `TcpOpts` value.
+//!   * `SegmentTx { .. }` struct construction (per-segment
+//!     `seq`, `ack`, `payload` slice + a freshly-constructed
+//!     `TcpOpts` value built from the conn's TS state).
 //!   * `frame.clear()` + `frame.resize(needed, 0)` to right-size the
 //!     scratch.
 //!   * Downstream the mbuf alloc, `copy_nonoverlapping`, refcount bump,
@@ -59,6 +96,21 @@
 //! is invoked through a `Vec`/`Box`-backed `out` buffer here, not the
 //! engine-owned `tx_frame_scratch` `RefCell`, so register allocation and
 //! surrounding-code interleaving may differ from the production hotspot.
+//!
+//! Concretely: `build_segment` is declared `pub fn` with NO `#[inline]`
+//! attribute (tcp_output.rs:43). The production hot-path call site lives
+//! in the same crate (`dpdk-net-core`) at engine.rs:6050 inside
+//! `Engine::send_bytes`. This bench imports the function cross-crate
+//! (see `use dpdk_net_core::tcp_output::build_segment;` below). The
+//! cross-crate import means the inlining boundary is fat-LTO-dependent:
+//! the workspace root Cargo.toml sets `[profile.release] lto = "fat"`,
+//! `codegen-units = 1` (release profile that bench harnesses inherit),
+//! which lets LLVM inline across crate boundaries at link time, so the
+//! release-bench number should match the production same-crate cost.
+//! Without fat LTO (e.g. a debug bench, or thin-LTO release), the
+//! production call site may inline `build_segment` while this bench's
+//! cross-crate call would not — the numbers reported here assume fat
+//! LTO is on (it is, per workspace Cargo.toml).
 //!
 //! # `black_box` discipline
 //!
@@ -250,7 +302,10 @@ fn bench_build_segment_data_mss(c: &mut Criterion) {
 /// Pseudo-header-only checksum: the 12-byte fold over src_ip + dst_ip +
 /// proto + tcp_seg_len. Used by the A-HW TX-offload path
 /// (tcp_output.rs:223) where the PMD folds in the TCP header + payload
-/// at wire time. Pure compute, no allocation; sub-10 ns target.
+/// at wire time. Pure compute, no allocation; observed sub-10 ns per
+/// call on this host (~7-8 ns ≈ ~35-40 cycles at 5 GHz, see top-of-file
+/// doc-comment for the cost breakdown). "Sub-10 ns" is the measurement,
+/// not a target.
 ///
 /// `iter_custom` + BATCH=128 amortizes criterion's per-iter overhead
 /// (same pattern as `bench_tsc_read_*` and `bench_parse_options`). The
