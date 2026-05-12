@@ -5275,11 +5275,11 @@ impl Engine {
 
     /// A6.6 Task 3 + T7/T8/T9: pop up to `total_delivered` bytes' worth
     /// of `InOrderSegment` entries from `conn.recv.bytes` into
-    /// `conn.delivered_segments`, materialize a scatter-gather iovec
+    /// `conn.delivered_segments`, append a fresh scatter-gather iovec
     /// slice into `conn.readable_scratch_iovecs`, then emit a SINGLE
-    /// `Event::Readable` covering the full slice.
+    /// `Event::Readable` covering the appended range.
     ///
-    /// Ownership model post-T7:
+    /// Ownership model post-T7 + 2026-05-12 multi-emit fix:
     /// - Segments in `recv.bytes` each own exactly one mbuf refcount
     ///   (bumped at tcp_input ingest on the in-order append, or
     ///   transferred via `DrainedMbuf::into_handle()` on the gap-close
@@ -5295,6 +5295,33 @@ impl Engine {
     ///   (dropping refcounts via `MbufHandle::Drop`) and
     ///   `conn.readable_scratch_iovecs` (invalidating the pointers
     ///   returned at the ABI boundary).
+    ///
+    /// # 2026-05-12 multi-`deliver_readable`-per-poll fix
+    ///
+    /// Pre-fix this method cleared both `delivered_segments` and
+    /// `readable_scratch_iovecs` at the top of every invocation, so a
+    /// second `deliver_readable` call within the same poll clobbered
+    /// the first event's iovec backing — the first `Readable` event
+    /// landed in the queue with a `(seg_idx_start, seg_count)` slice
+    /// that pointed at scratch entries the second emit had freed and
+    /// overwritten (the underlying mbuf refcounts dropped on
+    /// `delivered_segments.clear()`, returning the mbufs to their
+    /// pool while a queued `Readable` still believed it held a
+    /// reference). Surface symptom: bench-rx-burst saw `peer_send_ns
+    /// ≈ 0` records when two RX-burst segments delivered to one conn
+    /// in a single poll (`tools/bench-rx-burst/src/dpdk.rs`
+    /// `PEER_SEND_NS_FLOOR` sentinel, commit `25f5353`).
+    ///
+    /// Post-fix this method APPENDS to both vectors. The per-event
+    /// slice is recorded as `seg_idx_start = pre-append scratch len`
+    /// and `seg_count = number of entries appended in this emit`. Both
+    /// vectors continue to be cleared at top-of-poll (releasing all
+    /// prior-poll refcounts before any new RX dispatches can land),
+    /// so the per-poll lifetime contract at the C ABI boundary is
+    /// unchanged. Within a single poll, multiple emits stack:
+    /// `delivered_segments` holds every mbuf refcount the poll has
+    /// delivered, keeping every iovec `base` pointer valid for the
+    /// full inter-poll consumer-drain window.
     ///
     /// `rx_hw_ts_ns`: NIC-provided RX timestamp captured at the per-
     /// mbuf decode boundary in `poll_once` and threaded through the
@@ -5324,11 +5351,21 @@ impl Engine {
             return;
         };
 
-        // A6.6 T7/T8: pop into `delivered_segments`, preserving offset
-        // + len windows. The front segment's existing refcount is moved
-        // on full pop; partial pop bumps via `try_clone` and keeps the
-        // remainder in `recv.bytes`.
-        conn.delivered_segments.clear();
+        // 2026-05-12 multi-emit fix: snapshot the pre-emit length of
+        // `delivered_segments` so the new event's iovec slice can be
+        // recorded as `[seg_idx_start, seg_idx_start + seg_count)` into
+        // the (now-accumulating) per-conn scratch. Pre-fix this method
+        // `.clear()`'d both vectors before the pop loop; that dropped
+        // every prior emit's refcounts and stale-ified every queued
+        // `Readable` event for this conn in the same poll. Now both
+        // vectors accumulate within a poll; `poll_once` clears them
+        // before the next RX burst.
+        let seg_idx_start = conn.delivered_segments.len() as u32;
+
+        // A6.6 T7/T8: pop into `delivered_segments` APPENDING after any
+        // earlier-emit entries (see fix doc above). The front segment's
+        // existing refcount is moved on full pop; partial pop bumps via
+        // `try_clone` and keeps the remainder in `recv.bytes`.
         let mut remaining = total_delivered;
         while remaining > 0 {
             match conn.recv.bytes.front() {
@@ -5377,13 +5414,18 @@ impl Engine {
             }
         }
 
-        // A6.6 T8: materialize the iovec array for this READABLE event
-        // into the per-conn scratch. Capacity is retained across polls
-        // (§7.6 scratch-reuse policy); `.clear()` keeps it but discards
-        // stale pointers from the previous event's emission.
-        conn.readable_scratch_iovecs.clear();
+        // A6.6 T8 + 2026-05-12 multi-emit fix: APPEND the iovec entries
+        // for this event onto the per-conn scratch. Pre-fix the scratch
+        // was cleared at the top of every invocation (clobbering earlier
+        // queued events' backing); post-fix entries accumulate within a
+        // poll and are released only at top-of-`poll_once`. Capacity is
+        // retained across polls (§7.6 scratch-reuse policy).
         let mut total_len: u32 = 0;
-        for seg in &conn.delivered_segments {
+        // Walk only the newly-pushed `delivered_segments` entries (from
+        // `seg_idx_start` onward) — earlier emits' segments already had
+        // their iovecs materialized into the scratch and must not be
+        // re-pushed.
+        for seg in &conn.delivered_segments[seg_idx_start as usize..] {
             conn.readable_scratch_iovecs.push(crate::iovec::DpdkNetIovec {
                 base: seg.data_ptr(),
                 len: seg.len as u32,
@@ -5391,12 +5433,15 @@ impl Engine {
             });
             total_len = total_len.saturating_add(seg.len as u32);
         }
-        let seg_count = conn.readable_scratch_iovecs.len() as u32;
+        let seg_count = (conn.readable_scratch_iovecs.len() as u32)
+            .saturating_sub(seg_idx_start);
 
-        // A6.6 T9: single READABLE event covers the full iovec slice.
-        // `seg_idx_start` is always 0 — scratch is cleared at the top
-        // of this call and we only emit one event per deliver_readable
-        // invocation.
+        // A6.6 T9 + 2026-05-12 fix: each `Readable` event covers ONLY
+        // its own emit's iovec slice — `seg_idx_start` (snapshot above)
+        // is the index of the first iovec entry this emit appended.
+        // Pre-fix `seg_idx_start` was always 0 because the scratch
+        // cleared per-emit; post-fix it advances as multiple emits
+        // stack within one poll.
         // A10 D4 (G1+G2): obs-none compiles the READABLE push + now_ns
         // + per-event observability counter bumps away. The pop loop
         // above and the `readable_scratch_iovecs` materialization stay
@@ -5428,7 +5473,7 @@ impl Engine {
                 events.push(
                     InternalEvent::Readable {
                         conn: handle,
-                        seg_idx_start: 0,
+                        seg_idx_start,
                         seg_count,
                         total_len,
                         rx_hw_ts_ns,
@@ -5441,7 +5486,7 @@ impl Engine {
         }
         #[cfg(feature = "obs-none")]
         {
-            let _ = (seg_count, total_len, rx_hw_ts_ns);
+            let _ = (seg_count, seg_idx_start, total_len, rx_hw_ts_ns);
         }
         drop(ft);
         add(&self.counters.tcp.recv_buf_delivered, total_delivered as u64);
