@@ -81,6 +81,38 @@ use crate::segment::{parse_burst_chunk, SegmentRecord};
 /// visible failure.
 const STALL_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Sentinel floor for a plausible `peer_send_ns` value. `peer_send_ns`
+/// is `CLOCK_REALTIME` ns since 1970 captured on the peer at the
+/// `send()` call site (see `burst-echo-server.c`). Real values are
+/// ~1.78e18 in 2026 and grow over time; the floor `1.5e18` corresponds
+/// to roughly 2017-07-14 — well below any realistic benched-against
+/// peer's wall clock yet comfortably above any value that could arise
+/// from a misaligned parse.
+///
+/// # Why this is needed
+///
+/// T56 fast-iter-suite (2026-05-12) bench-rx-burst dpdk_net at
+/// `burst_count >= 64` showed p99/mean latencies of ~1.78e18 ns — the
+/// signature shape of `dut_recv_ns - 0`. Root cause: when the engine's
+/// `deliver_readable` scratch is clobbered mid-stream (two
+/// `Readable`s in one poll, see module docstring's "engine event/
+/// scratch model"), `recv_buf` becomes misaligned vs. the peer's
+/// per-W segment grid. `parse_burst_chunk` then reads the segment
+/// payload's zero-pad bytes (everything past byte 16 of a W-byte
+/// segment is zero from `burst-echo-server::send_burst`) as if they
+/// were a header — producing `peer_send_ns = 0`, hence `latency_ns =
+/// dut_recv_ns - 0 = epoch_ns ≈ 1.78e18` records that corrupt the
+/// percentile rollup.
+///
+/// The fix rejects records below this floor in `consume_chunk_into_buf`.
+/// The parse cursor still advances past the filtered entry so the same
+/// bytes aren't re-emitted on the next `consume_chunk_into_buf` call.
+/// The dpdk arm is the only one affected — linux_kernel reads the TCP
+/// stream via `std::net::TcpStream::read()` which can't drop bytes
+/// mid-stream, and fstack reads via `ff_read()` with similar
+/// guarantees from the F-Stack TCP layer.
+const PEER_SEND_NS_FLOOR: u64 = 1_500_000_000_000_000_000;
+
 /// One bucket's run-time configuration. Caller owns `engine` + `conn`.
 pub struct DpdkRxBurstCfg<'a> {
     pub engine: &'a Engine,
@@ -305,16 +337,25 @@ fn consume_chunk_into_buf(
     // sequence index. `next_seg_idx` just bounds the parse cursor
     // forward in `recv_buf` to avoid re-emitting the same record on
     // each iteration.
+    //
+    // Records whose parsed `peer_send_ns` falls below
+    // `PEER_SEND_NS_FLOOR` are misaligned-parse artifacts (the cursor
+    // landed on a segment's zero-pad region, not a header) and are
+    // dropped before reaching the CSV. The parse cursor still advances
+    // so the same bytes aren't re-evaluated on the next call. See the
+    // `PEER_SEND_NS_FLOOR` doc comment for full context.
     let parsed = parse_burst_chunk(recv_buf, segment_size);
     while *next_seg_idx < parsed.len() as u64 {
         let (seq_idx, peer_send_ns) = parsed[*next_seg_idx as usize];
-        records.push(SegmentRecord::new(
-            bucket_id,
-            burst_idx,
-            seq_idx,
-            peer_send_ns,
-            dut_recv_ns,
-        ));
+        if peer_send_ns >= PEER_SEND_NS_FLOOR {
+            records.push(SegmentRecord::new(
+                bucket_id,
+                burst_idx,
+                seq_idx,
+                peer_send_ns,
+                dut_recv_ns,
+            ));
+        }
         *next_seg_idx += 1;
     }
 }
@@ -494,11 +535,21 @@ mod tests {
         out
     }
 
+    /// CLOCK_REALTIME ns anchor used to build synthetic segments at a
+    /// plausible peer wall-clock. Set above `PEER_SEND_NS_FLOOR` so
+    /// the misaligned-parse filter in `consume_chunk_into_buf` doesn't
+    /// reject the test's records as garbage. Roughly matches the
+    /// 2026-05-12 T56 run for documentation.
+    const TEST_PEER_SEND_NS_ANCHOR: u64 = 1_778_569_397_000_000_000;
+
     /// Concat `n` segments at indices `start..start+n` into one Vec.
+    /// `peer_send_ns` is offset from `TEST_PEER_SEND_NS_ANCHOR` so all
+    /// generated headers pass the misaligned-parse sentinel filter.
     fn build_segments(start: u64, n: u64, w: usize) -> Vec<u8> {
         let mut out = Vec::with_capacity((n as usize) * w);
         for i in 0..n {
-            out.extend_from_slice(&build_segment(start + i, (start + i) * 1_000, w));
+            let peer_send_ns = TEST_PEER_SEND_NS_ANCHOR + (start + i) * 1_000;
+            out.extend_from_slice(&build_segment(start + i, peer_send_ns, w));
         }
         out
     }
@@ -540,7 +591,10 @@ mod tests {
         assert_eq!(records.len(), n as usize);
         for (i, rec) in records.iter().enumerate() {
             assert_eq!(rec.seg_idx, i as u64);
-            assert_eq!(rec.peer_send_ns, (i as u64) * 1_000);
+            assert_eq!(
+                rec.peer_send_ns,
+                TEST_PEER_SEND_NS_ANCHOR + (i as u64) * 1_000
+            );
             assert_eq!(rec.dut_recv_ns, 12_345);
         }
     }
@@ -728,6 +782,107 @@ mod tests {
         assert_eq!(
             next_seg_idx, 0,
             "next_seg_idx only advances on the record=true path"
+        );
+    }
+
+    /// Bug regression: when the dpdk engine drops/clobbers bytes
+    /// mid-stream within a coalesced delivery, `recv_buf` ends up
+    /// misaligned vs. the peer's segment grid — `parse_burst_chunk`
+    /// then reads the segment payload's zero-pad bytes (everything
+    /// past byte 16 of each W-byte segment is zero from
+    /// `burst-echo-server`) as if they were header `peer_send_ns`
+    /// values, producing records with `peer_send_ns == 0`.
+    ///
+    /// `SegmentRecord::new` computes `latency_ns = dut_recv_ns -
+    /// peer_send_ns`, so `peer_send_ns == 0` gives `latency_ns ==
+    /// dut_recv_ns` (a `CLOCK_REALTIME` ns ~1.78e18 in 2026), which
+    /// drags p99/mean to nonsense values.
+    ///
+    /// T56 fast-iter-suite (2026-05-12) bench-rx-burst dpdk_net CSV
+    /// shows this for `burst_count >= 64` at every `segment_size` —
+    /// see the bench-reports/t56-* file.
+    ///
+    /// Fix: filter out records whose `peer_send_ns` falls below the
+    /// "plausibly a 2017+ wall clock" floor (1.5e18 ns). Real records
+    /// from `burst-echo-server` carry `CLOCK_REALTIME` ns of the
+    /// peer's `clock_gettime` call — comfortably above the floor for
+    /// any benched-against host running NTP. Records below the floor
+    /// are misaligned-parse artifacts and dropped.
+    #[test]
+    fn consume_chunk_into_buf_filters_records_with_zero_peer_send_ns() {
+        let w: usize = 64;
+        let total: usize = 3 * w;
+        // CLOCK_REALTIME ns roughly matching the T56 run (2026-05-12).
+        let realistic_peer_send_ns: u64 = 1_778_569_397_700_000_000;
+
+        // Two valid segments...
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0u64.to_be_bytes());
+        bytes.extend_from_slice(&realistic_peer_send_ns.to_be_bytes());
+        bytes.extend_from_slice(&vec![0u8; w - 16]);
+        bytes.extend_from_slice(&1u64.to_be_bytes());
+        bytes.extend_from_slice(&(realistic_peer_send_ns + 1_000).to_be_bytes());
+        bytes.extend_from_slice(&vec![0u8; w - 16]);
+        // ...then a third W-byte block that's all-zero. This mirrors
+        // the misaligned-parse case where the parse cursor lands on a
+        // segment's zero-pad region instead of a header.
+        bytes.extend_from_slice(&vec![0u8; w]);
+
+        let chunk = DrainOutcome {
+            bytes,
+            engine_delivered: total as u64,
+        };
+
+        // dut_recv_ns at the time of recv: matches T56's "now in
+        // 2026-05-12 ns" pattern. If the bug is present, the third
+        // record will carry `latency_ns == dut_recv_ns ≈ 1.78e18`.
+        let dut_recv_ns: u64 = 1_778_569_397_700_001_000;
+
+        let mut recv_buf = Vec::new();
+        let mut records = Vec::new();
+        let mut next_seg_idx: u64 = 0;
+        let mut engine_delivered_total: u64 = 0;
+
+        consume_chunk_into_buf(
+            &chunk,
+            dut_recv_ns,
+            total,
+            w,
+            /* bucket_id */ 0,
+            /* burst_idx */ 0,
+            /* record */ true,
+            &mut recv_buf,
+            &mut records,
+            &mut next_seg_idx,
+            &mut engine_delivered_total,
+        );
+
+        // Only the two valid records survive; the all-zero parsed
+        // entry must not become a CSV row.
+        assert_eq!(
+            records.len(),
+            2,
+            "the all-zero parsed entry should be filtered out, got records: {records:?}"
+        );
+        for rec in &records {
+            assert!(
+                rec.peer_send_ns > 1_000_000_000_000_000_000,
+                "valid record must have peer_send_ns ~ CLOCK_REALTIME ns, got {}",
+                rec.peer_send_ns
+            );
+            assert!(
+                rec.latency_ns < 1_000_000_000,
+                "valid record latency must be sub-second; got {} ns (likely epoch-ns leak)",
+                rec.latency_ns
+            );
+        }
+
+        // `next_seg_idx` still advances over the parsed-but-filtered
+        // entry so the parser cursor doesn't re-emit it on the next
+        // `consume_chunk_into_buf` call.
+        assert_eq!(
+            next_seg_idx, 3,
+            "parse cursor must advance past the filtered entry to avoid re-emission"
         );
     }
 }
