@@ -110,14 +110,49 @@ declare -a OKS=()
 declare -i FAIL_COUNT=0
 declare -i OK_COUNT=0
 
+# Per-arm hard cap (seconds). Generous enough for the heaviest configured arm
+# (bench-tx-maxtp at 12s × 9 buckets = ~108s) but short enough to bail if a
+# bench gets stuck on a hung peer echo-server. Override via env if needed.
+RUN_ONE_TIMEOUT="${RUN_ONE_TIMEOUT:-300}"
+
+# Peer echo-server worker count is bounded (~10). The dpdk_net and fstack
+# arms leave stale ESTABLISHED connections behind because their stacks tear
+# down the TX queue without sending TCP FINs to the peer — so each bucket
+# pins one worker slot. Restart the peer's echo-server (NOT the sink/burst
+# servers) before every dpdk_net/fstack arm to release worker slots.
+PEER_RESTART_DELAY="${PEER_RESTART_DELAY:-1}"
+
 log() { printf '[suite %s] %s\n' "$(date -u +%H:%M:%S)" "$*" | tee -a "$LOG_FILE" >&2; }
 
 ts_now() { date -u +%s; }
 
+# Restart the peer's :10001 echo-server. Used between dpdk_net/fstack arms
+# to clear leaked TCP connections that pin all echo-server worker threads.
+#
+# Implementation note: `pkill -f /tmp/echo-server $PEER_ECHO_PORT` would also
+# match the remote bash command we're running (its own argv contains the
+# pattern), self-killing the shell. We therefore use `pgrep -fx` (exact full
+# cmdline match) → explicit `kill`, which only matches the echo-server.
+peer_restart_echo_server() {
+    log "    peer: restart echo-server :$PEER_ECHO_PORT (clear stale ESTAB)"
+    ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "$PEER_SSH" "
+        pids=\$(pgrep -fx '/tmp/echo-server $PEER_ECHO_PORT' 2>/dev/null || true)
+        if [ -n \"\$pids\" ]; then
+            kill -KILL \$pids 2>/dev/null || true
+            sleep 0.3
+        fi
+        nohup /tmp/echo-server $PEER_ECHO_PORT >/tmp/echo-server.log 2>&1 </dev/null &
+        disown
+        sleep $PEER_RESTART_DELAY
+        pgrep -fx '/tmp/echo-server $PEER_ECHO_PORT' >/dev/null
+    " >>"$LOG_FILE" 2>&1 || log "    WARN: peer echo-server restart failed (see $LOG_FILE)"
+}
+
 # run_one <desc> <output-csv> <command...>
 #
-# Runs the bench command, appending its stdout+stderr to the per-arm log file
-# (and the suite log). Outputs OK / FAIL message. Never aborts the suite.
+# Runs the bench command under `timeout $RUN_ONE_TIMEOUT`, appending stdout+stderr
+# to the per-arm log file (and the suite log). Outputs OK / FAIL / TIMEOUT
+# message. Never aborts the suite.
 run_one() {
     local desc="$1" outcsv="$2"
     shift 2
@@ -133,10 +168,12 @@ run_one() {
     {
         printf '=== %s ===\n' "$desc"
         printf 'cmd: %s\n' "$*"
-        printf 'started: %s\n' "$(date -u -Iseconds)"
+        printf 'started: %s timeout=%ss\n' "$(date -u -Iseconds)" "$RUN_ONE_TIMEOUT"
     } >"$arm_log"
 
-    if "$@" >>"$arm_log" 2>&1; then
+    # `timeout --foreground` lets Ctrl+C reach the bench process; `-k 30`
+    # SIGKILLs 30s after SIGTERM if the bench refuses to exit.
+    if timeout --foreground -k 30 "$RUN_ONE_TIMEOUT" "$@" >>"$arm_log" 2>&1; then
         ended=$(ts_now)
         elapsed=$((ended - started))
         log "    OK ($elapsed s)"
@@ -148,10 +185,14 @@ run_one() {
         local rc=$?
         ended=$(ts_now)
         elapsed=$((ended - started))
-        log "    FAIL rc=$rc ($elapsed s) — see $arm_log"
-        FAILS+=("$desc (rc=$rc, log=$arm_log)")
+        local tag="FAIL"
+        if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+            tag="TIMEOUT"
+        fi
+        log "    $tag rc=$rc ($elapsed s) — see $arm_log"
+        FAILS+=("$desc ($tag rc=$rc, log=$arm_log)")
         FAIL_COUNT=$((FAIL_COUNT + 1))
-        printf 'FAIL rc=%d %s elapsed=%ds\n' "$rc" "$desc" "$elapsed" >>"$arm_log"
+        printf '%s rc=%d %s elapsed=%ds\n' "$tag" "$rc" "$desc" "$elapsed" >>"$arm_log"
         return 0  # don't abort the suite
     fi
 }
@@ -176,6 +217,10 @@ preflight() {
         exit 2
     fi
     log "preflight: DUT $DUT_PCI bound to vfio-pci OK"
+
+    # Reset the peer's :10001 echo-server so we start with no stale ESTAB
+    # connections holding worker slots.
+    peer_restart_echo_server
 }
 
 # ---------------------------------------------------------------------------
@@ -203,6 +248,7 @@ run_bench_rtt() {
                 --output-csv "$RESULTS_DIR/bench-rtt-dpdk_net.csv" \
                 --payload-bytes-sweep 64,128,256,1024 \
                 --iterations 10000 --warmup 100
+    peer_restart_echo_server
 
     run_one "bench-rtt linux_kernel" \
         "$RESULTS_DIR/bench-rtt-linux_kernel.csv" \
@@ -235,6 +281,7 @@ run_bench_rtt() {
                 --output-csv "$RESULTS_DIR/bench-rtt-fstack.csv" \
                 --payload-bytes-sweep 64,128,256,1024 \
                 --iterations 10000 --warmup 100
+    peer_restart_echo_server
 }
 
 # bench-tx-burst
@@ -259,6 +306,7 @@ run_bench_tx_burst() {
                 --burst-sizes 65536,1048576 \
                 --gap-mss 0,10 \
                 --bursts-per-bucket 200 --warmup 20
+    peer_restart_echo_server
 
     run_one "bench-tx-burst linux_kernel" \
         "$RESULTS_DIR/bench-tx-burst-linux_kernel.csv" \
@@ -293,6 +341,7 @@ run_bench_tx_burst() {
                 --burst-sizes 65536,1048576 \
                 --gap-mss 0,10 \
                 --bursts-per-bucket 200 --warmup 20
+    peer_restart_echo_server
 }
 
 # bench-tx-maxtp
@@ -317,12 +366,17 @@ run_bench_tx_maxtp() {
                 --write-sizes 4096,16384,65536 \
                 --conn-counts 1,4,16 \
                 --warmup-secs 2 --duration-secs 10
+    peer_restart_echo_server
 
-    # linux_kernel arm — note PEER_SINK_PORT (10002), not ECHO_PORT.
+    # linux_kernel arm — note PEER_SINK_PORT (10002), not ECHO_PORT. The
+    # `--local-ip` flag is documented as dpdk-only but bench-tx-maxtp's
+    # peer-rwnd probe path still parses it as IPv4 for every stack, so we
+    # pass DUT_LOCAL_IP here too — it's a no-op for the linux arm itself.
     run_one "bench-tx-maxtp linux_kernel" \
         "$RESULTS_DIR/bench-tx-maxtp-linux_kernel.csv" \
         "$BENCH_TX_MAXTP" \
             --stack linux_kernel \
+            --local-ip "$DUT_LOCAL_IP" \
             --peer-ip "$PEER_IP" \
             --peer-port "$PEER_SINK_PORT" \
             --tool fast-iter-suite \
@@ -352,6 +406,7 @@ run_bench_tx_maxtp() {
                 --write-sizes 4096,16384,65536 \
                 --conn-counts 1,4,16 \
                 --warmup-secs 2 --duration-secs 10
+    peer_restart_echo_server
 }
 
 # bench-rx-burst
@@ -423,6 +478,10 @@ run_verify_rack_tlp() {
     local artifacts="$RESULTS_DIR/verify-rack-tlp"
     mkdir -p "$artifacts"
 
+    # verify-rack-tlp runs 5 netem scenarios sequentially; allow up to 30 min
+    # before SIGKILL. Override via VERIFY_RACK_TLP_TIMEOUT env if needed.
+    local prev_timeout="$RUN_ONE_TIMEOUT"
+    RUN_ONE_TIMEOUT="${VERIFY_RACK_TLP_TIMEOUT:-1800}"
     run_one "verify-rack-tlp" \
         "$artifacts/verify-rack-tlp.log" \
         env \
@@ -440,29 +499,29 @@ run_verify_rack_tlp() {
             PRECONDITION_MODE=lenient \
             BENCH_RTT_BIN="$BENCH_RTT" \
             "$VERIFY_RACK_TLP"
+    RUN_ONE_TIMEOUT="$prev_timeout"
 }
 
 # ---------------------------------------------------------------------------
 # Summary generation (parse CSVs into SUMMARY.md).
 # ---------------------------------------------------------------------------
 
-# CSV column layout (bench-rtt / tx-burst / tx-maxtp / rx-burst all share the
-# same `agg_kind` / `value` schema written by `bench_common::csv_writer`):
-#   tool,feature_set,bucket_id,<dimensions...>,agg_kind,value
+# CSV schema (spec §14, bench_common::csv_row::CsvRow). The columns we rely on
+# here are `test_case`, `feature_set`, `dimensions_json` (JSON-encoded grid
+# coords), `metric_name`, `metric_unit`, `metric_value`, `metric_aggregation`.
+# One row per (bucket, metric, aggregation) tuple — typically 7 aggregations
+# per metric per bucket (p50/p99/p999/mean/stddev/ci95_lower/ci95_upper).
 #
-# This summarizer pulls (p50, p99, mean) rows per (stack, bucket).
+# This summarizer pivots into (bucket × metric) tables with p50/p99/mean cols.
 
 summarize_one_csv() {
-    # $1 = csv path
-    # $2 = column name to use as "bucket label" (e.g. "payload_bytes" for rtt)
-    # ... unused — we just print every (bucket_id, agg_kind=p50/p99/mean) row.
     local csv="$1"
     if [ ! -s "$csv" ]; then
         printf '_(no data — CSV missing or empty)_\n\n'
         return
     fi
     python3 - "$csv" <<'PY' 2>&1 || true
-import csv, sys
+import csv, json, sys
 path = sys.argv[1]
 try:
     with open(path) as f:
@@ -473,33 +532,56 @@ except Exception as e:
 if not rows:
     print("_(empty CSV — header only)_")
     sys.exit(0)
-# Build (bucket_id, agg_kind) → value lookup
+
+# (dim_tuple, metric_name, aggregation) → (value, unit)
 data = {}
+metrics = []
+seen_metrics = set()
 buckets = []
 seen_buckets = set()
+dim_keys_order = []
+
 for r in rows:
-    b = r.get("bucket_id", "")
-    if b not in seen_buckets:
-        buckets.append(b)
-        seen_buckets.add(b)
-    agg = r.get("agg_kind", "")
-    val = r.get("value", "")
-    data[(b, agg)] = val
-# Find dimension columns (anything except tool, feature_set, bucket_id, agg_kind, value)
-skip = {"tool", "feature_set", "bucket_id", "agg_kind", "value"}
-dim_cols = [k for k in rows[0].keys() if k not in skip]
-# Print as table.
-hdr = ["bucket"] + dim_cols + ["p50", "p99", "mean"]
-print("| " + " | ".join(hdr) + " |")
-print("|" + "|".join(["---"] * len(hdr)) + "|")
-for b in buckets:
-    # Pick first row matching this bucket to get its dimension values.
-    src = next((r for r in rows if r.get("bucket_id") == b), {})
-    dims = [src.get(c, "") for c in dim_cols]
-    p50 = data.get((b, "p50"), "—")
-    p99 = data.get((b, "p99"), "—")
-    mean = data.get((b, "mean"), "—")
-    print("| " + " | ".join([b] + dims + [p50, p99, mean]) + " |")
+    try:
+        dims = json.loads(r.get("dimensions_json", "{}") or "{}")
+    except Exception:
+        dims = {}
+    # Drop the `stack` dim (constant per CSV).
+    dims.pop("stack", None)
+    for k in dims:
+        if k not in dim_keys_order:
+            dim_keys_order.append(k)
+    dim_tup = tuple(str(dims.get(k, "")) for k in dim_keys_order)
+    metric = r.get("metric_name", "")
+    unit = r.get("metric_unit", "")
+    agg = r.get("metric_aggregation", "")
+    val = r.get("metric_value", "")
+    data[(dim_tup, metric, agg)] = (val, unit)
+    if metric and metric not in seen_metrics:
+        metrics.append(metric)
+        seen_metrics.add(metric)
+    if dim_tup not in seen_buckets:
+        buckets.append(dim_tup)
+        seen_buckets.add(dim_tup)
+
+# Re-normalize bucket tuples to the final dim_keys_order length.
+buckets = [b + ("",) * (len(dim_keys_order) - len(b)) for b in buckets]
+
+for metric in metrics:
+    # Pick the unit from the first matching row.
+    unit = next((u for ((_, m, _), (_, u)) in data.items() if m == metric), "")
+    print(f"**metric: `{metric}`** ({unit})")
+    print()
+    hdr = list(dim_keys_order) + ["p50", "p99", "mean"]
+    print("| " + " | ".join(hdr) + " |")
+    print("|" + "|".join(["---"] * len(hdr)) + "|")
+    for b in buckets:
+        row = list(b)
+        for agg in ("p50", "p99", "mean"):
+            val, _ = data.get((b, metric, agg), ("—", ""))
+            row.append(val if val else "—")
+        print("| " + " | ".join(row) + " |")
+    print()
 PY
 }
 
