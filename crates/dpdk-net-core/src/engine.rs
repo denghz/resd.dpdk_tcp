@@ -83,9 +83,15 @@ pub fn align_up_to_tick_ns(deadline_ns: u64) -> u64 {
 // port, queue, or mempool. Not a production Engine — no RX/TX burst path.
 #[cfg(feature = "bench-internals")]
 pub mod test_support {
+    use crate::counters::{add, inc, Counters};
     use crate::flow_table::{ConnHandle, FlowTable, FourTuple};
+    use crate::mempool::Mbuf;
     use crate::tcp_conn::TcpConn;
     use crate::tcp_events::EventQueue;
+    use crate::tcp_options::TcpOpts;
+    use crate::tcp_output::{build_segment, SegmentTx, TCP_ACK, TCP_PSH};
+    use crate::tcp_retrans::RetransEntry;
+    use crate::tcp_send_ack_log::SeqRange;
     use crate::tcp_timer_wheel::{TimerId, TimerKind, TimerNode, TimerWheel};
 
     /// Owner-handle sentinel stamped on harness-origin timers — matches the
@@ -214,6 +220,228 @@ pub mod test_support {
         /// Used by T2.4 unit tests to assert the clock-read side effect.
         pub fn now_ns(&self) -> u64 {
             self.now_ns
+        }
+    }
+
+    /// Pre-loop conn-scoped snapshot consumed by
+    /// `EngineNoEalHarness::send_bytes_segment_build_step`. Mirrors the
+    /// single immutable-borrow snapshot in `Engine::send_bytes`
+    /// (engine.rs:5671-5688) so the helper does not re-borrow the
+    /// flow_table on every segment. Filled once at the top of the
+    /// caller's per-burst loop; threaded through unchanged.
+    #[derive(Clone, Copy)]
+    pub struct SegmentBuildSnapshot {
+        pub src_mac: [u8; 6],
+        pub dst_mac: [u8; 6],
+        pub src_ip: u32,
+        pub dst_ip: u32,
+        pub src_port: u16,
+        pub dst_port: u16,
+        pub rcv_nxt: u32,
+        pub advertised_window: u16,
+        pub ts_enabled: bool,
+        pub ts_recent: u32,
+    }
+
+    /// Caller-supplied mutable state threaded through
+    /// `send_bytes_segment_build_step`. Bundling the borrows here keeps
+    /// the helper signature legible (otherwise it takes ~10 `&mut`
+    /// arguments).
+    ///
+    /// * `frame` is the engine's `tx_frame_scratch` analogue
+    ///   (engine.rs:5723) — reused across segments, never shrunk.
+    /// * `mbuf_data` simulates the `dst` region inside the buffer that
+    ///   `rte_pktmbuf_append` returns at engine.rs:5792. The helper
+    ///   copies the built frame here exactly as the production code
+    ///   does at engine.rs:5800-5802. Must be at least
+    ///   `FRAME_HDRS_MIN + 40 + payload.len()` bytes (one segment's worth).
+    /// * `wheel` accepts the first-segment RTO arm.
+    /// * `counters` receives the `eth.tx_bytes` + `tcp.tx_data` updates.
+    /// * `fake_mbuf_ptr` is stashed in the `RetransEntry::mbuf` field;
+    ///   the helper never dereferences it. In production this is the
+    ///   freshly-allocated `rte_pktmbuf_alloc` return value.
+    pub struct SegmentBuildScratch<'a> {
+        pub frame: &'a mut Vec<u8>,
+        pub mbuf_data: &'a mut [u8],
+        pub wheel: &'a mut TimerWheel,
+        pub counters: &'a Counters,
+        pub fake_mbuf_ptr: *mut dpdk_net_sys::rte_mbuf,
+    }
+
+    /// Outcome of one helper call. Returned so callers (and the unit
+    /// test) can `black_box` an observable consumer of the work and
+    /// assert against deterministic side effects.
+    #[derive(Debug, Clone, Copy)]
+    pub struct SegmentBuildOutcome {
+        /// Total frame bytes written into `mbuf_data` (L2+L3+TCP
+        /// headers + payload). `None` if `build_segment` rejected
+        /// (caller breaks the burst loop).
+        pub frame_len: Option<usize>,
+        /// `true` when this segment triggered the first-burst RTO arm
+        /// (engine.rs:5907) — i.e. `was_empty == true` on entry and
+        /// `rto_timer_id` was `None`. Set even if the arm itself
+        /// no-op'd due to `rto_us == 0`.
+        pub armed_rto: bool,
+    }
+
+    impl EngineNoEalHarness {
+        /// One segment's worth of `Engine::send_bytes` per-segment loop
+        /// body (engine.rs:5734-5944), minus the four EAL-only ops that
+        /// require a live DPDK port + mempool. Lives here so any future
+        /// drift in the production loop either updates this helper or
+        /// breaks `send_bytes_segment_build_step_emits_expected_frame_shape`
+        /// below — guarding against the silent-divergence risk codex
+        /// flagged on T1.
+        ///
+        /// What this DOES mirror (engine.rs line numbers in parens):
+        ///
+        ///   * TS option per RFC 7323 §3 MUST-22 (5740-5748)
+        ///   * `SegmentTx` literal build (5749-5762)
+        ///   * `frame.clear()` + `frame.resize(needed, 0)` (5767-5773)
+        ///   * `build_segment(&seg, frame.as_mut_slice())` (5774) — the
+        ///     dominant per-segment cost (IPv4 + TCP cksum + hdr pack)
+        ///   * `copy_nonoverlapping(frame.as_ptr(), dst, n)` (5800-5802)
+        ///   * `eth.tx_bytes += n` + `tcp.tx_data += 1` counter ops
+        ///     (5855-5856)
+        ///   * `RetransEntry { .. }` literal + `push_after_tx` (5879-5896)
+        ///   * `send_ack_log.record_send(...)` (5900-5906) — early-return
+        ///     when the log is disabled
+        ///   * First-segment RTO arm via `TimerWheel::add` (5907-5938) —
+        ///     fires once per burst when `was_empty && rto_timer_id is None`
+        ///
+        /// What this DOES NOT mirror (deliberately — out of scope without EAL):
+        ///
+        ///   * `shim_rte_pktmbuf_alloc(tx_data_mempool)` (5784) — fake
+        ///     mbuf is caller-supplied
+        ///   * `shim_rte_pktmbuf_append(m, n)` (5792) — `mbuf_data` slice
+        ///     is the simulated append return
+        ///   * `tx_offload_finalize(m, ...)` (5810) — reads live mbuf
+        ///     fields written by `rte_pktmbuf_append`
+        ///   * `shim_rte_mbuf_refcnt_update(m, 1)` (5824)
+        ///   * `tx_pending_data` ring push (5829-5849)
+        ///   * `arm_tlp_pto(handle)` post-loop (5985-5986) — gate short-
+        ///     circuits without SRTT in the fixture; production cost
+        ///     with SRTT (gate eval + TimerWheel::add) is not captured
+        ///
+        /// `cur_seq` is the seq for THIS segment (caller advances by
+        /// `payload.len()` between calls). `payload` MUST already be
+        /// chunked at MSS — this helper builds exactly one segment.
+        pub fn send_bytes_segment_build_step(
+            conn: &mut TcpConn,
+            cur_seq: u32,
+            payload: &[u8],
+            snapshot: &SegmentBuildSnapshot,
+            scratch: &mut SegmentBuildScratch<'_>,
+        ) -> SegmentBuildOutcome {
+            // engine.rs:5740-5748 — TS option per RFC 7323 §3 MUST-22.
+            let options = if snapshot.ts_enabled {
+                let tsval = (crate::clock::now_ns() / 1000) as u32;
+                TcpOpts {
+                    timestamps: Some((tsval, snapshot.ts_recent)),
+                    ..Default::default()
+                }
+            } else {
+                TcpOpts::default()
+            };
+            // engine.rs:5749-5762 — SegmentTx literal build.
+            let seg = SegmentTx {
+                src_mac: snapshot.src_mac,
+                dst_mac: snapshot.dst_mac,
+                src_ip: snapshot.src_ip,
+                dst_ip: snapshot.dst_ip,
+                src_port: snapshot.src_port,
+                dst_port: snapshot.dst_port,
+                seq: cur_seq,
+                ack: snapshot.rcv_nxt,
+                flags: TCP_ACK | TCP_PSH,
+                window: snapshot.advertised_window,
+                options,
+                payload,
+            };
+            // engine.rs:5767-5773 — pre-size the frame scratch.
+            let needed = crate::tcp_output::FRAME_HDRS_MIN + 40 + payload.len();
+            scratch.frame.clear();
+            scratch.frame.resize(needed, 0);
+            // engine.rs:5774 — the dominant per-segment cost.
+            let Some(n) = build_segment(&seg, scratch.frame.as_mut_slice()) else {
+                return SegmentBuildOutcome {
+                    frame_len: None,
+                    armed_rto: false,
+                };
+            };
+            // engine.rs:5800-5802 — copy the freshly-built frame into
+            // the (caller-supplied) mbuf data area. `mbuf_data` must be
+            // sized for `n`; the caller is responsible for that.
+            // Safety: caller guarantees `mbuf_data.len() >= n` (the
+            // helper's contract); both pointers are aligned to u8.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    scratch.frame.as_ptr(),
+                    scratch.mbuf_data.as_mut_ptr(),
+                    n,
+                );
+            }
+            // engine.rs:5855-5856 — counter updates.
+            add(&scratch.counters.eth.tx_bytes, n as u64);
+            inc(&scratch.counters.tcp.tx_data);
+
+            // engine.rs:5877-5907 — RetransEntry + push_after_tx +
+            // first-burst RTO arm gate.
+            let first_tx_ts_ns = crate::clock::now_ns();
+            let hdrs_len = (n - payload.len()) as u16;
+            let entry = RetransEntry {
+                seq: cur_seq,
+                len: payload.len() as u16,
+                mbuf: Mbuf::from_ptr(scratch.fake_mbuf_ptr),
+                first_tx_ts_ns,
+                xmit_count: 1,
+                sacked: false,
+                lost: false,
+                xmit_ts_ns: first_tx_ts_ns,
+                hdrs_len,
+            };
+            let was_empty = conn.snd_retrans.is_empty();
+            conn.snd_retrans.push_after_tx(entry);
+            // engine.rs:5900-5906 — record_send is an early-return when
+            // the per-segment send-ack log is disabled (default), so the
+            // measured cost is the early-return branch.
+            conn.send_ack_log.record_send(
+                SeqRange {
+                    begin: cur_seq,
+                    end: cur_seq.wrapping_add(payload.len() as u32),
+                },
+                first_tx_ts_ns,
+            );
+
+            // engine.rs:5907-5938 — first-burst RTO arm gate.
+            let mut armed_rto = false;
+            if was_empty && conn.rto_timer_id.is_none() {
+                armed_rto = true;
+                let rto_us = conn.rtt_est.rto_us();
+                if rto_us > 0 {
+                    let fire_at = first_tx_ts_ns + (rto_us as u64 * 1_000);
+                    let id = scratch.wheel.add(
+                        first_tx_ts_ns,
+                        TimerNode {
+                            fire_at_ns: fire_at,
+                            // Harness has no real ConnHandle; matches
+                            // EngineNoEalHarness::timer_add convention.
+                            owner_handle: 1,
+                            kind: TimerKind::Rto,
+                            user_data: 0,
+                            generation: 0,
+                            cancelled: false,
+                        },
+                    );
+                    conn.rto_timer_id = Some(id);
+                    conn.timer_ids.push(id);
+                }
+            }
+
+            SegmentBuildOutcome {
+                frame_len: Some(n),
+                armed_rto,
+            }
         }
     }
 }
@@ -8618,5 +8846,244 @@ mod rx_mempool_size_default_formula_tests {
         let mut cfg = EngineConfig::default();
         cfg.rx_mempool_size = 1024;
         assert_eq!(cfg.rx_mempool_size, 1024);
+    }
+}
+
+/// a10-perf-23.11 T1-followup: drift guard for the bench-internals
+/// send-segment helper. The helper at `test_support::EngineNoEalHarness::
+/// send_bytes_segment_build_step` mirrors the per-segment loop body of
+/// `Engine::send_bytes`. If `send_bytes` changes shape (new options,
+/// different counter ordering, retrans-entry layout, RTO arm gate) and
+/// the helper is not updated in lock-step, this test breaks — surfacing
+/// the divergence at PR time rather than years later when a bench number
+/// drifts silently.
+#[cfg(all(test, feature = "bench-internals"))]
+mod send_bytes_segment_build_step_drift_guard {
+    use crate::counters::Counters;
+    use crate::engine::test_support::{
+        EngineNoEalHarness, SegmentBuildScratch, SegmentBuildSnapshot,
+    };
+    use crate::flow_table::FourTuple;
+    use crate::l2::ETH_HDR_LEN;
+    use crate::tcp_conn::TcpConn;
+    use crate::tcp_output::{FRAME_HDRS_MIN, IPV4_HDR_MIN, TCP_ACK, TCP_HDR_MIN, TCP_PSH};
+    use crate::tcp_state::TcpState;
+    use crate::tcp_timer_wheel::TimerWheel;
+
+    const OUR_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+    const GATEWAY_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
+    const TS_RECENT: u32 = 0xCAFE_BABE;
+    const CUR_SEQ: u32 = 1001;
+    const RCV_NXT: u32 = 5001;
+    const ADV_WIN: u16 = 256;
+    const LOCAL_IP: u32 = 0x0a_00_00_02;
+    const PEER_IP: u32 = 0x0a_00_00_01;
+    const LOCAL_PORT: u16 = 40_000;
+    const PEER_PORT: u16 = 5_000;
+
+    fn fixture_conn() -> TcpConn {
+        let t = FourTuple {
+            local_ip: LOCAL_IP,
+            local_port: LOCAL_PORT,
+            peer_ip: PEER_IP,
+            peer_port: PEER_PORT,
+        };
+        let mut c = TcpConn::new_client(
+            t,
+            1000,
+            1460,
+            1024,
+            256 * 1024,
+            5_000,
+            5_000,
+            1_000_000,
+        );
+        c.state = TcpState::Established;
+        c.snd_una = CUR_SEQ;
+        c.snd_nxt = CUR_SEQ;
+        c.irs = RCV_NXT - 1;
+        c.rcv_nxt = RCV_NXT;
+        c.snd_wnd = 64 * 1024;
+        c.ts_enabled = true;
+        c.ts_recent = TS_RECENT;
+        c
+    }
+
+    fn snapshot() -> SegmentBuildSnapshot {
+        SegmentBuildSnapshot {
+            src_mac: OUR_MAC,
+            dst_mac: GATEWAY_MAC,
+            src_ip: LOCAL_IP,
+            dst_ip: PEER_IP,
+            src_port: LOCAL_PORT,
+            dst_port: PEER_PORT,
+            rcv_nxt: RCV_NXT,
+            advertised_window: ADV_WIN,
+            ts_enabled: true,
+            ts_recent: TS_RECENT,
+        }
+    }
+
+    /// Drives the helper with a known fixture and asserts the produced
+    /// frame's observable shape. If `Engine::send_bytes`'s per-segment
+    /// body diverges (e.g. flag byte changes, header offsets shift, TS
+    /// option dropped, RTO arm gate refactored) without the helper being
+    /// updated in lock-step, this test will fail and force the author
+    /// to update one or the other.
+    #[test]
+    fn helper_emits_expected_frame_shape_for_128b_payload() {
+        let mut conn = fixture_conn();
+        let mut frame: Vec<u8> = Vec::with_capacity(FRAME_HDRS_MIN + 40 + 1460);
+        let mut mbuf_data = vec![0u8; 4096];
+        let mut wheel = TimerWheel::new(64);
+        let counters = Counters::new();
+        let snap = snapshot();
+
+        // Fixture: 128-byte payload, all 0x42.
+        let payload = [0x42u8; 128];
+        let mut scratch = SegmentBuildScratch {
+            frame: &mut frame,
+            mbuf_data: mbuf_data.as_mut_slice(),
+            wheel: &mut wheel,
+            counters: &counters,
+            // Helper never derefs the mbuf pointer; a non-null sentinel
+            // suffices to mirror the production code shape.
+            fake_mbuf_ptr: 0x1usize as *mut dpdk_net_sys::rte_mbuf,
+        };
+        let outcome = EngineNoEalHarness::send_bytes_segment_build_step(
+            &mut conn,
+            CUR_SEQ,
+            &payload,
+            &snap,
+            &mut scratch,
+        );
+
+        // (1) frame_len is L2+L3+TCP(20)+TS-opt(12)+payload(128) = 14+20+32+128 = 194.
+        // TS option encodes as 1 NOP + 1 NOP + 1 kind(8) + 1 len(10) + 4 TSval + 4 TSecr
+        // = 12 bytes; the 40-byte option cushion in `needed` is pre-allocated but
+        // `build_segment` writes only the actually-encoded option bytes.
+        let n = outcome.frame_len.expect("build_segment must succeed for 128B payload");
+        let expected_tcp_hdr_with_ts = TCP_HDR_MIN + 12;
+        let expected_n = ETH_HDR_LEN + IPV4_HDR_MIN + expected_tcp_hdr_with_ts + 128;
+        assert_eq!(n, expected_n, "frame_len mismatch (helper drifted from build_segment)");
+
+        // (2) Ethernet header: dst MAC at [0..6], src MAC at [6..12].
+        assert_eq!(&mbuf_data[0..6], &GATEWAY_MAC[..]);
+        assert_eq!(&mbuf_data[6..12], &OUR_MAC[..]);
+        // EtherType IPv4 = 0x0800.
+        assert_eq!(&mbuf_data[12..14], &[0x08, 0x00]);
+
+        // (3) IPv4 header: protocol byte at offset 14+9 = 23 must be TCP (6).
+        assert_eq!(mbuf_data[ETH_HDR_LEN + 9], 6, "IP proto must be TCP");
+
+        // (4) TCP header: src/dst port + flag byte.
+        let tcp_off = ETH_HDR_LEN + IPV4_HDR_MIN;
+        let src_port_be = u16::from_be_bytes([mbuf_data[tcp_off], mbuf_data[tcp_off + 1]]);
+        let dst_port_be = u16::from_be_bytes([mbuf_data[tcp_off + 2], mbuf_data[tcp_off + 3]]);
+        assert_eq!(src_port_be, LOCAL_PORT);
+        assert_eq!(dst_port_be, PEER_PORT);
+        // Flag byte at TCP offset 13 (data-offset+flags-low at 12..14):
+        assert_eq!(
+            mbuf_data[tcp_off + 13],
+            TCP_ACK | TCP_PSH,
+            "flag byte must be ACK|PSH for data segment"
+        );
+
+        // (5) Payload bytes at the tail of the frame.
+        assert_eq!(&mbuf_data[n - 128..n], &payload[..]);
+
+        // (6) Side effects on the conn — one retrans entry pushed.
+        assert_eq!(conn.snd_retrans.len(), 1);
+        let e = conn.snd_retrans.entries.front().expect("entry pushed");
+        assert_eq!(e.seq, CUR_SEQ);
+        assert_eq!(e.len, 128);
+        assert_eq!(e.xmit_count, 1);
+        assert_eq!(e.hdrs_len, (n - 128) as u16);
+
+        // (7) First-burst RTO arm fired (was_empty && rto_timer_id.is_none()).
+        assert!(outcome.armed_rto, "first-burst RTO arm must fire");
+        assert!(conn.rto_timer_id.is_some(), "rto_timer_id must be set");
+
+        // (8) Counter side effects.
+        use std::sync::atomic::Ordering;
+        assert_eq!(
+            counters.eth.tx_bytes.load(Ordering::Relaxed),
+            n as u64,
+            "eth.tx_bytes must equal frame_len"
+        );
+        assert_eq!(
+            counters.tcp.tx_data.load(Ordering::Relaxed),
+            1,
+            "tcp.tx_data must increment by 1"
+        );
+    }
+
+    /// Drift guard for the WARM path: when the conn already has a
+    /// pending retrans entry (was_empty == false) and rto_timer_id is
+    /// Some, the helper MUST skip the RTO arm. If production refactors
+    /// drop the gate, this test breaks.
+    #[test]
+    fn helper_skips_rto_arm_when_burst_already_in_flight() {
+        use crate::mempool::Mbuf;
+        use crate::tcp_retrans::RetransEntry;
+        use crate::tcp_timer_wheel::{TimerKind, TimerNode};
+
+        let mut conn = fixture_conn();
+        // Pre-seed an in-flight entry so was_empty == false.
+        conn.snd_retrans.push_after_tx(RetransEntry {
+            seq: CUR_SEQ.wrapping_sub(128),
+            len: 128,
+            mbuf: Mbuf::null_for_test(),
+            first_tx_ts_ns: 0,
+            xmit_count: 1,
+            sacked: false,
+            lost: false,
+            xmit_ts_ns: 0,
+            hdrs_len: 0,
+        });
+        // Pre-seed an rto_timer_id so the second gate clause matches
+        // production's warm-path state too.
+        let mut wheel = TimerWheel::new(64);
+        let pre_id = wheel.add(
+            0,
+            TimerNode {
+                fire_at_ns: 1_000_000_000,
+                owner_handle: 1,
+                kind: TimerKind::Rto,
+                user_data: 0,
+                generation: 0,
+                cancelled: false,
+            },
+        );
+        conn.rto_timer_id = Some(pre_id);
+
+        let mut frame: Vec<u8> = Vec::with_capacity(FRAME_HDRS_MIN + 40 + 1460);
+        let mut mbuf_data = vec![0u8; 4096];
+        let counters = Counters::new();
+        let snap = snapshot();
+        let payload = [0x42u8; 128];
+
+        let mut scratch = SegmentBuildScratch {
+            frame: &mut frame,
+            mbuf_data: mbuf_data.as_mut_slice(),
+            wheel: &mut wheel,
+            counters: &counters,
+            fake_mbuf_ptr: 0x1usize as *mut dpdk_net_sys::rte_mbuf,
+        };
+        let outcome = EngineNoEalHarness::send_bytes_segment_build_step(
+            &mut conn,
+            CUR_SEQ,
+            &payload,
+            &snap,
+            &mut scratch,
+        );
+
+        assert!(outcome.frame_len.is_some());
+        // Warm path MUST NOT re-arm.
+        assert!(!outcome.armed_rto, "warm path must skip RTO arm");
+        // The pre-seeded rto_timer_id is unchanged.
+        assert_eq!(conn.rto_timer_id, Some(pre_id));
+        // Two retrans entries now (pre-seed + this segment).
+        assert_eq!(conn.snd_retrans.len(), 2);
     }
 }
