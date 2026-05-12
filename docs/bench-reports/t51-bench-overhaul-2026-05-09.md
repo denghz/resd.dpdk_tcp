@@ -175,6 +175,35 @@ linux_kernel against a real ENA NIC.
 confirming the operator's report that HW-TS is not exposed in
 ap-south-1 on the current ENA driver.
 
+**bench-rtt fstack arm — fast-iter live-verify (2026-05-12)**: WORKS.
+The fstack arm enabled via `./scripts/fast-iter-setup.sh up --with-fstack`
+(or `fstack-conf` on an already-up peer) auto-generates a per-DUT
+`$HOME/.fast-iter-fstack.conf` (PCI address parsed from
+`dpdk-devbind.py --status`, IP from IMDS device-number≠0 ENI) and
+rebuilds `bench-{rtt,tx-burst,tx-maxtp,rx-burst}` with `--features fstack`.
+The operator points each tool at the conf via the new `--fstack-conf`
+flag (added to bench-rtt in this commit; bench-tx-burst / bench-tx-maxtp /
+bench-rx-burst already had it). bench-rtt's fstack arm also gained the
+missing `ff_init_from_args(...)` call at scope entry; previously the
+arm called `ff_run` without ever invoking `ff_init`, which would have
+errored on first wire op. Empirical RTT on the c6a.xlarge fast-iter DUT
+(0000:28:00.0 NIC, 1 conn, single 128 B payload, 100 warmup + 1000
+measure iters against the existing peer at 10.4.1.228):
+
+| metric | dpdk_net | fstack | Δ |
+|--------|---------:|-------:|--:|
+| p50    | 72.1 µs  | 100.0 µs | +38% |
+| p99    | 97.9 µs  | 133.1 µs | +36% |
+| p999   | 112.3 µs | 170.5 µs | +52% |
+| mean   | 73.7 µs  | 100.6 µs | +37% |
+
+(Higher fstack latency vs dpdk_net is empirically expected — fstack's
+BSD-shaped `ff_socket` / `ff_write` / `ff_read` path adds per-syscall
+overhead vs dpdk_net's direct event-table consumption. The numbers are
+in the right shape for an absolute-µs spot check; statistically rigorous
+comparison requires the full nightly matrix with 100k iters and
+controlled `precondition_governor` etc.)
+
 ### Original deferral rationale (pre-2026-05-11, kept for context)
 
 The 5-bucket Hw attribution path was code-validated in Phase 9 against
@@ -319,12 +348,44 @@ sudo ./target/release/bench-rtt --stack dpdk_net \
 ./scripts/fast-iter-setup.sh down         # terminate + clear state
 ```
 
+**F-Stack arm** (added 2026-05-12): pass `--with-fstack` to `up`, or
+invoke `fstack-conf` standalone on an already-up peer:
+```
+./scripts/fast-iter-setup.sh up --with-fstack  # full path: provision + start +
+                                               #   write $HOME/.fast-iter-fstack.conf +
+                                               #   rebuild bench-{rtt,tx-burst,tx-maxtp,
+                                               #   rx-burst} with --features fstack.
+./scripts/fast-iter-setup.sh fstack-conf       # idempotent: regen the conf + rebuild
+                                               #   only. Use this when the peer is up
+                                               #   already, or after a NIC rebind on the
+                                               #   DUT (PCI address changed).
+source ./.fast-iter.env                        # exports FSTACK_CONF in addition to PEER_*
+sudo -E ./target/release/bench-rtt --stack fstack \
+    --peer-ip "$PEER_IP" --peer-port "$PEER_ECHO_PORT" \
+    --fstack-conf "$FSTACK_CONF" \
+    --output-csv /tmp/fstack.csv ...
+```
+
+The fstack flow auto-detects the DUT's data-NIC PCI address from
+`dpdk-devbind.py --status` (the row bound to `vfio-pci`) and the
+DUT's data-NIC IP from EC2 IMDS (the ENI with `device-number≠0`).
+Writes a per-DUT `[dpdk]/[port0]/[freebsd.*]` config to
+`$HOME/.fast-iter-fstack.conf` so the bench tools target the correct
+NIC even if `/etc/f-stack.conf` is stale or points at an older Nitro
+generation's PCI address. The four bench tools each accept
+`--fstack-conf <PATH>`; the path is forwarded to `ff_init` as
+`--conf=<PATH>`. Requires `libfstack.a` at `${FF_PATH:-/opt/f-stack}/lib/`
+— the script fails fast if missing.
+
 State files:
 - `$HOME/.bench-fast-iter.state.json` — peer instance id + ip + port map
   (overridable via `$BENCH_FAST_ITER_STATE`).
+- `$HOME/.fast-iter-fstack.conf` — auto-generated F-Stack conf when
+  `--with-fstack` is set (overridable via `$FAST_ITER_FSTACK_CONF`).
 - `./.fast-iter.env` — sourceable env file with `PEER_IP`, `PEER_SSH`,
-  `PEER_INSTANCE_ID`, `PEER_ECHO_PORT`, `PEER_SINK_PORT`, `PEER_BURST_PORT`
-  (overridable via `$BENCH_FAST_ITER_ENV`; gitignored).
+  `PEER_INSTANCE_ID`, `PEER_ECHO_PORT`, `PEER_SINK_PORT`, `PEER_BURST_PORT`,
+  and (with `--with-fstack`) `FSTACK_CONF` (overridable via
+  `$BENCH_FAST_ITER_ENV`; gitignored).
 
 The script fails fast on prereq / build / SSH errors and traps `EXIT` to
 terminate a half-provisioned peer so the operator never gets stuck paying
