@@ -628,36 +628,53 @@ fn run_linux_kernel(args: &Args) -> anyhow::Result<Vec<BucketResult>> {
 fn run_fstack(args: &Args) -> anyhow::Result<Vec<BucketResult>> {
     validate_fstack_args(args)?;
     init_fstack(args)?;
+    // fstack's `run_rtt_grid` drives the ENTIRE sweep inside one
+    // ff_run invocation. `ff_run` calls `rte_eal_cleanup` on exit and
+    // is therefore one-shot per process — pre-T55 we looped per bucket
+    // and the second iteration of that loop SIGSEGV'd inside the
+    // F-Stack poll loop on the fast-iter-suite 4-payload sweep
+    // (64/128/256/1024). The state machine in
+    // `bench_rtt::fstack::imp` now threads `bucket_idx` through so all
+    // buckets complete before ff_stop_run() fires. Single connection
+    // per bucket; multi-conn fstack RTT (the `--connections > 1`
+    // path) remains Phase 6+ future work — see the early-bail below.
+    if args.connections > 1 {
+        anyhow::bail!(
+            "--connections > 1 is not yet supported on the fstack arm \
+             (single ff_run invocation per process; multi-conn fstack \
+             RTT is Phase 6+ future work). Use --connections 1 or pick \
+             another stack."
+        );
+    }
     let peer_ip = parse_ip_host_order(&args.peer_ip)?;
-    let mut buckets: Vec<BucketResult> = Vec::with_capacity(args.payload_bytes_sweep.len());
-    for &payload_bytes in &args.payload_bytes_sweep {
-        // fstack's run_rtt_workload uses one ff_run invocation; we drive
-        // a single connection per bucket. Multi-conn fstack RTT remains
-        // future work. bench-tx-maxtp's fstack arm shows it's possible
-        // (per-conn ff_socket + ff_poll multiplexing), but bench-rtt's
-        // request/response inner loop needs the same callback restructure
-        // before --connections > 1 is correct here. Tracked as a Phase 6+
-        // follow-up.
-        if args.connections > 1 {
+    let grid = fstack::imp::enumerate_rtt_grid(
+        &args.payload_bytes_sweep,
+        args.warmup,
+        args.iterations,
+    );
+    let results = fstack::imp::run_rtt_grid(peer_ip, args.peer_port, &grid);
+    let mut buckets: Vec<BucketResult> = Vec::with_capacity(results.len());
+    for r in results {
+        if let Some(err) = r.error {
+            // Per-bucket failure: bail the whole arm. linux_kernel + dpdk
+            // arms also bail on bucket-level errors (they use ? on the
+            // bucket-level future), so this matches the existing
+            // contract. A future change could keep buckets that
+            // succeeded — but the summary CSV is keyed by `bucket_id`
+            // and an empty `samples` would trip the "produced no
+            // samples" assertion in `emit_csv`. Bail rather than emit
+            // a marker row to keep the call-site signature simple;
+            // T55 follow-ups already track the more nuanced
+            // emit-marker-row behaviour for the burst grid.
             anyhow::bail!(
-                "--connections > 1 is not yet supported on the fstack arm \
-                 (single ff_run invocation per process; multi-conn fstack \
-                 RTT is Phase 6+ future work). Use --connections 1 or pick \
-                 another stack."
+                "fstack bucket payload={} failed: {err}",
+                r.payload_bytes
             );
         }
-        let samples = fstack::imp::run_rtt_workload(
-            peer_ip,
-            args.peer_port,
-            payload_bytes,
-            payload_bytes,
-            args.warmup,
-            args.iterations,
-        )?;
         buckets.push(BucketResult {
-            bucket_id: format!("payload_{payload_bytes}"),
-            payload_bytes,
-            samples,
+            bucket_id: format!("payload_{}", r.payload_bytes),
+            payload_bytes: r.payload_bytes,
+            samples: r.samples,
             failed_iter_count: 0,
             rx_hw_ts_ns: Vec::new(),
             // F-Stack drives its own ff_run loop with no per-iter

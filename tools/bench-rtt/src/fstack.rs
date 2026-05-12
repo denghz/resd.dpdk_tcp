@@ -8,8 +8,29 @@
 //! inside ff_run's poll loop, so a call sequence outside it never
 //! makes wire progress. Additionally, `ff_run` calls `rte_eal_cleanup()`
 //! on exit, which can only fire once per process. The entire RTT
-//! workload (warmup + measurement) therefore completes inside a SINGLE
-//! ff_run invocation, driven by a per-iteration callback.
+//! workload — including the FULL `--payload-bytes-sweep` axis (all
+//! buckets) — therefore completes inside a SINGLE ff_run invocation,
+//! driven by a per-iteration callback that threads a `bucket_idx`
+//! state field. Each bucket opens its own connection, runs warmup +
+//! measurement, then closes the fd before the state machine advances
+//! to the next bucket.
+//!
+//! This mirrors the same one-ff_run-per-process pattern bench-tx-burst
+//! uses for its K × G grid (`fstack::run_burst_grid`) and
+//! bench-tx-maxtp uses for its K-axis sweep (`fstack::run_maxtp_grid`).
+//!
+//! # Regression history — T55 fast-iter-suite SIGSEGV
+//!
+//! Pre-T55, this module exposed `run_rtt_workload(payload, warmup, iter)`
+//! which called `ff_run` once per invocation. `bench-rtt::main` then
+//! looped over `--payload-bytes-sweep` calling this function per
+//! bucket. With a single-element sweep (`--payload-bytes-sweep 128`)
+//! the bench worked; with the four-element default sweep from
+//! `fast-iter-suite.sh` (`64,128,256,1024`) the second call to
+//! `ff_run` segfaulted because `rte_eal_cleanup()` had fired at the
+//! end of bucket 0's ff_run unwind. The fix restructures the state
+//! machine to drive the full sweep inside one ff_run invocation; see
+//! `enumerate_rtt_grid` + `run_rtt_grid` below for the new entry.
 //!
 //! # Errno + sockopt namespace
 //!
@@ -53,9 +74,49 @@ pub mod imp {
     /// hit. Matches the linux_kernel arm.
     const RTT_TIMEOUT: Duration = Duration::from_secs(10);
 
+    /// A single payload bucket inside the F-Stack RTT sweep. Mirrors
+    /// bench-tx-burst's `burst::Bucket` and bench-tx-maxtp's `maxtp::Bucket`
+    /// in shape, but RTT-shaped (request-response payload + warmup + iter
+    /// count, not K × G). Each bucket runs against its own freshly-opened
+    /// connection inside the shared `ff_run` invocation.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct RttBucket {
+        pub payload_bytes: usize,
+        pub warmup: u64,
+        pub iterations: u64,
+    }
+
+    /// Per-bucket result emitted by `run_rtt_grid`. `samples` holds the
+    /// per-iteration RTT in ns (warmup excluded). `error` is `Some(msg)`
+    /// when the bucket bailed mid-sweep — the rest of the grid still
+    /// runs, mirroring bench-tx-burst's per-bucket Err handling.
+    pub struct RttBucketResult {
+        pub payload_bytes: usize,
+        pub samples: Vec<f64>,
+        pub error: Option<String>,
+    }
+
+    /// Build an `RttBucket` grid from a `--payload-bytes-sweep` argv slice
+    /// plus shared warmup + iteration counts. Order matches argv (the
+    /// sweep axis label in summary + raw CSV rows is keyed by index, so
+    /// re-ordering would mis-pair rows downstream — see
+    /// `bench_rtt::main::emit_csv` for the dimension layout).
+    pub fn enumerate_rtt_grid(payloads: &[usize], warmup: u64, iterations: u64) -> Vec<RttBucket> {
+        payloads
+            .iter()
+            .map(|&payload_bytes| RttBucket {
+                payload_bytes,
+                warmup,
+                iterations,
+            })
+            .collect()
+    }
+
     /// Phases of the per-bucket RTT state machine. Each `ff_run`
     /// callback invocation advances the machine until it hits a
-    /// would-block (Yield) or completes (Stopped).
+    /// would-block (Yield) or completes (Stopped). The same machine
+    /// loops across every bucket in `state.grid`, indexed by
+    /// `state.bucket_idx`, before calling `ff_stop_run`.
     enum Phase {
         /// Open socket, set non-blocking, issue `ff_connect`.
         Connect,
@@ -85,11 +146,15 @@ pub mod imp {
             recvd: usize,
             t0: Instant,
         },
-        /// Bucket finished cleanly; close fd + flag completion.
-        CloseAndDone,
-        /// Bucket failed; close fd + record error.
+        /// Bucket finished cleanly; close fd, push samples, advance
+        /// to next bucket (or terminate the sweep).
+        CloseAndNext,
+        /// Bucket failed; close fd, record error, advance to next bucket.
+        /// Mirrors bench-tx-burst's per-bucket Err handling so a mid-
+        /// sweep failure on (say) the 1024-byte bucket doesn't kill the
+        /// 64/128/256-byte rows.
         BucketError(String),
-        /// All done — call `ff_stop_run`.
+        /// All buckets done — call `ff_stop_run`.
         Done,
     }
 
@@ -101,69 +166,143 @@ pub mod imp {
 
     /// Mutable state owned by the RTT driver and threaded through
     /// `ff_run` via a `*mut c_void`. The state lives on the calling
-    /// thread's stack for the entire `ff_run` invocation.
-    struct State {
+    /// thread's stack for the entire `ff_run` invocation. The full
+    /// payload-sweep grid is reachable via `grid[bucket_idx]`.
+    struct State<'a> {
         peer_ip_host_order: u32,
         peer_port: u16,
-        request: Vec<u8>,
-        response_bytes: usize,
-        warmup: u64,
-        iterations: u64,
+        grid: &'a [RttBucket],
+        /// Pre-allocated per-bucket request payloads (zero-filled).
+        /// Indexed by `bucket_idx`. We pre-allocate up front so each
+        /// per-iter advance() avoids any allocator work — matches the
+        /// `payload_for_bucket` layout in bench-tx-burst's grid driver.
+        payload_for_bucket: Vec<Vec<u8>>,
+        /// Per-bucket sample buffers, populated as each bucket finishes.
+        /// Pre-sized to grid.len() so we can index in by bucket_idx
+        /// without re-allocating the outer Vec mid-sweep.
+        bucket_samples: Vec<Vec<f64>>,
+        /// Per-bucket error (when the bucket bailed mid-run). Same
+        /// indexing rule as `bucket_samples`.
+        bucket_errors: Vec<Option<String>>,
+        bucket_idx: usize,
         fd: c_int,
         phase: Phase,
-        samples: Vec<f64>,
-        error: Option<String>,
         stopped: bool,
     }
 
-    /// Drive one RTT workload (warmup + measurement) inside a single
-    /// `ff_run` invocation. `ff_run` is one-shot per process, so the
-    /// caller (`bench-rtt::main` Task 4.5) must ensure this is the
-    /// only ff_run call for the entire bucket sweep — Phase 4 wires
-    /// per-payload buckets as additional state-machine sub-steps.
-    pub fn run_rtt_workload(
+    /// Drive the entire payload-sweep grid inside a single `ff_run`
+    /// invocation. Returns one `RttBucketResult` per grid bucket in
+    /// the same order as the input slice.
+    ///
+    /// `ff_run` is one-shot per process (it calls `rte_eal_cleanup` on
+    /// exit), so ALL buckets must complete before `ff_stop_run` fires.
+    /// The callback advances a state machine; control returns to ff_run
+    /// on EAGAIN so DPDK can drain ACKs before the next attempt.
+    ///
+    /// A per-bucket failure (connect refused, send wedge, etc.) is
+    /// captured into the returned `RttBucketResult.error` and does NOT
+    /// abort the rest of the grid; this mirrors bench-tx-burst's
+    /// `run_burst_grid` and bench-tx-maxtp's `run_maxtp_grid` contract.
+    pub fn run_rtt_grid(
         peer_ip_host_order: u32,
         peer_port: u16,
-        request_bytes: usize,
-        response_bytes: usize,
-        warmup: u64,
-        iterations: u64,
-    ) -> anyhow::Result<Vec<f64>> {
+        grid: &[RttBucket],
+    ) -> Vec<RttBucketResult> {
+        if grid.is_empty() {
+            return Vec::new();
+        }
+
+        // Pre-allocate one zero-filled payload per bucket. Buckets may
+        // share a payload size (e.g. `--payload-bytes-sweep 128,128`),
+        // but the per-bucket buffer is cheap (max 1 MiB at the spec
+        // ceiling — see bench-rtt §6 default sweep) so we don't bother
+        // deduping the way bench-tx-burst does.
+        let payload_for_bucket: Vec<Vec<u8>> = grid
+            .iter()
+            .map(|b| vec![0u8; b.payload_bytes])
+            .collect();
+
+        let bucket_samples: Vec<Vec<f64>> = grid
+            .iter()
+            .map(|b| Vec::with_capacity(b.iterations as usize))
+            .collect();
+        let bucket_errors: Vec<Option<String>> = (0..grid.len()).map(|_| None).collect();
+
         let mut state = State {
             peer_ip_host_order,
             peer_port,
-            request: vec![0u8; request_bytes],
-            response_bytes,
-            warmup,
-            iterations,
+            grid,
+            payload_for_bucket,
+            bucket_samples,
+            bucket_errors,
+            bucket_idx: 0,
             fd: -1,
             phase: Phase::Connect,
-            samples: Vec::with_capacity(iterations as usize),
-            error: None,
             stopped: false,
         };
 
         // SAFETY: ff_run is synchronous; it blocks until the callback
         // calls ff_stop_run and the inner poll loop unwinds. The
         // stack frame of `state` therefore lives for the entire
-        // duration of this unsafe block.
+        // duration of this unsafe block, so the raw pointer remains
+        // valid for every callback invocation.
         unsafe {
-            let arg = &mut state as *mut State as *mut c_void;
+            let arg = &mut state as *mut State<'_> as *mut c_void;
             ff_run(rtt_callback, arg);
         }
 
-        if let Some(err) = state.error {
+        // Drain state.bucket_samples + state.bucket_errors into the
+        // returned Vec, preserving grid order. Each bucket contributes
+        // exactly one RttBucketResult.
+        let mut results: Vec<RttBucketResult> = Vec::with_capacity(grid.len());
+        for (i, bucket) in grid.iter().enumerate() {
+            let samples = std::mem::take(&mut state.bucket_samples[i]);
+            let error = std::mem::take(&mut state.bucket_errors[i]);
+            results.push(RttBucketResult {
+                payload_bytes: bucket.payload_bytes,
+                samples,
+                error,
+            });
+        }
+        results
+    }
+
+    /// Single-bucket convenience wrapper. Pre-T55 callers (the smoke
+    /// test at commit e16f312 and existing `--payload-bytes-sweep
+    /// <single>` invocations) drove one payload through this entry;
+    /// keep the surface so the function-level docstring stays as the
+    /// canonical reference for the inner state machine, but delegate
+    /// to `run_rtt_grid` so there's exactly one `ff_run` code path.
+    pub fn run_rtt_workload(
+        peer_ip_host_order: u32,
+        peer_port: u16,
+        request_bytes: usize,
+        _response_bytes: usize,
+        warmup: u64,
+        iterations: u64,
+    ) -> anyhow::Result<Vec<f64>> {
+        let grid = vec![RttBucket {
+            payload_bytes: request_bytes,
+            warmup,
+            iterations,
+        }];
+        let mut results = run_rtt_grid(peer_ip_host_order, peer_port, &grid);
+        let r = results
+            .pop()
+            .expect("run_rtt_grid returns one result per bucket");
+        if let Some(err) = r.error {
             anyhow::bail!("fstack RTT workload failed: {err}");
         }
-        Ok(state.samples)
+        Ok(r.samples)
     }
 
     /// `ff_run` invokes this once per poll iteration. Drive the state
     /// machine until we yield (EAGAIN / wait gate) or finish.
     extern "C" fn rtt_callback(arg: *mut c_void) -> c_int {
-        // SAFETY: `arg` came from `&mut State as *mut _ as *mut c_void`.
-        // ff_run is synchronous so the frame is alive; nothing aliases.
-        let state = unsafe { &mut *(arg as *mut State) };
+        // SAFETY: `arg` came from `&mut State as *mut _ as *mut c_void`
+        // in `run_rtt_grid`. ff_run is synchronous so the frame is
+        // alive; nothing aliases.
+        let state = unsafe { &mut *(arg as *mut State<'_>) };
 
         if state.stopped {
             return 0;
@@ -180,7 +319,7 @@ pub mod imp {
 
     /// One state-machine step. Many transitions can chain in one
     /// callback by looping on `Continue`.
-    fn advance(state: &mut State) -> Step {
+    fn advance(state: &mut State<'_>) -> Step {
         let phase = std::mem::replace(&mut state.phase, Phase::Done);
         match phase {
             Phase::Connect => phase_connect(state),
@@ -205,13 +344,13 @@ pub mod imp {
                 recvd,
                 t0,
             } => phase_measure_read(state, iter_done, recvd, t0),
-            Phase::CloseAndDone => phase_close_and_done(state),
+            Phase::CloseAndNext => phase_close_and_next(state),
             Phase::BucketError(msg) => phase_bucket_error(state, msg),
             Phase::Done => phase_done(state),
         }
     }
 
-    fn phase_connect(state: &mut State) -> Step {
+    fn phase_connect(state: &mut State<'_>) -> Step {
         let fd = unsafe { ff_socket(AF_INET as c_int, SOCK_STREAM, 0) };
         if fd < 0 {
             let errno = fstack_errno();
@@ -253,7 +392,7 @@ pub mod imp {
         Step::Continue
     }
 
-    fn phase_wait_connect(state: &mut State) -> Step {
+    fn phase_wait_connect(state: &mut State<'_>) -> Step {
         // Use ff_poll(POLLOUT, timeout=0) — see module-level note on
         // why SO_ERROR alone is ambiguous.
         let mut pfd = PollFd {
@@ -302,21 +441,41 @@ pub mod imp {
         Step::Continue
     }
 
-    fn phase_warmup(state: &mut State, iter_done: u64, mut sent: usize, mut recvd: usize) -> Step {
-        if iter_done >= state.warmup {
+    fn phase_warmup(
+        state: &mut State<'_>,
+        iter_done: u64,
+        mut sent: usize,
+        mut recvd: usize,
+    ) -> Step {
+        let bucket = state.grid[state.bucket_idx];
+        if iter_done >= bucket.warmup {
             state.phase = Phase::MeasureStart { iter_done: 0 };
             return Step::Continue;
         }
 
         // Drive send phase if not yet complete.
-        if sent < state.request.len() {
-            match pump_write(state.fd, &state.request, &mut sent) {
+        let request = state.payload_for_bucket[state.bucket_idx].clone();
+        // Clone is cheap relative to the actual ff_write hot path
+        // (request is allocated once per bucket, ≤ 1 MiB), and avoids
+        // borrowing state.payload_for_bucket immutably while we
+        // mutate state.phase below. Cargo-clippy::large_type_pass-by-
+        // value is not a concern here.
+        if sent < request.len() {
+            match pump_write(state.fd, &request, &mut sent) {
                 PumpStep::Progress => {
-                    state.phase = Phase::Warmup { iter_done, sent, recvd };
+                    state.phase = Phase::Warmup {
+                        iter_done,
+                        sent,
+                        recvd,
+                    };
                     return Step::Continue;
                 }
                 PumpStep::WouldBlock => {
-                    state.phase = Phase::Warmup { iter_done, sent, recvd };
+                    state.phase = Phase::Warmup {
+                        iter_done,
+                        sent,
+                        recvd,
+                    };
                     return Step::Yield;
                 }
                 PumpStep::Error(msg) => {
@@ -327,7 +486,7 @@ pub mod imp {
         }
 
         // Send done — drain echo.
-        match pump_drain(state.fd, state.response_bytes, &mut recvd) {
+        match pump_drain(state.fd, bucket.payload_bytes, &mut recvd) {
             DrainStep::Done => {
                 // One full warmup iter complete.
                 state.phase = Phase::Warmup {
@@ -338,7 +497,11 @@ pub mod imp {
                 Step::Continue
             }
             DrainStep::WouldBlock => {
-                state.phase = Phase::Warmup { iter_done, sent, recvd };
+                state.phase = Phase::Warmup {
+                    iter_done,
+                    sent,
+                    recvd,
+                };
                 Step::Yield
             }
             DrainStep::Error(msg) => {
@@ -348,7 +511,7 @@ pub mod imp {
         }
     }
 
-    fn phase_warmup_gap(state: &mut State, iter_done: u64, gap_until: Instant) -> Step {
+    fn phase_warmup_gap(state: &mut State<'_>, iter_done: u64, gap_until: Instant) -> Step {
         if Instant::now() >= gap_until {
             state.phase = Phase::Warmup {
                 iter_done,
@@ -361,9 +524,10 @@ pub mod imp {
         Step::Yield
     }
 
-    fn phase_measure_start(state: &mut State, iter_done: u64) -> Step {
-        if iter_done >= state.iterations {
-            state.phase = Phase::CloseAndDone;
+    fn phase_measure_start(state: &mut State<'_>, iter_done: u64) -> Step {
+        let bucket = state.grid[state.bucket_idx];
+        if iter_done >= bucket.iterations {
+            state.phase = Phase::CloseAndNext;
             return Step::Continue;
         }
         let t0 = Instant::now();
@@ -375,7 +539,12 @@ pub mod imp {
         Step::Continue
     }
 
-    fn phase_measure_write(state: &mut State, iter_done: u64, mut sent: usize, t0: Instant) -> Step {
+    fn phase_measure_write(
+        state: &mut State<'_>,
+        iter_done: u64,
+        mut sent: usize,
+        t0: Instant,
+    ) -> Step {
         if t0.elapsed() > RTT_TIMEOUT {
             state.phase = Phase::BucketError(format!(
                 "measure iter {iter_done}: send timeout (>{:?})",
@@ -383,9 +552,10 @@ pub mod imp {
             ));
             return Step::Continue;
         }
-        match pump_write(state.fd, &state.request, &mut sent) {
+        let request = state.payload_for_bucket[state.bucket_idx].clone();
+        match pump_write(state.fd, &request, &mut sent) {
             PumpStep::Progress => {
-                if sent >= state.request.len() {
+                if sent >= request.len() {
                     state.phase = Phase::MeasureRead {
                         iter_done,
                         recvd: 0,
@@ -393,11 +563,19 @@ pub mod imp {
                     };
                     return Step::Continue;
                 }
-                state.phase = Phase::MeasureWrite { iter_done, sent, t0 };
+                state.phase = Phase::MeasureWrite {
+                    iter_done,
+                    sent,
+                    t0,
+                };
                 Step::Continue
             }
             PumpStep::WouldBlock => {
-                state.phase = Phase::MeasureWrite { iter_done, sent, t0 };
+                state.phase = Phase::MeasureWrite {
+                    iter_done,
+                    sent,
+                    t0,
+                };
                 Step::Yield
             }
             PumpStep::Error(msg) => {
@@ -407,7 +585,12 @@ pub mod imp {
         }
     }
 
-    fn phase_measure_read(state: &mut State, iter_done: u64, mut recvd: usize, t0: Instant) -> Step {
+    fn phase_measure_read(
+        state: &mut State<'_>,
+        iter_done: u64,
+        mut recvd: usize,
+        t0: Instant,
+    ) -> Step {
         if t0.elapsed() > RTT_TIMEOUT {
             state.phase = Phase::BucketError(format!(
                 "measure iter {iter_done}: recv timeout (>{:?})",
@@ -415,17 +598,22 @@ pub mod imp {
             ));
             return Step::Continue;
         }
-        match pump_drain(state.fd, state.response_bytes, &mut recvd) {
+        let bucket = state.grid[state.bucket_idx];
+        match pump_drain(state.fd, bucket.payload_bytes, &mut recvd) {
             DrainStep::Done => {
                 let rtt_ns = t0.elapsed().as_nanos() as u64;
-                state.samples.push(rtt_ns as f64);
+                state.bucket_samples[state.bucket_idx].push(rtt_ns as f64);
                 state.phase = Phase::MeasureStart {
                     iter_done: iter_done + 1,
                 };
                 Step::Continue
             }
             DrainStep::WouldBlock => {
-                state.phase = Phase::MeasureRead { iter_done, recvd, t0 };
+                state.phase = Phase::MeasureRead {
+                    iter_done,
+                    recvd,
+                    t0,
+                };
                 Step::Yield
             }
             DrainStep::Error(msg) => {
@@ -435,30 +623,42 @@ pub mod imp {
         }
     }
 
-    fn phase_close_and_done(state: &mut State) -> Step {
+    fn phase_close_and_next(state: &mut State<'_>) -> Step {
         if state.fd >= 0 {
             unsafe {
                 let _ = ff_close(state.fd);
             }
             state.fd = -1;
         }
-        state.phase = Phase::Done;
+        // Advance to the next bucket. If we just finished the last
+        // bucket, transition to Done so ff_stop_run() fires.
+        state.bucket_idx += 1;
+        if state.bucket_idx < state.grid.len() {
+            state.phase = Phase::Connect;
+        } else {
+            state.phase = Phase::Done;
+        }
         Step::Continue
     }
 
-    fn phase_bucket_error(state: &mut State, msg: String) -> Step {
+    fn phase_bucket_error(state: &mut State<'_>, msg: String) -> Step {
         if state.fd >= 0 {
             unsafe {
                 let _ = ff_close(state.fd);
             }
             state.fd = -1;
         }
-        state.error = Some(msg);
-        state.phase = Phase::Done;
+        state.bucket_errors[state.bucket_idx] = Some(msg);
+        state.bucket_idx += 1;
+        if state.bucket_idx < state.grid.len() {
+            state.phase = Phase::Connect;
+        } else {
+            state.phase = Phase::Done;
+        }
         Step::Continue
     }
 
-    fn phase_done(state: &mut State) -> Step {
+    fn phase_done(state: &mut State<'_>) -> Step {
         if !state.stopped {
             unsafe { ff_stop_run() };
             state.stopped = true;
@@ -544,6 +744,40 @@ pub mod imp {
 
 #[cfg(not(feature = "fstack"))]
 pub mod imp {
+    /// Stub `RttBucket` for builds without the `fstack` feature so
+    /// downstream callers (e.g. integration tests) compile without
+    /// pulling in the F-Stack FFI surface. The fields mirror the
+    /// real type but are unused — `run_rtt_grid` here always returns
+    /// an empty Vec.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct RttBucket {
+        pub payload_bytes: usize,
+        pub warmup: u64,
+        pub iterations: u64,
+    }
+
+    pub struct RttBucketResult {
+        pub payload_bytes: usize,
+        pub samples: Vec<f64>,
+        pub error: Option<String>,
+    }
+
+    pub fn enumerate_rtt_grid(
+        _payloads: &[usize],
+        _warmup: u64,
+        _iterations: u64,
+    ) -> Vec<RttBucket> {
+        Vec::new()
+    }
+
+    pub fn run_rtt_grid(
+        _peer_ip_host_order: u32,
+        _peer_port: u16,
+        _grid: &[RttBucket],
+    ) -> Vec<RttBucketResult> {
+        Vec::new()
+    }
+
     pub fn run_rtt_workload(
         _peer_ip_host_order: u32,
         _peer_port: u16,
