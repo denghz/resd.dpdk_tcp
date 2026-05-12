@@ -5,7 +5,8 @@
 //! in-order data segment with PAWS + SACK enabled. The ACK field on
 //! that segment equals `snd_una` (no left-edge advance), so the
 //! send-side ACK-processing branches that run on every production
-//! pure-ACK are NOT exercised by that target — see
+//! ADVANCING pure-ACK (the ones where `ack > snd_una`) are NOT
+//! exercised by that target — see
 //! `bench_tcp_input_pure_ack` below.
 //!
 //! `bench_tcp_input_ooo_segment` measures the same for an OOO segment
