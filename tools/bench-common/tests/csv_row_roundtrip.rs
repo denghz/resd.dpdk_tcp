@@ -27,7 +27,12 @@ fn sample_row() -> CsvRow {
         test_case: "burst".into(),
         feature_set: "default".into(),
         dimensions_json: r#"{"K_bytes":262144,"G_ms":10,"stack":"dpdk_net"}"#.into(),
-        metric_name: "throughput_per_burst_bps".into(),
+        // Codex I2 (2026-05-13): dpdk_net bench-tx-burst rows now emit
+        // `pmd_handoff_rate_bps` (was `throughput_per_burst_bps`). This
+        // test only round-trips the string through CSV — any non-empty
+        // metric_name value satisfies the assertion; tracking the
+        // live label is for readability.
+        metric_name: "pmd_handoff_rate_bps".into(),
         metric_unit: "bytes_per_sec".into(),
         metric_value: 8.7e9,
         metric_aggregation: MetricAggregation::P99,

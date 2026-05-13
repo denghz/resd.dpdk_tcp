@@ -161,18 +161,20 @@ no code fix required — the existing measurement positions are correct.
 
 ## bench-tx-burst — per-arm metric labels
 
-Follow-up #2 from the original T57 list is now closed. The CSV `metric_name`
-column now distinguishes wire-rate from buffer-fill-rate so readers don't
-conflate the two:
+Follow-up #2 from the original T57 list is now closed; codex I2 (2026-05-13)
+follow-up reframed the dpdk_net label to make the PMD-handoff vs wire-rate
+distinction explicit. The CSV `metric_name` column now distinguishes which
+**handoff boundary** the per-burst rate was measured at; **none** of the
+three is a wire-rate metric:
 
 | arm | metric_name | what `K / (t1 − t0)` actually measures |
 |---|---|---|
-| `dpdk_net` | `throughput_per_burst_bps` | wire-rate proxy — `t1` captured at `rte_eth_tx_burst`-return |
+| `dpdk_net` | `pmd_handoff_rate_bps` | bytes handed to the PMD send ring — `t1` captured at `rte_eth_tx_burst`-return (codex I2 2026-05-13: not wire rate — PMD ring + driver-internal queues buffer) |
 | `linux_kernel` | `write_acceptance_rate_bps` | buffer-fill — `t1` captured after `write_all` returns (bytes accepted into kernel send buffer, NOT on wire) |
 | `fstack` | `write_acceptance_rate_bps` | buffer-fill — `t1` captured after `ff_write` returns (bytes accepted into F-Stack BSD-shaped send buffer, NOT on wire) |
 
-dpdk_net (real wire, throughput_per_burst_bps):
-| K | G | throughput Gbps | initiation p50 |
+dpdk_net (PMD-handoff rate, post-rename — was `throughput_per_burst_bps`):
+| K | G | PMD handoff Gbps | initiation p50 |
 |---:|---:|---:|---:|
 | 64 KiB | 0 ms | 1.00 | 30.8 µs |
 | 64 KiB | 10 ms | 1.35 | 34.2 µs |
@@ -183,12 +185,25 @@ linux + fstack rows in the T57 SUMMARY.md showed 8–78 Gbps under the legacy
 unified `throughput_per_burst_bps` label — 8× over ENA's 10 Gbps line rate.
 Those rows now emit `write_acceptance_rate_bps`, so the label itself tells
 the reader that the figure is a software-buffer-ingest rate. The numeric
-value did NOT change; the wire-rate calibration on those arms is still
-gated on a HW-TS hook (`Engine::last_tx_hw_ts` for fstack-on-DPDK, ENA
-TX timestamp dynfield once advertised).
+value did NOT change; wire-rate calibration on every arm is still gated on
+a HW-TS hook (`Engine::last_tx_hw_ts` for fstack-on-DPDK, an ENA TX
+timestamp dynfield once advertised, or peer-side packet capture).
+
+**Why dpdk_net was also renamed (codex I2 2026-05-13):** the original
+T57 follow-up #2 left dpdk_net on `throughput_per_burst_bps` under the
+framing that `rte_eth_tx_burst`-return was a wire-rate proxy. Codex's
+adversarial review pointed out that `rte_eth_tx_burst` returning only
+means the mbuf has been enqueued onto the PMD send ring — the ENA
+driver-internal queues and the PMD ring itself can buffer mbufs across
+calls. On low-payload, low-iteration counts the figure can exceed line
+rate (e.g. 18 Gbps on a 5 Gbps NIC, because the PMD is buffering). The
+metric is therefore an application-to-PMD handoff rate, and the new
+label `pmd_handoff_rate_bps` makes that explicit. Wire-rate claims need
+peer-capture or HW TX timestamps — separate follow-up.
 
 Per-arm rationale + the `Stack::throughput_metric_name` helper:
-`tools/bench-tx-burst/src/lib.rs`.
+`tools/bench-tx-burst/src/lib.rs`. Per-arm assertion coverage:
+`tools/bench-tx-burst/tests/burst_grid.rs::{linux_arm_emits_write_acceptance_rate_not_pmd_handoff, fstack_arm_emits_write_acceptance_rate_not_pmd_handoff, dpdk_arm_emits_pmd_handoff_rate_bps}`.
 
 ## verify-rack-tlp — ALL 5 scenarios PASS
 

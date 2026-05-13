@@ -287,7 +287,7 @@ fn emit_bucket_rows_dimensions_json_matches_spec_11_3_shape() {
         let metric_name = rec.get(metric_name_idx).unwrap();
         let metric_unit = rec.get(metric_unit_idx).unwrap();
         match metric_name {
-            "throughput_per_burst_bps" => {
+            "pmd_handoff_rate_bps" => {
                 // Throughput unit is spelled out as `bits_per_sec`
                 // (not the ambiguous `bps`) per spec §14.1.
                 assert_eq!(metric_unit, "bits_per_sec");
@@ -304,26 +304,42 @@ fn emit_bucket_rows_dimensions_json_matches_spec_11_3_shape() {
             other => panic!("unexpected metric_name {other}"),
         }
     }
-    assert!(seen_throughput, "throughput_per_burst_bps row missing");
+    assert!(seen_throughput, "pmd_handoff_rate_bps row missing");
     assert!(seen_initiation, "burst_initiation_ns row missing");
     assert!(seen_steady, "burst_steady_bps row missing");
 }
 
 // ---------------------------------------------------------------------------
-// T57 follow-up #2: per-arm metric-name labelling.
+// T57 follow-up #2 + codex I2 (2026-05-13): per-arm metric-name labelling.
 //
-// Misleading-metric bug: `throughput_per_burst_bps` was emitted on EVERY
-// arm, but the linux_kernel and fstack arms capture t1 after
-// `write()` / `ff_write()` returns — i.e. when bytes are accepted into
-// the kernel/F-Stack send buffer, NOT when bytes leave the NIC. The
-// dpdk_net arm captures t1 at `rte_eth_tx_burst`-return which IS a
-// wire-rate proxy. Emitting the same metric_name on both arms led
-// readers to compare buffer-fill rates against wire rates (linux/fstack
-// "65 Gbps" vs dpdk_net "1 Gbps" on a 10 Gbps line).
+// History:
 //
-// Fix: emit `write_acceptance_rate_bps` on linux_kernel + fstack rows;
-// keep `throughput_per_burst_bps` on dpdk_net rows. Same `bits_per_sec`
-// unit; same per-bucket aggregation count (7 rows × 3 metrics = 21).
+//   Phase 1 (legacy): `throughput_per_burst_bps` was emitted on EVERY
+//   arm, but the linux_kernel and fstack arms capture t1 after
+//   `write()` / `ff_write()` returns — i.e. when bytes are accepted
+//   into the kernel/F-Stack send buffer, NOT when bytes leave the
+//   NIC. Emitting the same metric_name on both arms led readers to
+//   compare buffer-fill rates against wire rates (linux/fstack
+//   "65 Gbps" vs dpdk_net "1 Gbps" on a 10 Gbps line).
+//
+//   Phase 2 (T57 follow-up #2): linux_kernel + fstack rows renamed to
+//   `write_acceptance_rate_bps`; dpdk_net kept `throughput_per_burst_bps`
+//   under the (mistaken) framing that `rte_eth_tx_burst`-return was
+//   a wire-rate proxy.
+//
+//   Phase 3 (codex I2 2026-05-13, this rename): dpdk_net renamed
+//   `throughput_per_burst_bps` → `pmd_handoff_rate_bps`. Codex
+//   adversarial review pointed out that `rte_eth_tx_burst` returning
+//   only means the mbuf was enqueued onto the PMD send ring; the
+//   PMD ring buffers, and on low-payload, low-iteration counts the
+//   reported value can exceed line rate (e.g. 18 Gbps on a 5 Gbps
+//   NIC). The dpdk_net row is therefore an application-to-PMD
+//   handoff rate, not wire rate.
+//
+// All three labels (`pmd_handoff_rate_bps`, `write_acceptance_rate_bps`)
+// share the `bits_per_sec` unit and the same per-bucket aggregation
+// count (7 rows × 3 metrics = 21). None is wire-rate; the labels
+// distinguish which handoff boundary was measured.
 // ---------------------------------------------------------------------------
 
 fn emit_one_bucket_and_collect_metric_names(stack: Stack) -> Vec<String> {
@@ -367,15 +383,22 @@ fn emit_one_bucket_and_collect_metric_names(stack: Stack) -> Vec<String> {
 }
 
 #[test]
-fn linux_arm_emits_write_acceptance_rate_not_throughput() {
-    // T57 follow-up #2: linux_kernel rows MUST NOT carry
-    // `throughput_per_burst_bps` (that name claims wire-rate
-    // calibration the linux arm doesn't have). Instead, the linux
-    // arm's primary metric is `write_acceptance_rate_bps`.
+fn linux_arm_emits_write_acceptance_rate_not_pmd_handoff() {
+    // T57 follow-up #2 + codex I2 (2026-05-13): linux_kernel rows
+    // MUST NOT carry `pmd_handoff_rate_bps` (that name names the
+    // dpdk_net PMD send-ring handoff which the linux arm doesn't
+    // perform). Instead, the linux arm's primary metric is
+    // `write_acceptance_rate_bps` (bytes accepted into the kernel
+    // send buffer).
     let names = emit_one_bucket_and_collect_metric_names(Stack::LinuxKernel);
     assert!(
+        !names.iter().any(|n| n == "pmd_handoff_rate_bps"),
+        "linux_kernel row should NOT emit pmd_handoff_rate_bps; got names: {names:?}"
+    );
+    // Defensive: also reject the long-retired pre-T57 label.
+    assert!(
         !names.iter().any(|n| n == "throughput_per_burst_bps"),
-        "linux_kernel row should NOT emit throughput_per_burst_bps; got names: {names:?}"
+        "linux_kernel row should NOT emit retired throughput_per_burst_bps; got names: {names:?}"
     );
     let primary_count = names
         .iter()
@@ -398,14 +421,18 @@ fn linux_arm_emits_write_acceptance_rate_not_throughput() {
 }
 
 #[test]
-fn fstack_arm_emits_write_acceptance_rate_not_throughput() {
+fn fstack_arm_emits_write_acceptance_rate_not_pmd_handoff() {
     // Same shape as the linux assertion: fstack captures t1 after
     // `ff_write` returns → buffer-fill rate → same metric label
     // `write_acceptance_rate_bps`.
     let names = emit_one_bucket_and_collect_metric_names(Stack::Fstack);
     assert!(
+        !names.iter().any(|n| n == "pmd_handoff_rate_bps"),
+        "fstack row should NOT emit pmd_handoff_rate_bps; got names: {names:?}"
+    );
+    assert!(
         !names.iter().any(|n| n == "throughput_per_burst_bps"),
-        "fstack row should NOT emit throughput_per_burst_bps; got names: {names:?}"
+        "fstack row should NOT emit retired throughput_per_burst_bps; got names: {names:?}"
     );
     let primary_count = names
         .iter()
@@ -418,24 +445,32 @@ fn fstack_arm_emits_write_acceptance_rate_not_throughput() {
 }
 
 #[test]
-fn dpdk_arm_still_emits_throughput_per_burst_bps() {
-    // dpdk_net's t1 is captured at `rte_eth_tx_burst`-return → wire-
-    // rate proxy → keeps the historical `throughput_per_burst_bps`
-    // label. Asymmetric on purpose: same physical metric concept,
-    // different completion semantics, different name. Readers can
-    // grep on metric_name to tell them apart.
+fn dpdk_arm_emits_pmd_handoff_rate_bps() {
+    // Codex I2 (2026-05-13): dpdk_net's t1 is captured at
+    // `rte_eth_tx_burst`-return — bytes handed to the PMD send ring,
+    // NOT on the wire. The metric_name `pmd_handoff_rate_bps` makes
+    // the measurement boundary explicit. Asymmetric on purpose vs
+    // linux/fstack's `write_acceptance_rate_bps`: same physical
+    // K / (t1 − t0) concept, different handoff boundary, different
+    // name. Readers can grep on metric_name to tell them apart. The
+    // retired `throughput_per_burst_bps` label is also rejected to
+    // catch regressions.
     let names = emit_one_bucket_and_collect_metric_names(Stack::DpdkNet);
     assert!(
         !names.iter().any(|n| n == "write_acceptance_rate_bps"),
         "dpdk_net row should NOT emit write_acceptance_rate_bps; got names: {names:?}"
     );
+    assert!(
+        !names.iter().any(|n| n == "throughput_per_burst_bps"),
+        "dpdk_net row should NOT emit retired throughput_per_burst_bps; got names: {names:?}"
+    );
     let primary_count = names
         .iter()
-        .filter(|n| *n == "throughput_per_burst_bps")
+        .filter(|n| *n == "pmd_handoff_rate_bps")
         .count();
     assert_eq!(
         primary_count, 7,
-        "dpdk_net row should emit 7 throughput_per_burst_bps rows; got names: {names:?}"
+        "dpdk_net row should emit 7 pmd_handoff_rate_bps rows; got names: {names:?}"
     );
 }
 

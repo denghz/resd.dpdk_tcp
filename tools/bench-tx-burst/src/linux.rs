@@ -35,9 +35,10 @@
 //! `write_all` returns, when the kernel has accepted all K bytes into
 //! its send buffer but has NOT necessarily put them on the wire. We
 //! deliberately use a DIFFERENT metric name from the dpdk_net arm's
-//! `throughput_per_burst_bps` (which captures t1 at
-//! `rte_eth_tx_burst`-return ≈ wire-rate) so downstream readers don't
-//! conflate buffer-fill rate with wire rate; see
+//! `pmd_handoff_rate_bps` (which captures t1 at
+//! `rte_eth_tx_burst`-return — bytes handed to the PMD send ring;
+//! also NOT wire rate — codex I2 2026-05-13) so downstream readers
+//! can tell the two handoff boundaries apart in the CSV; see
 //! `Stack::throughput_metric_name` (T57 follow-up #2). Secondary
 //! `burst_initiation_ns` and `burst_steady_bps` mirror the dpdk arm
 //! but use the same `Instant::now()` clock for `t_first_wire` (right

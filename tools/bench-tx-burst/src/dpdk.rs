@@ -12,15 +12,26 @@
 //! - `t_first_wire` = NIC HW TX timestamp on segment 1 of the burst.
 //!   On ENA, no TX-TS dynfield is advertised; fall back to the TSC
 //!   captured right after the first `engine.send_bytes` call returns
-//!   (which is the closest observable point to "segment 1 hit the
-//!   NIC" that user-space gets without HW TS).
+//!   (after the engine has handed the first segment to the PMD send
+//!   ring, but NOT after that segment has been observed on the wire —
+//!   `t_first_wire` is a slight misnomer pending the HW-TS hook).
 //! - `t1` = NIC HW TX timestamp on the last segment of the burst. On
 //!   ENA, fall back to TSC captured at the end of the drain when
 //!   `drain_tx_pending_data` has flushed the final segment through
 //!   `rte_eth_tx_burst`.
 //!
-//! Throughput per burst = K / (t1 − t0), emitted in bps (bench-common's
-//! summariser aggregates across ≥10 k bursts per bucket).
+//! K / (t1 − t0) is emitted in bps as `pmd_handoff_rate_bps`
+//! (bench-common's summariser aggregates across ≥10 k bursts per
+//! bucket). Codex I2 (2026-05-13): this is the rate at which the
+//! application handed bytes to the PMD send ring — NOT wire rate.
+//! `rte_eth_tx_burst` returning does not mean the segment is on the
+//! wire; ENA driver-internal queues + the PMD ring itself can buffer
+//! mbufs across calls. On low-payload, low-iteration counts the
+//! reported value can exceed line rate (e.g. 18 Gbps on a 5 Gbps
+//! NIC). Wire-rate calibration is a separate follow-up: once a HW TX
+//! timestamp dynfield is advertised on the NIC (mlx5/ice today, ENA
+//! future-gen) or peer-side packet capture is wired in, a
+//! `wire_rate_bps` metric becomes available.
 //!
 //! # TX-TS availability
 //!
@@ -405,23 +416,29 @@ fn send_first_segment_and_capture_wire_time(
 /// Readable events.
 ///
 /// Returns `t1_tsc`: the TSC value sampled right after the final
-/// `rte_eth_tx_burst` (the closest observable point to "segment N hit
-/// the wire" without HW TS — spec §11.1: "TSC-at-`rte_eth_tx_burst`-
-/// return"). Capturing here — BEFORE the post-flush drain — keeps the
-/// t1−t0 window tight to what the TX path actually spent; capturing
-/// after the drain would fold poll-loop / Readable-drain noise into
-/// the throughput denominator and bias throughput low.
+/// `rte_eth_tx_burst` returns (spec §11.1: "TSC-at-`rte_eth_tx_burst`-
+/// return"). Codex I2 (2026-05-13): this captures the PMD-handoff
+/// boundary, not "segment N hit the wire" — `rte_eth_tx_burst`
+/// returning means the mbuf has been enqueued onto the PMD send ring;
+/// the ENA driver still has to DMA it out before it's on the wire.
+/// Capturing here — BEFORE the post-flush drain — keeps the t1−t0
+/// window tight to what the TX path actually spent; capturing after
+/// the drain would fold poll-loop / Readable-drain noise into the
+/// throughput denominator and bias the PMD-handoff rate low.
 ///
-/// Once `Engine::last_tx_hw_ts(conn)` lands, the HW-TS path reads the
-/// exact NIC timestamp instead. Error on drain timeout (no forward
-/// progress within `STALL_TIMEOUT`) so a jammed peer produces a
-/// visible failure, but a slow-but-steady transfer is not killed
-/// purely on absolute wall-clock — the 2026-05-03 bench-pair run hit
-/// `K=1MiB G=10ms` burst 244 stalling at 151_552/1_048_576 bytes
-/// after the previous fixed-60s ceiling expired. The new model: we
-/// reset the deadline whenever `send_bytes` accepts ≥1 byte, so the
-/// failure surface is "no byte accepted in `STALL_TIMEOUT`", not
-/// "this big burst couldn't finish in 60s flat".
+/// Once `Engine::last_tx_hw_ts(conn)` lands, a wire-rate path can
+/// read the exact NIC TX timestamp instead, and the per-arm
+/// `throughput_metric_name` accessor can return `wire_rate_bps`
+/// (gated on `throughput_is_wire_rate_calibrated()` flipping true).
+/// Error on drain timeout (no forward progress within
+/// `STALL_TIMEOUT`) so a jammed peer produces a visible failure, but
+/// a slow-but-steady transfer is not killed purely on absolute
+/// wall-clock — the 2026-05-03 bench-pair run hit `K=1MiB G=10ms`
+/// burst 244 stalling at 151_552/1_048_576 bytes after the previous
+/// fixed-60s ceiling expired. The new model: we reset the deadline
+/// whenever `send_bytes` accepts ≥1 byte, so the failure surface is
+/// "no byte accepted in `STALL_TIMEOUT`", not "this big burst
+/// couldn't finish in 60s flat".
 fn drive_burst_remainder_to_completion(
     engine: &Engine,
     conn: ConnHandle,

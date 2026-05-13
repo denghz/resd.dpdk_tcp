@@ -376,12 +376,15 @@ pub fn emit_bucket_rows<W: std::io::Write>(
         aggregate.tx_ts_mode.map(|m| m.as_str()),
     );
 
-    // T57 follow-up #2: per-arm metric name. dpdk_net keeps the
-    // historical `throughput_per_burst_bps` (t1 captured at
-    // rte_eth_tx_burst-return ≈ wire rate); linux_kernel and fstack
-    // emit `write_acceptance_rate_bps` because their t1 is captured
-    // after `write()` / `ff_write()` returns — measuring the rate the
-    // stack ingests payload into its send buffer, NOT wire rate. See
+    // T57 follow-up #2 + codex I2 (2026-05-13): per-arm metric name.
+    // dpdk_net emits `pmd_handoff_rate_bps` (t1 captured at
+    // rte_eth_tx_burst-return — bytes handed to the PMD send ring,
+    // NOT on the wire); linux_kernel and fstack emit
+    // `write_acceptance_rate_bps` because their t1 is captured after
+    // `write()` / `ff_write()` returns — measuring the rate the
+    // stack ingests payload into its send buffer, NOT wire rate.
+    // None of the three is wire-rate; the labels distinguish which
+    // handoff boundary was measured. See
     // `Stack::throughput_metric_name` for the rationale.
     let throughput_metric_name = aggregate.stack.throughput_metric_name();
     match &aggregate.throughput_bps {

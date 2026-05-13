@@ -38,14 +38,16 @@
 //!   accepted by F-Stack.
 //!
 //! Primary metric per burst = K / (t1 − t0), bps. Emitted to CSV as
-//! `write_acceptance_rate_bps` (not `throughput_per_burst_bps`):
+//! `write_acceptance_rate_bps` (NOT a wire-rate metric):
 //! `ff_write` returns when F-Stack has accepted bytes into its BSD-
 //! shaped send buffer, NOT when the segment hits the wire, so this
-//! metric is a buffer-fill-rate, not a wire-rate. The dpdk_net arm
-//! emits `throughput_per_burst_bps` because its t1 captures
-//! `rte_eth_tx_burst`-return which IS a wire-rate proxy. See
-//! `Stack::throughput_metric_name` for the per-arm rationale (T57
-//! follow-up #2).
+//! metric is a buffer-fill-rate. The dpdk_net arm emits
+//! `pmd_handoff_rate_bps` because its t1 captures
+//! `rte_eth_tx_burst`-return — bytes handed to the PMD send ring,
+//! also NOT wire rate (codex I2 2026-05-13). The two labels
+//! distinguish the application/PMD-handoff boundaries; neither is
+//! wire-rate. See `Stack::throughput_metric_name` for the per-arm
+//! rationale (T57 follow-up #2 + codex I2).
 //!
 //! # Soft-fail per-bucket
 //!
