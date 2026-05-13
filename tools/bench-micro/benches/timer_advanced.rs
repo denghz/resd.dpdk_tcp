@@ -123,9 +123,9 @@
 //!   bucket walk of 1 entry + slot.take + SmallVec push (inline). The
 //!   first cursor tick of a fresh wheel also pays a one-time `last_tick`
 //!   write.
-//! - `advance_fires_8` ~480 ns. Same per-bucket walk shape, 8 slot.take
-//!   + 8 SmallVec pushes (all inline — SmallVec capacity is exactly 8).
-//!   No heap allocation in the timed region.
+//! - `advance_fires_8` ~480 ns. Same per-bucket walk shape, 8 slot.take +
+//!   8 SmallVec pushes (all inline — SmallVec capacity is exactly 8). No
+//!   heap allocation in the timed region.
 //! - `advance_fires_64` ~1.3 µs. 64 slot.take + 64 SmallVec pushes;
 //!   the 9th push exceeds inline capacity and triggers one heap
 //!   allocation, and the remaining 55 pushes write into the heap
