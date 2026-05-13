@@ -1,9 +1,23 @@
-# T57 fast-iter-suite — fair comparison (2026-05-12)
+# T57 fast-iter-suite — controlled three-stack comparison (2026-05-12)
 
 **Run:** fifth fast-iter suite invocation, all 2026-05-12 follow-ups merged.
 **Branch:** `a10-perf-23.11` at `61c5e00`.
 **Status:** **DONE — 13/13 OK, 0 FAIL, 35 min wallclock.**
 **Results:** `target/bench-results/fast-iter-2026-05-12T09-37-47Z/`
+
+> **Title note (codex I5 2026-05-13).** This report was originally
+> titled "fair comparison". Codex's adversarial review flagged that
+> phrasing as an overclaim: the three arms run with different
+> user-space APIs (blocking `TcpStream::write_all` vs `poll_once()` +
+> drain vs nonblocking `ff_write`), against two different ENIs, on
+> AWS-shared-tenancy network. What this report measures is a
+> **controlled three-stack comparison with disclosed methodology**, not
+> an apples-to-apples fairness claim. The "pure software-stack
+> overhead" framing in the original body has been reworded to
+> "end-to-end harness behavior under controlled conditions"; see the
+> "What this suite is NOT" section in
+> `docs/bench-reports/methodology-and-claims-2026-05-09.md` for the
+> full disclaimer list.
 
 ## What changed since T56
 
@@ -17,7 +31,7 @@
 | `abd9601` | **Hardened peer servers**: `TCP_USER_TIMEOUT=5s` + pthread-per-conn + 4 MiB SO_SNDBUF/RCVBUF on all three (echo-server, linux-tcp-sink, burst-echo-server). Self-recover from DUT SIGKILL in 5s instead of 15min. |
 | `61c5e00` | Drop between-arm peer restarts (servers self-recover now) |
 
-## Fair-comparison results — bench-rtt p50 RTT (real wire to 10.4.1.228)
+## Controlled-comparison results — bench-rtt p50 RTT (real wire to 10.4.1.228)
 
 | payload | dpdk_net | linux_kernel | fstack | linux−dpdk Δ |
 |---:|---:|---:|---:|---:|
@@ -26,17 +40,31 @@
 | 256 B | 77.0 µs | 106.9 µs | 100.1 µs | +30 µs (39%) |
 | 1024 B | 98.5 µs | 108.8 µs | 100.1 µs | +10 µs (10%) |
 
-**All three stacks talk to the SAME peer.** The remaining differences are pure software-stack overhead:
-- dpdk_net: ~77-99 µs — DPDK direct-NIC access, lowest overhead.
-- fstack: ~100 µs — FreeBSD socket layer on top of DPDK; consistent across payloads.
-- linux_kernel: ~104-109 µs — kernel TCP stack syscall + context-switch path; grows slightly with payload.
+**All three stacks talk to the same peer.** The remaining differences
+are end-to-end harness behavior — DUT stack + per-arm user-space API
+choice + NIC + ENA driver + AWS-shared-tenancy wire + the test driver
+itself. Read the per-stack µs values as ordering signals, not as
+pure-stack costs:
+- dpdk_net: ~77-99 µs — DPDK direct-NIC access via vfio-pci poll on
+  PCI `0000:28:00.0`, lowest observed under this harness.
+- fstack: ~100 µs — FreeBSD socket layer on top of DPDK on the same
+  NIC; consistent across payloads.
+- linux_kernel: ~104-109 µs — kernel TCP stack syscall + context-
+  switch path on a different ENI (`0000:27:00.0`, ENA driver under
+  `nsenter`); grows slightly with payload.
 
-> **Important — same peer, but the linux_kernel arm uses a DIFFERENT physical
-> NIC than dpdk_net + fstack.** See "Methodology — two-ENI comparison"
-> below for the full disclosure. The published software-stack-overhead
-> deltas are reported as the linux−dpdk Δ; readers should hold that
-> framing rather than treating the absolute numbers as a same-wire
-> measurement.
+> **Caveats — read alongside `methodology-and-claims-2026-05-09.md`
+> "What this suite is NOT".** Specifically:
+> (a) the linux_kernel arm uses a DIFFERENT physical NIC than dpdk_net
+> + fstack (codex B2, "two-ENI comparison" below);
+> (b) per-arm user-space APIs differ (codex I5) — `TcpStream::write_all`
+> vs `poll_once()` + drain vs `ff_write`, so the µs gap is "stack +
+> harness API model", not isolated TCP delta;
+> (c) absolute µs swings ~3× across an afternoon on AWS-shared-tenancy
+> hardware (T58 / `regression-diagnosis-2026-05-13.md`) — the ordering
+> across the three stacks is the stable claim, not the absolute µs.
+> The `linux−dpdk Δ` column is more portable than the raw µs because
+> it cancels the wire delta common to all three arms.
 
 ## Methodology — two-ENI comparison
 
@@ -61,13 +89,18 @@ class — are identical. The difference is the SOFTWARE driving the NIC:
   TCP, RACK/DCTCP/CUBIC machinery, netfilter / iptables traversal, qdisc
   egress, ENA `ena_start_xmit` → kernel-mediated descriptor ring write.
 
-**Why this still constitutes a fair comparison.** The headline claim is
-*"software-stack overhead"* — i.e. the cost the application pays for
-calling `read`/`write` (or `bench_rtt` ping-pong) against each stack. That
-overhead is, by construction, the gap between what the user-space program
-sees and what the wire could do. The two ENIs put both stacks on
-equivalent wire baselines; the published `linux−dpdk Δ` therefore
-isolates the software cost, not any wire asymmetry.
+**Why this still constitutes a useful controlled comparison.** The
+headline claim is *end-to-end harness behavior* — i.e. what the
+application sees when it calls `read`/`write` (or `bench_rtt`
+ping-pong) against each stack through the harness's per-arm API model.
+The two ENIs are functionally identical AWS ENA hardware, so wire-
+baseline asymmetry is bounded; the published `linux−dpdk Δ` cancels
+the (large) common-mode wire delta and is the more portable number,
+though it still rolls up per-arm API choice (codex I5) along with
+stack cost. Absolute µs across two runs hours apart on the same
+hardware swings ~3× (T58 environmental drift); the cross-stack
+ordering within a single run is the stable, publication-grade
+output.
 
 **What COULD differ at run time across the two ENIs:**
 - RX/TX queue counts (one ENA queue per active vCPU on the kernel side;
@@ -149,8 +182,8 @@ is populated, recv_buf not yet extended." The work timed inside each arm's
 measurement window differs by ~50 ns (dpdk_net's `drain_readable_bytes`
 includes an iovec→Vec copy + event-queue + flow-table-lookup overhead that
 fstack's `ff_read` doesn't carry), which **disadvantages dpdk_net** by that
-margin — i.e. makes dpdk_net look slower than its "true" stack overhead, in
-the same direction as the headline. The asymmetry is 40-300× smaller than
+margin — i.e. makes dpdk_net look slower than its bare RX-path harness
+cost would, in the same direction as the headline. The asymmetry is 40-300× smaller than
 the µs-scale gaps observed and is dwarfed by NTP-skew effects (~100 µs
 same-AZ); the qualitative finding survives. Live-wire validation against
 the same peer (10.4.1.228) re-confirmed fstack p50 ≤ dpdk_net p50 in all 9
@@ -277,7 +310,7 @@ For the first time across the entire bench-overhaul:
 
 1. **SUMMARY.md verify-rack-tlp section is empty** (parser stub from T55). Add a Python parser that reads `verify-rack-tlp.log.log` and pivots the per-scenario PASS/FAIL + counter deltas into a table.
 
-2. ~~bench-tx-burst linux + fstack throughput numbers are buffer-fill artifacts~~ **DONE 2026-05-12** (follow-up #2). Rename: linux_kernel and fstack arms now emit `write_acceptance_rate_bps` in the CSV `metric_name` column; dpdk_net keeps `throughput_per_burst_bps`. Label asymmetry is intentional — completion semantics differ across arms (`rte_eth_tx_burst`-return vs `write()`-return), so the metric name advertises which thing was measured. Per-arm rationale + helper in `tools/bench-tx-burst/src/lib.rs::Stack::throughput_metric_name`; failing-test coverage in `tools/bench-tx-burst/tests/burst_grid.rs`. The fast-iter SUMMARY.md pivot already dispatches on `metric_name` so renders both labels with no summarizer changes needed.
+2. ~~bench-tx-burst linux + fstack throughput numbers are buffer-fill artifacts~~ **DONE 2026-05-12** (follow-up #2), **updated 2026-05-13** (codex I2). Rename: linux_kernel and fstack arms emit `write_acceptance_rate_bps` in the CSV `metric_name` column; dpdk_net emits `pmd_handoff_rate_bps` (codex I2, was `throughput_per_burst_bps` until 2026-05-13). Label asymmetry is intentional — completion semantics differ across arms (`rte_eth_tx_burst`-return vs `write()`-return), so the metric name advertises which thing was measured. **None of the three is a wire-rate metric.** Per-arm rationale + helper in `tools/bench-tx-burst/src/lib.rs::Stack::throughput_metric_name`; failing-test coverage in `tools/bench-tx-burst/tests/burst_grid.rs`. The fast-iter SUMMARY.md pivot already dispatches on `metric_name` so renders both labels with no summarizer changes needed.
 
 3. **bench-tx-maxtp linux empty row in SUMMARY.md** at W=64K C=16 (last row showed `0.0`). Spot — but the other cells produced real data. Likely a CSV pivot bug in the summarizer, not a bench-tool bug.
 

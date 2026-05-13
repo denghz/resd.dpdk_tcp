@@ -2,6 +2,36 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Post-codex-review addendum (2026-05-13).** Codex's adversarial
+> review of the published fast-iter suite landed three IMPORTANTs and
+> one MINOR that affect plan-published doc claims (not the Phase 1–12
+> code path):
+> - **I2 (PMD-handoff metric rename) — DONE.** `throughput_per_burst_bps`
+>   renamed to `pmd_handoff_rate_bps` on the dpdk_net arm; linux + fstack
+>   already on `write_acceptance_rate_bps` since T57 follow-up #2. See
+>   `docs/bench-reports/methodology-and-claims-2026-05-09.md` for the
+>   per-arm semantic definitions and the post-rename history table.
+> - **I4 (fixed-order bias) — DONE.** `scripts/fast-iter-suite.sh` now
+>   randomizes per-tool stack execution order from a `--seed N` flag;
+>   resolved order logged into `metadata.json` and SUMMARY.md.
+> - **I5 (pure-stack overhead overclaim) — DONE in docs (this commit).**
+>   The phrase "pure software-stack overhead" / "user-space TCP stack
+>   performance" in the methodology doc and T57 report is reworded to
+>   "controlled three-stack comparison" / "end-to-end harness behavior".
+>   A new "What this suite is NOT" section in the methodology doc
+>   enumerates the wire-rate / API-asymmetry / two-ENI / AWS-shared-
+>   tenancy disclaimers.
+> - **M1 (stale docs) — DONE in docs (this commit).** Stale "loopback"
+>   wording in `linux-nat-investigation-2026-05-12.md` and the
+>   pre-Phase-2 mTCP framing in the methodology doc's Phase-1 history
+>   line are now marked as historical.
+>
+> The Phase 1–12 task list below remains the historical record of the
+> overhaul code path; the mTCP-arm removal (Phase 2 Task 2.1) and the
+> bench-vs-mtcp split (Phase 5) are preserved as written. New
+> publication-facing claims should reference the methodology doc, not
+> the per-phase task bodies in this plan.
+
 **Goal:** Reorganize the bench-tool suite to remove dead arms, consolidate overlapping benches, and close every coverage gap that blocks measuring (a) RX-side latency on small trading-quote-sized packets and (b) TX-side latency under retransmit-driving congestion. Comparator set is dpdk_net + linux_kernel + fstack only — mTCP arm is removed.
 
 **Architecture:**

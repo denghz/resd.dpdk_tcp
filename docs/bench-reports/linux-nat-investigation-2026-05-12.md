@@ -1,5 +1,15 @@
 # linux_kernel arm "NAT hang" investigation — 2026-05-12
 
+> **Historical / superseded (codex M1 2026-05-13).** The "Option B
+> taken — local loopback echo server" decision recorded in this
+> document is **no longer the suite's behavior**. T57 commit `74b07d3`
+> rewires the linux_kernel arm to use `sudo nsenter -t 1 -n` to
+> escape the proxied netns and talk to the real peer on `ens5`
+> (`0000:27:00.0`). The loopback path here is preserved as the
+> 2026-05-12 investigation record; current behavior is documented in
+> `docs/bench-reports/t57-fast-iter-suite-fair-comparison-2026-05-12.md`
+> §"Methodology — two-ENI comparison".
+
 **Triggering symptom:** `bench-rtt --stack linux_kernel` and
 `bench-rx-burst --stack linux_kernel` against the fast-iter peer at
 `10.4.1.228` get a few iterations through and then sit on `read_exact`

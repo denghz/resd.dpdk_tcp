@@ -11,6 +11,82 @@ operational definitions and link to specific changes (e.g. codex I2
 2026-05-13 renamed dpdk_net's `throughput_per_burst_bps` →
 `pmd_handoff_rate_bps`).
 
+## What this suite IS — controlled three-stack harness comparison
+
+The fast-iter suite produces a **controlled three-stack comparison
+(dpdk_net + linux_kernel + fstack) with disclosed methodology**, not a
+calibrated wire-rate or pure-stack-cost measurement. Every metric is
+captured at a user-space handoff boundary defined per-tool in the tables
+below; absolute numbers are **end-to-end harness behavior** (DUT stack
++ peer-side scheduling + NIC + driver + AWS shared-tenancy network +
+the test driver itself).
+
+Comparisons across stacks within a single suite invocation are the
+publication-grade claim. Absolute numbers are useful only as
+within-run sanity bounds and **must not** be quoted as portable
+stack-performance characteristics.
+
+## What this suite is NOT
+
+The disclaimers below are load-bearing for any reader using the
+fast-iter SUMMARY.md or T57-style report. Codex's 2026-05-13 adversarial
+review (I5) flagged earlier wordings ("pure stack overhead",
+"user-space TCP stack performance", "same peer, same wire") as
+overclaims; the methodology described here is narrower.
+
+- **NOT a wire-rate measurement.** `bench-tx-burst` captures `t1` at
+  the application-to-PMD or application-to-kernel handoff (see the
+  per-arm table below). No arm reads a NIC TX completion timestamp
+  today. Wire-rate calibration is gated on HW-TS dynfield availability
+  (mlx5/ice today; AWS ENA: not advertised on the current bench
+  instance) or peer-side packet capture.
+- **NOT a pure software-stack overhead measurement.** Codex review I5
+  noted that linux uses blocking `TcpStream::write_all/read_exact`,
+  dpdk_net uses `poll_once()` + Readable drain, fstack uses
+  nonblocking `ff_write/ff_read` loops — i.e. the harness's
+  per-arm API model is part of every number. "Pure stack" deltas
+  would require API-model normalization that this suite does not do.
+- **NOT a same-NIC comparison.** dpdk_net + fstack drive PCI
+  `0000:28:00.0` via vfio-pci; linux_kernel drives `0000:27:00.0`
+  via the in-tree ENA driver under `sudo nsenter -t 1 -n`. Both ENIs
+  are AWS ENA (vendor `0x1d0f`, device `0xec20`) on the same subnet
+  to the same peer, but they have independent IRQ steering, queue
+  counts, interrupt-coalescing defaults, and `ethtool -k` offload
+  state. Codex B2. Disclosed in T57's "Methodology — two-ENI
+  comparison" section; `scripts/log-nic-state.sh` snapshots both
+  NICs into every run's `nic-state.txt`.
+- **NOT isolated from AWS-shared-network conditions.** Both hosts
+  share AWS-tenancy data-plane bandwidth + queue-credit accounting.
+  The same code (`61c5e00`) produced ~78-100 µs RTT in T57
+  (2026-05-12 09:38 UTC) and ~200-300 µs RTT four hours later in
+  T58 — purely environmental (see `regression-diagnosis-2026-05-13.md`).
+  Absolute µs values can swing ~3× across an afternoon on the same
+  hardware. Ordering across stacks within a run is stable; absolute
+  µs across runs is not.
+- **NOT isolated from peer-side scheduling.** The peer runs
+  pthread-per-conn echo servers with `TCP_NODELAY`. Per-iter RTT
+  numbers include the peer's user-space wakeup + epoll/recv +
+  send-reply path; that latency is held roughly constant across
+  stacks but is non-zero and is part of every `rtt_ns` sample.
+- **NOT a deterministic-loss validation environment.** `verify-rack-tlp`
+  drives netem-injected loss on the peer side. Loss + reorder +
+  delay are stochastic; counter-floor assertions are conservative
+  ANY-of (RTO + RACK + TLP > floor) for the loss-only scenarios.
+  RACK is validated separately under `rack_reorder_4k` (peer-ingress
+  reorder + SACK-on; see T57 B3 repair).
+- **NOT a hardware-timestamped measurement.** No arm uses
+  `SO_TIMESTAMPING` (kernel) or `tx_timestamp` dynfield (DPDK).
+  Cross-host clock skew is bounded by NTP (~100 µs same-AZ); any
+  cross-host timestamp delta below ~100 µs is dominated by skew.
+  RX-segment latency uses an inline DUT-side TSC capture only.
+- **NOT statistically saturated.** Codex review I3 flagged the
+  publication-grade T57 as effectively one run per cell with p50
+  only. T58 (variance probe) ran 3 repeats. Confidence intervals,
+  p99/p999 in the headline, and randomized stack order (codex I4,
+  now in `scripts/fast-iter-suite.sh --seed N`) are post-codex
+  follow-ups; the published T57 numbers should be read as a
+  single-shot snapshot, not a statistically saturated mean.
+
 ## Metrics — bench-tx-burst per-arm labels
 
 `bench-tx-burst` emits one primary throughput metric per arm, with the
@@ -33,10 +109,12 @@ same handoff-boundary `t_first_wire` / `t1` capture semantics — see
 
 ### History
 
-- **Phase 1 (legacy `bench-vs-mtcp`):** `throughput_per_burst_bps` emitted
-  on every arm. Mismatched: linux/fstack figures (8–78 Gbps) far exceeded
-  ENA line rate because the label claimed wire-rate but the actual
-  measurement was the application-to-kernel buffer accept rate.
+- **Phase 1 (legacy `bench-vs-mtcp` — historical; the mTCP comparator
+  arm was removed in Phase 2 of the bench-overhaul, see plan Task 2.1):**
+  `throughput_per_burst_bps` emitted on every arm. Mismatched:
+  linux/fstack figures (8–78 Gbps) far exceeded ENA line rate because
+  the label claimed wire-rate but the actual measurement was the
+  application-to-kernel buffer accept rate.
 - **Phase 2 (T57 follow-up #2, 2026-05-12):** linux + fstack rows renamed
   to `write_acceptance_rate_bps`; dpdk_net kept `throughput_per_burst_bps`
   under the (mistaken) framing that `rte_eth_tx_burst`-return was a
