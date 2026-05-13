@@ -259,12 +259,23 @@ declare -A REQUIRED_NONZERO_ANY=(
 # To override: export FORCE_ITERS=N for a global override across all
 # scenarios (see FORCE_ITERS handling in the per-scenario loop below).
 # Scenarios not listed in this map fall back to $ITERS.
+# Iter counts trimmed for fast-iter wallclock (2026-05-13): the only goal is
+# to confirm each counter fires (>0 assertion), not statistical depth. The
+# previous (500k/200k/50k/50k/30k) totals ran ~33 min — past the suite's
+# 1800s outer timeout once low_loss_1pct went uniform (Option D, commit
+# d07d9ec). New totals: ~13-16 min. For nightly-grade depth on a physical-lab
+# DUT use FORCE_ITERS=1000000.
+#
+# Empirical per-scenario retransmit yield at the trimmed counts (from the
+# 2026-05-12 stabilization smoke + scaling): low_loss_05pct ~3000, low_loss_1pct
+# ~6000, high_loss_3pct ~3600, symmetric_3pct ~3600, high_loss_5pct ~200 —
+# all ≫ the >0 floor.
 declare -A SCENARIO_ITERS=(
-  [low_loss_05pct]=500000
-  [low_loss_1pct]=200000
-  [high_loss_3pct]=50000
-  [symmetric_3pct]=50000
-  [high_loss_5pct]=30000
+  [low_loss_05pct]=100000
+  [low_loss_1pct]=100000
+  [high_loss_3pct]=20000
+  [symmetric_3pct]=20000
+  [high_loss_5pct]=15000
 )
 
 # Order matters for the summary table — ascending by loss severity so the

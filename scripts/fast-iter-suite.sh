@@ -828,10 +828,12 @@ run_verify_rack_tlp() {
     local artifacts="$RESULTS_DIR/verify-rack-tlp"
     mkdir -p "$artifacts"
 
-    # verify-rack-tlp runs 5 netem scenarios sequentially; allow up to 30 min
-    # before SIGKILL. Override via VERIFY_RACK_TLP_TIMEOUT env if needed.
+    # verify-rack-tlp runs 5 netem scenarios sequentially. Post-2026-05-13
+    # iter trim the 5 scenarios total ~13-16 min; allow 35 min before SIGKILL
+    # to leave generous slack (RTO-bound scenarios have wide per-run spread).
+    # Override via VERIFY_RACK_TLP_TIMEOUT env if needed.
     local prev_timeout="$RUN_ONE_TIMEOUT"
-    RUN_ONE_TIMEOUT="${VERIFY_RACK_TLP_TIMEOUT:-1800}"
+    RUN_ONE_TIMEOUT="${VERIFY_RACK_TLP_TIMEOUT:-2100}"
     run_one "verify-rack-tlp" \
         "$artifacts/verify-rack-tlp.log" \
         env \
