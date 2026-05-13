@@ -34,32 +34,68 @@ pub enum L3Drop {
 /// transitions so the result is bit-for-bit identical to folding a single
 /// concatenated buffer. A6.5 §7.6: callers pre-build pseudo-headers as
 /// stack arrays and pass `&[&pseudo, tcp_hdr, payload]` without allocating.
+///
+/// PO3 optimization: when no carry is pending at chunk start (the common
+/// case — only chunks following an odd-length predecessor see a pending
+/// carry), the chunk body is folded 4 bytes per iteration via
+/// `chunks_exact(4)` (two 16-bit BE words per group), bounds-check-free.
+/// The carry-pending branch keeps the original 2-byte loop unchanged so
+/// chunk-boundary semantics are byte-identical to the pre-PO3 fold. `sum`
+/// is widened to `u64` so accumulation cannot overflow for any input size;
+/// the final end-around-carry fold works unchanged on a u64.
 pub fn internet_checksum(chunks: &[&[u8]]) -> u16 {
-    let mut sum: u32 = 0;
+    let mut sum: u64 = 0;
     let mut carry: Option<u8> = None;
     for chunk in chunks {
-        let mut i = 0usize;
-        // Handle a carry-over odd byte from the previous chunk by pairing
-        // it with the first byte of this chunk, if any.
+        // Carry-pending branch: pair the leftover byte with chunk[0], then
+        // fall through to the 2-byte loop for the rest of THIS chunk so
+        // the boundary semantics are bit-identical to the original fold.
         if let Some(high) = carry.take() {
+            let mut i: usize;
             if let Some(&low) = chunk.first() {
-                sum = sum.wrapping_add(u16::from_be_bytes([high, low]) as u32);
+                sum = sum.wrapping_add(u16::from_be_bytes([high, low]) as u64);
                 i = 1;
             } else {
                 carry = Some(high);
                 continue;
             }
+            while i + 1 < chunk.len() {
+                sum = sum.wrapping_add(u16::from_be_bytes([chunk[i], chunk[i + 1]]) as u64);
+                i += 2;
+            }
+            if i < chunk.len() {
+                carry = Some(chunk[i]);
+            }
+            continue;
         }
-        while i + 1 < chunk.len() {
-            sum = sum.wrapping_add(u16::from_be_bytes([chunk[i], chunk[i + 1]]) as u32);
-            i += 2;
+        // Fast path: no pending carry, so chunk starts on the same parity
+        // as a single concatenated buffer would. Fold the bulk 4 bytes at
+        // a time via chunks_exact(4) — each iteration adds two 16-bit BE
+        // words to `sum`, bounds-check-free since the iterator promises
+        // exactly 4 bytes per group. After the bulk, handle the
+        // 0/1/2/3-byte tail.
+        let mut iter = chunk.chunks_exact(4);
+        for group in &mut iter {
+            let w0 = u16::from_be_bytes([group[0], group[1]]) as u64;
+            let w1 = u16::from_be_bytes([group[2], group[3]]) as u64;
+            sum = sum.wrapping_add(w0).wrapping_add(w1);
         }
-        if i < chunk.len() {
-            carry = Some(chunk[i]);
+        let tail = iter.remainder();
+        match tail.len() {
+            0 => {}
+            1 => carry = Some(tail[0]),
+            2 => {
+                sum = sum.wrapping_add(u16::from_be_bytes([tail[0], tail[1]]) as u64);
+            }
+            3 => {
+                sum = sum.wrapping_add(u16::from_be_bytes([tail[0], tail[1]]) as u64);
+                carry = Some(tail[2]);
+            }
+            _ => unreachable!("chunks_exact(4) remainder is at most 3 bytes"),
         }
     }
     if let Some(tail) = carry {
-        sum = sum.wrapping_add((tail as u32) << 8);
+        sum = sum.wrapping_add((tail as u64) << 8);
     }
     while sum >> 16 != 0 {
         sum = (sum & 0xffff) + (sum >> 16);
@@ -434,5 +470,240 @@ mod tests {
             classify_l4_rx_cksum(RTE_MBUF_F_RX_L4_CKSUM_NONE),
             CksumOutcome::None
         );
+    }
+
+    // ------------------------------------------------------------------
+    // PO3 — `internet_checksum` 4-byte fold optimization safety net.
+    //
+    // `internet_checksum_ref` is a verbatim copy of the pre-PO3
+    // byte-pair-by-byte fold (matches the reference in
+    // tests/checksum_streaming_equiv.rs but is kept here as a private
+    // oracle so the unit-test module is self-contained). The property
+    // test below feeds the production and reference functions identical
+    // randomized inputs and asserts equal u16 output. If the optimized
+    // fold ever diverges from the reference on ANY chunk-list/byte
+    // pattern, this test fails before commit.
+    // ------------------------------------------------------------------
+
+    /// Reference fold: pre-PO3 byte-pair-by-byte algorithm. Kept here as
+    /// the safety-net oracle for the 4-byte fast path.
+    #[cfg(test)]
+    fn internet_checksum_ref(chunks: &[&[u8]]) -> u16 {
+        let mut sum: u32 = 0;
+        let mut carry: Option<u8> = None;
+        for chunk in chunks {
+            let mut i = 0usize;
+            if let Some(high) = carry.take() {
+                if let Some(&low) = chunk.first() {
+                    sum = sum.wrapping_add(u16::from_be_bytes([high, low]) as u32);
+                    i = 1;
+                } else {
+                    carry = Some(high);
+                    continue;
+                }
+            }
+            while i + 1 < chunk.len() {
+                sum = sum.wrapping_add(u16::from_be_bytes([chunk[i], chunk[i + 1]]) as u32);
+                i += 2;
+            }
+            if i < chunk.len() {
+                carry = Some(chunk[i]);
+            }
+        }
+        if let Some(tail) = carry {
+            sum = sum.wrapping_add((tail as u32) << 8);
+        }
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        !(sum as u16)
+    }
+
+    #[cfg_attr(miri, ignore = "long property test; oracle algorithm")]
+    #[test]
+    fn po3_edge_cases_empty_list() {
+        // Empty chunks list: no bytes, sum=0, fold no-op, complement = 0xffff.
+        assert_eq!(internet_checksum(&[]), 0xffff);
+        assert_eq!(internet_checksum(&[]), internet_checksum_ref(&[]));
+    }
+
+    #[cfg_attr(miri, ignore = "long property test; oracle algorithm")]
+    #[test]
+    fn po3_edge_cases_empty_chunks() {
+        // List with only empty chunks must be a no-op.
+        assert_eq!(internet_checksum(&[&[]]), 0xffff);
+        assert_eq!(internet_checksum(&[&[], &[], &[]]), 0xffff);
+        assert_eq!(internet_checksum(&[&[], &[1, 2, 3], &[]]), internet_checksum_ref(&[&[], &[1, 2, 3], &[]]));
+    }
+
+    #[cfg_attr(miri, ignore = "long property test; oracle algorithm")]
+    #[test]
+    fn po3_edge_cases_single_byte() {
+        // Single odd byte: contributes as 0xAB00, fold, complement.
+        for b in [0x00u8, 0x01, 0x7f, 0x80, 0xab, 0xff] {
+            let cs_opt = internet_checksum(&[&[b]]);
+            let cs_ref = internet_checksum_ref(&[&[b]]);
+            assert_eq!(cs_opt, cs_ref, "single byte 0x{:02x}", b);
+        }
+    }
+
+    #[cfg_attr(miri, ignore = "long property test; oracle algorithm")]
+    #[test]
+    fn po3_edge_cases_small_chunk_sizes() {
+        // Hand-picked: 1/2/3/4/5/6/7/8-byte chunks — exercises every
+        // chunks_exact(4) remainder length (0/1/2/3) and the head
+        // 4-byte group boundary.
+        let patterns: [&[u8]; 9] = [
+            &[],
+            &[0xde],
+            &[0xde, 0xad],
+            &[0xde, 0xad, 0xbe],
+            &[0xde, 0xad, 0xbe, 0xef],
+            &[0xde, 0xad, 0xbe, 0xef, 0xfe],
+            &[0xde, 0xad, 0xbe, 0xef, 0xfe, 0xed],
+            &[0xde, 0xad, 0xbe, 0xef, 0xfe, 0xed, 0xfa],
+            &[0xde, 0xad, 0xbe, 0xef, 0xfe, 0xed, 0xfa, 0xce],
+        ];
+        for p in patterns {
+            assert_eq!(
+                internet_checksum(&[p]),
+                internet_checksum_ref(&[p]),
+                "len {}",
+                p.len()
+            );
+        }
+    }
+
+    #[cfg_attr(miri, ignore = "long property test; oracle algorithm")]
+    #[test]
+    fn po3_edge_cases_odd_then_even_boundary() {
+        // CRITICAL boundary case: odd-length chunk followed by another
+        // chunk — the carry byte from chunk 1 pairs with chunk 2's first
+        // byte. This is the path that bypasses the 4-byte fast path
+        // because `carry` is pending at chunk 2's start.
+        let c1: &[u8] = &[0xa1]; // 1 byte → leaves carry
+        let c2: &[u8] = &[0xb2, 0xc3, 0xd4, 0xe5]; // 4 bytes
+        assert_eq!(
+            internet_checksum(&[c1, c2]),
+            internet_checksum_ref(&[c1, c2])
+        );
+        // Carry pairs with c2[0] = 0xb2 → 0xa1b2, then 2-byte loop folds
+        // c2[1..3] = (0xc3,0xd4), and c2[4]=0xe5 leaves a new carry.
+        let c3: &[u8] = &[0xb2, 0xc3, 0xd4, 0xe5, 0xf6]; // 5 bytes
+        assert_eq!(
+            internet_checksum(&[c1, c3]),
+            internet_checksum_ref(&[c1, c3])
+        );
+        // Chain of three odd-length chunks.
+        let a: &[u8] = &[0x11];
+        let b: &[u8] = &[0x22, 0x33, 0x44];
+        let c: &[u8] = &[0x55, 0x66, 0x77, 0x88, 0x99];
+        assert_eq!(
+            internet_checksum(&[a, b, c]),
+            internet_checksum_ref(&[a, b, c])
+        );
+    }
+
+    #[cfg_attr(miri, ignore = "long property test; oracle algorithm")]
+    #[test]
+    fn po3_edge_cases_three_byte_chunk_pairs() {
+        // 3-byte chunks: chunks_exact(4) yields zero groups, remainder=3
+        // → the `3` arm of the tail match runs.
+        let c: &[u8] = &[0xaa, 0xbb, 0xcc];
+        assert_eq!(internet_checksum(&[c]), internet_checksum_ref(&[c]));
+        // 3+3=6 bytes: first chunk leaves carry, second chunk starts
+        // with carry-pending so it takes the 2-byte path.
+        let d: &[u8] = &[0x11, 0x22, 0x33];
+        let e: &[u8] = &[0x44, 0x55, 0x66];
+        assert_eq!(
+            internet_checksum(&[d, e]),
+            internet_checksum_ref(&[d, e])
+        );
+    }
+
+    /// Deterministic xorshift64* PRNG — no external dependency.
+    /// Stream state lives in the closure caller.
+    #[inline]
+    fn xorshift64star_next(state: &mut u64) -> u64 {
+        let mut x = *state;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        *state = x;
+        x.wrapping_mul(0x2545F4914F6CDD1D)
+    }
+
+    #[cfg_attr(miri, ignore = "long property test")]
+    #[test]
+    fn po3_property_random_chunks_match_reference() {
+        // 5000 random configurations: 1-5 chunks, each 0-200 bytes,
+        // random byte content. Assert optimized == reference for every
+        // configuration.
+        let mut rng: u64 = 0xdeadbeefcafef00d;
+        for iter in 0..5000 {
+            let r = xorshift64star_next(&mut rng);
+            let n_chunks = ((r & 0x7) % 5) as usize + 1; // 1..=5
+            let mut bufs: Vec<Vec<u8>> = Vec::with_capacity(n_chunks);
+            for _ in 0..n_chunks {
+                let r2 = xorshift64star_next(&mut rng);
+                let len = (r2 % 201) as usize; // 0..=200
+                let mut buf = Vec::with_capacity(len);
+                for _ in 0..len {
+                    let rb = xorshift64star_next(&mut rng);
+                    buf.push(rb as u8);
+                }
+                bufs.push(buf);
+            }
+            let slices: Vec<&[u8]> = bufs.iter().map(|v| v.as_slice()).collect();
+            let opt = internet_checksum(&slices);
+            let reference = internet_checksum_ref(&slices);
+            assert_eq!(
+                opt, reference,
+                "iter {} diverged: chunks={:?}",
+                iter,
+                bufs.iter().map(|v| v.len()).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[cfg_attr(miri, ignore = "long property test")]
+    #[test]
+    fn po3_property_random_includes_carry_boundaries() {
+        // Targeted: force odd-length first chunks so the carry-pending
+        // boundary path is exercised heavily. 5000 iters.
+        let mut rng: u64 = 0x0123456789abcdef;
+        for iter in 0..5000 {
+            let r = xorshift64star_next(&mut rng);
+            let n_chunks = ((r & 0x7) % 4) as usize + 2; // 2..=5
+            let mut bufs: Vec<Vec<u8>> = Vec::with_capacity(n_chunks);
+            for idx in 0..n_chunks {
+                let r2 = xorshift64star_next(&mut rng);
+                // Make ALL chunks odd-length so every transition is a
+                // carry-pending boundary. Mix in occasional 0-length.
+                let force_zero = (r2 & 0xff) < 16;
+                let len = if force_zero {
+                    0
+                } else {
+                    let raw = (r2 % 100) as usize;
+                    raw * 2 + 1 // always odd
+                };
+                let _ = idx;
+                let mut buf = Vec::with_capacity(len);
+                for _ in 0..len {
+                    let rb = xorshift64star_next(&mut rng);
+                    buf.push(rb as u8);
+                }
+                bufs.push(buf);
+            }
+            let slices: Vec<&[u8]> = bufs.iter().map(|v| v.as_slice()).collect();
+            let opt = internet_checksum(&slices);
+            let reference = internet_checksum_ref(&slices);
+            assert_eq!(
+                opt, reference,
+                "carry-iter {} diverged: chunks={:?}",
+                iter,
+                bufs.iter().map(|v| v.len()).collect::<Vec<_>>()
+            );
+        }
     }
 }
