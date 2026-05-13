@@ -6479,6 +6479,23 @@ impl Engine {
             // `bulk_n` is non-null and ready for use.
             let m = mbufs[segments_consumed];
             segments_consumed += 1;
+            // PO10 codex defense-in-depth (C1): `shim_rte_pktmbuf_append`
+            // takes a u16; the nominal MSS-bounded path is well under
+            // u16::MAX (max ~1554 vs 65535) so this guard never fires in
+            // practice. But the cast was the only thing preventing a
+            // pathological mss_cap from silently truncating to a wrong
+            // data_len and producing a corrupted on-wire frame. Free THIS
+            // mbuf + the unconsumed tail and break with `tx_drop_nomem`
+            // (matches the catastrophic-shape pattern used by the
+            // append-null and size-drift branches below).
+            if actual_n > u16::MAX as usize {
+                unsafe { sys::shim_rte_pktmbuf_free(m) };
+                for &leftover in &mbufs[segments_consumed..bulk_n] {
+                    unsafe { sys::shim_rte_pktmbuf_free(leftover) };
+                }
+                inc(&self.counters.eth.tx_drop_nomem);
+                break;
+            }
             let dst = unsafe { sys::shim_rte_pktmbuf_append(m, actual_n as u16) };
             if dst.is_null() {
                 // append-fail on a freshly-allocated mbuf "shouldn't
@@ -6525,15 +6542,22 @@ impl Engine {
                     build_segment(&seg, mbuf_data)
                 };
                 let Some(n) = n_opt else {
-                    // PO10: `actual_n` is sized EXACTLY to what
-                    // `build_segment_inner` writes (it checks
-                    // `out.len() < total_written` and we passed
-                    // `total_written` bytes), so this branch is
-                    // unreachable in practice. Treat as the same
-                    // catastrophic-shape failure as the append-null
-                    // case above: free THIS mbuf and the unconsumed
-                    // tail before breaking. The mbuf was already
-                    // appended to (data_len > 0) but
+                    // PO10 codex defense-in-depth (M1): this None branch
+                    // is unreachable GIVEN `build_segment_inner`'s
+                    // current contract (it checks `out.len() <
+                    // total_written` and we pass exactly `total_written`
+                    // bytes, so it returns `Some(total_written)` =
+                    // `Some(actual_n)`). Kept for defense-in-depth — if
+                    // a future `build_segment` refactor introduces a new
+                    // None path, this branch frees the allocated mbuf
+                    // correctly. The runtime `n != actual_n` size-drift
+                    // check below provides a similar guard against the
+                    // mismatched-Some case.
+                    //
+                    // Treat as the same catastrophic-shape failure as
+                    // the append-null case above: free THIS mbuf and the
+                    // unconsumed tail before breaking. The mbuf was
+                    // already appended to (data_len > 0) but
                     // `shim_rte_pktmbuf_free` reclaims the whole mbuf
                     // (data + metadata) regardless of data_len.
                     unsafe { sys::shim_rte_pktmbuf_free(m) };
@@ -6543,10 +6567,29 @@ impl Engine {
                     inc(&self.counters.eth.tx_drop_nomem);
                     break;
                 };
-                debug_assert_eq!(
-                    n, actual_n,
-                    "build_segment wrote {n} bytes into mbuf appended for {actual_n}"
-                );
+                // PO10 codex defense-in-depth (C2): the previous
+                // `debug_assert_eq!` was compiled out in release. If
+                // `build_segment_inner` ever returned `Some(n)` with
+                // `n != actual_n` (impossible per its current contract:
+                // it returns `Some(total_written)` where `total_written`
+                // is the exact value we used to size `actual_n`), the
+                // mbuf would carry `actual_n` bytes of `data_len` but
+                // only `n` bytes of written frame — trailing garbage on
+                // the wire. Lock in the invariant with a runtime check.
+                // Same free-and-break shape as the None branch above and
+                // the append-null path.
+                if n != actual_n {
+                    unsafe { sys::shim_rte_pktmbuf_free(m) };
+                    for &leftover in &mbufs[segments_consumed..bulk_n] {
+                        unsafe { sys::shim_rte_pktmbuf_free(leftover) };
+                    }
+                    // No dedicated "build_size_drift" counter exists; the
+                    // other abnormal-exit paths in this loop all bump
+                    // `tx_drop_nomem`, so we mirror that. A dedicated
+                    // counter is unjustified for an unreachable branch.
+                    inc(&self.counters.eth.tx_drop_nomem);
+                    break;
+                }
                 n
             };
             // A-HW Task 7: apply TX offload metadata + pseudo-header-only
