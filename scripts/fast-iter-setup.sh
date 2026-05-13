@@ -228,6 +228,14 @@ nb_vdev=0
 nb_bond=0
 # PCI device: data NIC bound to vfio-pci (auto-detected on this DUT).
 allow=$pci
+# Drain TX burst queue every main-loop iteration (0 = no batch-delay window).
+# F-Stack's BURST_TX_DRAIN_US default of 100us causes per-iter RTT
+# workloads (1 outgoing pkt per iter, never reaching MAX_PKT_BURST=32)
+# to sit in the TX queue up to a full drain interval, manifesting as
+# a bimodal 200us/300us bench-rtt distribution depending on the
+# (random) phase between user-space send and the next drain tick.
+# See docs/bench-reports/fstack-bimodality-investigation-2026-05-13.md.
+pkt_tx_delay=0
 
 [port0]
 addr=$ip

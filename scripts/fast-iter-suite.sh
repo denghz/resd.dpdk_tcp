@@ -598,6 +598,12 @@ preflight() {
 run_bench_rtt() {
     log "=== bench-rtt — RTT (payload sweep 64,128,256,1024) ==="
 
+    # --raw-samples-csv: emits one row per iteration (bucket_id, iter_idx,
+    # rtt_ns) so write_summary can compute p99/p999 + decile signatures
+    # from the underlying distribution rather than relying on the per-CSV
+    # p50/p99/mean aggregates alone. Surfaced for T58 follow-up: fstack
+    # 128B/1024B showed run-to-run bimodality that p50-only summaries
+    # hid. See docs/bench-reports/fstack-bimodality-investigation-*.md.
     run_one "bench-rtt dpdk_net" \
         "$RESULTS_DIR/bench-rtt-dpdk_net.csv" \
         sudo -E env "PATH=$PATH" PEER_IP="$PEER_IP" \
@@ -613,6 +619,7 @@ run_bench_rtt() {
                 --feature-set dpdk_net \
                 --precondition-mode lenient \
                 --output-csv "$RESULTS_DIR/bench-rtt-dpdk_net.csv" \
+                --raw-samples-csv "$RESULTS_DIR/bench-rtt-dpdk_net-raw.csv" \
                 --payload-bytes-sweep 64,128,256,1024 \
                 --iterations 10000 --warmup 100
     reset_dpdk_state
@@ -628,6 +635,7 @@ run_bench_rtt() {
             --feature-set linux_kernel \
             --precondition-mode lenient \
             --output-csv "$RESULTS_DIR/bench-rtt-linux_kernel.csv" \
+            --raw-samples-csv "$RESULTS_DIR/bench-rtt-linux_kernel-raw.csv" \
             --payload-bytes-sweep 64,128,256,1024 \
             --iterations 10000 --warmup 100
 
@@ -647,6 +655,7 @@ run_bench_rtt() {
                 --feature-set fstack \
                 --precondition-mode lenient \
                 --output-csv "$RESULTS_DIR/bench-rtt-fstack.csv" \
+                --raw-samples-csv "$RESULTS_DIR/bench-rtt-fstack-raw.csv" \
                 --payload-bytes-sweep 64,128,256,1024 \
                 --iterations 10000 --warmup 100
     reset_dpdk_state
@@ -981,6 +990,92 @@ for metric in metrics:
 PY
 }
 
+# summarize_rtt_with_raw: bench-rtt-specific summarizer that consumes BOTH
+# the aggregate summary CSV (for metric labels / order) AND the raw-sample
+# sidecar (for p50/p99/p999/mean recomputed from the underlying samples).
+# The aggregate CSV only carries p50/p99/mean from emit_csv, so p999
+# requires the raw sidecar. Falls back to summarize_one_csv if no raw
+# CSV is present (e.g. older runs or a missing sidecar).
+summarize_rtt_with_raw() {
+    local summary_csv="$1"
+    local raw_csv="$2"
+    if [ ! -s "$raw_csv" ]; then
+        summarize_one_csv "$summary_csv"
+        return
+    fi
+    python3 - "$raw_csv" <<'PY' 2>&1 || true
+import csv, statistics, sys
+from collections import defaultdict
+path = sys.argv[1]
+try:
+    by_bucket = defaultdict(list)
+    with open(path) as f:
+        for r in csv.DictReader(f):
+            bid = r.get("bucket_id", "")
+            try:
+                by_bucket[bid].append(float(r["rtt_ns"]))
+            except (KeyError, ValueError):
+                continue
+except Exception as e:
+    print(f"_(error reading raw CSV: {e})_")
+    sys.exit(0)
+if not by_bucket:
+    print("_(raw CSV had no rows)_")
+    sys.exit(0)
+
+def pct(sorted_xs, p):
+    if not sorted_xs:
+        return float("nan")
+    n = len(sorted_xs)
+    # Nearest-rank percentile, matching bench_common's typical convention.
+    idx = max(0, min(n - 1, int(round(p * (n - 1)))))
+    return sorted_xs[idx]
+
+# Each bucket_id is "payload_<bytes>" — strip the prefix for display.
+def bid_label(bid):
+    if bid.startswith("payload_"):
+        return bid[len("payload_"):]
+    return bid
+
+print("**metric: `rtt_ns`** (ns, recomputed from raw samples)")
+print()
+hdr = ["payload_bytes", "n", "p50", "p99", "p999", "mean"]
+print("| " + " | ".join(hdr) + " |")
+print("|" + "|".join(["---"] * len(hdr)) + "|")
+# Sort numerically by payload size so the table reads 64,128,256,1024.
+def sort_key(bid):
+    try:
+        return int(bid_label(bid))
+    except ValueError:
+        return 1 << 62
+for bid in sorted(by_bucket.keys(), key=sort_key):
+    xs = sorted(by_bucket[bid])
+    n = len(xs)
+    p50 = pct(xs, 0.50)
+    p99 = pct(xs, 0.99)
+    p999 = pct(xs, 0.999)
+    mean = statistics.fmean(xs) if xs else float("nan")
+    print(f"| {bid_label(bid)} | {n} | {p50:.0f} | {p99:.0f} | {p999:.0f} | {mean:.0f} |")
+print()
+
+# Decile signature — exposes bimodality. A single jump between two
+# adjacent deciles (e.g. d4=200µs, d5=300µs) signals a bimodal
+# distribution; a smooth march signals unimodal.
+print("**deciles (d1..d9, ns) — for bimodality screening**")
+print()
+hdr2 = ["payload_bytes", "d1", "d2", "d3", "d4", "d5", "d6", "d7", "d8", "d9"]
+print("| " + " | ".join(hdr2) + " |")
+print("|" + "|".join(["---"] * len(hdr2)) + "|")
+for bid in sorted(by_bucket.keys(), key=sort_key):
+    xs = sorted(by_bucket[bid])
+    cells = [bid_label(bid)]
+    for d in range(1, 10):
+        cells.append(f"{pct(xs, d / 10.0):.0f}")
+    print("| " + " | ".join(cells) + " |")
+print()
+PY
+}
+
 write_summary() {
     local summary="$RESULTS_DIR/SUMMARY.md"
     {
@@ -1035,7 +1130,13 @@ write_summary() {
         printf '> constraint, not a multi-conn comparison.\n\n'
         for stack in dpdk_net linux_kernel fstack; do
             printf '### %s\n\n' "$stack"
-            summarize_one_csv "$RESULTS_DIR/bench-rtt-$stack.csv"
+            # T58 follow-up: use raw-sample sidecar for p50/p99/p999/mean +
+            # decile signature (exposes the fstack 128B/1024B bimodality
+            # the aggregate-only summary hid). Falls back to the aggregate
+            # CSV pivot if the raw sidecar is absent.
+            summarize_rtt_with_raw \
+                "$RESULTS_DIR/bench-rtt-$stack.csv" \
+                "$RESULTS_DIR/bench-rtt-$stack-raw.csv"
             printf '\n'
         done
 
