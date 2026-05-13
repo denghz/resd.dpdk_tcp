@@ -19,11 +19,15 @@ Per-cell computations:
   Pooled tail percentiles (p50 / p99 / p999):
     For bench-rtt, the per-run `*-raw.csv` sidecar carries one row per
     iteration (bucket_id, iter_idx, rtt_ns). Pool ALL raw samples across
-    all N runs and compute p50 / p99 / p999 on the pooled distribution.
+    all N runs and compute p50 / p99 / p999 on the pooled distribution
+    (nearest-rank, matching bench_common's emit_csv convention).
     For tools without a raw sidecar (bench-tx-burst / bench-tx-maxtp /
-    bench-rx-burst), fall back to averaging the per-run aggregate's p50 /
-    p99 (the suite does not emit p999 in the aggregate CSV for those
-    tools).
+    bench-rx-burst), fall back to averaging the per-run aggregate's
+    `p50` / `p99` / `p999` rows — bench_common's emit_csv DOES emit a
+    p999 aggregation row for all metrics, so the column does populate
+    for those tools too, but the value is a per-run-averaged percentile
+    (less robust at the extreme tail than the pooled-raw approach used
+    for bench-rtt).
 
   Per-cell CV across runs:
     100 * stdev(per_run_means) / mean(per_run_means). Computed from the
@@ -459,6 +463,7 @@ def aggregate(
             per_run_means: List[float] = []
             per_run_p50s: List[float] = []
             per_run_p99s: List[float] = []
+            per_run_p999s: List[float] = []
             for run_agg in per_run_aggs:
                 aggs = run_agg.get(key, {})
                 m_val = aggs.get("mean")
@@ -470,6 +475,12 @@ def aggregate(
                 p99_val = aggs.get("p99")
                 if p99_val is not None and math.isfinite(p99_val):
                     per_run_p99s.append(p99_val)
+                # p999 is emitted in the aggregate CSV by every tool that goes
+                # through bench_common's emit_csv (which is all four bench
+                # tools). Capture it so non-RTT tools also surface a tail.
+                p999_val = aggs.get("p999")
+                if p999_val is not None and math.isfinite(p999_val):
+                    per_run_p999s.append(p999_val)
 
             n_runs = len(per_run_means)
 
@@ -479,15 +490,19 @@ def aggregate(
             )
             cv = cv_percent(per_run_means)
 
-            # Tail percentiles.
-            p_source = "per_run_p50_mean"
+            # Tail percentiles — default = averaged per-run aggregate rows.
+            # Overridden below for bench-rtt where we pool raw samples
+            # (10 000 samples / payload / run, ~50 000 pooled at N=5).
+            p_source = "per_run_aggregate_mean"
             p50_v = (
                 statistics.fmean(per_run_p50s) if per_run_p50s else float("nan")
             )
             p99_v = (
                 statistics.fmean(per_run_p99s) if per_run_p99s else float("nan")
             )
-            p999_v = float("nan")
+            p999_v = (
+                statistics.fmean(per_run_p999s) if per_run_p999s else float("nan")
+            )
 
             if tool == "bench-rtt":
                 # Pool raw samples for the matching payload_bytes dim across
@@ -649,13 +664,15 @@ def render_markdown(agg: Dict[str, Any]) -> str:
         "per-run means."
     )
     out.append(
-        "- Per-cell p50 / p99 / p999 (bench-rtt only): pooled across all "
-        "raw-sample sidecars, nearest-rank percentile."
+        "- Per-cell p50 / p99 / p999 (bench-rtt): pooled across all "
+        "raw-sample sidecars, nearest-rank percentile (the publication-grade "
+        "tail estimate; ~50 000 samples at N=5)."
     )
     out.append(
-        "- Per-cell p50 / p99 (other tools): mean of per-run aggregate "
-        "p50 / p99 rows (the suite does not emit p999 in the aggregate "
-        "CSV for non-RTT tools)."
+        "- Per-cell p50 / p99 / p999 (other tools): mean of per-run aggregate "
+        "p50 / p99 / p999 rows. bench_common's emit_csv emits a p999 row for "
+        "all metrics, but averaging per-run p999 is a less-robust tail "
+        "estimator than the pooled-raw approach used for bench-rtt."
     )
     out.append(
         "- Per-cell CV: 100 × stdev(per-run means) / mean(per-run means)."
