@@ -1026,16 +1026,21 @@ mod tests {
     }
 
     #[test]
-    fn parse_ts_sack_fast_path_byte_identical_to_general_loop_for_n1_n2_n3() {
+    fn parse_ts_sack_fast_path_round_trips_for_n1_n2_n3_and_general_loop_match_for_n1_n2() {
         // Exhaustive cross-check: for each N ∈ {1, 2, 3}, build the
         // canonical TS+SACK buffer via the encoder (which uses the well-
-        // tested encode loop), and verify both:
-        //   (a) parse_options output equals the original TcpOpts (fast-path
-        //       round-trips through encoder), AND
-        //   (b) parse_options output equals what the general loop would
-        //       produce on a buffer with the same contents but a trailing
-        //       OPT_END byte that disqualifies the length-based fast-path
-        //       match — proving fast-path and general loop agree.
+        // tested encode loop), and verify:
+        //   (a) parse_options output equals the original TcpOpts for all
+        //       three N values (fast-path round-trips through encoder).
+        //   (b) For N ∈ {1, 2} (where the 40-byte budget has room for a
+        //       trailing OPT_END), parse_options output also equals what
+        //       the general loop produces on a buffer with the same
+        //       contents plus an OPT_END byte that disqualifies the
+        //       length-based fast-path match — proving fast-path and
+        //       general loop agree byte-for-byte on the decoded TcpOpts.
+        //   (c) For N=3 the 40-byte budget is full so leg (b) is skipped;
+        //       (a)'s round-trip through the encoder remains the proof of
+        //       correctness for that case.
         for n in 1usize..=3 {
             let mut built = TcpOpts {
                 timestamps: Some((0xABCD_EF01u32 ^ (n as u32), 0x1234_5678 ^ (n as u32))),
