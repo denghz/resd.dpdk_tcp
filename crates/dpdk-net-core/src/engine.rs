@@ -2892,7 +2892,7 @@ impl Engine {
     /// (`tcp.tx_syn`) and state stashing (`syn_tx_ts_ns`) so the two
     /// paths stay easy to tell apart.
     fn emit_syn_with_flags(&self, handle: ConnHandle, flags: u8, now_ns: u64) -> bool {
-        use crate::tcp_output::{build_segment, SegmentTx, TCP_ACK};
+        use crate::tcp_output::{build_segment, build_segment_offload, SegmentTx, TCP_ACK};
         let (tuple, iss, ack_val, our_mss, recv_buffer_bytes) = {
             let ft = self.flow_table.borrow();
             let Some(c) = ft.get(handle) else {
@@ -2923,7 +2923,16 @@ impl Engine {
             payload: &[],
         };
         let mut buf = [0u8; 128];
-        let Some(n) = build_segment(&seg, &mut buf) else {
+        // PO6: SYN/SYN-ACK is low-frequency but the branch is mechanical
+        // (same pattern as ACK emitter / send_bytes). Saves the SW full
+        // fold over the empty SYN payload + 4-byte MSS option on the
+        // offload-active path.
+        let n_opt = if self.tx_cksum_offload_active {
+            build_segment_offload(&seg, &mut buf)
+        } else {
+            build_segment(&seg, &mut buf)
+        };
+        let Some(n) = n_opt else {
             return false;
         };
         self.tx_tcp_frame(&buf[..n], &seg)
@@ -3703,7 +3712,7 @@ impl Engine {
         handle: ConnHandle,
         fired_id: crate::tcp_timer_wheel::TimerId,
     ) {
-        use crate::tcp_output::{build_segment, SegmentTx, TCP_ACK, TCP_PSH};
+        use crate::tcp_output::{build_segment, build_segment_offload, SegmentTx, TCP_ACK, TCP_PSH};
 
         // Phase 1: validate fired_id + snapshot TX fields.
         let snap = {
@@ -3779,7 +3788,16 @@ impl Engine {
             payload: &probe_payload,
         };
         let mut buf = [0u8; 160]; // 14+20+20+40 opts + 1 payload; 160 is safe
-        let Some(n) = build_segment(&seg, &mut buf) else { return };
+        // PO6: persist probe is rare but mechanical — mirror the offload
+        // branch from send_bytes / emit_ack. tx_tcp_frame's
+        // tx_offload_finalize call rewrites the cksum fields to the same
+        // final wire bytes either way.
+        let n_opt = if self.tx_cksum_offload_active {
+            build_segment_offload(&seg, &mut buf)
+        } else {
+            build_segment(&seg, &mut buf)
+        };
+        let Some(n) = n_opt else { return };
         let sent = self.tx_tcp_frame(&buf[..n], &seg);
         if sent {
             crate::counters::inc(&self.counters.tcp.tx_persist);
@@ -5549,7 +5567,7 @@ impl Engine {
     /// Engine (which requires EAL/DPDK).
     fn emit_ack(&self, handle: ConnHandle) {
         use crate::counters::{add, inc};
-        use crate::tcp_output::{build_segment, SegmentTx, TCP_ACK};
+        use crate::tcp_output::{build_segment, build_segment_offload, SegmentTx, TCP_ACK};
         let ft = self.flow_table.borrow();
         let Some(conn) = ft.get(handle) else {
             return;
@@ -5607,7 +5625,18 @@ impl Engine {
         // Sized to cover max TCP-options budget: 14 (eth) + 20 (ip) +
         // 20 (tcp min) + 40 (max tcp opts) = 94; round up to 128.
         let mut buf = [0u8; 128];
-        let Some(n) = build_segment(&seg, &mut buf) else {
+        // PO6: bare-ACK emitter fires on every received data segment.
+        // Mirror the PO4 send_bytes branch — skip the SW full TCP fold
+        // when offload is active; tx_offload_finalize inside
+        // tx_tcp_frame rewrites the cksum fields to the same final
+        // post-finalize bytes. Wire-equivalence verified by the
+        // `build_segment_offload_wire_equivalent_*` tests.
+        let n_opt = if self.tx_cksum_offload_active {
+            build_segment_offload(&seg, &mut buf)
+        } else {
+            build_segment(&seg, &mut buf)
+        };
+        let Some(n) = n_opt else {
             return;
         };
         if self.tx_tcp_frame(&buf[..n], &seg) {
@@ -5645,7 +5674,9 @@ impl Engine {
 
     fn emit_rst(&self, handle: ConnHandle, incoming: &crate::tcp_input::ParsedSegment) {
         use crate::counters::inc;
-        use crate::tcp_output::{build_segment, SegmentTx, TCP_ACK, TCP_RST};
+        use crate::tcp_output::{
+            build_segment, build_segment_offload, SegmentTx, TCP_ACK, TCP_RST,
+        };
         let ft = self.flow_table.borrow();
         let Some(conn) = ft.get(handle) else {
             return;
@@ -5667,7 +5698,13 @@ impl Engine {
             payload: &[],
         };
         let mut buf = [0u8; 64];
-        let Some(n) = build_segment(&seg, &mut buf) else {
+        // PO6: emit_rst branch mirrors send_bytes / emit_ack.
+        let n_opt = if self.tx_cksum_offload_active {
+            build_segment_offload(&seg, &mut buf)
+        } else {
+            build_segment(&seg, &mut buf)
+        };
+        let Some(n) = n_opt else {
             return;
         };
         drop(ft);
@@ -5684,7 +5721,7 @@ impl Engine {
         incoming: &crate::tcp_input::ParsedSegment,
     ) {
         use crate::counters::inc;
-        use crate::tcp_output::{build_segment, SegmentTx, TCP_RST};
+        use crate::tcp_output::{build_segment, build_segment_offload, SegmentTx, TCP_RST};
         let seg = SegmentTx {
             src_mac: self.our_mac,
             dst_mac: self.gateway_mac.get(),
@@ -5700,7 +5737,13 @@ impl Engine {
             payload: &[],
         };
         let mut buf = [0u8; 64];
-        let Some(n) = build_segment(&seg, &mut buf) else {
+        // PO6: emit_rst_for_syn_sent_bad_ack branch mirrors emit_rst.
+        let n_opt = if self.tx_cksum_offload_active {
+            build_segment_offload(&seg, &mut buf)
+        } else {
+            build_segment(&seg, &mut buf)
+        };
+        let Some(n) = n_opt else {
             return;
         };
         if self.tx_tcp_frame(&buf[..n], &seg) {
@@ -5713,7 +5756,9 @@ impl Engine {
     /// else seq=0, ack=incoming.seq+payload_len+SYN_FLAG+FIN_FLAG, flags=RST|ACK.
     fn send_rst_unmatched(&self, tuple: &FourTuple, incoming: &crate::tcp_input::ParsedSegment) {
         use crate::counters::inc;
-        use crate::tcp_output::{build_segment, SegmentTx, TCP_ACK, TCP_FIN, TCP_RST, TCP_SYN};
+        use crate::tcp_output::{
+            build_segment, build_segment_offload, SegmentTx, TCP_ACK, TCP_FIN, TCP_RST, TCP_SYN,
+        };
         if (incoming.flags & TCP_RST) != 0 {
             return; // don't RST a RST.
         }
@@ -5744,7 +5789,13 @@ impl Engine {
             payload: &[],
         };
         let mut buf = [0u8; 64];
-        let Some(n) = build_segment(&seg, &mut buf) else {
+        // PO6: send_rst_unmatched branch mirrors emit_rst.
+        let n_opt = if self.tx_cksum_offload_active {
+            build_segment_offload(&seg, &mut buf)
+        } else {
+            build_segment(&seg, &mut buf)
+        };
+        let Some(n) = n_opt else {
             return;
         };
         if self.tx_tcp_frame(&buf[..n], &seg) {
@@ -6590,7 +6641,9 @@ impl Engine {
 
     pub fn close_conn(&self, handle: ConnHandle) -> Result<(), Error> {
         use crate::counters::inc;
-        use crate::tcp_output::{build_segment, SegmentTx, TCP_ACK, TCP_FIN};
+        use crate::tcp_output::{
+            build_segment, build_segment_offload, SegmentTx, TCP_ACK, TCP_FIN,
+        };
 
         let (tuple, seq, rcv_nxt, state, free_space_total, ws_shift_out, ts_enabled, ts_recent) = {
             let ft = self.flow_table.borrow();
@@ -6652,7 +6705,13 @@ impl Engine {
         // to 128. Earlier 64-byte buffer only held header-only FINs and
         // would fail once F-7 (TS option on FIN) lands.
         let mut buf = [0u8; 128];
-        let Some(n) = build_segment(&seg, &mut buf) else {
+        // PO6: close_conn (FIN emit) branch mirrors emit_ack.
+        let n_opt = if self.tx_cksum_offload_active {
+            build_segment_offload(&seg, &mut buf)
+        } else {
+            build_segment(&seg, &mut buf)
+        };
+        let Some(n) = n_opt else {
             return Err(Error::PeerUnreachable(tuple.peer_ip));
         };
         if !self.tx_tcp_frame(&buf[..n], &seg) {
@@ -6773,7 +6832,9 @@ impl Engine {
 
     fn retransmit_inner(&self, conn_handle: ConnHandle, entry_index: usize) {
         use crate::counters::inc;
-        use crate::tcp_output::{build_retrans_header, SegmentTx, TCP_ACK, TCP_PSH};
+        use crate::tcp_output::{
+            build_retrans_header, build_retrans_header_offload, SegmentTx, TCP_ACK, TCP_PSH,
+        };
 
         // Phase 0: drain any in-flight new-send mbufs out of the TX ring
         // BEFORE we touch the snd_retrans data mbuf.
@@ -6918,12 +6979,11 @@ impl Engine {
             payload: &[],
         };
 
-        // Read the original payload bytes directly from the data mbuf for
-        // the TCP checksum fold. The mbuf holds the on-wire frame built
-        // by `send_bytes` (Ethernet + IPv4 + TCP-with-options + payload
-        // contiguously) but `data_off` and `data_len` shift over its
-        // lifetime as the TAP/PMD software-cksum path adj's headers off
-        // the front:
+        // Compute the live header prefix on the data mbuf. The mbuf holds
+        // the on-wire frame built by `send_bytes` (Ethernet + IPv4 +
+        // TCP-with-options + payload contiguously) but `data_off` and
+        // `data_len` shift over its lifetime as the TAP/PMD software-cksum
+        // path adj's headers off the front:
         //
         //   construction:        data_len = hdrs + payload   (e.g. 1466)
         //   after 1st TAP burst: data_len = hdrs - 54 + payload (1412 — TAP
@@ -6942,12 +7002,7 @@ impl Engine {
         // Safety: data_mbuf_ptr came from a live RetransEntry; the engine
         // holds a refcount on it via Mbuf (incremented at push-time, not
         // yet decremented — snd_retrans still owns the entry).
-        let data_ptr = unsafe { sys::shim_rte_pktmbuf_data(data_mbuf_ptr) } as *const u8;
         let data_len = unsafe { sys::shim_rte_pktmbuf_data_len(data_mbuf_ptr) };
-        debug_assert!(
-            !data_ptr.is_null(),
-            "live mbuf in snd_retrans must have a valid data pointer"
-        );
         debug_assert!(
             data_len >= entry_len,
             "Stage 1 invariant: snd_retrans data mbuf must contain at least `len` \
@@ -6960,24 +7015,52 @@ impl Engine {
              entry_len={entry_len}) — TAP/PMD adj should only shrink"
         );
         let live_hdrs_len = data_len - entry_len;
-        // Safety: data_ptr + live_hdrs_len .. + entry_len describes the
-        // payload region inside the data mbuf we hold a refcount on. The
-        // slice lifetime is bounded by this function (we do not stash it
-        // past the build_retrans_header call, which copies out the bytes
-        // into its checksum fold).
-        let payload_bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                data_ptr.add(live_hdrs_len as usize),
-                entry_len as usize,
-            )
-        };
-
+        // PO6: on the `tx_cksum_offload_active == true` path the NIC
+        // computes the TCP checksum at wire time, so we don't need to
+        // fold the payload bytes here. That means we can skip BOTH the
+        // SW payload fold AND the `shim_rte_pktmbuf_data` FFI shim call
+        // that fetches the payload pointer — `build_retrans_header_offload`
+        // takes only the payload length for the IPv4 total-length / TCP
+        // pseudo-header length fields.
+        //
+        // Wire-equivalence verified by the
+        // `build_retrans_header_offload_wire_equivalent_to_build_retrans_header_plus_rewrite`
+        // unit test in `tcp_output.rs`.
+        //
         // Phase 3: write header bytes into the hdr mbuf. Budget the same
         // 40-byte TCP-options cushion as `send_bytes` (MSS + WS + SACK-perm
         // + TS peak = 20, plus SACK blocks). Ethernet(14) + IPv4(20) +
         // TCP(20+40) = 94 bytes; round to 128.
         let mut hdr_scratch = [0u8; 128];
-        let Some(hdr_n) = build_retrans_header(&seg, payload_bytes, &mut hdr_scratch) else {
+        let hdr_n_opt = if self.tx_cksum_offload_active {
+            // Offload path: skip the data-mbuf-pointer read and the SW
+            // payload fold; the NIC re-folds the chained payload bytes
+            // at wire time after tx_offload_finalize sets the mbuf flags.
+            build_retrans_header_offload(&seg, entry_len as u32, &mut hdr_scratch)
+        } else {
+            // Non-offload path: read the payload bytes out of the data
+            // mbuf so the SW checksum fold can incorporate them. The
+            // slice lifetime is bounded by this function (we do not
+            // stash it past the build_retrans_header call, which copies
+            // out the bytes into its checksum fold).
+            //
+            // Safety: data_ptr + live_hdrs_len .. + entry_len describes
+            // the payload region inside the data mbuf we hold a
+            // refcount on.
+            let data_ptr = unsafe { sys::shim_rte_pktmbuf_data(data_mbuf_ptr) } as *const u8;
+            debug_assert!(
+                !data_ptr.is_null(),
+                "live mbuf in snd_retrans must have a valid data pointer"
+            );
+            let payload_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    data_ptr.add(live_hdrs_len as usize),
+                    entry_len as usize,
+                )
+            };
+            build_retrans_header(&seg, payload_bytes, &mut hdr_scratch)
+        };
+        let Some(hdr_n) = hdr_n_opt else {
             // Header-too-small is impossible for 128-byte scratch; keep explicit.
             unsafe { sys::shim_rte_pktmbuf_free(hdr_mbuf) };
             inc(&self.counters.eth.tx_drop_nomem);
@@ -7907,7 +7990,9 @@ impl Engine {
         iss_peer: u32,
     ) {
         use crate::counters::inc;
-        use crate::tcp_output::{build_segment, SegmentTx, TCP_ACK, TCP_RST};
+        use crate::tcp_output::{
+            build_segment, build_segment_offload, SegmentTx, TCP_ACK, TCP_RST,
+        };
         let seg = SegmentTx {
             src_mac: self.our_mac,
             dst_mac: self.gateway_mac.get(),
@@ -7925,7 +8010,13 @@ impl Engine {
             payload: &[],
         };
         let mut buf = [0u8; 64];
-        let Some(n) = build_segment(&seg, &mut buf) else {
+        // PO6: emit_rst_for_unsolicited_syn branch mirrors emit_rst.
+        let n_opt = if self.tx_cksum_offload_active {
+            build_segment_offload(&seg, &mut buf)
+        } else {
+            build_segment(&seg, &mut buf)
+        };
+        let Some(n) = n_opt else {
             return;
         };
         if self.tx_tcp_frame(&buf[..n], &seg) {

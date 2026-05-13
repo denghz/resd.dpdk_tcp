@@ -143,6 +143,65 @@ pub fn build_retrans_header(
     )
 }
 
+/// Offload-aware sibling of `build_retrans_header`. Same wire-bytes
+/// output as `build_retrans_header(seg, payload_bytes, out)` followed by
+/// `tx_offload_rewrite_cksums`, but written in one pass with no SW
+/// payload fold.
+///
+/// PO6 (perf optimisation): on the `tx_cksum_offload_active == true`
+/// retransmit path, the full TCP payload fold that `build_retrans_header`
+/// performs over the chained-data-mbuf bytes is dead work — the NIC
+/// re-folds those same bytes at wire time. `build_retrans_header_offload`
+/// produces the post-finalize cksum state directly, skipping BOTH the
+/// per-byte payload fold AND the `shim_rte_pktmbuf_data` read that
+/// fetches the payload bytes out of the chained data mbuf. Stronger than
+/// PO4 for the send_bytes hot path: this skips the FFI shim call too.
+///
+/// `payload_len_for_framing` is the wire-side payload byte count (the
+/// `entry.len` value the caller passes in). It is used ONLY for the
+/// IPv4 total-length and TCP pseudo-header length fields — there are
+/// NO payload bytes folded, so the caller does NOT need to read the
+/// chained data mbuf's bytes.
+///
+/// `seg.payload` MUST be empty (`&[]`) — payload writes go into the
+/// chained data mbuf, not `out`.
+///
+/// Returns the number of bytes written (header length only), or `None`
+/// if `out` is too small or `payload_len_for_framing > u16::MAX`.
+///
+/// Wire-equivalence invariant: after
+/// `build_retrans_header_offload(seg, payload_len, out)` followed by
+/// `tx_offload_rewrite_cksums(out, ...)`, the bytes in `out[..n]` are
+/// bit-identical to the bytes produced by
+/// `build_retrans_header(seg, real_payload, out)` followed by
+/// `tx_offload_rewrite_cksums` (verified by the
+/// `build_retrans_header_offload_wire_equivalent_to_build_retrans_header_plus_rewrite`
+/// unit test).
+pub fn build_retrans_header_offload(
+    seg: &SegmentTx,
+    payload_len_for_framing: u32,
+    out: &mut [u8],
+) -> Option<usize> {
+    debug_assert!(
+        seg.payload.is_empty(),
+        "build_retrans_header_offload expects seg.payload == &[] — payload lives in chained data mbuf"
+    );
+    if payload_len_for_framing > u16::MAX as u32 {
+        return None;
+    }
+    // Pass an empty payload_for_csum slice — under CsumStrategy::Offload
+    // the inner builder uses only `declared_payload_len` for the IPv4
+    // total-length + TCP pseudo-header length fields and never folds
+    // payload bytes, so the slice contents are irrelevant.
+    build_segment_inner(
+        seg,
+        &[],
+        payload_len_for_framing,
+        out,
+        CsumStrategy::Offload,
+    )
+}
+
 /// Shared implementation for `build_segment` and `build_retrans_header`.
 ///
 /// * `seg.payload` is what actually gets WRITTEN to `out` after the TCP
@@ -902,6 +961,168 @@ mod tests {
 
         // Payload bytes still at the tail of the frame.
         assert_eq!(&out[n - payload.len()..n], &payload[..]);
+    }
+
+    // PO6 wire-equivalence test: `build_retrans_header_offload` must
+    // produce the same final post-`tx_offload_rewrite_cksums` mbuf state
+    // as the old `build_retrans_header(payload_bytes)` +
+    // `tx_offload_rewrite_cksums` sequence, on every offload-active
+    // retransmit. The mbuf bytes go to the NIC unchanged after chaining,
+    // so byte-by-byte equality of the header region is the correctness
+    // gate. PO6 is stronger than PO4: the offload variant takes only the
+    // payload LENGTH, not the bytes, so the production caller skips the
+    // `shim_rte_pktmbuf_data` FFI call that reads the chained data mbuf.
+    #[cfg(feature = "hw-offload-tx-cksum")]
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
+    #[test]
+    fn build_retrans_header_offload_wire_equivalent_to_build_retrans_header_plus_rewrite() {
+        // ACK+PSH retrans header with TS option present (production
+        // retrans path always carries TS once TS is negotiated, per RFC
+        // 7323 §3 MUST-22 — exercises the option encode path too).
+        let mut base = base();
+        base.flags = TCP_ACK | TCP_PSH;
+        base.options = crate::tcp_options::TcpOpts {
+            timestamps: Some((0x1122_3344, 0xaabb_ccdd)),
+            ..Default::default()
+        };
+        let real_payload = b"PO6-wire-equivalence-fixture-bytes-with-some-length";
+        // Important: hdr-only seg has empty payload (production retrans
+        // path passes seg.payload == &[]). The payload bytes live in the
+        // chained data mbuf.
+        let hdr_only_seg = SegmentTx {
+            payload: &[],
+            ..base
+        };
+        let payload_len = real_payload.len() as u32;
+
+        // Path A: build_retrans_header (full SW fold over real payload)
+        // + tx_offload_rewrite_cksums.
+        let mut a = [0u8; 160];
+        let n_a = build_retrans_header(&hdr_only_seg, real_payload, &mut a)
+            .expect("build_retrans_header");
+        let opts_len = hdr_only_seg.options.encoded_len();
+        let tcp_hdr_len = TCP_HDR_MIN + opts_len;
+        let ok_a = tx_offload_rewrite_cksums(
+            &mut a[..n_a],
+            hdr_only_seg.src_ip,
+            hdr_only_seg.dst_ip,
+            tcp_hdr_len,
+            payload_len,
+        );
+        assert!(ok_a);
+
+        // Path B: build_retrans_header_offload (no SW fold, payload bytes
+        // NOT read — only the length matters) + idempotent rewrite. The
+        // production retransmit path calls the rewrite again via
+        // tx_offload_finalize; including it here mirrors the call
+        // sequence and exercises rewrite idempotency.
+        let mut b = [0u8; 160];
+        let n_b = build_retrans_header_offload(&hdr_only_seg, payload_len, &mut b)
+            .expect("build_retrans_header_offload");
+        let ok_b = tx_offload_rewrite_cksums(
+            &mut b[..n_b],
+            hdr_only_seg.src_ip,
+            hdr_only_seg.dst_ip,
+            tcp_hdr_len,
+            payload_len,
+        );
+        assert!(ok_b);
+
+        // Same number of bytes, same bytes.
+        assert_eq!(n_a, n_b, "header length must match");
+        assert_eq!(
+            &a[..n_a],
+            &b[..n_b],
+            "wire header bytes must be bit-identical after build_retrans_header_offload + rewrite vs build_retrans_header + rewrite"
+        );
+
+        // Spot-check the cksum fields explicitly: TCP cksum =
+        // pseudo-only fold (with declared payload_len in the
+        // pseudo-header tcp_length field), IPv4 cksum = 0.
+        let ip_cksum_off = ETH_HDR_LEN + 10;
+        assert_eq!(b[ip_cksum_off], 0);
+        assert_eq!(b[ip_cksum_off + 1], 0);
+        let tcp_cksum_off = ETH_HDR_LEN + IPV4_HDR_MIN + 16;
+        let pseudo_len = tcp_hdr_len as u32 + payload_len;
+        let expected_tcp = tcp_pseudo_header_checksum(
+            hdr_only_seg.src_ip,
+            hdr_only_seg.dst_ip,
+            pseudo_len,
+        );
+        let actual_tcp = u16::from_be_bytes([b[tcp_cksum_off], b[tcp_cksum_off + 1]]);
+        assert_eq!(actual_tcp, expected_tcp);
+    }
+
+    // PO6: build_retrans_header_offload must reject framing lengths that
+    // overflow the 16-bit IPv4 total-length field. Mirrors the existing
+    // `build_retrans_header_returns_none_on_small_buf` shape but checks
+    // the length-too-large guard rather than the buf-too-small one.
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
+    #[test]
+    fn build_retrans_header_offload_returns_none_on_oversize_payload_len() {
+        let seg = SegmentTx {
+            payload: &[],
+            ..base()
+        };
+        let mut out = [0u8; 128];
+        // u16::MAX + 1 — the IPv4 total-length field is 16 bits, so the
+        // guard rejects a framing length that overflows it.
+        let oversize = u16::MAX as u32 + 1;
+        assert!(build_retrans_header_offload(&seg, oversize, &mut out).is_none());
+    }
+
+    // PO6: build_retrans_header_offload writes pseudo-only TCP cksum +
+    // zero IPv4 cksum directly, without reading any payload bytes. This
+    // is a feature-agnostic check (compiles + runs whether
+    // hw-offload-tx-cksum is on or off — same as the
+    // `build_segment_offload_writes_pseudo_only_*` sibling test).
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
+    #[test]
+    fn build_retrans_header_offload_writes_pseudo_only_and_zero_ip_csum() {
+        let mut base = base();
+        base.flags = TCP_ACK | TCP_PSH;
+        base.options = crate::tcp_options::TcpOpts::default();
+        let hdr_only_seg = SegmentTx {
+            payload: &[],
+            ..base
+        };
+        let payload_len: u32 = 1400; // typical MSS-sized retrans
+
+        let mut out = [0u8; 128];
+        let n = build_retrans_header_offload(&hdr_only_seg, payload_len, &mut out)
+            .expect("build_retrans_header_offload");
+
+        // No payload was written (retrans header only).
+        let opts_len = hdr_only_seg.options.encoded_len();
+        let tcp_hdr_len = TCP_HDR_MIN + opts_len;
+        assert_eq!(n, ETH_HDR_LEN + IPV4_HDR_MIN + tcp_hdr_len);
+
+        // IPv4 cksum field = 0.
+        let ip_cksum_off = ETH_HDR_LEN + 10;
+        assert_eq!(out[ip_cksum_off], 0, "IPv4 cksum hi byte must be 0");
+        assert_eq!(out[ip_cksum_off + 1], 0, "IPv4 cksum lo byte must be 0");
+
+        // IPv4 total-length reflects header + DECLARED payload length,
+        // even though no payload bytes were written into `out`. This is
+        // the on-wire framing field that the chained data mbuf will
+        // satisfy.
+        let ip_total_len = u16::from_be_bytes([out[ETH_HDR_LEN + 2], out[ETH_HDR_LEN + 3]]);
+        assert_eq!(
+            ip_total_len as u32,
+            (IPV4_HDR_MIN + tcp_hdr_len) as u32 + payload_len
+        );
+
+        // TCP cksum field = pseudo-header-only fold over (src,dst,proto,
+        // tcp_seg_len) where tcp_seg_len = tcp_hdr_len + payload_len.
+        let tcp_cksum_off = ETH_HDR_LEN + IPV4_HDR_MIN + 16;
+        let pseudo_len = tcp_hdr_len as u32 + payload_len;
+        let expected = tcp_pseudo_header_checksum(
+            hdr_only_seg.src_ip,
+            hdr_only_seg.dst_ip,
+            pseudo_len,
+        );
+        let actual = u16::from_be_bytes([out[tcp_cksum_off], out[tcp_cksum_off + 1]]);
+        assert_eq!(actual, expected, "TCP cksum must be pseudo-header-only fold");
     }
 
     // build_segment (unchanged) MUST still produce a verifiable full-fold
