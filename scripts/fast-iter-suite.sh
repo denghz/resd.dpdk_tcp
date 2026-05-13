@@ -30,7 +30,18 @@
 # trip), so this avoids the proxy + measures the right thing.
 #
 # Usage:
-#   ./scripts/fast-iter-suite.sh
+#   ./scripts/fast-iter-suite.sh [--seed N] [--dry-run]
+#
+# Flags:
+#   --seed N        Seed for per-tool stack-order randomization (default: current
+#                   epoch). Stack order within each tool is shuffled so the
+#                   third-run stack is not systematically disadvantaged by AWS
+#                   ENA bandwidth-allowance drain over the suite wallclock (see
+#                   codex IMPORTANT I4, 2026-05-13). The seed is logged into
+#                   $RESULTS_DIR/metadata.json so a run can be replayed.
+#   --dry-run       Print the planned per-tool stack order matrix and exit
+#                   without running any bench. Useful for verifying the
+#                   randomization works without burning ~35 min of wallclock.
 #
 # Overrides (env):
 #   RESULTS_DIR_OVERRIDE       Absolute path to use instead of the default
@@ -174,6 +185,57 @@ PY
     exit 0
 fi
 
+# ---------------------------------------------------------------------------
+# CLI flag parsing — --seed + --dry-run.
+#
+# codex IMPORTANT I4 (2026-05-13): the per-tool stack order is randomized so a
+# single suite invocation does not systematically disadvantage the third-run
+# stack via AWS ENA bandwidth-allowance drain over the ~35-min wallclock. The
+# `--seed N` flag pins the RNG so a regression can be replayed exactly; the
+# default is the current epoch (logged into $RESULTS_DIR/metadata.json so any
+# run can be replayed).
+# ---------------------------------------------------------------------------
+SEED=""
+DRY_RUN=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --seed)
+            if [ $# -lt 2 ]; then
+                printf 'fast-iter-suite: --seed requires a value\n' >&2
+                exit 2
+            fi
+            SEED="$2"
+            shift 2
+            ;;
+        --seed=*)
+            SEED="${1#--seed=}"
+            shift
+            ;;
+        --dry-run)
+            DRY_RUN=1
+            shift
+            ;;
+        --help|-h)
+            sed -n '2,68p' "$0" | sed 's/^# \{0,1\}//'
+            exit 0
+            ;;
+        *)
+            printf 'fast-iter-suite: unknown flag %s (try --help)\n' "$1" >&2
+            exit 2
+            ;;
+    esac
+done
+if [ -z "$SEED" ]; then
+    SEED=$(date -u +%s)
+fi
+# Validate seed is a non-negative integer (bash arithmetic later uses it).
+case "$SEED" in
+    ''|*[!0-9]*)
+        printf 'fast-iter-suite: --seed must be a non-negative integer, got %q\n' "$SEED" >&2
+        exit 2
+        ;;
+esac
+
 ENV_FILE="$WORKDIR/.fast-iter.env"
 if [ ! -f "$ENV_FILE" ]; then
     printf 'fast-iter-suite: %s not found — run ./scripts/fast-iter-setup.sh up --with-fstack first\n' "$ENV_FILE" >&2
@@ -248,24 +310,30 @@ BENCH_TX_MAXTP="$WORKDIR/target/release/bench-tx-maxtp"
 BENCH_RX_BURST="$WORKDIR/target/release/bench-rx-burst"
 VERIFY_RACK_TLP="$WORKDIR/scripts/verify-rack-tlp.sh"
 
-for bin in "$BENCH_RTT" "$BENCH_TX_BURST" "$BENCH_TX_MAXTP" "$BENCH_RX_BURST"; do
-    [ -x "$bin" ] || { printf 'fast-iter-suite: missing binary %s\n' "$bin" >&2; exit 2; }
-done
-[ -x "$VERIFY_RACK_TLP" ] || { printf 'fast-iter-suite: missing %s\n' "$VERIFY_RACK_TLP" >&2; exit 2; }
+# --dry-run skips binary existence checks: dry-run only prints the planned
+# stack order matrix and exits, so the bench binaries are never invoked.
+# This lets the order-randomization logic be smoke-tested on a host that
+# hasn't built the suite (e.g. a fresh checkout or an agent worktree).
+if [ "$DRY_RUN" != "1" ]; then
+    for bin in "$BENCH_RTT" "$BENCH_TX_BURST" "$BENCH_TX_MAXTP" "$BENCH_RX_BURST"; do
+        [ -x "$bin" ] || { printf 'fast-iter-suite: missing binary %s\n' "$bin" >&2; exit 2; }
+    done
+    [ -x "$VERIFY_RACK_TLP" ] || { printf 'fast-iter-suite: missing %s\n' "$VERIFY_RACK_TLP" >&2; exit 2; }
 
-# Peer C binaries — only needed in loopback fallback mode. Auto-detected
-# below; we still require the binaries on disk in case the operator
-# explicitly sets LINUX_KERNEL_VIA_NSENTER=0.
-[ -x "$LOCAL_ECHO_SERVER_BIN" ] || {
-    printf 'fast-iter-suite: missing %s — run `make -C tools/bench-e2e/peer` to build\n' \
-        "$LOCAL_ECHO_SERVER_BIN" >&2
-    exit 2
-}
-[ -x "$LOCAL_BURST_ECHO_SERVER_BIN" ] || {
-    printf 'fast-iter-suite: missing %s — run `make -C tools/bench-e2e/peer` to build\n' \
-        "$LOCAL_BURST_ECHO_SERVER_BIN" >&2
-    exit 2
-}
+    # Peer C binaries — only needed in loopback fallback mode. Auto-detected
+    # below; we still require the binaries on disk in case the operator
+    # explicitly sets LINUX_KERNEL_VIA_NSENTER=0.
+    [ -x "$LOCAL_ECHO_SERVER_BIN" ] || {
+        printf 'fast-iter-suite: missing %s — run `make -C tools/bench-e2e/peer` to build\n' \
+            "$LOCAL_ECHO_SERVER_BIN" >&2
+        exit 2
+    }
+    [ -x "$LOCAL_BURST_ECHO_SERVER_BIN" ] || {
+        printf 'fast-iter-suite: missing %s — run `make -C tools/bench-e2e/peer` to build\n' \
+            "$LOCAL_BURST_ECHO_SERVER_BIN" >&2
+        exit 2
+    }
+fi
 
 # Resolve LINUX_KERNEL_VIA_NSENTER=auto by probing sudo nsenter.
 if [ "$LINUX_KERNEL_VIA_NSENTER" = "auto" ]; then
@@ -292,13 +360,16 @@ else
 fi
 
 # Verify fstack symbols are present in all four binaries.
-for bin in "$BENCH_RTT" "$BENCH_TX_BURST" "$BENCH_TX_MAXTP" "$BENCH_RX_BURST"; do
-    count=$(nm "$bin" 2>/dev/null | grep -c ' T ff_socket' || true)
-    if [ "$count" -eq 0 ]; then
-        printf 'fast-iter-suite: %s missing fstack symbols — rebuild with --features fstack\n' "$bin" >&2
-        exit 2
-    fi
-done
+# --dry-run skips this check too — dry-run never invokes the binaries.
+if [ "$DRY_RUN" != "1" ]; then
+    for bin in "$BENCH_RTT" "$BENCH_TX_BURST" "$BENCH_TX_MAXTP" "$BENCH_RX_BURST"; do
+        count=$(nm "$bin" 2>/dev/null | grep -c ' T ff_socket' || true)
+        if [ "$count" -eq 0 ]; then
+            printf 'fast-iter-suite: %s missing fstack symbols — rebuild with --features fstack\n' "$bin" >&2
+            exit 2
+        fi
+    done
+fi
 
 # ---------------------------------------------------------------------------
 # Logging + run helpers.
@@ -323,6 +394,130 @@ PEER_RESTART_DELAY="${PEER_RESTART_DELAY:-1}"
 log() { printf '[suite %s] %s\n' "$(date -u +%H:%M:%S)" "$*" | tee -a "$LOG_FILE" >&2; }
 
 ts_now() { date -u +%s; }
+
+# ---------------------------------------------------------------------------
+# Per-tool stack-order randomization (codex IMPORTANT I4, 2026-05-13).
+#
+# Why: scripts/fast-iter-suite.sh used to run dpdk_net → linux_kernel → fstack
+# in that fixed order for every arm of every tool. AWS ENA has bandwidth-
+# allowance / burst-credit accounting that drains over the ~35-min suite
+# wallclock, so the third-run stack is systematically disadvantaged. Cross-
+# stack comparisons therefore carried a built-in order bias. T58 variance
+# runs also showed environmental drift over a single suite run (T57 → T58
+# 2-3× regression on the same code). Result: we now randomize the order
+# per-tool, derive the RNG state from a top-level $SEED, and log the
+# resulting matrix into $RESULTS_DIR/metadata.json so any run can be
+# replayed deterministically.
+#
+# Shuffle implementation: Fisher-Yates over a copy of $STACKS, seeded by
+# bash's $RANDOM. We re-seed RANDOM with a per-tool offset of the master
+# seed so a single $SEED reproduces all four tools' orderings independently.
+# Bash's $RANDOM is a 15-bit LCG (`__random_seed` in lib/sh/random.c), which
+# is more than enough entropy for a 3-element shuffle (3! = 6 permutations).
+# ---------------------------------------------------------------------------
+STACKS=(dpdk_net linux_kernel fstack)
+
+# Tool index map — index into the master seed so each tool gets a
+# deterministic but distinct per-tool seed offset. Declared as a parallel
+# pair of arrays (assoc arrays exist but indices stay readable this way).
+TOOLS=(bench-rtt bench-tx-burst bench-tx-maxtp bench-rx-burst)
+
+# fisher_yates_shuffle <seed> <stack...> — prints the shuffled stack list
+# on stdout, one per line, deterministically. The seed is fed into $RANDOM
+# so the same seed always emits the same permutation.
+fisher_yates_shuffle() {
+    local seed="$1"
+    shift
+    local -a arr=("$@")
+    local n=${#arr[@]}
+    local i j tmp
+    # Seed bash's PRNG. RANDOM is treated as a sink for the integer.
+    RANDOM=$seed
+    # Standard Fisher-Yates: walk from end, swap with a random index in
+    # [0..i]. The trailing modulus collapses RANDOM's 15-bit range to
+    # [0..i] uniformly enough for n=3 (rejection sampling is overkill).
+    for (( i = n - 1; i > 0; i-- )); do
+        j=$(( RANDOM % (i + 1) ))
+        if [ "$j" != "$i" ]; then
+            tmp="${arr[i]}"
+            arr[i]="${arr[j]}"
+            arr[j]="$tmp"
+        fi
+    done
+    local s
+    for s in "${arr[@]}"; do
+        printf '%s\n' "$s"
+    done
+}
+
+# Pre-compute the per-tool stack order. Each tool gets a seed of
+# `SEED + tool_index` so a single $SEED reproduces the full matrix.
+declare -a ORDER_BENCH_RTT=()
+declare -a ORDER_BENCH_TX_BURST=()
+declare -a ORDER_BENCH_TX_MAXTP=()
+declare -a ORDER_BENCH_RX_BURST=()
+
+compute_stack_orders() {
+    local tool_idx tool tool_seed stack
+    # shellcheck disable=SC2034
+    for tool_idx in "${!TOOLS[@]}"; do
+        tool="${TOOLS[$tool_idx]}"
+        tool_seed=$(( SEED + tool_idx ))
+        local -a shuffled=()
+        # Capture shuffled list into an array via mapfile.
+        mapfile -t shuffled < <(fisher_yates_shuffle "$tool_seed" "${STACKS[@]}")
+        case "$tool" in
+            bench-rtt)       ORDER_BENCH_RTT=("${shuffled[@]}") ;;
+            bench-tx-burst)  ORDER_BENCH_TX_BURST=("${shuffled[@]}") ;;
+            bench-tx-maxtp)  ORDER_BENCH_TX_MAXTP=("${shuffled[@]}") ;;
+            bench-rx-burst)  ORDER_BENCH_RX_BURST=("${shuffled[@]}") ;;
+        esac
+    done
+}
+
+# tool_stack_order <tool-name> — print the per-tool resolved order, one
+# stack per line. Wraps the four ORDER_* arrays so call sites stay terse.
+tool_stack_order() {
+    case "$1" in
+        bench-rtt)       printf '%s\n' "${ORDER_BENCH_RTT[@]}" ;;
+        bench-tx-burst)  printf '%s\n' "${ORDER_BENCH_TX_BURST[@]}" ;;
+        bench-tx-maxtp)  printf '%s\n' "${ORDER_BENCH_TX_MAXTP[@]}" ;;
+        bench-rx-burst)  printf '%s\n' "${ORDER_BENCH_RX_BURST[@]}" ;;
+        *) printf 'tool_stack_order: unknown tool %s\n' "$1" >&2; return 1 ;;
+    esac
+}
+
+# write_metadata_json: emit $RESULTS_DIR/metadata.json with the seed +
+# per-tool stack order. Hand-written JSON (no jq dependency): the schema
+# is small and stable.
+write_metadata_json() {
+    local out="$RESULTS_DIR/metadata.json"
+    {
+        printf '{\n'
+        printf '  "seed": %s,\n' "$SEED"
+        printf '  "utc_ts": "%s",\n' "$UTC_TS"
+        printf '  "dry_run": %s,\n' "$([ "$DRY_RUN" = 1 ] && printf 'true' || printf 'false')"
+        printf '  "stack_orders": {\n'
+        local last=$((${#TOOLS[@]} - 1))
+        local i tool stack first
+        for i in "${!TOOLS[@]}"; do
+            tool="${TOOLS[$i]}"
+            printf '    "%s": [' "$tool"
+            first=1
+            while IFS= read -r stack; do
+                if [ "$first" = 1 ]; then first=0; else printf ', '; fi
+                printf '"%s"' "$stack"
+            done < <(tool_stack_order "$tool")
+            if [ "$i" -lt "$last" ]; then
+                printf '],\n'
+            else
+                printf ']\n'
+            fi
+        done
+        printf '  }\n'
+        printf '}\n'
+    } >"$out"
+}
 
 # Reset DPDK / F-Stack state on the DUT. Used after every DPDK/fstack arm
 # (success or failure) and especially after TIMEOUT/FAIL paths where the
@@ -595,15 +790,19 @@ preflight() {
 # ---------------------------------------------------------------------------
 
 # bench-rtt
-run_bench_rtt() {
-    log "=== bench-rtt — RTT (payload sweep 64,128,256,1024) ==="
-
-    # --raw-samples-csv: emits one row per iteration (bucket_id, iter_idx,
-    # rtt_ns) so write_summary can compute p99/p999 + decile signatures
-    # from the underlying distribution rather than relying on the per-CSV
-    # p50/p99/mean aggregates alone. Surfaced for T58 follow-up: fstack
-    # 128B/1024B showed run-to-run bimodality that p50-only summaries
-    # hid. See docs/bench-reports/fstack-bimodality-investigation-*.md.
+#
+# Per-stack helpers — each emits one arm. Split out of run_bench_rtt so the
+# parent function can iterate the shuffled $ORDER_BENCH_RTT and dispatch
+# without baking a fixed dpdk_net → linux_kernel → fstack order into the
+# call sequence (codex IMPORTANT I4, 2026-05-13).
+#
+# --raw-samples-csv: emits one row per iteration (bucket_id, iter_idx,
+# rtt_ns) so write_summary can compute p99/p999 + decile signatures
+# from the underlying distribution rather than relying on the per-CSV
+# p50/p99/mean aggregates alone. Surfaced for T58 follow-up: fstack
+# 128B/1024B showed run-to-run bimodality that p50-only summaries
+# hid. See docs/bench-reports/fstack-bimodality-investigation-*.md.
+run_bench_rtt_dpdk_net() {
     run_one "bench-rtt dpdk_net" \
         "$RESULTS_DIR/bench-rtt-dpdk_net.csv" \
         sudo -E env "PATH=$PATH" PEER_IP="$PEER_IP" \
@@ -623,8 +822,10 @@ run_bench_rtt() {
                 --payload-bytes-sweep 64,128,256,1024 \
                 --iterations 10000 --warmup 100
     reset_dpdk_state
+}
 
-    # linux_kernel → host-netns wrapper + real peer (default) OR local-loopback (fallback).
+# linux_kernel → host-netns wrapper + real peer (default) OR local-loopback (fallback).
+run_bench_rtt_linux_kernel() {
     run_one "bench-rtt linux_kernel" \
         "$RESULTS_DIR/bench-rtt-linux_kernel.csv" \
         "${LINUX_NETNS_WRAPPER[@]}" "$BENCH_RTT" \
@@ -638,7 +839,9 @@ run_bench_rtt() {
             --raw-samples-csv "$RESULTS_DIR/bench-rtt-linux_kernel-raw.csv" \
             --payload-bytes-sweep 64,128,256,1024 \
             --iterations 10000 --warmup 100
+}
 
+run_bench_rtt_fstack() {
     run_one "bench-rtt fstack" \
         "$RESULTS_DIR/bench-rtt-fstack.csv" \
         sudo -E env "PATH=$PATH" PEER_IP="$PEER_IP" FSTACK_CONF="$FSTACK_CONF" \
@@ -661,10 +864,22 @@ run_bench_rtt() {
     reset_dpdk_state
 }
 
-# bench-tx-burst
-run_bench_tx_burst() {
-    log "=== bench-tx-burst — K x G grid (K={64K,1M}, G={0,10}) ==="
+run_bench_rtt() {
+    log "=== bench-rtt — RTT (payload sweep 64,128,256,1024) — order: ${ORDER_BENCH_RTT[*]} ==="
+    local stack
+    while IFS= read -r stack; do
+        case "$stack" in
+            dpdk_net)      run_bench_rtt_dpdk_net ;;
+            linux_kernel)  run_bench_rtt_linux_kernel ;;
+            fstack)        run_bench_rtt_fstack ;;
+            *) log "run_bench_rtt: unknown stack $stack — skipping" ;;
+        esac
+    done < <(tool_stack_order bench-rtt)
+}
 
+# bench-tx-burst — per-stack helpers + parent dispatcher (codex IMPORTANT
+# I4, 2026-05-13). See run_bench_rtt above for the rationale.
+run_bench_tx_burst_dpdk_net() {
     run_one "bench-tx-burst dpdk_net" \
         "$RESULTS_DIR/bench-tx-burst-dpdk_net.csv" \
         sudo -E env "PATH=$PATH" PEER_IP="$PEER_IP" \
@@ -684,8 +899,10 @@ run_bench_tx_burst() {
                 --gap-mss 0,10 \
                 --bursts-per-bucket 200 --warmup 20
     reset_dpdk_state
+}
 
-    # linux_kernel → host-netns wrapper + real peer (default) OR local-loopback (fallback).
+# linux_kernel → host-netns wrapper + real peer (default) OR local-loopback (fallback).
+run_bench_tx_burst_linux_kernel() {
     run_one "bench-tx-burst linux_kernel" \
         "$RESULTS_DIR/bench-tx-burst-linux_kernel.csv" \
         "${LINUX_NETNS_WRAPPER[@]}" "$BENCH_TX_BURST" \
@@ -699,7 +916,9 @@ run_bench_tx_burst() {
             --burst-sizes 65536,1048576 \
             --gap-mss 0,10 \
             --bursts-per-bucket 200 --warmup 20
+}
 
+run_bench_tx_burst_fstack() {
     run_one "bench-tx-burst fstack" \
         "$RESULTS_DIR/bench-tx-burst-fstack.csv" \
         sudo -E env "PATH=$PATH" PEER_IP="$PEER_IP" FSTACK_CONF="$FSTACK_CONF" \
@@ -722,10 +941,22 @@ run_bench_tx_burst() {
     reset_dpdk_state
 }
 
-# bench-tx-maxtp
-run_bench_tx_maxtp() {
-    log "=== bench-tx-maxtp — W x C grid (W={4K,16K,64K}, C={1,4,16}) ==="
+run_bench_tx_burst() {
+    log "=== bench-tx-burst — K x G grid (K={64K,1M}, G={0,10}) — order: ${ORDER_BENCH_TX_BURST[*]} ==="
+    local stack
+    while IFS= read -r stack; do
+        case "$stack" in
+            dpdk_net)      run_bench_tx_burst_dpdk_net ;;
+            linux_kernel)  run_bench_tx_burst_linux_kernel ;;
+            fstack)        run_bench_tx_burst_fstack ;;
+            *) log "run_bench_tx_burst: unknown stack $stack — skipping" ;;
+        esac
+    done < <(tool_stack_order bench-tx-burst)
+}
 
+# bench-tx-maxtp — per-stack helpers + parent dispatcher (codex IMPORTANT
+# I4, 2026-05-13). See run_bench_rtt above for the rationale.
+run_bench_tx_maxtp_dpdk_net() {
     run_one "bench-tx-maxtp dpdk_net" \
         "$RESULTS_DIR/bench-tx-maxtp-dpdk_net.csv" \
         sudo -E env "PATH=$PATH" PEER_IP="$PEER_IP" \
@@ -745,12 +976,14 @@ run_bench_tx_maxtp() {
                 --conn-counts 1,4,16 \
                 --warmup-secs 2 --duration-secs 10
     reset_dpdk_state
+}
 
-    # linux_kernel → host-netns wrapper + real peer's :10002 linux-tcp-sink
-    # (default) OR local-loopback fallback. The `--local-ip` flag is
-    # documented as dpdk-only but bench-tx-maxtp's peer-rwnd probe path
-    # still parses it as IPv4 for every stack, so we pass DUT_LOCAL_IP here
-    # too — it's a no-op for the linux arm itself.
+# linux_kernel → host-netns wrapper + real peer's :10002 linux-tcp-sink
+# (default) OR local-loopback fallback. The `--local-ip` flag is
+# documented as dpdk-only but bench-tx-maxtp's peer-rwnd probe path
+# still parses it as IPv4 for every stack, so we pass DUT_LOCAL_IP here
+# too — it's a no-op for the linux arm itself.
+run_bench_tx_maxtp_linux_kernel() {
     run_one "bench-tx-maxtp linux_kernel" \
         "$RESULTS_DIR/bench-tx-maxtp-linux_kernel.csv" \
         "${LINUX_NETNS_WRAPPER[@]}" "$BENCH_TX_MAXTP" \
@@ -765,7 +998,9 @@ run_bench_tx_maxtp() {
             --write-sizes 4096,16384,65536 \
             --conn-counts 1,4,16 \
             --warmup-secs 2 --duration-secs 10
+}
 
+run_bench_tx_maxtp_fstack() {
     run_one "bench-tx-maxtp fstack" \
         "$RESULTS_DIR/bench-tx-maxtp-fstack.csv" \
         sudo -E env "PATH=$PATH" PEER_IP="$PEER_IP" FSTACK_CONF="$FSTACK_CONF" \
@@ -788,15 +1023,27 @@ run_bench_tx_maxtp() {
     reset_dpdk_state
 }
 
-# bench-rx-burst
-run_bench_rx_burst() {
-    log "=== bench-rx-burst — W x N grid (W={64,128,256}, N={16,64,256}) ==="
+run_bench_tx_maxtp() {
+    log "=== bench-tx-maxtp — W x C grid (W={4K,16K,64K}, C={1,4,16}) — order: ${ORDER_BENCH_TX_MAXTP[*]} ==="
+    local stack
+    while IFS= read -r stack; do
+        case "$stack" in
+            dpdk_net)      run_bench_tx_maxtp_dpdk_net ;;
+            linux_kernel)  run_bench_tx_maxtp_linux_kernel ;;
+            fstack)        run_bench_tx_maxtp_fstack ;;
+            *) log "run_bench_tx_maxtp: unknown stack $stack — skipping" ;;
+        esac
+    done < <(tool_stack_order bench-tx-maxtp)
+}
 
-    # T56 v4 (2026-05-12): preflight already restarted burst-echo-server.
-    # The hardened server (pthread-per-conn + TCP_USER_TIMEOUT=5s) clears
-    # wedged worker threads within 5 s, so we no longer need to restart it
-    # between arms.
-
+# bench-rx-burst — per-stack helpers + parent dispatcher (codex IMPORTANT
+# I4, 2026-05-13). See run_bench_rtt above for the rationale.
+#
+# T56 v4 (2026-05-12): preflight already restarted burst-echo-server.
+# The hardened server (pthread-per-conn + TCP_USER_TIMEOUT=5s) clears
+# wedged worker threads within 5 s, so we no longer need to restart it
+# between arms.
+run_bench_rx_burst_dpdk_net() {
     run_one "bench-rx-burst dpdk_net" \
         "$RESULTS_DIR/bench-rx-burst-dpdk_net.csv" \
         sudo -E env "PATH=$PATH" PEER_IP="$PEER_IP" \
@@ -816,8 +1063,10 @@ run_bench_rx_burst() {
                 --burst-counts 16,64,256 \
                 --measure-bursts 200 --warmup-bursts 20
     reset_dpdk_state
+}
 
-    # linux_kernel → host-netns wrapper + real peer (default) OR local-loopback (fallback).
+# linux_kernel → host-netns wrapper + real peer (default) OR local-loopback (fallback).
+run_bench_rx_burst_linux_kernel() {
     run_one "bench-rx-burst linux_kernel" \
         "$RESULTS_DIR/bench-rx-burst-linux_kernel.csv" \
         "${LINUX_NETNS_WRAPPER[@]}" "$BENCH_RX_BURST" \
@@ -831,7 +1080,9 @@ run_bench_rx_burst() {
             --segment-sizes 64,128,256 \
             --burst-counts 16,64,256 \
             --measure-bursts 200 --warmup-bursts 20
+}
 
+run_bench_rx_burst_fstack() {
     run_one "bench-rx-burst fstack" \
         "$RESULTS_DIR/bench-rx-burst-fstack.csv" \
         sudo -E env "PATH=$PATH" PEER_IP="$PEER_IP" FSTACK_CONF="$FSTACK_CONF" \
@@ -852,6 +1103,19 @@ run_bench_rx_burst() {
                 --burst-counts 16,64,256 \
                 --measure-bursts 200 --warmup-bursts 20
     reset_dpdk_state
+}
+
+run_bench_rx_burst() {
+    log "=== bench-rx-burst — W x N grid (W={64,128,256}, N={16,64,256}) — order: ${ORDER_BENCH_RX_BURST[*]} ==="
+    local stack
+    while IFS= read -r stack; do
+        case "$stack" in
+            dpdk_net)      run_bench_rx_burst_dpdk_net ;;
+            linux_kernel)  run_bench_rx_burst_linux_kernel ;;
+            fstack)        run_bench_rx_burst_fstack ;;
+            *) log "run_bench_rx_burst: unknown stack $stack — skipping" ;;
+        esac
+    done < <(tool_stack_order bench-rx-burst)
 }
 
 # verify-rack-tlp
@@ -1085,6 +1349,30 @@ write_summary() {
             "$PEER_IP" "$DUT_LOCAL_IP" "$DUT_PCI" "$DUT_LCORE"
         printf '**Wallclock:** %s — %s\n\n' "$WALLCLOCK_START_HUMAN" "$WALLCLOCK_END_HUMAN"
         printf '**Outcome:** %d OK, %d FAIL\n\n' "$OK_COUNT" "$FAIL_COUNT"
+        printf '**Seed:** `%s` (per-tool stack-order randomization, codex IMPORTANT I4)\n\n' "$SEED"
+
+        # Per-tool stack-order matrix — codex IMPORTANT I4, 2026-05-13.
+        # The pre-fix suite ran dpdk_net → linux_kernel → fstack for every
+        # tool, so the third-run stack was systematically disadvantaged by
+        # AWS ENA bandwidth-allowance drain over the ~35-min wallclock.
+        # Order is now derived from $SEED + tool_index (Fisher-Yates), and
+        # logged here so reviewers can verify the comparison is order-
+        # symmetric across runs. Re-run with --seed $SEED to reproduce the
+        # exact ordering.
+        printf '## Stack-order matrix (codex I4 randomization)\n\n'
+        printf '> Per-tool stack execution order, shuffled from the master `seed` above.\n'
+        printf '> See `metadata.json` for the machine-readable form.\n\n'
+        printf '| tool | 1st | 2nd | 3rd |\n'
+        printf '|---|---|---|---|\n'
+        local _t
+        for _t in "${TOOLS[@]}"; do
+            local _o1 _o2 _o3
+            local _arr=()
+            mapfile -t _arr < <(tool_stack_order "$_t")
+            _o1="${_arr[0]:-}"; _o2="${_arr[1]:-}"; _o3="${_arr[2]:-}"
+            printf '| %s | %s | %s | %s |\n' "$_t" "$_o1" "$_o2" "$_o3"
+        done
+        printf '\n'
 
         # Two-ENI methodology NOTE — addresses T57 codex-review BLOCKER B2.
         # The linux_kernel arm drives a DIFFERENT physical NIC than the
@@ -1235,14 +1523,36 @@ on_exit() {
     fi
     echo "================================================================================"
 }
+# Compute per-tool stack orders + emit metadata.json (codex IMPORTANT I4,
+# 2026-05-13). Must happen BEFORE preflight so --dry-run can short-circuit
+# without touching the peer / NIC.
+compute_stack_orders
+write_metadata_json
+log "seed=$SEED dry_run=$DRY_RUN"
+log "stack order — bench-rtt:       ${ORDER_BENCH_RTT[*]}"
+log "stack order — bench-tx-burst:  ${ORDER_BENCH_TX_BURST[*]}"
+log "stack order — bench-tx-maxtp:  ${ORDER_BENCH_TX_MAXTP[*]}"
+log "stack order — bench-rx-burst:  ${ORDER_BENCH_RX_BURST[*]}"
+
+if [ "$DRY_RUN" = "1" ]; then
+    # --dry-run: planned order matrix only, no bench / preflight / peer side
+    # effects. Skip the EXIT trap's reset_dpdk_state + write_summary too,
+    # since RESULTS_DIR is intentionally empty (no CSVs to summarize).
+    trap - EXIT
+    log "--dry-run: stack order matrix emitted to $RESULTS_DIR/metadata.json (skipping preflight + bench)"
+    cat "$RESULTS_DIR/metadata.json"
+    exit 0
+fi
+
 trap on_exit EXIT
 
-log "fast-iter-suite start — results=$RESULTS_DIR"
+log "fast-iter-suite start — results=$RESULTS_DIR seed=$SEED"
 preflight
 
 # DPDK NIC exclusivity: must be strictly sequential across DPDK/fstack arms,
 # but the helpers themselves already serialize correctly because each is a
-# `run_one` invocation.
+# `run_one` invocation. The PER-TOOL order is randomized per the codex I4
+# fix; see compute_stack_orders above.
 run_bench_rtt
 run_bench_tx_burst
 run_bench_tx_maxtp

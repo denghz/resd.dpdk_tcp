@@ -117,3 +117,31 @@ timestamp directly.
 
 DUT-side measurement — does NOT include the network path latency.
 Captures the engine's RX-path internal latency only.
+
+## Stack-order randomization (codex IMPORTANT I4, 2026-05-13)
+
+The 2026-05-09 fast-iter-suite originally ran `dpdk_net → linux_kernel →
+fstack` in a fixed order for every arm of every tool. Codex's 2026-05-13
+adversarial review (IMPORTANT I4) flagged that AWS ENA's bandwidth-
+allowance / burst-credit accounting drains over the ~35-min suite
+wallclock, so the third-run stack was systematically disadvantaged — and
+T58 variance runs also showed ~2-3× environmental drift over a single
+suite run on the same code, confirming that fixed-order comparisons
+carried a built-in order bias.
+
+Fix: `scripts/fast-iter-suite.sh` now randomizes the per-tool stack
+execution order. The order is derived from a master `$SEED` (CLI flag
+`--seed N`, default current epoch); per-tool seeds are `SEED + tool_index`
+so a single seed reproduces the full 4×3 order matrix deterministically.
+The resolved order is logged into `$RESULTS_DIR/metadata.json` (machine-
+readable) and rendered as a "Stack-order matrix" table in
+`$RESULTS_DIR/SUMMARY.md` (reviewer-readable).
+
+Smoke verification: `./scripts/fast-iter-suite.sh --seed N --dry-run`
+prints the planned matrix without invoking any bench, so reviewers can
+sanity-check the seed → order mapping in a few seconds.
+
+Implication for comparisons: cross-stack deltas in a single run are now
+order-symmetric in expectation (no stack is systematically last); for
+absolute-numbers-grade comparisons, average over multiple runs with
+different seeds to marginalize out the per-run order effect.
