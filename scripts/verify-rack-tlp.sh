@@ -443,7 +443,11 @@ setup_ifb_reorder() {
     log "  setting peer tcp_sack=1 (baseline was $RACK_REORDER_SAVED_SACK)"
     ssh_peer "sudo sysctl -w net.ipv4.tcp_sack=1 >/dev/null"
     log "  loading ifb on peer (numifbs=1) + ingress redirect"
+    # Remote `set -e` so the function returns non-zero if any *required*
+    # step fails; the `|| true` on the `del`s is intentional (idempotent
+    # cleanup of any leftover state from a previous interrupted run).
     ssh_peer "
+        set -e
         sudo modprobe ifb numifbs=1 2>/dev/null || true
         sudo ip link set ifb0 up
         sudo tc qdisc del dev ifb0 root 2>/dev/null || true
