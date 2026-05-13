@@ -93,6 +93,13 @@ static EXPECTED_COUNTERS: &[(&str, u64)] = &[
     // NOT tx_data (separate code path in engine).
     ("tcp.tx_data", 4),
     ("tcp.tx_retrans", 1),
+    // Phase 11 (C-E2) added per-trigger retransmit sub-counters that
+    // partition tcp.tx_retrans by trigger (RTO/RACK/TLP). The single
+    // retransmit in this scenario is RTO-driven (timer fire — see
+    // `inc_tx_retrans_rto` in counters.rs), so the RTO sub-counter
+    // equals the aggregate. tx_retrans_rack and tx_retrans_tlp stay
+    // 0 (not in this list, enforced by assert_no_unexpected_counters).
+    ("tcp.tx_retrans_rto", 1),
     ("tcp.tx_rto", 1),
     ("tcp.conn_open", 1),
     ("tcp.conn_close", 1),
