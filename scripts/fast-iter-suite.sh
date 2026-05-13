@@ -194,6 +194,12 @@ DUT_LOCAL_IP="${DUT_LOCAL_IP:-10.4.1.141}"
 DUT_GATEWAY="${DUT_GATEWAY:-10.4.1.1}"
 DUT_LCORE="${DUT_LCORE:-2}"
 PEER_NIC="${PEER_NIC:-ens5}"
+# DUT kernel NIC name + IP — used by the linux_kernel arm via nsenter
+# (when LINUX_KERNEL_VIA_NSENTER=1) AND captured by log-nic-state.sh into
+# nic-state.txt. This is the SEPARATE physical ENI from $DUT_PCI; see
+# T57 "Methodology — two-ENI comparison" section.
+DUT_KERNEL_NIC="${DUT_KERNEL_NIC:-ens5}"
+DUT_KERNEL_NIC_IP="${DUT_KERNEL_NIC_IP:-10.4.1.139}"
 EAL_ARGS="-l 2-3 -n 4 --in-memory --huge-unlink -a ${DUT_PCI},large_llq_hdr=1,miss_txc_to=3"
 
 VERIFY_RACK_ITERS="${VERIFY_RACK_ITERS:-50000}"
@@ -541,6 +547,28 @@ preflight() {
         exit 2
     fi
     log "preflight: DUT $DUT_PCI bound to vfio-pci OK"
+
+    # Two-ENI state capture. The linux_kernel arm uses a different physical
+    # NIC than dpdk_net + fstack (T57 codex-review BLOCKER B2: same peer,
+    # different wire). Capture per-NIC ethtool / IRQ / qdisc / iptables /
+    # route state for BOTH DUT NICs AND the peer's kernel NIC to a single
+    # `nic-state.txt` so reviewers can verify that queue / coalescing /
+    # offload differences across NICs explain (or don't explain) any
+    # deltas in the headline numbers. See T57 "Methodology — two-ENI
+    # comparison" section + SUMMARY.md NOTE block.
+    if [ -x "$WORKDIR/scripts/log-nic-state.sh" ]; then
+        log "preflight: capture two-ENI state → $RESULTS_DIR/nic-state.txt"
+        DUT_KERNEL_NIC="$DUT_KERNEL_NIC" \
+        DUT_KERNEL_NIC_IP="$DUT_KERNEL_NIC_IP" \
+        DUT_DPDK_PCI="$DUT_PCI" \
+        PEER_NIC="$PEER_NIC" \
+        PEER_SSH="$PEER_SSH" \
+            "$WORKDIR/scripts/log-nic-state.sh" "$RESULTS_DIR/nic-state.txt" \
+            >>"$LOG_FILE" 2>&1 \
+            || log "    WARN: log-nic-state.sh non-zero exit (capture is observational; not aborting)"
+    else
+        log "preflight: log-nic-state.sh missing — skipping two-ENI state capture"
+    fi
 
     # Reset the peer's :10001 echo-server + :10003 burst-echo-server so we
     # start with no stale ESTAB connections holding worker slots. These are
@@ -960,6 +988,37 @@ write_summary() {
         printf '**Wallclock:** %s — %s\n\n' "$WALLCLOCK_START_HUMAN" "$WALLCLOCK_END_HUMAN"
         printf '**Outcome:** %d OK, %d FAIL\n\n' "$OK_COUNT" "$FAIL_COUNT"
 
+        # Two-ENI methodology NOTE — addresses T57 codex-review BLOCKER B2.
+        # The linux_kernel arm drives a DIFFERENT physical NIC than the
+        # dpdk_net / fstack arms (separate AWS ENA ENIs, same subnet, same
+        # peer). Same peer, different wire. The NIC state snapshot at
+        # `nic-state.txt` (captured during preflight) lets reviewers verify
+        # what queue / coalescing / IRQ / offload differences exist between
+        # the two ENIs at run time.
+        printf '## Methodology — two-ENI comparison\n\n'
+        printf '> **The three stacks do NOT all drive the same physical NIC.**'
+        printf ' dpdk_net + fstack use the DPDK NIC at `%s` (vfio-pci,' "$DUT_PCI"
+        printf ' polled at lcore `%s`). linux_kernel uses a separate kernel' "$DUT_LCORE"
+        printf ' NIC `%s` (`%s`) bound to the in-tree `ena` driver, reached' \
+            "$DUT_KERNEL_NIC" "$DUT_KERNEL_NIC_IP"
+        printf ' via `sudo nsenter -t 1 -n` to escape the dev-host REDSOCKS'
+        printf ' proxy. Both NICs are AWS ENA on the same subnet to the same'
+        printf ' peer (`%s`), so the wire physics are identical (same' "$PEER_IP"
+        printf ' NIC family, same kernel, same switch fabric), but RX/TX'
+        printf ' queue counts, IRQ steering, interrupt coalescing, and ENA'
+        printf ' offload defaults can differ across the two ENIs.\n'
+        printf '>\n'
+        printf '> **Run-time NIC state snapshot:** `nic-state.txt` (alongside'
+        printf ' this SUMMARY) captures `ip -s link`, full `ethtool`'
+        printf ' (`-c`/`-k`/`-l`/`-S`), `/proc/interrupts`, `tc qdisc`,'
+        printf ' `iptables`, and `ip route` for BOTH DUT NICs AND the peer'
+        printf ' kernel NIC — reviewers can diff across runs to confirm'
+        printf ' queue / IRQ / coalescing parity (or call out where they'
+        printf ' diverge). See T57 "Methodology — two-ENI comparison"'
+        printf ' section for the full disclosure + future-work plan for an'
+        printf ' absolute-numbers-grade same-physical-NIC comparison via'
+        printf ' vfio/ena rebinding.\n\n'
+
         printf '## bench-rtt — RTT (ns), payload sweep\n\n'
         printf '> **Note — all three stacks tested at `--connections 1` only.**\n'
         printf '> fstack RTT arm currently lacks multi-conn support\n'
@@ -1024,7 +1083,10 @@ write_summary() {
         fi
 
         printf '## Artifacts\n\n'
-        find "$RESULTS_DIR" -maxdepth 2 -type f \( -name '*.csv' -o -name '*.log' \) | sort \
+        # Include nic-state.txt alongside CSVs + logs so reviewers can find
+        # the two-ENI state snapshot referenced by the Methodology section.
+        find "$RESULTS_DIR" -maxdepth 2 -type f \
+            \( -name '*.csv' -o -name '*.log' -o -name 'nic-state.txt' \) | sort \
             | sed "s|^$RESULTS_DIR/|- |"
     } >"$summary"
     log "summary written: $summary"

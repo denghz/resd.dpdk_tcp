@@ -26,10 +26,89 @@
 | 256 B | 77.0 µs | 106.9 µs | 100.1 µs | +30 µs (39%) |
 | 1024 B | 98.5 µs | 108.8 µs | 100.1 µs | +10 µs (10%) |
 
-**All three stacks now talk to the SAME peer over the SAME wire.** The remaining differences are pure software-stack overhead:
+**All three stacks talk to the SAME peer.** The remaining differences are pure software-stack overhead:
 - dpdk_net: ~77-99 µs — DPDK direct-NIC access, lowest overhead.
 - fstack: ~100 µs — FreeBSD socket layer on top of DPDK; consistent across payloads.
 - linux_kernel: ~104-109 µs — kernel TCP stack syscall + context-switch path; grows slightly with payload.
+
+> **Important — same peer, but the linux_kernel arm uses a DIFFERENT physical
+> NIC than dpdk_net + fstack.** See "Methodology — two-ENI comparison"
+> below for the full disclosure. The published software-stack-overhead
+> deltas are reported as the linux−dpdk Δ; readers should hold that
+> framing rather than treating the absolute numbers as a same-wire
+> measurement.
+
+## Methodology — two-ENI comparison
+
+This comparison runs on the standard DPDK-vs-kernel test-bench shape:
+
+| stack | NIC PCI | interface | driver | local IP | how invoked |
+|---|---|---|---|---:|---|
+| dpdk_net | `0000:28:00.0` | (vfio-pci poll) | vfio-pci → DPDK ENA PMD | `10.4.1.141` | DPDK lcore 2, `EAL_ARGS=-l 2-3` |
+| fstack | `0000:28:00.0` | (vfio-pci poll) | vfio-pci → DPDK ENA PMD → F-Stack BSD socket layer | `10.4.1.141` | DPDK lcore 2, same EAL args; one stack at a time (DPDK vfio is exclusive) |
+| linux_kernel | `0000:27:00.0` | `ens5` | in-tree AWS `ena` | `10.4.1.139` | `sudo nsenter -t 1 -n` (escape dev-host REDSOCKS proxy → host netns) |
+
+**The two ENIs are functionally identical hardware.** Both are AWS Elastic
+Network Adapter (vendor `0x1d0f`, device `0xec20`) on the same subnet
+(`10.4.1.0/24`) talking to the same peer (`10.4.1.228:10001/10002/10003`)
+through the same VPC routing and security-group rules. The wire physics —
+ENA hardware queue rings, PCIe interconnect, virtio-style TX/RX descriptor
+shape, in-VPC switch latency, peer NIC parking on the same physical host
+class — are identical. The difference is the SOFTWARE driving the NIC:
+- DPDK arm: PMD polls the NIC ring directly from lcore 2 with no kernel
+  context switch, no IRQ, no qdisc, no iptables.
+- Linux arm: standard Linux kernel TCP/IP stack — syscall entry, kernel
+  TCP, RACK/DCTCP/CUBIC machinery, netfilter / iptables traversal, qdisc
+  egress, ENA `ena_start_xmit` → kernel-mediated descriptor ring write.
+
+**Why this still constitutes a fair comparison.** The headline claim is
+*"software-stack overhead"* — i.e. the cost the application pays for
+calling `read`/`write` (or `bench_rtt` ping-pong) against each stack. That
+overhead is, by construction, the gap between what the user-space program
+sees and what the wire could do. The two ENIs put both stacks on
+equivalent wire baselines; the published `linux−dpdk Δ` therefore
+isolates the software cost, not any wire asymmetry.
+
+**What COULD differ at run time across the two ENIs:**
+- RX/TX queue counts (one ENA queue per active vCPU on the kernel side;
+  DPDK arm uses a single hardware queue at lcore 2)
+- IRQ steering and CPU affinity for the kernel ena driver
+- Interrupt coalescing (`ethtool -c`) — different defaults for adaptive
+  RX coalescing
+- ENA offload defaults (`ethtool -k`) — GSO/GRO/LRO state
+- Driver-level qdisc / netfilter / iptables on the kernel NIC only
+
+**Mitigation — run-time state capture.** Every fast-iter-suite invocation
+now writes `nic-state.txt` alongside the SUMMARY at the start of the run
+(see `scripts/log-nic-state.sh`, wired into `fast-iter-suite.sh::preflight`).
+It captures, for the DUT kernel NIC (`ens5` via `sudo nsenter -t 1 -n`),
+the DUT DPDK NIC (`0000:28:00.0` via `lspci -k -vv` + sysfs), AND the
+peer kernel NIC (`ens5` via SSH):
+- `ip -s link show <ifname>` — packet/byte counters, MTU, link state
+- `ethtool <ifname>` — speed, duplex, autoneg
+- `ethtool -c <ifname>` — interrupt coalescing (critical for latency)
+- `ethtool -k <ifname>` — TCP/UDP offloads
+- `ethtool -l <ifname>` — channel/queue count
+- `ethtool -S <ifname>` — ENA xstats (incl. `bw_*_allowance_exceeded`)
+- `/proc/interrupts | grep <ifname>` — IRQ distribution + affinity
+- `tc qdisc show dev <ifname>` — egress qdisc
+- `sudo iptables -L -v -n | head -30` — netfilter rules
+- `ip route` — route table
+
+Reviewers can diff `nic-state.txt` between two runs (or between the two
+DUT NICs in a single run) to confirm queue / IRQ / coalescing parity, or
+to call out where they diverge and re-interpret the headline numbers
+under that disclosure.
+
+**Future work — Option A (not in this delivery).** A future enhancement
+will optionally rebind `0000:28:00.0` from vfio-pci to ena between the
+DPDK and linux arms within the same suite invocation, run the linux arm
+against the same physical NIC + same IP (`10.4.1.141`) as the DPDK arms,
+then rebind back. That gives an absolute-numbers-grade comparison
+("same-NIC-vfio-vs-kernel") at the cost of suite robustness (a failed
+mid-suite rebind leaves the DUT NIC in a half-bound state requiring
+manual recovery). For publication-candidate runs we stay with the
+two-ENI disclosure path documented here.
 
 > **Note — all three stacks tested at `--connections 1` only.** fstack's
 > RTT arm currently lacks multi-conn support
@@ -150,7 +229,7 @@ cat target/bench-results/fast-iter-<UTC>/SUMMARY.md
 For the first time across the entire bench-overhaul:
 
 - **All four bench tools** (bench-rtt, bench-tx-burst, bench-tx-maxtp, bench-rx-burst) work end-to-end on **all three stacks** (dpdk_net, linux_kernel, fstack).
-- **All three stacks** traverse the same physical wire to the same peer (no loopback, no proxy).
+- **All three stacks** talk to the same peer over real wire (no loopback, no proxy). See "Methodology — two-ENI comparison" for the dpdk_net/fstack vs linux_kernel NIC disclosure — same peer, two physical ENIs.
 - **Phase 11 counters** (`tx_retrans_rto/rack/tlp`) validate against real netem-induced loss.
 - **Hardened peer servers** survive DUT SIGKILL within 5s (was 15 min).
 
