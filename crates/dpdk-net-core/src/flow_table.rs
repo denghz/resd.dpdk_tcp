@@ -102,17 +102,32 @@ pub fn hash_bucket_for_lookup(
 pub struct FlowTable {
     slots: Vec<Option<TcpConn>>,
     by_tuple: HashMap<FourTuple, u32>,
+    /// LIFO stack of slot indices currently free. `insert` pops, `remove`
+    /// pushes. Avoids the O(N) `slots.iter().position(is_none)` scan that
+    /// the previous implementation paid on every accept.
+    ///
+    /// Invariant: an index `i` is in `free_slots` ⟺ `slots[i].is_none()`.
+    /// No index ever appears twice — `insert` pops (removes from stack,
+    /// fills slot), `remove` pushes only when `slot.take()` actually
+    /// returned a connection (slot was occupied), `clear_all` rebuilds
+    /// both to a consistent state.
+    free_slots: Vec<u32>,
 }
 
 impl FlowTable {
     pub fn new(max_connections: u32) -> Self {
-        let mut slots = Vec::with_capacity(max_connections as usize);
-        for _ in 0..max_connections {
+        let n = max_connections as usize;
+        let mut slots = Vec::with_capacity(n);
+        for _ in 0..n {
             slots.push(None);
         }
+        // Pushed in reverse so pop() yields 0, 1, 2, ... — keeps the
+        // first-insert-gets-slot-0 behavior the old linear-scan had.
+        let free_slots: Vec<u32> = (0..max_connections).rev().collect();
         Self {
             slots,
-            by_tuple: HashMap::with_capacity(max_connections as usize),
+            by_tuple: HashMap::with_capacity(n),
+            free_slots,
         }
     }
 
@@ -128,7 +143,11 @@ impl FlowTable {
         if self.by_tuple.contains_key(&tuple) {
             return None;
         }
-        let slot_idx = self.slots.iter().position(|s| s.is_none())?;
+        let slot_idx = self.free_slots.pop()? as usize; // O(1)
+        debug_assert!(
+            self.slots[slot_idx].is_none(),
+            "free_slots stack points at an occupied slot"
+        );
         self.slots[slot_idx] = Some(conn);
         self.by_tuple.insert(tuple, slot_idx as u32);
         Some(slot_idx as u32 + 1)
@@ -190,6 +209,10 @@ impl FlowTable {
         let slot = self.slots.get_mut(idx)?;
         let conn = slot.take()?;
         self.by_tuple.remove(&conn.four_tuple());
+        // Reclaim the slot. `slot.take()?` already returned (so the slot
+        // was occupied and is now empty) — pushing here cannot create a
+        // duplicate index in `free_slots`.
+        self.free_slots.push(idx as u32);
         Some(conn)
     }
 
@@ -216,6 +239,10 @@ impl FlowTable {
     pub fn clear_all(&mut self) {
         self.slots.iter_mut().for_each(|s| *s = None);
         self.by_tuple.clear();
+        // Rebuild the free-slot stack to match: every slot is now empty.
+        // Reverse order so pop() yields 0, 1, 2, ... like a fresh table.
+        self.free_slots.clear();
+        self.free_slots.extend((0..self.slots.len() as u32).rev());
     }
 }
 
