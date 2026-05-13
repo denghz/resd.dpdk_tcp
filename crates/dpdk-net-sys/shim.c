@@ -41,6 +41,18 @@ struct rte_mbuf *shim_rte_pktmbuf_alloc(struct rte_mempool *mp) {
     return rte_pktmbuf_alloc(mp);
 }
 
+/* PO9: rte_pktmbuf_alloc_bulk is static inline; re-export so the Rust
+ * `Engine::send_bytes` hot path can drop N per-segment FFI hops to a
+ * single bulk-alloc call. Fills `mbufs[0..count]` with freshly-allocated
+ * mbufs from `mp`. Returns 0 on success; -ENOENT (or other non-zero)
+ * when the mempool can't satisfy the whole batch — on partial failure
+ * NO mbufs are retrieved (DPDK rte_mempool_get_bulk is all-or-nothing),
+ * so callers can treat any non-zero return as "no mbufs delivered" and
+ * fall through to the mempool-pressure backpressure path. */
+int shim_rte_pktmbuf_alloc_bulk(struct rte_mempool *mp, struct rte_mbuf **mbufs, unsigned count) {
+    return rte_pktmbuf_alloc_bulk(mp, mbufs, count);
+}
+
 /* rte_pktmbuf_append is static inline; re-export.
  * Returns a pointer to the appended region, or NULL on overflow. */
 char *shim_rte_pktmbuf_append(struct rte_mbuf *m, uint16_t len) {

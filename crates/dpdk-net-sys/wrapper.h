@@ -34,6 +34,13 @@ uint16_t shim_rte_eth_tx_burst(uint16_t port_id, uint16_t queue_id,
                                struct rte_mbuf **tx_pkts, uint16_t nb_pkts);
 void shim_rte_pktmbuf_free(struct rte_mbuf *m);
 struct rte_mbuf *shim_rte_pktmbuf_alloc(struct rte_mempool *mp);
+/* PO9: bulk-alloc N mbufs in one FFI call. Returns 0 on success;
+ * non-zero (typically -ENOENT) when the mempool can't satisfy the
+ * whole count — DPDK's `rte_mempool_get_bulk` is all-or-nothing, so
+ * partial alloc never occurs and `mbufs[..]` is untouched on failure.
+ * Replaces N per-segment `shim_rte_pktmbuf_alloc` hops in the
+ * `Engine::send_bytes` hot path. */
+int shim_rte_pktmbuf_alloc_bulk(struct rte_mempool *mp, struct rte_mbuf **mbufs, unsigned count);
 char *shim_rte_pktmbuf_append(struct rte_mbuf *m, uint16_t len);
 int shim_rte_eth_macaddr_get(uint16_t port_id, struct rte_ether_addr *mac_addr);
 int shim_rte_eth_dev_get_mtu(uint16_t port_id, uint16_t *mtu);

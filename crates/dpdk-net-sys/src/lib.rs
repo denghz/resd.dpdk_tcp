@@ -45,6 +45,10 @@ mod tests {
         let _d: unsafe extern "C" fn(*const rte_mbuf) -> *mut std::os::raw::c_void =
             shim_rte_pktmbuf_data;
         let _e: unsafe extern "C" fn(*const rte_mbuf) -> u16 = shim_rte_pktmbuf_data_len;
+        // PO9: bulk-alloc shim symbol. Same EAL caveat — calling it
+        // needs a live mempool; this test only proves the link.
+        let _f: unsafe extern "C" fn(*mut rte_mempool, *mut *mut rte_mbuf, u32) -> i32 =
+            shim_rte_pktmbuf_alloc_bulk;
     }
 
     #[test]

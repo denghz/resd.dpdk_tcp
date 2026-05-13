@@ -6338,6 +6338,89 @@ impl Engine {
         //     "one TSC read shared across both consumers" pattern.
         let now_ns_at_send = crate::clock::now_ns();
         let tsval_at_send = (now_ns_at_send / 1000) as u32;
+
+        // PO9: bulk mbuf alloc. Replace N per-segment
+        // `shim_rte_pktmbuf_alloc` FFI hops with one
+        // `shim_rte_pktmbuf_alloc_bulk` call. Compute the segment count
+        // up front from `remaining / mss_cap` (ceil) and bulk-alloc that
+        // many mbufs. The loop then `consume[s]` the pre-allocated mbufs
+        // from `mbufs[segments_consumed]` rather than calling
+        // `rte_pktmbuf_alloc` per iteration.
+        //
+        // Cap at BULK_MAX = 32: bounds the stack array, and typical
+        // bursts are <=10 segments at MSS so the cap is rarely the
+        // limiter. When `total_segments > BULK_MAX` we transmit the
+        // first BULK_MAX segments and return `Ok(accepted < bytes.len())`
+        // so the caller retries — same partial-fill behaviour
+        // `send_bytes` already produces under mempool pressure.
+        //
+        // CRITICAL: every unconsumed mbuf in `mbufs[segments_consumed..bulk_n]`
+        // MUST be freed on any early break (build_segment None, etc.).
+        // Pushed mbufs transfer ownership to the TX path (drain or ring),
+        // which frees them on TX-completion / tx_drop_full_ring. The
+        // per-iter "alloc failed -> break" check is gone (bulk_alloc is
+        // all-or-nothing per DPDK semantics — `rte_mempool_get_bulk`
+        // returns -ENOENT without retrieving any mbufs on insufficient
+        // mempool, so any non-zero return implies `mbufs[..]` is
+        // untouched and no free is needed).
+        const BULK_MAX: usize = 32;
+        let total_segments = (remaining as u32).div_ceil(mss_cap);
+        let bulk_n = (total_segments as usize).min(BULK_MAX);
+        // Cap the byte budget at exactly bulk_n * mss_cap so the loop
+        // never requests more mbufs than were allocated. If
+        // total_segments was clamped at BULK_MAX, the loop will produce
+        // accepted < bytes.len() and the caller retries — matching the
+        // pre-PO9 partial-fill contract.
+        if bulk_n < total_segments as usize {
+            remaining = remaining.min(bulk_n * mss_cap as usize);
+        }
+        let mut mbufs: [*mut sys::rte_mbuf; BULK_MAX] = [std::ptr::null_mut(); BULK_MAX];
+        let mut segments_consumed: usize = 0;
+        // `bulk_alloc_failed` lets the loop skip without entering (no
+        // mbufs to consume) while keeping the post-loop bookkeeping
+        // (`send_buf_full` / `send_refused_pending`) consistent with the
+        // pre-PO9 first-segment alloc-failure path: `accepted == 0 <
+        // bytes.len()` ⇒ the backpressure flag fires.
+        let bulk_alloc_failed = if bulk_n > 0 {
+            // Safety: `tx_data_mempool` is alive (engine-owned); `mbufs`
+            // is a stack array of `BULK_MAX` slots and `bulk_n <= BULK_MAX`,
+            // so writing `bulk_n` pointers is in-bounds. The shim returns
+            // 0 on success and leaves `mbufs[..]` untouched on non-zero
+            // (DPDK `rte_mempool_get_bulk` is all-or-nothing).
+            let ret = unsafe {
+                sys::shim_rte_pktmbuf_alloc_bulk(
+                    self.tx_data_mempool.as_ptr(),
+                    mbufs.as_mut_ptr(),
+                    bulk_n as u32,
+                )
+            };
+            if ret != 0 {
+                // Mempool can't satisfy the whole batch. Treat as
+                // pool-exhaustion backpressure: bump `tx_drop_nomem`
+                // once (matches the pre-PO9 single-bump on first per-
+                // segment alloc failure) and short-circuit the loop.
+                // Fall through to the post-loop flush path so the
+                // `accepted < bytes.len()` backpressure signal still
+                // fires. Nothing to free — bulk_alloc is all-or-
+                // nothing per DPDK `rte_mempool_get_bulk` semantics.
+                inc(&self.counters.eth.tx_drop_nomem);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        // Short-circuit the loop on bulk-alloc failure by zeroing
+        // `remaining`. Skipping the `while remaining > 0` body keeps
+        // every post-loop branch (snd_nxt, send_buf_full,
+        // accumulator-flush, arm_tlp_pto) intact and consistent with
+        // the pre-PO9 first-alloc-failure path which also fell through
+        // those branches via `break`.
+        if bulk_alloc_failed {
+            remaining = 0;
+        }
+
         while remaining > 0 {
             let take = remaining.min(mss_cap as usize);
             let payload = &bytes[offset..offset + take];
@@ -6397,6 +6480,12 @@ impl Engine {
             };
             let Some(n) = n_opt else {
                 // Shouldn't happen; buf is sized for hdrs+opts+take.
+                // PO9: the bulk-alloc above pre-reserved `bulk_n` mbufs;
+                // free the unconsumed tail (mbufs[segments_consumed..bulk_n])
+                // to avoid leaking mempool entries.
+                for &leftover in &mbufs[segments_consumed..bulk_n] {
+                    unsafe { sys::shim_rte_pktmbuf_free(leftover) };
+                }
                 break;
             };
 
@@ -6405,17 +6494,25 @@ impl Engine {
             // `snd_retrans` for retransmit. `tx_data_frame` is kept for
             // control frames; `send_bytes` needs the mbuf pointer and the
             // pre-tx_burst refcount bump, so the steps are inlined here.
-            let m = unsafe { sys::shim_rte_pktmbuf_alloc(self.tx_data_mempool.as_ptr()) };
-            if m.is_null() {
-                inc(&self.counters.eth.tx_drop_nomem);
-                // Pool exhaustion is backpressure, not a hard error. Return Ok(accepted)
-                // (Ok(0) on first alloc) so the caller spins on poll_once() until ACKs
-                // retire snd_retrans mbufs and the pool refills.
-                break;
-            }
+            // PO9: pull from the pre-allocated `mbufs` array instead of
+            // calling `rte_pktmbuf_alloc` per iteration. The bulk-alloc
+            // before the loop is all-or-nothing, so every slot up to
+            // `bulk_n` is non-null and ready for use.
+            let m = mbufs[segments_consumed];
+            segments_consumed += 1;
             let dst = unsafe { sys::shim_rte_pktmbuf_append(m, n as u16) };
             if dst.is_null() {
+                // append-fail on a freshly-allocated mbuf "shouldn't
+                // happen" (the data room covers FRAME_HDRS_MIN + 40 +
+                // mss_cap), but if it does, free THIS mbuf AND every
+                // remaining unconsumed mbuf from the bulk before
+                // breaking. `m` was popped out of `mbufs[]` via the
+                // segments_consumed bump above, so the slice iteration
+                // below skips it.
                 unsafe { sys::shim_rte_pktmbuf_free(m) };
+                for &leftover in &mbufs[segments_consumed..bulk_n] {
+                    unsafe { sys::shim_rte_pktmbuf_free(leftover) };
+                }
                 inc(&self.counters.eth.tx_drop_nomem);
                 break;
             }
