@@ -79,23 +79,21 @@
 //! bench DOES pay the per-call options encode; what it does NOT
 //! exercise are the additional per-segment costs production pays:
 //!
-//!   * `tx_frame_scratch` `RefCell::borrow_mut` to access the
-//!     engine-owned reusable frame buffer.
 //!   * `SegmentTx { .. }` struct construction (per-segment
 //!     `seq`, `ack`, `payload` slice + a freshly-constructed
 //!     `TcpOpts` value built from the conn's TS state).
-//!   * `frame.clear()` + `frame.resize(needed, 0)` to right-size the
-//!     scratch.
-//!   * Downstream the mbuf alloc, `copy_nonoverlapping`, refcount bump,
-//!     and TX-burst submission.
+//!   * Downstream the mbuf alloc, `shim_rte_pktmbuf_append` (whose
+//!     returned `dst` is now the `&mut [u8]` build_segment writes
+//!     into directly post-PO10), refcount bump, and TX-burst submission.
 //!
 //! T1's `bench_send_*` measures the whole bundle; this bench peels off
 //! the `build_segment` step on its own. T2's `bench_parse_options`
 //! measures the inverse RX-decode side. Neither this bench nor T2
 //! exercises the production-call-site inlining boundary — `build_segment`
 //! is invoked through a `Vec`/`Box`-backed `out` buffer here, not the
-//! engine-owned `tx_frame_scratch` `RefCell`, so register allocation and
-//! surrounding-code interleaving may differ from the production hotspot.
+//! mbuf-data `&mut [u8]` returned by `rte_pktmbuf_append` (PO10), so
+//! register allocation and surrounding-code interleaving may differ from
+//! the production hotspot.
 //!
 //! Concretely: `build_segment` is declared `pub fn` with NO `#[inline]`
 //! attribute (tcp_output.rs:43). The production hot-path call site lives

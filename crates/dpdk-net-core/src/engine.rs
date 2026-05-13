@@ -257,13 +257,16 @@ pub mod test_support {
     /// the helper signature legible (otherwise it takes ~10 `&mut`
     /// arguments).
     ///
-    /// * `frame` is the engine's `tx_frame_scratch` analogue
-    ///   (engine.rs:5999) — reused across segments, never shrunk.
     /// * `mbuf_data` simulates the `dst` region inside the buffer that
-    ///   `rte_pktmbuf_append` returns at engine.rs:6068. The helper
-    ///   copies the built frame here exactly as the production code
-    ///   does at engine.rs:6076-6078. Must be at least
-    ///   `FRAME_HDRS_MIN + 40 + payload.len()` bytes (one segment's worth).
+    ///   `rte_pktmbuf_append` returns. PO10 removed the production
+    ///   `tx_frame_scratch` Vec — `build_segment` now writes the wire
+    ///   bytes DIRECTLY into the mbuf's data area, so the helper does
+    ///   the same: it passes `mbuf_data[..actual_n]` straight to
+    ///   `build_segment` / `build_segment_offload`. The slice must be
+    ///   at least `FRAME_HDRS_MIN + opts_len + payload.len()` bytes
+    ///   (one segment's worth, sized exactly — no 40-byte options
+    ///   cushion needed because `build_segment_inner` writes only the
+    ///   actual encoded options).
     /// * `wheel` accepts the first-segment RTO arm.
     /// * `counters` is referenced for sub-counter atomics that the
     ///   helper still performs internally (e.g. `tcp.tx_payload_bytes`
@@ -274,7 +277,6 @@ pub mod test_support {
     ///   the helper never dereferences it. In production this is the
     ///   freshly-allocated `rte_pktmbuf_alloc` return value.
     pub struct SegmentBuildScratch<'a> {
-        pub frame: &'a mut Vec<u8>,
         pub mbuf_data: &'a mut [u8],
         pub wheel: &'a mut TimerWheel,
         pub counters: &'a Counters,
@@ -348,10 +350,11 @@ pub mod test_support {
         ///     adding ~5 ns of borrow tracking).
         ///   * TS option per RFC 7323 §3 MUST-22 (6016-6024)
         ///   * `SegmentTx` literal build (6025-6038)
-        ///   * `frame.clear()` + `frame.resize(needed, 0)` (6048-6049)
-        ///   * `build_segment(&seg, frame.as_mut_slice())` (6050) — the
-        ///     dominant per-segment cost (IPv4 + TCP cksum + hdr pack)
-        ///   * `copy_nonoverlapping(frame.as_ptr(), dst, n)` (6076-6078)
+        ///   * `build_segment(&seg, mbuf_data)` — the dominant per-segment
+        ///     cost (IPv4 + TCP cksum + hdr pack). PO10: production writes
+        ///     DIRECTLY into the mbuf via `&mut [u8]` (no scratch Vec, no
+        ///     copy); the helper mirrors that by handing `mbuf_data`
+        ///     straight to `build_segment`.
         ///   * `RetransEntry { .. }` literal + `push_after_tx` (6155-6172)
         ///   * `send_ack_log.record_send(...)` (6176-6182) — early-return
         ///     when the log is disabled
@@ -362,8 +365,8 @@ pub mod test_support {
         ///
         ///   * `shim_rte_pktmbuf_alloc(tx_data_mempool)` (6060) — fake
         ///     mbuf is caller-supplied
-        ///   * `shim_rte_pktmbuf_append(m, n)` (6068) — `mbuf_data` slice
-        ///     is the simulated append return
+        ///   * `shim_rte_pktmbuf_append(m, actual_n)` (6068) — `mbuf_data`
+        ///     slice is the simulated append return
         ///   * `tx_offload_finalize(m, ...)` (6085-6092) — reads live
         ///     mbuf fields written by `rte_pktmbuf_append`
         ///   * `shim_rte_mbuf_refcnt_update(m, 1)` (6100)
@@ -444,17 +447,22 @@ pub mod test_support {
                 options,
                 payload,
             };
-            // engine.rs:6043-6049 — pre-size the frame scratch.
-            let needed = crate::tcp_output::FRAME_HDRS_MIN + 40 + payload.len();
-            scratch.frame.clear();
-            scratch.frame.resize(needed, 0);
-            // engine.rs:6233-6240 — the dominant per-segment cost.
+            // PO10: production sizes the mbuf append EXACTLY to the
+            // bytes `build_segment_inner` will write — no 40-byte option
+            // slack, no scratch Vec, no memcpy. The helper mirrors that
+            // by slicing `mbuf_data` down to `actual_n` and passing the
+            // slice directly to `build_segment`. `mbuf_data` must be at
+            // least `actual_n` bytes; the caller (bench / drift-guard
+            // test) owns sizing.
+            let opts_len = seg.options.encoded_len();
+            let actual_n = crate::tcp_output::FRAME_HDRS_MIN + opts_len + payload.len();
+            // engine.rs send_bytes (PO10) — the dominant per-segment cost.
             // PO4: pick build_segment vs build_segment_offload to mirror
             // the production branch on Engine::tx_cksum_offload_active.
             let n_opt = if tx_csum_offload_active {
-                build_segment_offload(&seg, scratch.frame.as_mut_slice())
+                build_segment_offload(&seg, &mut scratch.mbuf_data[..actual_n])
             } else {
-                build_segment(&seg, scratch.frame.as_mut_slice())
+                build_segment(&seg, &mut scratch.mbuf_data[..actual_n])
             };
             let Some(n) = n_opt else {
                 return SegmentBuildOutcome {
@@ -462,18 +470,10 @@ pub mod test_support {
                     armed_rto: false,
                 };
             };
-            // engine.rs:6076-6078 — copy the freshly-built frame into
-            // the (caller-supplied) mbuf data area. `mbuf_data` must be
-            // sized for `n`; the caller is responsible for that.
-            // Safety: caller guarantees `mbuf_data.len() >= n` (the
-            // helper's contract); both pointers are aligned to u8.
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    scratch.frame.as_ptr(),
-                    scratch.mbuf_data.as_mut_ptr(),
-                    n,
-                );
-            }
+            debug_assert_eq!(
+                n, actual_n,
+                "build_segment wrote {n} bytes into mbuf_data slice of {actual_n}"
+            );
             // PO8: production batches the per-segment eth.tx_bytes/tcp.tx_data
             // ops into stack-local u64 accumulators that flush once after
             // the burst loop (see engine.rs send_bytes post-loop flush).
@@ -1231,12 +1231,6 @@ pub struct Engine {
     /// queue here — they stay on their existing `tx_frame` /
     /// `tx_data_frame` inline paths.
     pub(crate) tx_pending_data: RefCell<Vec<std::ptr::NonNull<sys::rte_mbuf>>>,
-
-    /// Reusable scratch buffer for per-segment TX frame staging. Sized
-    /// at `engine_create` to fit MSS + 40-byte option budget + FRAME_HDRS_MIN.
-    /// Borrow semantics mirror `tx_pending_data`: borrow_mut + clear + resize.
-    /// §7.6 scratch-reuse policy.
-    pub(crate) tx_frame_scratch: RefCell<Vec<u8>>,
 
     /// Per-poll scratch for copying a connection's timer-id list out
     /// before cancel operations that would re-borrow the conn. A6.5
@@ -2030,11 +2024,6 @@ impl Engine {
                 },
             )),
             tx_pending_data: RefCell::new(Vec::with_capacity(cfg.tx_ring_size as usize)),
-            tx_frame_scratch: RefCell::new(Vec::with_capacity(
-                cfg.tcp_mss as usize
-                    + crate::tcp_output::FRAME_HDRS_MIN
-                    + 40,
-            )),
             timer_ids_scratch: RefCell::new(SmallVec::new()),
             conn_handles_scratch: RefCell::new(SmallVec::new()),
             // Pre-allocate the heap-spill past inline-16 at creation
@@ -6304,17 +6293,31 @@ impl Engine {
         let mut total_tx_bytes_acc: u64 = 0;
         let mut total_tx_data_segs_acc: u64 = 0;
 
-        let mut frame = self.tx_frame_scratch.borrow_mut();
-        // Pre-size to cover the first segment's needed bytes. Inner loop
-        // grows on demand for atypical sizes.
-        let initial_cap_needed = crate::tcp_output::FRAME_HDRS_MIN + 40 + mss_cap as usize;
-        // Two-phase borrowing doesn't kick in across the `reserve` arg
-        // because the immutable borrow is held through method lookup on
-        // `Vec`; snapshot the capacity to sidestep E0502.
-        let current_cap = frame.capacity();
-        if current_cap < initial_cap_needed {
-            frame.reserve(initial_cap_needed - current_cap);
-        }
+        // PO10: `tx_frame_scratch` is gone. With the mbufs bulk-allocated
+        // immediately below (PO9), every segment's destination memory is
+        // already known — `build_segment` writes the wire bytes DIRECTLY
+        // into the mbuf's data area via the `&mut [u8]` returned by
+        // `rte_pktmbuf_append`. This eliminates two per-segment costs:
+        //   * `frame.clear()` + `frame.resize(needed, 0)` zero-fill
+        //     (~50 ns at MSS)
+        //   * `copy_nonoverlapping(frame.as_ptr(), dst, n)` memcpy
+        //     (~50-100 ns at MSS)
+        // Net win: ~100-150 ns per MSS segment on the hot path.
+        //
+        // Soundness of `&mut [u8]` over FFI memory (u8, the only byte
+        // shape we care about):
+        //   * The pointer from `rte_pktmbuf_append` is non-null (we
+        //     check) and 1-byte aligned (every byte address is u8-aligned).
+        //   * DPDK guarantees `actual_n` bytes after `dst` are within
+        //     the mbuf's data buffer when `append` returns non-null.
+        //   * `u8` has no invalid bit patterns — every byte is a valid u8.
+        //   * The slice is the sole alias on that memory: we just
+        //     appended fresh bytes into a freshly-allocated mbuf that
+        //     no other code path holds a reference to. The slice's
+        //     lifetime ends inside the loop body, before any other
+        //     code (offload finalize, refcnt update, ring push) touches
+        //     the mbuf via a raw pointer.
+        //
         // PO7: hoist `crate::clock::now_ns()` out of the per-segment loop.
         // The loop previously paid two TSC reads (+ scaled-multiply
         // ns-conversion) per segment — one for the TS-option `tsval`,
@@ -6451,43 +6454,19 @@ impl Engine {
                 options,
                 payload,
             };
-            // Budget 40 bytes for max TCP options (RFC 9293 §3.1 limit).
-            // F-6 introduces TS option on data segments; with MSS-sized
-            // payloads the frame grows by 12 bytes. Keep a 40-byte
-            // cushion for any future option additions under A5+.
-            let needed = crate::tcp_output::FRAME_HDRS_MIN + 40 + take;
-            // A6.5 Task 1: reuse the engine-owned scratch buffer across
-            // segments. `clear()` drops the logical length to 0 without
-            // shrinking capacity; `resize()` zero-fills the range
-            // build_segment will overwrite.
-            frame.clear();
-            frame.resize(needed, 0);
-            // PO4: when the NIC's TX cksum offload is active, skip the
-            // dead SW full TCP fold inside build_segment — the value is
-            // overwritten downstream by `tx_offload_finalize`'s call to
-            // `tx_offload_rewrite_cksums`. `build_segment_offload` writes
-            // the pseudo-only TCP cksum + zero IPv4 cksum directly,
-            // producing the same final post-finalize wire bytes
-            // (verified by the `build_segment_offload_wire_equivalent_*`
-            // unit tests in tcp_output.rs). Saves ~250-400 ns at MSS.
-            // tx_offload_finalize still runs below — its mbuf flag set
-            // + l2/l3/l4_len writes are essential and idempotent over
-            // the cksum fields.
-            let n_opt = if self.tx_cksum_offload_active {
-                build_segment_offload(&seg, frame.as_mut_slice())
-            } else {
-                build_segment(&seg, frame.as_mut_slice())
-            };
-            let Some(n) = n_opt else {
-                // Shouldn't happen; buf is sized for hdrs+opts+take.
-                // PO9: the bulk-alloc above pre-reserved `bulk_n` mbufs;
-                // free the unconsumed tail (mbufs[segments_consumed..bulk_n])
-                // to avoid leaking mempool entries.
-                for &leftover in &mbufs[segments_consumed..bulk_n] {
-                    unsafe { sys::shim_rte_pktmbuf_free(leftover) };
-                }
-                break;
-            };
+            // PO10: size the mbuf append to the EXACT frame length —
+            // ETH_HDR_LEN + IPV4_HDR_MIN + TCP_HDR_MIN + opts_len + take.
+            // The previous 40-byte options cushion was sized for scratch
+            // reuse across segments with varying option lengths;
+            // `rte_pktmbuf_append` writes the chosen length into
+            // `data_len`, so it must equal the bytes `build_segment` will
+            // actually write. `build_segment_inner` writes exactly
+            // ETH_HDR_LEN + IPV4_HDR_MIN + (TCP_HDR_MIN + opts_len) +
+            // seg.payload.len() bytes — see tcp_output.rs:227 — and never
+            // touches buffer slack beyond that, so an exact-size buffer
+            // is sufficient (no zero-padding of unused option bytes).
+            let opts_len = seg.options.encoded_len();
+            let actual_n = crate::tcp_output::FRAME_HDRS_MIN + opts_len + take;
 
             // A5 task 10: inline alloc + append + refcnt_update(+1) +
             // tx_burst, capturing the mbuf pointer so it can be stashed in
@@ -6500,7 +6479,7 @@ impl Engine {
             // `bulk_n` is non-null and ready for use.
             let m = mbufs[segments_consumed];
             segments_consumed += 1;
-            let dst = unsafe { sys::shim_rte_pktmbuf_append(m, n as u16) };
+            let dst = unsafe { sys::shim_rte_pktmbuf_append(m, actual_n as u16) };
             if dst.is_null() {
                 // append-fail on a freshly-allocated mbuf "shouldn't
                 // happen" (the data room covers FRAME_HDRS_MIN + 40 +
@@ -6516,17 +6495,67 @@ impl Engine {
                 inc(&self.counters.eth.tx_drop_nomem);
                 break;
             }
-            // Safety: `dst` points to `n` writable bytes inside the freshly
-            // allocated mbuf's data room (see DPDK `rte_pktmbuf_append`).
-            unsafe {
-                std::ptr::copy_nonoverlapping(frame.as_ptr(), dst as *mut u8, n);
-            }
+            // PO10: build_segment writes directly into the mbuf's data
+            // area. `dst..dst+actual_n` is a freshly-appended, exclusive,
+            // writable region inside the mbuf — see soundness comment at
+            // the pre-loop scratch-removal block. Cast to `&mut [u8]` is
+            // sound because: (a) `dst` is non-null + u8-aligned, (b) the
+            // mbuf guarantees `actual_n` writable bytes after `append`
+            // returned non-null, (c) `u8` has no invalid bit patterns,
+            // (d) no other slice or raw pointer references this region
+            // while the slice lives — the slice's lifetime ends at the
+            // close of this match arm, before any FFI op on `m` runs.
+            // PO4: when the NIC's TX cksum offload is active, skip the
+            // dead SW full TCP fold inside build_segment — the value is
+            // overwritten downstream by `tx_offload_finalize`'s call to
+            // `tx_offload_rewrite_cksums`. `build_segment_offload` writes
+            // the pseudo-only TCP cksum + zero IPv4 cksum directly,
+            // producing the same final post-finalize wire bytes
+            // (verified by the `build_segment_offload_wire_equivalent_*`
+            // unit tests in tcp_output.rs). Saves ~250-400 ns at MSS.
+            // tx_offload_finalize still runs below — its mbuf flag set
+            // + l2/l3/l4_len writes are essential and idempotent over
+            // the cksum fields.
+            let n = {
+                let mbuf_data: &mut [u8] =
+                    unsafe { std::slice::from_raw_parts_mut(dst as *mut u8, actual_n) };
+                let n_opt = if self.tx_cksum_offload_active {
+                    build_segment_offload(&seg, mbuf_data)
+                } else {
+                    build_segment(&seg, mbuf_data)
+                };
+                let Some(n) = n_opt else {
+                    // PO10: `actual_n` is sized EXACTLY to what
+                    // `build_segment_inner` writes (it checks
+                    // `out.len() < total_written` and we passed
+                    // `total_written` bytes), so this branch is
+                    // unreachable in practice. Treat as the same
+                    // catastrophic-shape failure as the append-null
+                    // case above: free THIS mbuf and the unconsumed
+                    // tail before breaking. The mbuf was already
+                    // appended to (data_len > 0) but
+                    // `shim_rte_pktmbuf_free` reclaims the whole mbuf
+                    // (data + metadata) regardless of data_len.
+                    unsafe { sys::shim_rte_pktmbuf_free(m) };
+                    for &leftover in &mbufs[segments_consumed..bulk_n] {
+                        unsafe { sys::shim_rte_pktmbuf_free(leftover) };
+                    }
+                    inc(&self.counters.eth.tx_drop_nomem);
+                    break;
+                };
+                debug_assert_eq!(
+                    n, actual_n,
+                    "build_segment wrote {n} bytes into mbuf appended for {actual_n}"
+                );
+                n
+            };
             // A-HW Task 7: apply TX offload metadata + pseudo-header-only
             // TCP cksum rewrite to the mbuf when offload is active.
             // Safety: `m` is freshly-allocated, exclusive to us until
             // tx_burst; the data buffer was fully populated by the
-            // copy_nonoverlapping above (n bytes = full L2+L3+TCP+payload),
-            // so the finalizer's data-buffer preconditions hold.
+            // PO10 in-place `build_segment` write above (n bytes = full
+            // L2+L3+TCP+payload), so the finalizer's data-buffer
+            // preconditions hold.
             unsafe {
                 crate::tcp_output::tx_offload_finalize(
                     m,
@@ -9421,7 +9450,7 @@ mod send_bytes_segment_build_step_drift_guard {
     use crate::flow_table::{FlowTable, FourTuple};
     use crate::l2::ETH_HDR_LEN;
     use crate::tcp_conn::TcpConn;
-    use crate::tcp_output::{FRAME_HDRS_MIN, IPV4_HDR_MIN, TCP_ACK, TCP_HDR_MIN, TCP_PSH};
+    use crate::tcp_output::{IPV4_HDR_MIN, TCP_ACK, TCP_HDR_MIN, TCP_PSH};
     use crate::tcp_state::TcpState;
     use crate::tcp_timer_wheel::TimerWheel;
 
@@ -9508,7 +9537,11 @@ mod send_bytes_segment_build_step_drift_guard {
     #[test]
     fn helper_emits_expected_frame_shape_for_128b_payload() {
         let (mut flow_table, handle) = fixture_table();
-        let mut frame: Vec<u8> = Vec::with_capacity(FRAME_HDRS_MIN + 40 + 1460);
+        // PO10: `mbuf_data` is the sole destination for the wire bytes —
+        // the production `tx_frame_scratch` Vec is gone, and the helper
+        // writes through `mbuf_data` directly. 4096 is comfortably larger
+        // than any single MSS frame, so the slice-narrowing inside the
+        // helper (`&mut mbuf_data[..actual_n]`) always fits.
         let mut mbuf_data = vec![0u8; 4096];
         let mut wheel = TimerWheel::new(64);
         let counters = Counters::new();
@@ -9517,7 +9550,6 @@ mod send_bytes_segment_build_step_drift_guard {
         // Fixture: 128-byte payload, all 0x42.
         let payload = [0x42u8; 128];
         let mut scratch = SegmentBuildScratch {
-            frame: &mut frame,
             mbuf_data: mbuf_data.as_mut_slice(),
             wheel: &mut wheel,
             counters: &counters,
@@ -9672,14 +9704,14 @@ mod send_bytes_segment_build_step_drift_guard {
             c.rto_timer_id = Some(pre_id);
         }
 
-        let mut frame: Vec<u8> = Vec::with_capacity(FRAME_HDRS_MIN + 40 + 1460);
+        // PO10: see equivalent comment in
+        // `helper_emits_expected_frame_shape_for_128b_payload`.
         let mut mbuf_data = vec![0u8; 4096];
         let counters = Counters::new();
         let snap = snapshot();
         let payload = [0x42u8; 128];
 
         let mut scratch = SegmentBuildScratch {
-            frame: &mut frame,
             mbuf_data: mbuf_data.as_mut_slice(),
             wheel: &mut wheel,
             counters: &counters,

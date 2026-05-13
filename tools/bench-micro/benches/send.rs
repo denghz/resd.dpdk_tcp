@@ -38,11 +38,11 @@
 //!     ~5 ns of `RefCell` borrow-tracking that production pays
 //!   * TS option per RFC 7323 §3 MUST-22                          (6016-6024)
 //!   * `SegmentTx` literal build                                  (6025-6038)
-//!   * `frame.clear()` + `frame.resize(needed, 0)`                (6048-6049)
-//!   * `tcp_output::build_segment(&seg, &mut frame[..])`          (6050)
-//!     — IPv4 + TCP checksum + header pack; the dominant cost
-//!   * `std::ptr::copy_nonoverlapping` of `n` frame bytes into
-//!     the (fake-Box-backed) mbuf data area                       (6076-6078)
+//!   * `tcp_output::build_segment(&seg, &mut mbuf_data[..actual_n])`
+//!     — IPv4 + TCP checksum + header pack; the dominant cost.
+//!     PO10: production writes the wire bytes DIRECTLY into the mbuf's
+//!     data area (no scratch Vec + memcpy); the helper mirrors that by
+//!     handing `mbuf_data` straight to `build_segment`.
 //!   * `RetransEntry { .. }` + `SendRetrans::push_after_tx`       (6155-6172)
 //!   * `send_ack_log.record_send(..)` — early-return when disabled (6176-6182)
 //!   * First-burst RTO arm: `TimerWheel::add(..)`                 (6187-6214)
@@ -61,9 +61,11 @@
 //!
 //!   * `shim_rte_pktmbuf_alloc(tx_data_mempool)`            (6060)
 //!     — no live DPDK mempool exists in this process.
-//!   * `shim_rte_pktmbuf_append(m, n)`                      (6068)
+//!   * `shim_rte_pktmbuf_append(m, actual_n)`               (6068)
 //!     — needs the mbuf returned by `alloc`; the fake-Box `mbuf_data`
-//!     slice simulates the returned `dst` region.
+//!     slice simulates the returned `dst` region. PO10: production
+//!     calls `build_segment` with the slice produced by `append`; the
+//!     helper hands `mbuf_data[..actual_n]` to `build_segment`.
 //!   * `tx_offload_finalize(m, &seg, ..)`                   (6085-6092)
 //!     — reads/writes live mbuf metadata (`ol_flags`, `l2_len`,
 //!     `l3_len`, TCP-cksum pseudo-header rewrite) written by
@@ -136,7 +138,6 @@ use dpdk_net_core::engine::test_support::{
 use dpdk_net_core::flow_table::{ConnHandle, FlowTable, FourTuple};
 use dpdk_net_core::mempool::Mbuf;
 use dpdk_net_core::tcp_conn::TcpConn;
-use dpdk_net_core::tcp_output::FRAME_HDRS_MIN;
 use dpdk_net_core::tcp_retrans::RetransEntry;
 use dpdk_net_core::tcp_state::TcpState;
 use dpdk_net_core::tcp_timer_wheel::{TimerKind, TimerNode, TimerWheel};
@@ -259,7 +260,6 @@ fn run_segment_build_loop(
     flow_table: &mut FlowTable,
     handle: ConnHandle,
     bytes: &[u8],
-    frame: &mut Vec<u8>,
     fake_mbuf_data: &mut [u8],
     wheel: &mut TimerWheel,
     counters: &Counters,
@@ -311,12 +311,12 @@ fn run_segment_build_loop(
 
     let advertised_window = (free_space_total >> ws_shift_out).min(u16::MAX as u32) as u16;
 
-    // Mirrors engine.rs:5999-6009 — pre-size the frame scratch.
-    let initial_cap_needed = FRAME_HDRS_MIN + 40 + mss_cap as usize;
-    let current_cap = frame.capacity();
-    if current_cap < initial_cap_needed {
-        frame.reserve(initial_cap_needed - current_cap);
-    }
+    // PO10: production no longer pre-sizes a scratch `Vec<u8>` —
+    // `Engine::tx_frame_scratch` was removed when `build_segment` started
+    // writing directly into the mbuf data area. The bench mirrors that
+    // by handing `fake_mbuf_data` (a Box-backed 4096B simulated mbuf data
+    // region) straight to the helper. `fake_mbuf_data` is sized in each
+    // bench target to cover the max single-segment frame at MSS.
 
     // Snapshot bundled per the helper's contract — read once, threaded
     // unchanged through every per-segment call.
@@ -370,7 +370,6 @@ fn run_segment_build_loop(
             payload,
             &snapshot,
             &mut SegmentBuildScratch {
-                frame,
                 mbuf_data: fake_mbuf_data,
                 wheel,
                 counters,
@@ -440,7 +439,10 @@ fn run_segment_build_loop(
 fn bench_send_small_segment_build_cold(c: &mut Criterion) {
     c.bench_function("bench_send_small_segment_build_cold", |b| {
         let payload = [0x42u8; 128];
-        let mut frame: Vec<u8> = Vec::with_capacity(FRAME_HDRS_MIN + 40 + MSS as usize);
+        // PO10: production's `tx_frame_scratch` Vec is gone; build_segment
+        // now writes directly into the mbuf data area. The bench mirrors
+        // that — only `fake_mbuf_data` (the simulated mbuf data region)
+        // is needed.
         let mut fake_mbuf_data: Box<[u8; 4096]> = Box::new([0u8; 4096]);
         let counters = Counters::new();
 
@@ -455,7 +457,6 @@ fn bench_send_small_segment_build_cold(c: &mut Criterion) {
                     flow_table,
                     *handle,
                     black_box(&payload),
-                    &mut frame,
                     fake_mbuf_data.as_mut_slice(),
                     wheel,
                     &counters,
@@ -477,7 +478,10 @@ fn bench_send_small_segment_build_cold(c: &mut Criterion) {
 fn bench_send_small_segment_build_warm(c: &mut Criterion) {
     c.bench_function("bench_send_small_segment_build_warm", |b| {
         let payload = [0x42u8; 128];
-        let mut frame: Vec<u8> = Vec::with_capacity(FRAME_HDRS_MIN + 40 + MSS as usize);
+        // PO10: production's `tx_frame_scratch` Vec is gone; build_segment
+        // now writes directly into the mbuf data area. The bench mirrors
+        // that — only `fake_mbuf_data` (the simulated mbuf data region)
+        // is needed.
         let mut fake_mbuf_data: Box<[u8; 4096]> = Box::new([0u8; 4096]);
         let counters = Counters::new();
 
@@ -494,7 +498,6 @@ fn bench_send_small_segment_build_warm(c: &mut Criterion) {
                     flow_table,
                     *handle,
                     black_box(&payload),
-                    &mut frame,
                     fake_mbuf_data.as_mut_slice(),
                     wheel,
                     &counters,
@@ -518,7 +521,10 @@ fn bench_send_small_segment_build_warm(c: &mut Criterion) {
 fn bench_send_large_segment_build_cold(c: &mut Criterion) {
     c.bench_function("bench_send_large_segment_build_cold", |b| {
         let payload = vec![0x42u8; 8 * 1024];
-        let mut frame: Vec<u8> = Vec::with_capacity(FRAME_HDRS_MIN + 40 + MSS as usize);
+        // PO10: production's `tx_frame_scratch` Vec is gone; build_segment
+        // now writes directly into the mbuf data area. The bench mirrors
+        // that — only `fake_mbuf_data` (the simulated mbuf data region)
+        // is needed.
         let mut fake_mbuf_data: Box<[u8; 4096]> = Box::new([0u8; 4096]);
         let counters = Counters::new();
 
@@ -533,7 +539,6 @@ fn bench_send_large_segment_build_cold(c: &mut Criterion) {
                     flow_table,
                     *handle,
                     black_box(&payload),
-                    &mut frame,
                     fake_mbuf_data.as_mut_slice(),
                     wheel,
                     &counters,
@@ -553,7 +558,10 @@ fn bench_send_large_segment_build_cold(c: &mut Criterion) {
 fn bench_send_large_segment_build_warm(c: &mut Criterion) {
     c.bench_function("bench_send_large_segment_build_warm", |b| {
         let payload = vec![0x42u8; 8 * 1024];
-        let mut frame: Vec<u8> = Vec::with_capacity(FRAME_HDRS_MIN + 40 + MSS as usize);
+        // PO10: production's `tx_frame_scratch` Vec is gone; build_segment
+        // now writes directly into the mbuf data area. The bench mirrors
+        // that — only `fake_mbuf_data` (the simulated mbuf data region)
+        // is needed.
         let mut fake_mbuf_data: Box<[u8; 4096]> = Box::new([0u8; 4096]);
         let counters = Counters::new();
 
@@ -570,7 +578,6 @@ fn bench_send_large_segment_build_warm(c: &mut Criterion) {
                     flow_table,
                     *handle,
                     black_box(&payload),
-                    &mut frame,
                     fake_mbuf_data.as_mut_slice(),
                     wheel,
                     &counters,
