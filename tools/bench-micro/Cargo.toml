@@ -20,6 +20,7 @@ hostname = "0.4"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+smallvec = { workspace = true }
 
 [[bench]]
 name = "poll"
@@ -46,11 +47,39 @@ name = "timer"
 harness = false
 
 [[bench]]
+name = "timer_advanced"
+harness = false
+
+[[bench]]
 name = "counters"
 harness = false
 
 [[bench]]
+name = "parse_options"
+harness = false
+
+[[bench]]
+name = "build_segment"
+harness = false
+
+[[bench]]
+name = "rx_prelude"
+harness = false
+
+[[bench]]
 name = "throughput"
+harness = false
+
+[[bench]]
+name = "loss_detection"
+harness = false
+
+[[bench]]
+name = "deliver_readable"
+harness = false
+
+[[bench]]
+name = "flow_scale"
 harness = false
 
 [[bin]]

@@ -1,9 +1,29 @@
 //! bench-micro::throughput — sustained-rate benches for the 4 real-code families.
 //!
-//! Latency benches (`poll.rs`, `flow_lookup.rs`, `tcp_input.rs`, `timer.rs`)
-//! measure single-call cost. This file measures sustained ops/sec under
-//! continuous load — surfaces allocation patterns, cache thrash, and
-//! drift over time that latency benches don't catch.
+//! # Discipline boundary (NOT comparable to other bench-micro files)
+//!
+//! This file measures **sustained throughput (ops/sec)**, NOT single-call
+//! latency. Numbers reported here are NOT directly comparable to the
+//! ns/iter values produced by the other bench-micro files (which report
+//! `(ns_per_iter, p50, p99, p999)` per the
+//! `target/bench-results/bench-micro/` CSV schema). Reasons the numbers
+//! diverge:
+//!
+//! - Reports `Throughput::Elements` with criterion's throughput discipline
+//!   (elements/second). Latency CSVs translate criterion's per-iter cost
+//!   directly to `ns_per_iter`.
+//! - Each bench batches K=1024 operations per criterion iteration. The
+//!   reported per-element cost amortizes the closure-call overhead
+//!   across the batch — a single ns-per-iter rendering would conflate
+//!   that with the per-call cost.
+//! - measurement_time defaults to 30 s here to surface drift / cache
+//!   thrash / allocator behavior over a sustained run, vs. the 5 s
+//!   default for latency benches in this crate.
+//!
+//! Consumers reading CSV: throughput rows are tagged via criterion's
+//! `Throughput::Elements` metadata; the latency-oriented `ns_per_iter`
+//! summarization in `summarize.rs` should treat those rows distinctly
+//! from the other bench-micro outputs.
 //!
 //! Each bench batches K operations per criterion iteration. Reports
 //! ops/sec via `criterion::Throughput::Elements`. measurement_time
@@ -24,17 +44,21 @@ const BATCH: u64 = 1024;
 const TEST_SEND_BUF_BYTES: u32 = 256 * 1024;
 
 // =====================================================================
-// poll throughput — sustained EngineNoEalHarness::poll_once iterations
+// poll scheduler-tick throughput — sustained EngineNoEalHarness::poll_once
+// iterations. As with `poll.rs`, only the scheduler-tick subset of
+// `Engine::poll_once` is exercised (clock + flow_table iter + timer
+// advance + event drain). rx_burst / tx_burst paths require EAL and
+// are NOT measured here.
 // =====================================================================
 
-fn bench_poll_throughput_empty(c: &mut Criterion) {
+fn bench_poll_scheduler_tick_throughput_empty(c: &mut Criterion) {
     let mut group = c.benchmark_group("throughput");
     group
         .throughput(Throughput::Elements(BATCH))
         .measurement_time(Duration::from_secs(30))
         .sample_size(50);
 
-    group.bench_function("poll_empty_throughput", |b| {
+    group.bench_function("poll_scheduler_tick_empty_throughput", |b| {
         let mut h = EngineNoEalHarness::new(64, 1_000_000);
         b.iter_custom(|iters| {
             let start = Instant::now();
@@ -51,14 +75,14 @@ fn bench_poll_throughput_empty(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_poll_throughput_with_timers(c: &mut Criterion) {
+fn bench_poll_scheduler_tick_throughput_with_timers(c: &mut Criterion) {
     let mut group = c.benchmark_group("throughput");
     group
         .throughput(Throughput::Elements(BATCH))
         .measurement_time(Duration::from_secs(30))
         .sample_size(50);
 
-    group.bench_function("poll_idle_with_timers_throughput", |b| {
+    group.bench_function("poll_scheduler_tick_idle_with_timers_throughput", |b| {
         let mut h = EngineNoEalHarness::new(64, 1_000_000);
         // Pre-populate 256 non-firing timers so advance walks a real
         // bucket chain on every iter.
@@ -303,8 +327,8 @@ criterion_group! {
     name = benches;
     config = Criterion::default();
     targets =
-        bench_poll_throughput_empty,
-        bench_poll_throughput_with_timers,
+        bench_poll_scheduler_tick_throughput_empty,
+        bench_poll_scheduler_tick_throughput_with_timers,
         bench_flow_lookup_throughput_hot,
         bench_timer_throughput,
         bench_tcp_input_throughput_data
