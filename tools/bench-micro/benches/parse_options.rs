@@ -23,25 +23,24 @@
 //! `AD-A8.5-tx-wscale-position` (modern Linux emits WSCALE last instead,
 //! see tcp_options.rs:5-12). Encoder source is at tcp_options.rs:148-228.
 //!
-//! Note: the T9-H7 fast-path inside `parse_options`
-//! (tcp_options.rs:274-288) matches a different 12-byte shape —
-//! `[OPT_TIMESTAMP, 10, tsval4, tsecr4, NOP, NOP]` (TS first, trailing
-//! NOPs). The encoder emits `NOP, NOP, OPT_TIMESTAMP, 10, tsval4, tsecr4`
-//! (leading NOPs), so the fast-path's `opts[0] == OPT_TIMESTAMP` check
-//! does NOT fire on encoder-produced blobs (or on Linux-peer-produced
-//! ACKs, which use the same NOP+NOP+TS order). These benches therefore
-//! measure the **general state-machine loop**, not the fast-path. If a
-//! production peer (e.g. some BSD or appliance stack) emits TS-first
-//! with trailing NOPs, the fast-path will apply for that traffic and
-//! the cost is lower than what this bench reports; the encoder shape is
-//! the right reference for our own peer + Linux interop.
+//! Note: `parse_options` has two TS-only 12-byte fast-paths (PO2). The
+//! NOP-first one — `[NOP, NOP, OPT_TIMESTAMP, 10, tsval4, tsecr4]`,
+//! RFC 7323 Appendix A's recommended layout — matches the encoder's
+//! TS-only output and the shape Linux peers emit on steady-state data
+//! ACKs, so `bench_parse_options_ts_only` exercises that fast-path's
+//! straight-line decode. The TS-first one —
+//! `[OPT_TIMESTAMP, 10, tsval4, tsecr4, NOP, NOP]` — covers any peer
+//! that emits TS before the NOP padding. The `ts_sack` and SYN-shape
+//! benches don't match either fast-path (longer / non-canonical) and
+//! still measure the general state-machine loop.
 //!
 //! # Variants
 //!
 //! * `bench_parse_options_ts_only` — 12-byte canonical TS-only ACK
-//!   buffer as `NOP, NOP, OPT_TIMESTAMP, 10, tsval4, tsecr4`. Exercises
-//!   the state-machine loop's NOP-skip path twice plus the TIMESTAMP
-//!   branch (see tcp_options.rs:294-298 + tcp_options.rs:339-356).
+//!   buffer as `NOP, NOP, OPT_TIMESTAMP, 10, tsval4, tsecr4`. Hits the
+//!   PO2 NOP-first fast-path in `parse_options` (a length + 4-byte
+//!   prefix check, then a straight-line two-`u32::from_be_bytes` decode,
+//!   no state-machine loop).
 //! * `bench_parse_options_ts_sack` — TS option + a 2-block SACK option,
 //!   the shape the encoder emits when an ACK reports a single reorder:
 //!   `NOP+NOP+TS(12) + NOP+NOP+SACK_hdr+2*8` = 32 bytes (see the
@@ -150,13 +149,13 @@ fn bench_parse_options_ts_only(c: &mut Criterion) {
     // 4-byte alignment) and is what every modern Linux peer emits on
     // steady-state data ACKs.
     //
-    // Important: this shape does NOT fire the T9-H7 fast-path at
-    // tcp_options.rs:274-275. That fast-path requires `opts[0] ==
-    // OPT_TIMESTAMP` (TS first, trailing NOPs); on NOP+NOP+TS we have
-    // `opts[0] == OPT_NOP` and fall through to the general state-machine
-    // loop. This bench therefore measures the general-loop path on the
-    // canonical Linux-peer TS-only shape. The fast-path is effectively
-    // dead code in production for any Linux-peer traffic.
+    // This shape hits the PO2 NOP-first fast-path in `parse_options`:
+    // `opts.len() == 12 && opts[0..4] == [NOP, NOP, OPT_TIMESTAMP, 10]`
+    // → straight-line decode of tsval/tsecr, no state-machine loop. (The
+    // other 12-byte fast-path, `[OPT_TIMESTAMP, 10, ..., NOP, NOP]`,
+    // covers TS-first peers and is not exercised here.) This bench
+    // therefore measures the fast-path cost on the canonical Linux-peer /
+    // own-encoder TS-only shape.
     let opts = TcpOpts {
         timestamps: Some((0x0000_1000, 0xCAFE_BABE)),
         ..Default::default()

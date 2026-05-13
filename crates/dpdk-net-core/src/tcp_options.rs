@@ -256,19 +256,53 @@ pub enum OptionParseError {
 /// `Result` discriminant store whenever the caller's branch later
 /// proves a specific `Err` variant.
 ///
-/// T9 H7 (production-code throughput hunt): the steady-state
-/// inbound-data path carries Timestamps + 2 NOP-pad bytes only — a
-/// 12-byte options buffer with `[OPT_TIMESTAMP, 10, tsval4, tsecr4,
-/// NOP, NOP]`. Detecting this canonical shape with a single
-/// length+first-byte check lets us bypass the generic state-machine
-/// loop's branches (outer match on `[END | NOP | kind]` × 12 iters,
-/// inner match on `kind`) and emit a straight-line decode of the TS
-/// option. The general parser stays as the fall-through for any non-
-/// canonical buffer (longer, NOPs first, MSS present, etc.); the
-/// fast-path is purely additive.
+/// Two straight-line fast-paths short-circuit the generic state-machine
+/// loop for the steady-state inbound-data shape (Timestamps only, padded
+/// to a 12-byte word-aligned buffer). Both bypass the generic loop's
+/// branches (outer match on `[END | NOP | kind]` × 12 iters, inner match
+/// on `kind`) and emit a straight-line decode of the TS option; both
+/// produce output byte-identical to what the generic loop would yield for
+/// the same input. The two shapes are:
+///
+/// 1. NOP-first — `[NOP, NOP, OPT_TIMESTAMP=8, 10, tsval4, tsecr4]`,
+///    RFC 7323 Appendix A's recommended `<nop>,<nop>,<timestamp>` layout
+///    for non-SYN segments. This is the shape Linux peers emit and the
+///    shape our own `TcpOpts::encode` emits, so this is the fast-path
+///    production actually hits for Linux interop and self-loopback.
+/// 2. TS-first — `[OPT_TIMESTAMP=8, 10, tsval4, tsecr4, NOP, NOP]` (the
+///    original "T9 H7" fast-path), kept for any peer that emits
+///    Timestamps before the NOP padding (some BSD/appliance stacks).
+///
+/// The generic parser remains the fall-through for any non-canonical
+/// buffer (longer, MSS present, malformed, etc.); both fast-paths are
+/// purely additive. The byte checks for the two shapes are mutually
+/// exclusive (`opts[0]` is `OPT_NOP` vs. `OPT_TIMESTAMP`), so their order
+/// here is irrelevant.
 #[inline]
 pub fn parse_options(opts: &[u8]) -> Result<TcpOpts, OptionParseError> {
-    // T9 H7 fast-path: canonical TS-only ACK buffer
+    // Linux-canonical TS-only ACK buffer: [NOP, NOP, OPT_TIMESTAMP=8, 10,
+    // tsval4, tsecr4] (12 bytes, word-aligned — RFC 7323 Appendix A
+    // recommends <nop>,<nop>,<timestamp> for non-SYN segments, and our own
+    // TcpOpts::encode emits this shape). Decoded straight-line; no loop.
+    if opts.len() == 12
+        && opts[0] == OPT_NOP
+        && opts[1] == OPT_NOP
+        && opts[2] == OPT_TIMESTAMP
+        && opts[3] == LEN_TIMESTAMP
+    {
+        let tsval = u32::from_be_bytes([opts[4], opts[5], opts[6], opts[7]]);
+        let tsecr = u32::from_be_bytes([opts[8], opts[9], opts[10], opts[11]]);
+        return Ok(TcpOpts {
+            mss: None,
+            wscale: None,
+            sack_permitted: false,
+            timestamps: Some((tsval, tsecr)),
+            sack_blocks: [SackBlock { left: 0, right: 0 }; MAX_SACK_BLOCKS_DECODE],
+            sack_block_count: 0,
+            ws_clamped: false,
+        });
+    }
+    // T9 H7 fast-path: TS-first TS-only ACK buffer
     // `[OPT_TIMESTAMP=8, 10, tsval4, tsecr4, NOP, NOP]` (12 bytes,
     // word-aligned). Decoded straight-line; no loop.
     if opts.len() == 12 && opts[0] == OPT_TIMESTAMP && opts[1] == LEN_TIMESTAMP
@@ -688,5 +722,100 @@ mod tests {
         bytes[1] = (2 + 8 * 5) as u8;
         let err = parse_options(&bytes).unwrap_err();
         assert_eq!(err, OptionParseError::BadSackBlockCount);
+    }
+
+    #[test]
+    fn parse_ts_only_nop_first_fast_path_matches_encoder_output() {
+        // PO2: the Linux-canonical / our-own-encoder TS-only ACK shape is
+        // `[NOP, NOP, OPT_TIMESTAMP, 10, tsval4, tsecr4]` (12 bytes). Build
+        // it via the actual encoder, parse it back, and assert round-trip
+        // equality — this proves the NOP-first fast-path produces output
+        // byte-identical to what the encoder emits (and what the general
+        // loop would have produced for the same bytes).
+        let built = TcpOpts {
+            timestamps: Some((0xA1B2_C3D4, 0x0F1E_2D3C)),
+            ..Default::default()
+        };
+        let mut buf = [0u8; 40];
+        let n = built.encode(&mut buf).unwrap();
+        assert_eq!(n, 12, "TS-only encoder output must be 12 bytes");
+        // Confirm the wire shape is NOP-first (the shape the fast-path matches).
+        assert_eq!(&buf[..4], &[OPT_NOP, OPT_NOP, OPT_TIMESTAMP, LEN_TIMESTAMP]);
+        let parsed = parse_options(&buf[..n]).unwrap();
+        assert_eq!(parsed, built);
+        assert_eq!(parsed.timestamps, Some((0xA1B2_C3D4, 0x0F1E_2D3C)));
+        assert_eq!(parsed.mss, None);
+        assert_eq!(parsed.wscale, None);
+        assert!(!parsed.sack_permitted);
+        assert_eq!(parsed.sack_block_count, 0);
+        assert!(!parsed.ws_clamped);
+    }
+
+    #[test]
+    fn parse_ts_only_nop_first_fast_path_byte_identical_to_general_loop() {
+        // Hand-build the NOP-first TS-only buffer with distinctive byte
+        // values and verify the parsed result is exactly what the general
+        // loop would produce (2 NOP skips, then the TIMESTAMP arm).
+        let tsval: u32 = 0xDEAD_BEEF;
+        let tsecr: u32 = 0x1234_5678;
+        let mut buf = [0u8; 12];
+        buf[0] = OPT_NOP;
+        buf[1] = OPT_NOP;
+        buf[2] = OPT_TIMESTAMP;
+        buf[3] = LEN_TIMESTAMP;
+        buf[4..8].copy_from_slice(&tsval.to_be_bytes());
+        buf[8..12].copy_from_slice(&tsecr.to_be_bytes());
+        let parsed = parse_options(&buf).unwrap();
+        let expected = TcpOpts {
+            timestamps: Some((tsval, tsecr)),
+            ..Default::default()
+        };
+        assert_eq!(parsed, expected);
+    }
+
+    #[test]
+    fn parse_ts_only_nop_first_thirteen_bytes_with_end_uses_general_loop() {
+        // NEGATIVE test: a 13-byte buffer
+        // `[NOP, NOP, OPT_TIMESTAMP, 10, ...8 data..., END]` must NOT fire
+        // the (12-byte-only) fast-path; the general loop handles it (decode
+        // TS, then OPT_END short-circuits). Result must still be correct.
+        let tsval: u32 = 0xAABB_CCDD;
+        let tsecr: u32 = 0x0011_2233;
+        let mut buf = [0u8; 13];
+        buf[0] = OPT_NOP;
+        buf[1] = OPT_NOP;
+        buf[2] = OPT_TIMESTAMP;
+        buf[3] = LEN_TIMESTAMP;
+        buf[4..8].copy_from_slice(&tsval.to_be_bytes());
+        buf[8..12].copy_from_slice(&tsecr.to_be_bytes());
+        buf[12] = OPT_END;
+        let parsed = parse_options(&buf).unwrap();
+        assert_eq!(parsed.timestamps, Some((tsval, tsecr)));
+        assert_eq!(parsed.mss, None);
+        assert_eq!(parsed.wscale, None);
+        assert!(!parsed.sack_permitted);
+        assert_eq!(parsed.sack_block_count, 0);
+    }
+
+    #[test]
+    fn parse_ts_only_ts_first_fast_path_still_works() {
+        // The original T9 H7 TS-first fast-path
+        // `[OPT_TIMESTAMP, 10, tsval4, tsecr4, NOP, NOP]` must still apply
+        // for any peer that emits that layout.
+        let tsval: u32 = 0xCAFE_F00D;
+        let tsecr: u32 = 0x8765_4321;
+        let mut buf = [0u8; 12];
+        buf[0] = OPT_TIMESTAMP;
+        buf[1] = LEN_TIMESTAMP;
+        buf[2..6].copy_from_slice(&tsval.to_be_bytes());
+        buf[6..10].copy_from_slice(&tsecr.to_be_bytes());
+        buf[10] = OPT_NOP;
+        buf[11] = OPT_NOP;
+        let parsed = parse_options(&buf).unwrap();
+        let expected = TcpOpts {
+            timestamps: Some((tsval, tsecr)),
+            ..Default::default()
+        };
+        assert_eq!(parsed, expected);
     }
 }
