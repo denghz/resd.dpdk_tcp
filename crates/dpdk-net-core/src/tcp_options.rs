@@ -256,28 +256,38 @@ pub enum OptionParseError {
 /// `Result` discriminant store whenever the caller's branch later
 /// proves a specific `Err` variant.
 ///
-/// Two straight-line fast-paths short-circuit the generic state-machine
-/// loop for the steady-state inbound-data shape (Timestamps only, padded
-/// to a 12-byte word-aligned buffer). Both bypass the generic loop's
-/// branches (outer match on `[END | NOP | kind]` × 12 iters, inner match
-/// on `kind`) and emit a straight-line decode of the TS option; both
-/// produce output byte-identical to what the generic loop would yield for
-/// the same input. The two shapes are:
+/// Three straight-line fast-paths short-circuit the generic state-machine
+/// loop. All bypass the generic loop's branches (outer match on
+/// `[END | NOP | kind]` × N iters, inner match on `kind`) and emit a
+/// straight-line decode; all produce output byte-identical to what the
+/// generic loop would yield for the same input. The three shapes are:
 ///
-/// 1. NOP-first — `[NOP, NOP, OPT_TIMESTAMP=8, 10, tsval4, tsecr4]`,
-///    RFC 7323 Appendix A's recommended `<nop>,<nop>,<timestamp>` layout
-///    for non-SYN segments. This is the shape Linux peers emit and the
-///    shape our own `TcpOpts::encode` emits, so this is the fast-path
+/// 1. NOP-first TS-only — `[NOP, NOP, OPT_TIMESTAMP=8, 10, tsval4, tsecr4]`
+///    (12 bytes), RFC 7323 Appendix A's recommended
+///    `<nop>,<nop>,<timestamp>` layout for non-SYN segments. This is the
+///    shape Linux peers emit and the shape our own `TcpOpts::encode`
+///    emits on steady-state data ACKs, so this is the fast-path
 ///    production actually hits for Linux interop and self-loopback.
-/// 2. TS-first — `[OPT_TIMESTAMP=8, 10, tsval4, tsecr4, NOP, NOP]` (the
-///    original "T9 H7" fast-path), kept for any peer that emits
-///    Timestamps before the NOP padding (some BSD/appliance stacks).
+/// 2. TS-first TS-only — `[OPT_TIMESTAMP=8, 10, tsval4, tsecr4, NOP, NOP]`
+///    (12 bytes, the original "T9 H7" fast-path), kept for any peer that
+///    emits Timestamps before the NOP padding (some BSD/appliance stacks).
+/// 3. NOP-first TS+SACK — `[NOP, NOP, OPT_TIMESTAMP=8, 10, tsval4, tsecr4,
+///    NOP, NOP, OPT_SACK=5, 2+8*N, ...N×(left4, right4)...]` for
+///    N ∈ {1, 2, 3} SACK blocks (total lengths 24/32/40). This is the
+///    Linux-canonical shape an ACK takes during loss recovery / reordering
+///    (RFC 7323 Appendix A + RFC 2018 §3), and the shape our own
+///    `TcpOpts::encode` emits for the same `TcpOpts` value (see
+///    `ack_with_timestamp_and_two_sack_blocks_word_aligned` round-trip).
+///    N is capped at 3 because RFC 2018 §3 limits the SACK block count to
+///    3 when Timestamps is present (40-byte option budget); N=4 buffers
+///    omit Timestamps and so cannot match this shape.
 ///
 /// The generic parser remains the fall-through for any non-canonical
-/// buffer (longer, MSS present, malformed, etc.); both fast-paths are
-/// purely additive. The byte checks for the two shapes are mutually
-/// exclusive (`opts[0]` is `OPT_NOP` vs. `OPT_TIMESTAMP`), so their order
-/// here is irrelevant.
+/// buffer (longer, MSS present, malformed, etc.); the three fast-paths
+/// are purely additive. The byte checks across the three shapes are
+/// mutually exclusive on length × prefix (lengths 12/24/32/40 are
+/// disjoint; for length 12 the TS-only pair disambiguates on `opts[0]`),
+/// so their order here is irrelevant.
 #[inline]
 pub fn parse_options(opts: &[u8]) -> Result<TcpOpts, OptionParseError> {
     // Linux-canonical TS-only ACK buffer: [NOP, NOP, OPT_TIMESTAMP=8, 10,
@@ -317,6 +327,65 @@ pub fn parse_options(opts: &[u8]) -> Result<TcpOpts, OptionParseError> {
             timestamps: Some((tsval, tsecr)),
             sack_blocks: [SackBlock { left: 0, right: 0 }; MAX_SACK_BLOCKS_DECODE],
             sack_block_count: 0,
+            ws_clamped: false,
+        });
+    }
+    // PO5: Linux-canonical TS + SACK ACK buffer, the shape every Linux peer
+    // emits on every ACK after it has received an out-of-order segment from
+    // us (loss recovery / reordering). RFC 7323 Appendix A NOP+NOP+TS prefix
+    // followed by NOP+NOP+SACK header + N×(left4, right4) per RFC 2018 §3,
+    // with N ∈ {1, 2, 3}:
+    //   N=1 → 24 bytes, opts[15] (SACK len) = 10
+    //   N=2 → 32 bytes, opts[15] (SACK len) = 18
+    //   N=3 → 40 bytes, opts[15] (SACK len) = 26
+    // RFC 2018 §3 caps SACK blocks at 3 when Timestamps is present (the
+    // 40-byte TCP option budget), so N=4 buffers never match this shape.
+    // Decoded straight-line; matches `TcpOpts::encode`'s output for the same
+    // input (see `ack_with_timestamp_and_two_sack_blocks_word_aligned`).
+    let len = opts.len();
+    if (len == 24 || len == 32 || len == 40)
+        && opts[0] == OPT_NOP
+        && opts[1] == OPT_NOP
+        && opts[2] == OPT_TIMESTAMP
+        && opts[3] == LEN_TIMESTAMP
+        && opts[12] == OPT_NOP
+        && opts[13] == OPT_NOP
+        && opts[14] == OPT_SACK
+        && opts[15] as usize == len - 14
+    {
+        let tsval = u32::from_be_bytes([opts[4], opts[5], opts[6], opts[7]]);
+        let tsecr = u32::from_be_bytes([opts[8], opts[9], opts[10], opts[11]]);
+        // SACK blocks start at opts[16]. Each block is 8 bytes (4 left + 4 right).
+        // For len ∈ {24, 32, 40}, sack_block_count ∈ {1, 2, 3} respectively, all
+        // ≤ MAX_SACK_BLOCKS_DECODE (4). Straight-line per-block decode — no loop.
+        let sack_block_count = (len - 16) / 8;
+        let mut sack_blocks = [SackBlock { left: 0, right: 0 }; MAX_SACK_BLOCKS_DECODE];
+        // Decode block 0 (always present for len ∈ {24, 32, 40}).
+        sack_blocks[0] = SackBlock {
+            left: u32::from_be_bytes([opts[16], opts[17], opts[18], opts[19]]),
+            right: u32::from_be_bytes([opts[20], opts[21], opts[22], opts[23]]),
+        };
+        if len >= 32 {
+            // Block 1 (len 32 or 40).
+            sack_blocks[1] = SackBlock {
+                left: u32::from_be_bytes([opts[24], opts[25], opts[26], opts[27]]),
+                right: u32::from_be_bytes([opts[28], opts[29], opts[30], opts[31]]),
+            };
+        }
+        if len == 40 {
+            // Block 2 (len 40 only).
+            sack_blocks[2] = SackBlock {
+                left: u32::from_be_bytes([opts[32], opts[33], opts[34], opts[35]]),
+                right: u32::from_be_bytes([opts[36], opts[37], opts[38], opts[39]]),
+            };
+        }
+        return Ok(TcpOpts {
+            mss: None,
+            wscale: None,
+            sack_permitted: false,
+            timestamps: Some((tsval, tsecr)),
+            sack_blocks,
+            sack_block_count: sack_block_count as u8,
             ws_clamped: false,
         });
     }
@@ -817,5 +886,193 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(parsed, expected);
+    }
+
+    #[test]
+    fn parse_ts_sack_nop_first_fast_path_n1_matches_encoder() {
+        // PO5: round-trip the N=1 SACK-block shape via the actual encoder.
+        // Encoder emits NOP+NOP+TS(10) + NOP+NOP+SACK_hdr+1*8 = 24 bytes, the
+        // shape a Linux peer emits on the first ACK after a single segment
+        // gap. parse_options must match the encoded value byte-for-byte via
+        // the new TS+SACK fast-path.
+        let mut built = TcpOpts {
+            timestamps: Some((0xAABB_CCDD, 0x1122_3344)),
+            ..Default::default()
+        };
+        built.push_sack_block(SackBlock { left: 5000, right: 6000 });
+        let mut buf = [0u8; 40];
+        let n = built.encode(&mut buf).unwrap();
+        assert_eq!(n, 24, "TS + 1-block SACK encoder output must be 24 bytes");
+        // Confirm wire shape matches the fast-path's expected prefix.
+        assert_eq!(&buf[0..4], &[OPT_NOP, OPT_NOP, OPT_TIMESTAMP, LEN_TIMESTAMP]);
+        assert_eq!(&buf[12..16], &[OPT_NOP, OPT_NOP, OPT_SACK, 10]);
+        let parsed = parse_options(&buf[..n]).unwrap();
+        assert_eq!(parsed, built);
+        // Spell out every field to catch any divergence between fast-path
+        // and general-loop output.
+        assert_eq!(parsed.timestamps, Some((0xAABB_CCDD, 0x1122_3344)));
+        assert_eq!(parsed.mss, None);
+        assert_eq!(parsed.wscale, None);
+        assert!(!parsed.sack_permitted);
+        assert_eq!(parsed.sack_block_count, 1);
+        assert_eq!(
+            parsed.sack_blocks[0],
+            SackBlock { left: 5000, right: 6000 }
+        );
+        assert_eq!(parsed.sack_blocks[1], SackBlock::default());
+        assert!(!parsed.ws_clamped);
+    }
+
+    #[test]
+    fn parse_ts_sack_nop_first_fast_path_n2_matches_general_loop() {
+        // PO5: hand-build a 32-byte NOP-first TS + 2-block SACK buffer with
+        // distinctive byte values. parse_options (via the fast-path) must
+        // produce the exact value the generic loop would produce — which is
+        // what we hand-construct as `expected`.
+        let tsval: u32 = 0xDEAD_BEEF;
+        let tsecr: u32 = 0x5566_7788;
+        let s0 = SackBlock { left: 0x1000_0001, right: 0x1000_0002 };
+        let s1 = SackBlock { left: 0x2000_0001, right: 0x2000_0002 };
+        let mut buf = [0u8; 32];
+        // TS group: NOP, NOP, TS, 10, tsval4, tsecr4.
+        buf[0] = OPT_NOP;
+        buf[1] = OPT_NOP;
+        buf[2] = OPT_TIMESTAMP;
+        buf[3] = LEN_TIMESTAMP;
+        buf[4..8].copy_from_slice(&tsval.to_be_bytes());
+        buf[8..12].copy_from_slice(&tsecr.to_be_bytes());
+        // SACK group: NOP, NOP, SACK, 18, 2 blocks.
+        buf[12] = OPT_NOP;
+        buf[13] = OPT_NOP;
+        buf[14] = OPT_SACK;
+        buf[15] = 18;
+        buf[16..20].copy_from_slice(&s0.left.to_be_bytes());
+        buf[20..24].copy_from_slice(&s0.right.to_be_bytes());
+        buf[24..28].copy_from_slice(&s1.left.to_be_bytes());
+        buf[28..32].copy_from_slice(&s1.right.to_be_bytes());
+
+        let parsed = parse_options(&buf).unwrap();
+
+        let mut expected = TcpOpts {
+            timestamps: Some((tsval, tsecr)),
+            ..Default::default()
+        };
+        expected.sack_block_count = 2;
+        expected.sack_blocks[0] = s0;
+        expected.sack_blocks[1] = s1;
+        assert_eq!(parsed, expected);
+    }
+
+    #[test]
+    fn parse_ts_sack_nop_first_fast_path_n3_matches_encoder() {
+        // PO5: round-trip the N=3 SACK-block shape (40-byte option budget
+        // exactly). MAX_SACK_BLOCKS_EMIT is 3 so this is the maximum the
+        // encoder can produce with Timestamps present.
+        let mut built = TcpOpts {
+            timestamps: Some((0x0102_0304, 0x0506_0708)),
+            ..Default::default()
+        };
+        built.push_sack_block(SackBlock { left: 100, right: 200 });
+        built.push_sack_block(SackBlock { left: 300, right: 400 });
+        built.push_sack_block(SackBlock { left: 500, right: 600 });
+        let mut buf = [0u8; 40];
+        let n = built.encode(&mut buf).unwrap();
+        assert_eq!(n, 40, "TS + 3-block SACK encoder output must be 40 bytes");
+        let parsed = parse_options(&buf[..n]).unwrap();
+        assert_eq!(parsed, built);
+        assert_eq!(parsed.sack_block_count, 3);
+        assert_eq!(parsed.sack_blocks[0], SackBlock { left: 100, right: 200 });
+        assert_eq!(parsed.sack_blocks[1], SackBlock { left: 300, right: 400 });
+        assert_eq!(parsed.sack_blocks[2], SackBlock { left: 500, right: 600 });
+        assert_eq!(parsed.sack_blocks[3], SackBlock::default());
+    }
+
+    #[test]
+    fn parse_ts_sack_nop_first_thirtythree_bytes_falls_through_to_general_loop() {
+        // NEGATIVE test: a 33-byte buffer with the TS+SACK NOP-first prefix
+        // does NOT fire the fast-path (lengths 24/32/40 are the only matches).
+        // Construct a 32-byte valid TS+SACK buffer plus a trailing OPT_END.
+        // The general loop must still decode it correctly and short-circuit
+        // on END.
+        let tsval: u32 = 0xCAFE_BABE;
+        let tsecr: u32 = 0xF00D_BEEF;
+        let s0 = SackBlock { left: 0x7777_7777, right: 0x8888_8888 };
+        let s1 = SackBlock { left: 0x9999_9999, right: 0xAAAA_AAAA };
+        let mut buf = [0u8; 33];
+        buf[0] = OPT_NOP;
+        buf[1] = OPT_NOP;
+        buf[2] = OPT_TIMESTAMP;
+        buf[3] = LEN_TIMESTAMP;
+        buf[4..8].copy_from_slice(&tsval.to_be_bytes());
+        buf[8..12].copy_from_slice(&tsecr.to_be_bytes());
+        buf[12] = OPT_NOP;
+        buf[13] = OPT_NOP;
+        buf[14] = OPT_SACK;
+        buf[15] = 18;
+        buf[16..20].copy_from_slice(&s0.left.to_be_bytes());
+        buf[20..24].copy_from_slice(&s0.right.to_be_bytes());
+        buf[24..28].copy_from_slice(&s1.left.to_be_bytes());
+        buf[28..32].copy_from_slice(&s1.right.to_be_bytes());
+        buf[32] = OPT_END; // trailing END so the general loop terminates cleanly
+
+        let parsed = parse_options(&buf).unwrap();
+        assert_eq!(parsed.timestamps, Some((tsval, tsecr)));
+        assert_eq!(parsed.sack_block_count, 2);
+        assert_eq!(parsed.sack_blocks[0], s0);
+        assert_eq!(parsed.sack_blocks[1], s1);
+        assert_eq!(parsed.mss, None);
+        assert_eq!(parsed.wscale, None);
+        assert!(!parsed.sack_permitted);
+    }
+
+    #[test]
+    fn parse_ts_sack_fast_path_byte_identical_to_general_loop_for_n1_n2_n3() {
+        // Exhaustive cross-check: for each N ∈ {1, 2, 3}, build the
+        // canonical TS+SACK buffer via the encoder (which uses the well-
+        // tested encode loop), and verify both:
+        //   (a) parse_options output equals the original TcpOpts (fast-path
+        //       round-trips through encoder), AND
+        //   (b) parse_options output equals what the general loop would
+        //       produce on a buffer with the same contents but a trailing
+        //       OPT_END byte that disqualifies the length-based fast-path
+        //       match — proving fast-path and general loop agree.
+        for n in 1usize..=3 {
+            let mut built = TcpOpts {
+                timestamps: Some((0xABCD_EF01u32 ^ (n as u32), 0x1234_5678 ^ (n as u32))),
+                ..Default::default()
+            };
+            for i in 0..n {
+                built.push_sack_block(SackBlock {
+                    left: 1000 + (i as u32) * 100,
+                    right: 1050 + (i as u32) * 100,
+                });
+            }
+            let mut buf = [0u8; 41];
+            let encoded_len = built.encode(&mut buf[..40]).unwrap();
+            let expected_len = match n {
+                1 => 24,
+                2 => 32,
+                3 => 40,
+                _ => unreachable!(),
+            };
+            assert_eq!(encoded_len, expected_len, "n={n}");
+
+            // (a) Fast-path parse must match the original built TcpOpts.
+            let parsed_fast = parse_options(&buf[..encoded_len]).unwrap();
+            assert_eq!(parsed_fast, built, "fast-path mismatch for n={n}");
+
+            // (b) Append OPT_END to break the fast-path length match; the
+            // general loop must produce the same TcpOpts (it short-circuits
+            // on OPT_END so the trailing byte is ignored). For n=3 the
+            // 40-byte option budget is full, so we skip this leg.
+            if encoded_len < 40 {
+                buf[encoded_len] = OPT_END;
+                let parsed_general = parse_options(&buf[..encoded_len + 1]).unwrap();
+                assert_eq!(
+                    parsed_general, parsed_fast,
+                    "general loop disagrees with fast-path for n={n}",
+                );
+            }
+        }
     }
 }

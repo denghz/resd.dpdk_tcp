@@ -23,16 +23,22 @@
 //! `AD-A8.5-tx-wscale-position` (modern Linux emits WSCALE last instead,
 //! see tcp_options.rs:5-12). Encoder source is at tcp_options.rs:148-228.
 //!
-//! Note: `parse_options` has two TS-only 12-byte fast-paths (PO2). The
-//! NOP-first one — `[NOP, NOP, OPT_TIMESTAMP, 10, tsval4, tsecr4]`,
-//! RFC 7323 Appendix A's recommended layout — matches the encoder's
-//! TS-only output and the shape Linux peers emit on steady-state data
-//! ACKs, so `bench_parse_options_ts_only` exercises that fast-path's
-//! straight-line decode. The TS-first one —
-//! `[OPT_TIMESTAMP, 10, tsval4, tsecr4, NOP, NOP]` — covers any peer
-//! that emits TS before the NOP padding. The `ts_sack` and SYN-shape
-//! benches don't match either fast-path (longer / non-canonical) and
-//! still measure the general state-machine loop.
+//! Note: `parse_options` has three straight-line fast-paths. PO2 added
+//! two 12-byte TS-only ones: the NOP-first
+//! `[NOP, NOP, OPT_TIMESTAMP, 10, tsval4, tsecr4]` (RFC 7323 Appendix A's
+//! recommended layout, the shape Linux peers and our own encoder emit
+//! on steady-state data ACKs, so `bench_parse_options_ts_only` hits it)
+//! and the TS-first `[OPT_TIMESTAMP, 10, tsval4, tsecr4, NOP, NOP]`
+//! (covers peers that emit TS before the NOP padding).
+//!
+//! PO5 added the NOP-first TS+SACK fast-path for lengths 24/32/40 —
+//! shape `[NOP, NOP, OPT_TIMESTAMP, 10, tsval4, tsecr4, NOP, NOP,
+//! OPT_SACK, 2+8*N, ...N×(left4, right4)...]` for N ∈ {1, 2, 3} SACK
+//! blocks — which is the Linux-canonical ACK shape during loss recovery /
+//! reordering. `bench_parse_options_ts_sack` (32 bytes, N=2) now hits
+//! that fast-path's straight-line decode and the bench number drops
+//! accordingly. The SYN-shape bench still measures the general
+//! state-machine loop (20 bytes, non-canonical option mix).
 //!
 //! # Variants
 //!
@@ -168,7 +174,11 @@ fn bench_parse_options_ts_only(c: &mut Criterion) {
 
 fn bench_parse_options_ts_sack(c: &mut Criterion) {
     // TS + 2 SACK blocks: encoder emits NOP+NOP+TS(10) + NOP+NOP+SACK_hdr+2*8
-    // = 12 + 4 + 16 = 32 bytes (see tcp_options.rs:441-443).
+    // = 12 + 4 + 16 = 32 bytes (see tcp_options.rs:441-443). Per PO5, this
+    // 32-byte NOP-first shape now hits the TS+SACK straight-line fast-path
+    // in `parse_options` (a length + 8-byte prefix check, then a straight-
+    // line three-pair u32 decode for tsval/tsecr + both SACK blocks, no
+    // state-machine loop).
     let mut opts = TcpOpts {
         timestamps: Some((0x1122_3344, 0x5566_7788)),
         ..Default::default()
