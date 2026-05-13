@@ -78,7 +78,13 @@ overclaims; the methodology described here is narrower.
   `SO_TIMESTAMPING` (kernel) or `tx_timestamp` dynfield (DPDK).
   Cross-host clock skew is bounded by NTP (~100 µs same-AZ); any
   cross-host timestamp delta below ~100 µs is dominated by skew.
-  RX-segment latency uses an inline DUT-side TSC capture only.
+  RX-segment latency is a **cross-host** delta `dut_recv_ns −
+  peer_send_ns` with both endpoints anchored on `CLOCK_REALTIME`
+  (not pure DUT-side internal latency). The ~100 µs NTP skew is
+  therefore an absolute-value floor on every `rx_latency_ns`
+  sample. See "Metrics — bench-rx-burst" below for the exact
+  capture surface and the codex 2026-05-13 re-review correction
+  that prompted this disclosure.
 - **NOT statistically saturated.** Codex review I3 flagged the
   publication-grade T57 as effectively one run per cell with p50
   only. T58 (variance probe) ran 3 repeats. Confidence intervals,
@@ -189,12 +195,66 @@ timestamp directly.
 
 ## Metrics — bench-rx-burst (per-segment RX latency)
 
-| arm | metric_name | what it measures |
-|---|---|---|
-| all | `rx_latency_ns` | per-segment latency from the inline TSC capture right after `rte_eth_rx_burst` returns to the application-level handoff to the receive callback |
+> **Codex 2026-05-13 re-review correction (BLOCKER):** an earlier
+> version of this section claimed `rx_latency_ns` was a DUT-side
+> internal TSC measurement. That was wrong. The code in
+> `tools/bench-rx-burst/src/{segment,dpdk,linux,fstack}.rs`
+> computes a cross-host `CLOCK_REALTIME` delta. This section is
+> the corrected description.
 
-DUT-side measurement — does NOT include the network path latency.
-Captures the engine's RX-path internal latency only.
+| arm | metric_name | what it actually measures |
+|---|---|---|
+| all | `rx_latency_ns` | per-segment **cross-host** latency `dut_recv_ns − peer_send_ns` (saturating-subtract; clamps to 0 when peer_send_ns > dut_recv_ns due to clock skew). `peer_send_ns` is the peer's `CLOCK_REALTIME` ns captured just before `send()` in `tools/bench-e2e/peer/burst-echo-server.c`; `dut_recv_ns` is the DUT's `CLOCK_REALTIME` ns captured immediately after the engine event / `read()` / `ff_read()` returns (`tools/bench-rx-burst/src/segment.rs:15-19`, `dpdk.rs:53-64`, `linux.rs:36-46`, `fstack.rs:48-54`). |
+
+**What this measurement includes** (every `rx_latency_ns` sample
+contains all of these — none of them is isolable today):
+
+1. Peer's `clock_gettime(CLOCK_REALTIME)` → `send()` latency on the
+   peer host.
+2. Peer-side kernel TX path (TCP segmentation, NIC enqueue, driver
+   doorbell), NIC TX queue + DMA.
+3. AWS shared-tenancy data-plane network latency to the DUT NIC.
+4. DUT NIC RX → driver → engine (dpdk_net / fstack) or kernel
+   `read()` (linux_kernel).
+5. Engine event-dispatch latency to the bench's read callback
+   plus the bench-side `clock_gettime(CLOCK_REALTIME)` capture
+   call.
+6. **NTP offset between the two hosts.** Same-AZ EC2 NTP keeps
+   absolute clock offset bounded at ~100 µs; that is the
+   absolute-value floor on every sample. The
+   `saturating_sub` in `SegmentRecord::new` clamps negative
+   deltas (where peer's clock was ahead of DUT's) to zero — so
+   the visible sub-100µs tail is partially an artifact of
+   clock-skew clamping, not a real latency mode.
+
+**What this measurement does NOT isolate:**
+
+- Pure DUT RX-path internal latency. To get that we would need
+  HW RX timestamps (`tx_timestamp`/`rx_timestamp` dynfield on
+  the DUT NIC, or `SO_TIMESTAMPING`) plus a coupled peer-side
+  HW TX timestamp — neither is available on the current AWS ENA
+  bench instance (Phase 9 c7i HW-TS, future work).
+- Per-stack absolute RX latency. Because every sample carries
+  the same peer + network components, **cross-stack ordering
+  on this metric is the publication-grade claim**; absolute µs
+  values are *cross-host* end-to-end values bounded below by
+  the NTP-skew floor.
+
+**How to read `rx_latency_ns` correctly:**
+
+- Cross-stack **ordering** within a single suite invocation
+  (e.g. "fstack p50 < dpdk_net p50 < linux_kernel p50") is the
+  intended signal — peer + network components cancel since the
+  same peer is hit by all three arms in the same run.
+- **Absolute µs values are cross-host end-to-end** and include
+  peer-send timestamp, peer-host NIC TX, AWS data-plane
+  transit, DUT NIC RX, and an NTP-bounded clock-offset term.
+  Do **not** quote `rx_latency_ns` p50/p99 as a DUT-stack RX
+  cost.
+- p999 tails on linux_kernel (~1.4–2.5 ms) come from kernel
+  TCP retransmit + scheduler-quantum tails that this metric
+  *does* expose, but they include the same peer-side and NTP
+  components as the bulk distribution.
 
 ## Stack-order randomization (codex IMPORTANT I4, 2026-05-13)
 

@@ -3,6 +3,65 @@
 **Branch state:** `a10-perf-23.11` at HEAD `a924b22` (post-I1..I5 codex fixes,
 post-T58 follow-ups).
 
+> ## Codex 2026-05-13 re-review caveats (read before quoting numbers)
+>
+> This report passed codex's first review of the I3 statistical-rigor work
+> but the 2026-05-13 codex re-review (`docs/bench-reports/codex-rereview-2026-05-13.md`)
+> raised three IMPORTANT caveats about the run itself. They do NOT
+> invalidate the findings but reframe what each table is evidence for.
+>
+> **1. Run used a pre-I2-rename binary (tx-burst column label is legacy,
+> data is still valid).** The 5-run pass was driven against a binary
+> rebuilt *before* the codex I2 `throughput_per_burst_bps` →
+> `pmd_handoff_rate_bps` rename landed in the running artifact (the
+> source rename was in tree but the build cache had not picked it up).
+> Consequence: the bench-tx-burst aggregator rows below carry the
+> **legacy** `throughput_per_burst_bps` column name for dpdk_net rather
+> than `pmd_handoff_rate_bps`. The underlying computation
+> (`K / (t1 − t0)` at `rte_eth_tx_burst`-return, see
+> `methodology-and-claims-2026-05-09.md`) did NOT change between the two
+> labels — codex I2 was a rename, not a semantic redefinition — so the
+> numeric values are valid as PMD-handoff-rate measurements. The
+> aggregator (`scripts/aggregate-fast-iter.py:105-124`) accepts both
+> names, which is why the report compiled cleanly despite the column
+> mismatch. **For publication, re-run the suite with a post-I2 binary
+> and confirm the column re-emits as `pmd_handoff_rate_bps`** —
+> recommended in §Scaling to N=10+.
+>
+> **2. bench-rx-burst `latency_ns` is a cross-host metric, not a pure
+> DUT RX latency.** The "9/9 cells significant for fstack-vs-linux"
+> finding in §bench-rx-burst is statistically valid for the cross-host
+> peer-send → DUT-recv delta, which is what the code actually computes.
+> It is **NOT** evidence for a pure DUT-side internal RX-path latency
+> claim — that interpretation would require HW RX timestamps which the
+> current AWS ENA bench instance does not expose. See the corrected
+> "Metrics — bench-rx-burst" section in
+> `docs/bench-reports/methodology-and-claims-2026-05-09.md` for the
+> full breakdown of what every `rx_latency_ns` sample includes (peer
+> send timestamp, peer NIC TX, network transit, DUT NIC RX, plus an
+> NTP-skew floor of ~100 µs same-AZ). The cross-stack **ordering**
+> signal ("fstack < dpdk_net < linux_kernel on this metric") is the
+> publication-grade claim; absolute µs are end-to-end cross-host
+> values bounded below by NTP skew.
+>
+> **3. Raw aggregate artifacts are reproduced inline.** The original
+> codex re-review note flagged `target/bench-results/stats-2026-05-13/`
+> as absent from this checkout because the dir is gitignored and lived
+> only in the agent worktree that produced it. To unblock reviewer
+> reproduction we have copied the AGGREGATE.md output into
+> `docs/bench-reports/t59-aggregate-2026-05-13.md` (committed under the
+> repo so reviewers can read the canonical numeric tables alongside
+> this report). The per-run raw CSVs (~MB-scale, gitignored) are still
+> only in the producing worktree — re-run `scripts/fast-iter-stats.sh`
+> with `--seed 42` to regenerate them locally.
+>
+> **Net recommendation for publication:** re-run with N≥10 against a
+> post-I2 binary, preserve the AGGREGATE.md + raw CSVs under
+> `docs/bench-reports/` from the start, and replace this disclaimer
+> with a "passed re-review" line. Until then, treat the numeric tables
+> below as preliminary cross-stack ordering evidence, not as
+> publication-grade absolute-value claims.
+
 **Why this report exists.** T58 ("fast-iter variance, 2026-05-13") ran the
 suite 3 times back-to-back and reported per-cell CVs ranging 0.7 % to 21.5 %
 on bench-rtt p50. Codex IMPORTANT I3 called that out — three runs is sampling
@@ -109,22 +168,32 @@ bootstrap-CI + paired-difference table.
 
 ## Artifacts
 
-- Raw bench-results: `target/bench-results/stats-2026-05-13/run-0{01..05}-seed-{42..46}/`
-- Pooled aggregate: `target/bench-results/stats-2026-05-13/AGGREGATE.md`
-  (full per-cell tables, more verbose than this report — quote-able as the
-  canonical numeric source)
+- **Pooled aggregate (preserved in-tree, codex 2026-05-13 re-review fix):**
+  `docs/bench-reports/t59-aggregate-2026-05-13.md` — full per-cell tables,
+  more verbose than this report. **Quote-able as the canonical numeric
+  source.** Contains the verbatim `AGGREGATE.md` output of
+  `scripts/aggregate-fast-iter.py` from the originating
+  `target/bench-results/stats-2026-05-13/` dir.
+- Raw bench-results (gitignored, agent-worktree only): originally at
+  `target/bench-results/stats-2026-05-13/run-0{01..05}-seed-{42..46}/`.
+  Regenerate via `bash scripts/fast-iter-stats.sh 5 --seed 42 --skip-verify`.
 - Per-run stats metadata: `target/bench-results/stats-2026-05-13/stats-metadata.json`
+  (regenerated alongside the raw bench-results).
 - Per-run completion log: `target/bench-results/stats-2026-05-13/runs.txt`
+  (regenerated alongside the raw bench-results).
 - Harness script: `scripts/fast-iter-stats.sh`
 - Aggregator: `scripts/aggregate-fast-iter.py`
 
 ## Results — full per-cell tables (mean ± 95 % CI, CV, p50/p99/p999, paired diff)
 
 The complete output of `scripts/aggregate-fast-iter.py` on this 5-run pass
-is saved at `target/bench-results/stats-2026-05-13/AGGREGATE.md`. The
-per-tool tables below are extracted from that file verbatim; cross-stack
-"YES"/"no" significance is the percentile-bootstrap paired-CI test
-described in §Methodology.
+is preserved in-tree at `docs/bench-reports/t59-aggregate-2026-05-13.md`
+(canonical numeric source; codex 2026-05-13 re-review IMPORTANT
+finding fix — the originating `target/bench-results/stats-2026-05-13/`
+dir is gitignored and was lost when the agent worktree was reaped).
+The per-tool tables below are extracted from that file verbatim;
+cross-stack "YES"/"no" significance is the percentile-bootstrap paired-CI
+test described in §Methodology.
 
 ### bench-rtt — `rtt_ns` (ns)
 
@@ -171,8 +240,12 @@ described in §Methodology.
    near 200 µs, others near 300 µs). The codex IMPORTANT I1 fix
    (`pkt_tx_delay=0`) reduced but did NOT eliminate this bimodality — only
    64B is well-behaved across all 5 runs (CV 22 % is misleading: the cell
-   actually contains the same mode-flip as the other payloads, see
-   `AGGREGATE.md` deciles section in run-001).
+   actually contains the same mode-flip as the other payloads — the
+   pooled raw-sample deciles section in `run-001-seed-42/` of the
+   originating `stats-2026-05-13/` dir would show this, but the
+   raw-CSV sidecars are gitignored; re-run via
+   `bash scripts/fast-iter-stats.sh 5 --seed 42 --skip-verify` to
+   regenerate them locally).
 
 3. **Cross-stack paired comparisons involving fstack are mostly NOT
    significant** because the wide fstack CI overwhelms the paired difference
@@ -280,7 +353,8 @@ timeout"` in one of the 5 runs — those count as n_runs=4 in the table.
   cross-stack ratios are still distorted by the two-ENI imbalance.
 
 - **dpdk_net vs fstack** (the same-NIC paired test) is significant in
-  all 9 cells (`AGGREGATE.md` paired table). fstack delivers ~2.5–3 Gbps
+  all 9 cells (see `docs/bench-reports/t59-aggregate-2026-05-13.md`
+  paired table for `sustained_goodput_bps`). fstack delivers ~2.5–3 Gbps
   vs dpdk_net's ~1 Gbps on this NIC (dpdk_net's ENA tx-data mempool
   exhaustion at C=16 lowers its number — see the C=16 W=4096 cell;
   dpdk_net at 780 Mbps is a Pool exhaustion signal, not a stack-comparison
@@ -297,6 +371,18 @@ timeout"` in one of the 5 runs — those count as n_runs=4 in the table.
   pools only the 4 valid runs for those cells.
 
 ### bench-rx-burst — `latency_ns` (ns)
+
+> **Cross-host metric reminder (codex 2026-05-13 re-review):**
+> `latency_ns` is computed as `dut_recv_ns − peer_send_ns` with both
+> endpoints anchored on `CLOCK_REALTIME` (see `methodology-and-claims-
+> 2026-05-09.md` §Metrics — bench-rx-burst for the full capture
+> breakdown). Every sample includes peer send latency, peer NIC TX,
+> AWS data-plane transit, DUT NIC RX, plus an NTP-skew floor of
+> ~100 µs same-AZ — it is NOT a pure DUT-side internal RX
+> measurement. The cross-stack **ordering** signal in this table
+> (e.g. "fstack < dpdk_net < linux_kernel on this metric") is the
+> publication-grade claim; absolute µs values are end-to-end
+> cross-host values bounded below by the NTP-skew floor.
 
 | W (segment_size) | N (burst_count) | stack | mean (ns) | 95% CI | CV% | p50 | p99 | p999 | n_runs |
 |---:|---:|---|---:|---|---:|---:|---:|---:|---:|
@@ -330,13 +416,30 @@ timeout"` in one of the 5 runs — those count as n_runs=4 in the table.
 
 **Findings — bench-rx-burst:**
 
-- **fstack consistently beats dpdk_net** (paired sig YES) in 5 of 9 cells
-  (W=128,256 across all N). At W=64 the two stacks are statistically
-  indistinguishable (overlapping CIs). The qualitative T57 finding
-  "fstack wins RX latency" is preserved.
-- **dpdk_net beats linux_kernel** in 8 of 9 cells (the W=256,N=256 cell
-  is borderline — CI engulfs 0). linux_kernel's RX latency carries a
-  ~1 ms p99/p999 tail that's the dominant signal for the test.
+All claims below are about the **cross-host** `dut_recv_ns −
+peer_send_ns` delta. They are NOT claims about pure DUT-side
+internal RX-path cost — that would require HW RX timestamps the
+bench instance does not expose. Read the disclaimer block at the
+top of this report and `methodology-and-claims-2026-05-09.md`
+§Metrics — bench-rx-burst before quoting absolute µs.
+
+- **fstack < dpdk_net on the cross-host RX delta** (paired sig YES) in
+  5 of 9 cells (W=128,256 across all N). At W=64 the two stacks are
+  statistically indistinguishable (overlapping CIs). The qualitative
+  T57 finding "fstack wins RX latency" is preserved as a cross-stack
+  ordering claim on the end-to-end peer-send-to-DUT-recv metric.
+- **dpdk_net < linux_kernel on the cross-host RX delta** in 8 of 9
+  cells (the W=256,N=256 cell is borderline — CI engulfs 0).
+  linux_kernel's RX delta carries a ~1 ms p99/p999 tail that's the
+  dominant signal for the test; that tail is real on the wire (kernel
+  TCP retransmit + scheduler-quantum delays) but the *bulk* of the
+  µs value is the same peer + network components that show up in
+  every stack's distribution.
+- **linux_kernel > fstack on the cross-host RX delta** (paired sig YES)
+  in 9 of 9 cells. This is the cell that codex's 2026-05-13 re-review
+  flagged as "statistically true for the cross-host delta but not
+  evidence for internal DUT RX latency". The ordering signal is valid;
+  the absolute µs values are NOT a pure-stack RX-cost number.
 - **Bootstrap CIs are widest at small N** — most cells have ~10 % CV
   across the 5 runs even for the DPDK stacks, so the 95 % CI half-width
   is ~10 % of the mean. This is the limit of N=5.
@@ -442,7 +545,10 @@ narrows the CI by ~29 %; N=5 → N=20 narrows by ~50 %.
 ## Verdict — preliminary statistical rigor achieved
 
 - **Framework reproducibility:** seed 42 → seeds 42..46 → 5 vanilla
-  `fast-iter-suite` runs, then `aggregate-fast-iter.py` → AGGREGATE.md.
+  `fast-iter-suite` runs, then `aggregate-fast-iter.py` → AGGREGATE.md
+  (preserved in-tree at `docs/bench-reports/t59-aggregate-2026-05-13.md`
+  for review; the original gitignored `target/bench-results/stats-2026-05-13/`
+  is regenerable via the harness invocation).
   Anyone with the worktree can replay the same numeric output by
   running `bash scripts/fast-iter-stats.sh 5 --seed 42 --skip-verify`.
 
