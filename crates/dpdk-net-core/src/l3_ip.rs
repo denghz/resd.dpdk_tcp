@@ -44,6 +44,18 @@ pub enum L3Drop {
 /// is widened to `u64` so accumulation cannot overflow for any input size;
 /// the final end-around-carry fold works unchanged on a u64.
 pub fn internet_checksum(chunks: &[&[u8]]) -> u16 {
+    // `sum` is widened to `u64` from the pre-PO3 `u32` for RFC 1071 §1
+    // correctness at very large inputs. The old `u32` accumulator silently
+    // truncated overflow at inputs >128 KB (~32k 16-bit words, when the
+    // running sum surpasses `u32::MAX`); RFC 1071 specifies the
+    // one's-complement sum with end-around carry — no truncation. A `u64`
+    // holds at least 2^48 16-bit-word adds without overflow, comfortably
+    // covering any realistic input including a fully-filled IPv4 packet
+    // (~65 KB) plus pseudo-header. Production TCP/IP packets are <2 KB so
+    // the old `u32` divergence point was unreachable in real traffic;
+    // the widening is preventive correctness, not a fix for a hot defect.
+    // See `po3_large_input_u64_widening_no_overflow` for the regression
+    // guard that locks in the RFC-correct behavior past the old wrap point.
     let mut sum: u64 = 0;
     let mut carry: Option<u8> = None;
     for chunk in chunks {
@@ -475,27 +487,37 @@ mod tests {
     // ------------------------------------------------------------------
     // PO3 — `internet_checksum` 4-byte fold optimization safety net.
     //
-    // `internet_checksum_ref` is a verbatim copy of the pre-PO3
-    // byte-pair-by-byte fold (matches the reference in
-    // tests/checksum_streaming_equiv.rs but is kept here as a private
-    // oracle so the unit-test module is self-contained). The property
-    // test below feeds the production and reference functions identical
-    // randomized inputs and asserts equal u16 output. If the optimized
-    // fold ever diverges from the reference on ANY chunk-list/byte
-    // pattern, this test fails before commit.
+    // `internet_checksum_ref` is the simple byte-pair-by-byte fold —
+    // structurally identical to the pre-PO3 implementation, BUT with
+    // `sum` widened to `u64` to match the post-PO3 production code's
+    // RFC 1071 correctness at very large inputs. The pre-PO3 `u32`
+    // accumulator silently truncated overflow at >128 KB inputs; that
+    // was a latent bug the PO3 widening fixed. Keeping the reference's
+    // `sum` at `u32` would mean this property test verifies "new
+    // optimized matches OLD buggy" — passing only because the test
+    // generates inputs (≤1 KB total) well below the divergence point.
+    // Using `u64` here makes the property test a meaningful RFC 1071
+    // equivalence check: two independent algorithms (4-byte fast path
+    // vs. byte-pair-by-byte) compared against the same correctness
+    // standard. The lock-in for the >128 KB widening point itself is
+    // in `po3_large_input_u64_widening_no_overflow` below.
     // ------------------------------------------------------------------
 
-    /// Reference fold: pre-PO3 byte-pair-by-byte algorithm. Kept here as
-    /// the safety-net oracle for the 4-byte fast path.
+    /// Reference fold: simple byte-pair-by-byte algorithm with a `u64`
+    /// accumulator, used as the safety-net oracle for the 4-byte fast
+    /// path. `sum: u64` matches the post-PO3 production accumulator so
+    /// the comparison is a RFC 1071 §1 equivalence check, not a parity
+    /// check against the pre-PO3 `u32` algorithm (which truncated
+    /// overflow at very large inputs).
     #[cfg(test)]
     fn internet_checksum_ref(chunks: &[&[u8]]) -> u16 {
-        let mut sum: u32 = 0;
+        let mut sum: u64 = 0;
         let mut carry: Option<u8> = None;
         for chunk in chunks {
             let mut i = 0usize;
             if let Some(high) = carry.take() {
                 if let Some(&low) = chunk.first() {
-                    sum = sum.wrapping_add(u16::from_be_bytes([high, low]) as u32);
+                    sum = sum.wrapping_add(u16::from_be_bytes([high, low]) as u64);
                     i = 1;
                 } else {
                     carry = Some(high);
@@ -503,7 +525,7 @@ mod tests {
                 }
             }
             while i + 1 < chunk.len() {
-                sum = sum.wrapping_add(u16::from_be_bytes([chunk[i], chunk[i + 1]]) as u32);
+                sum = sum.wrapping_add(u16::from_be_bytes([chunk[i], chunk[i + 1]]) as u64);
                 i += 2;
             }
             if i < chunk.len() {
@@ -511,7 +533,7 @@ mod tests {
             }
         }
         if let Some(tail) = carry {
-            sum = sum.wrapping_add((tail as u32) << 8);
+            sum = sum.wrapping_add((tail as u64) << 8);
         }
         while sum >> 16 != 0 {
             sum = (sum & 0xffff) + (sum >> 16);
@@ -619,6 +641,40 @@ mod tests {
             internet_checksum(&[d, e]),
             internet_checksum_ref(&[d, e])
         );
+    }
+
+    #[cfg_attr(miri, ignore = "131 KB allocation; slow under miri")]
+    #[test]
+    fn po3_large_input_u64_widening_no_overflow() {
+        // 131,076 bytes = 65,538 BE words of 0xFFFF — slightly past the
+        // pre-PO3 u32 wrap point (u32::MAX / 0xFFFF + 1 ≈ 65538 iters).
+        //
+        // Hand-computed RFC 1071 fold (u64 accumulator, no truncation):
+        //   raw_sum = 65538 * 0xFFFF = 0x1_0000_FFFE
+        //   fold #1: (0x1_0000_FFFE & 0xFFFF) + (0x1_0000_FFFE >> 16)
+        //          = 0xFFFE + 0x10000 = 0x1_FFFE
+        //   fold #2: (0x1_FFFE & 0xFFFF) + (0x1_FFFE >> 16)
+        //          = 0xFFFE + 0x1 = 0xFFFF
+        //   sum >> 16 == 0, loop exits.
+        //   !0xFFFF = 0x0000.
+        //
+        // The pre-PO3 u32 accumulator would have wrapped exactly once
+        // mid-accumulation (at iteration 65538), leaving 0x0000_FFFE in
+        // the u32, folding to 0xFFFE, and returning !0xFFFE = 0x0001.
+        // That divergence (0x0001 vs. 0x0000) is the latent u32 overflow
+        // bug PO3's u64 widening fixed. Production IPv4 packets cap at
+        // 65,535 bytes total — the divergence point was unreachable in
+        // real traffic. This test locks in the RFC-correct u64 behavior
+        // so any future change reintroducing u32 saturation fails here.
+        let big: Vec<u8> = vec![0xFFu8; 65538 * 2];
+        let chunks: [&[u8]; 1] = [big.as_slice()];
+        let got = internet_checksum(&chunks);
+        assert_eq!(got, 0x0000, "u64 RFC 1071 fold result");
+        // And the byte-pair-by-byte reference (also u64) must agree —
+        // two independent algorithms, one correctness standard.
+        let got_ref = internet_checksum_ref(&chunks);
+        assert_eq!(got_ref, 0x0000, "u64 reference fold result");
+        assert_eq!(got, got_ref);
     }
 
     /// Deterministic xorshift64* PRNG — no external dependency.
