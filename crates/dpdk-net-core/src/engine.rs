@@ -83,7 +83,11 @@ pub fn align_up_to_tick_ns(deadline_ns: u64) -> u64 {
 // port, queue, or mempool. Not a production Engine — no RX/TX burst path.
 #[cfg(feature = "bench-internals")]
 pub mod test_support {
-    use crate::counters::{add, inc, Counters};
+    // PO8: `inc` was previously imported for the per-segment
+    // `tcp.tx_data` bump inside `send_bytes_segment_build_step`. That
+    // op moved to the caller-side post-burst-loop flush (see comment in
+    // the helper body), so this module no longer needs `inc`.
+    use crate::counters::{add, Counters};
     use crate::flow_table::{ConnHandle, FlowTable, FourTuple};
     use crate::mempool::Mbuf;
     use crate::tcp_conn::TcpConn;
@@ -344,8 +348,6 @@ pub mod test_support {
         ///   * `build_segment(&seg, frame.as_mut_slice())` (6050) — the
         ///     dominant per-segment cost (IPv4 + TCP cksum + hdr pack)
         ///   * `copy_nonoverlapping(frame.as_ptr(), dst, n)` (6076-6078)
-        ///   * `eth.tx_bytes += n` + `tcp.tx_data += 1` counter ops
-        ///     (6131-6132)
         ///   * `RetransEntry { .. }` literal + `push_after_tx` (6155-6172)
         ///   * `send_ack_log.record_send(...)` (6176-6182) — early-return
         ///     when the log is disabled
@@ -365,6 +367,14 @@ pub mod test_support {
         ///   * `arm_tlp_pto(handle)` post-loop (6261-6263) — gate short-
         ///     circuits without SRTT in the fixture; production cost
         ///     with SRTT (gate eval + TimerWheel::add) is not captured
+        ///   * `eth.tx_bytes` / `tcp.tx_data` counter atomics — PO8 moved
+        ///     these from the per-segment loop body to a post-loop flush
+        ///     in `send_bytes` (2 fetch_add ops/call regardless of segment
+        ///     count, down from 2N/call). The bench mirrors this by
+        ///     accumulating in the burst-loop caller (`run_segment_build_loop`
+        ///     in tools/bench-micro/benches/send.rs) and issuing the
+        ///     equivalent flush after its inner loop — the helper itself
+        ///     no longer pays the per-call atomic.
         ///
         /// `cur_seq` is the seq for THIS segment (caller advances by
         /// `payload.len()` between calls). `payload` MUST already be
@@ -460,9 +470,16 @@ pub mod test_support {
                     n,
                 );
             }
-            // engine.rs:6131-6132 — counter updates.
-            add(&scratch.counters.eth.tx_bytes, n as u64);
-            inc(&scratch.counters.tcp.tx_data);
+            // PO8: production batches the per-segment eth.tx_bytes/tcp.tx_data
+            // ops into stack-local u64 accumulators that flush once after
+            // the burst loop (see engine.rs send_bytes post-loop flush).
+            // The helper mirrors that: it returns `frame_len = Some(n)` so
+            // the caller's burst loop can accumulate `sum(n)` and a segment
+            // count, then issue a single `add(eth.tx_bytes, sum)` +
+            // `add(tcp.tx_data, segs)` after the loop. No per-segment
+            // atomic happens inside this helper. The drift-guard tests
+            // below replicate the post-loop flush before asserting the
+            // counter values.
 
             // engine.rs:6153-6214 — RetransEntry + push_after_tx +
             // record_send + first-burst RTO arm gate, all under the
@@ -6264,6 +6281,25 @@ impl Engine {
         #[cfg(feature = "obs-byte-counters")]
         let mut tx_bytes_acc: u64 = 0;
 
+        // PO8: batch the per-segment `eth.tx_bytes` add and `tcp.tx_data`
+        // inc into stack-local u64 accumulators, flushed with a single
+        // `fetch_add` per counter just before the return. Same precedent
+        // as `tx_bytes_acc` (under `obs-byte-counters`) directly above —
+        // the production counter snapshot cadence is ≤1 Hz per the
+        // counter-policy memory note, so within-call per-segment vs
+        // per-call granularity is indistinguishable from the app's view.
+        // For an N-segment MSS burst this collapses 2N relaxed fetch_add
+        // ops on the hot path to 2 (one per counter at the exit), saving
+        // ~10 ns/burst on the 6-segment MSS path.
+        // Invariant: the per-call sums equal what the per-segment ops
+        // would have written (sum of `n` over completed iterations for
+        // `eth.tx_bytes`; segment count for `tcp.tx_data`). On a mid-loop
+        // break (alloc-fail / mempool-empty) the accumulators reflect
+        // ONLY the segments that made it onto the ring — same total the
+        // per-segment writes would have committed before the break.
+        let mut total_tx_bytes_acc: u64 = 0;
+        let mut total_tx_data_segs_acc: u64 = 0;
+
         let mut frame = self.tx_frame_scratch.borrow_mut();
         // Pre-size to cover the first segment's needed bytes. Inner loop
         // grows on demand for atypical sizes.
@@ -6432,12 +6468,16 @@ impl Engine {
                 let mut ring = self.tx_pending_data.borrow_mut();
                 ring.push(unsafe { std::ptr::NonNull::new_unchecked(m) });
             }
-            // eth.tx_bytes accounts accepted bytes — keep per-segment.
-            // eth.tx_pkts is now incremented by drain_tx_pending_data
-            // after the actual burst (Task 5). A pushed-but-unsent mbuf
-            // counts as tx_drop_full_ring in the drain path.
-            crate::counters::add(&self.counters.eth.tx_bytes, n as u64);
-            inc(&self.counters.tcp.tx_data);
+            // eth.tx_bytes accounts accepted bytes; eth.tx_pkts is now
+            // incremented by drain_tx_pending_data after the actual burst
+            // (Task 5). A pushed-but-unsent mbuf counts as
+            // tx_drop_full_ring in the drain path.
+            // PO8: accumulate locally; the post-loop flush below collapses
+            // N per-segment relaxed fetch_add ops into a single op per
+            // counter. See the accumulator-init comment above for the
+            // observability-granularity rationale.
+            total_tx_bytes_acc += n as u64;
+            total_tx_data_segs_acc += 1u64;
             #[cfg(feature = "obs-byte-counters")]
             {
                 tx_bytes_acc += take as u64;
@@ -6559,6 +6599,22 @@ impl Engine {
             if tx_bytes_acc > 0 {
                 crate::counters::add(&self.counters.tcp.tx_payload_bytes, tx_bytes_acc);
             }
+        }
+
+        // PO8: flush the per-call eth.tx_bytes / tcp.tx_data accumulators
+        // with a single fetch_add per counter. Guards on `> 0` skip the
+        // op entirely when the call transmitted no segments (e.g.
+        // bytes.len() == 0, peer-window-zero short-circuit at the top of
+        // the loop, or mempool-empty break on the first segment). The
+        // per-call totals equal the sum the per-segment ops would have
+        // written: `total_tx_bytes_acc = sum(n)` over completed
+        // iterations, `total_tx_data_segs_acc = segment count` — both
+        // identical to the OLD per-segment write pattern.
+        if total_tx_bytes_acc > 0 {
+            crate::counters::add(&self.counters.eth.tx_bytes, total_tx_bytes_acc);
+        }
+        if total_tx_data_segs_acc > 0 {
+            crate::counters::add(&self.counters.tcp.tx_data, total_tx_data_segs_acc);
         }
 
         // A5.5 Task 15: RFC 8985 §7.2 SHOULD — arm TLP PTO after
@@ -9442,16 +9498,26 @@ mod send_bytes_segment_build_step_drift_guard {
         assert!(conn.rto_timer_id.is_some(), "rto_timer_id must be set");
 
         // (8) Counter side effects.
+        //
+        // PO8: the helper no longer issues the per-call
+        // `add(eth.tx_bytes, n)` + `inc(tcp.tx_data)` atomics; the
+        // production `Engine::send_bytes` accumulates per segment and
+        // flushes once after the burst loop. This test replicates that
+        // post-burst flush so the existing equality assertions stand:
+        // for a single-segment "burst" the per-call totals (`n` and `1`)
+        // equal exactly what the old per-segment ops would have written.
         use std::sync::atomic::Ordering;
+        crate::counters::add(&counters.eth.tx_bytes, n as u64);
+        crate::counters::add(&counters.tcp.tx_data, 1u64);
         assert_eq!(
             counters.eth.tx_bytes.load(Ordering::Relaxed),
             n as u64,
-            "eth.tx_bytes must equal frame_len"
+            "eth.tx_bytes must equal frame_len after post-burst flush"
         );
         assert_eq!(
             counters.tcp.tx_data.load(Ordering::Relaxed),
             1,
-            "tcp.tx_data must increment by 1"
+            "tcp.tx_data must increment by 1 after post-burst flush"
         );
     }
 

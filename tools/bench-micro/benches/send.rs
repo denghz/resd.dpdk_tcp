@@ -43,10 +43,15 @@
 //!     — IPv4 + TCP checksum + header pack; the dominant cost
 //!   * `std::ptr::copy_nonoverlapping` of `n` frame bytes into
 //!     the (fake-Box-backed) mbuf data area                       (6076-6078)
-//!   * `counters::add(&eth.tx_bytes, n)` + `counters::inc(&tcp.tx_data)` (6131-6132)
 //!   * `RetransEntry { .. }` + `SendRetrans::push_after_tx`       (6155-6172)
 //!   * `send_ack_log.record_send(..)` — early-return when disabled (6176-6182)
 //!   * First-burst RTO arm: `TimerWheel::add(..)`                 (6187-6214)
+//!   * Post-burst `counters::add(&eth.tx_bytes, sum_n)` +
+//!     `counters::add(&tcp.tx_data, seg_count)` — PO8 moved the counter
+//!     bumps from per-segment to per-call, mirroring the production
+//!     post-loop flush in `Engine::send_bytes`. The flush happens in
+//!     `run_segment_build_loop` (this file) after the inner helper
+//!     loop returns, not inside the helper.
 //!
 //! # What this bench DELIBERATELY skips
 //!
@@ -344,6 +349,16 @@ fn run_segment_build_loop(
     // per 1460 B segment on Zen4 (less on smaller payloads).
     let mut byte_acc: u64 = 0;
 
+    // PO8: mirror engine.rs send_bytes post-loop flush — accumulate
+    // per-segment tx_bytes (= n) and tx_data (= 1) locally inside this
+    // burst loop, then issue a single `add` per counter after the loop.
+    // The helper no longer performs the per-call atomic; the bench loop
+    // owns the flush so the measured cost matches the production hot
+    // path (2 fetch_add ops/call regardless of segment count, instead
+    // of 2N/call before PO8). See engine.rs:6263 init comment.
+    let mut total_tx_bytes_acc: u64 = 0;
+    let mut total_tx_data_segs_acc: u64 = 0;
+
     while remaining > 0 {
         let take = remaining.min(mss_cap as usize);
         let payload = &bytes[offset..offset + take];
@@ -382,10 +397,25 @@ fn run_segment_build_loop(
         for &b in &fake_mbuf_data[..n] {
             byte_acc ^= b as u64;
         }
+        // PO8: per-segment accumulation (no atomic), flushed below.
+        total_tx_bytes_acc += n as u64;
+        total_tx_data_segs_acc += 1u64;
 
         offset += take;
         cur_seq = cur_seq.wrapping_add(take as u32);
         remaining -= take;
+    }
+
+    // PO8: post-loop counter flush — mirrors engine.rs send_bytes
+    // post-loop flush. Same `> 0` guards skip the atomic when the burst
+    // transmitted no segments (e.g. early-break on the first helper
+    // call). Captures the production hot-path cost: 2 fetch_add ops
+    // per send_bytes call, regardless of segment count.
+    if total_tx_bytes_acc > 0 {
+        dpdk_net_core::counters::add(&counters.eth.tx_bytes, total_tx_bytes_acc);
+    }
+    if total_tx_data_segs_acc > 0 {
+        dpdk_net_core::counters::add(&counters.tcp.tx_data, total_tx_data_segs_acc);
     }
 
     // engine.rs:6228-6233 — advance snd_nxt. Production code also
