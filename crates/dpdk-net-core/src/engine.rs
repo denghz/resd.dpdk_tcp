@@ -392,12 +392,24 @@ pub mod test_support {
             snapshot: &SegmentBuildSnapshot,
             scratch: &mut SegmentBuildScratch<'_>,
             tx_csum_offload_active: bool,
+            // PO7: pre-loop now_ns snapshot, taken ONCE at the top of
+            // `Engine::send_bytes` and shared across every segment in
+            // the burst. The helper consumes both derived forms — the
+            // TS-option tsval (µs) and the RetransEntry xmit_ts_ns —
+            // mirroring the production hoisting at engine.rs:6262.
+            // RFC 7323 §4.1 + RFC 8985 §6.2: within-burst µs-scale time
+            // variation is below TS clock granularity (1 ms) and the
+            // RACK min-RTT floor (1 ms), so a single snapshot per burst
+            // is physically equivalent to per-segment reads.
+            now_ns_at_send: u64,
         ) -> SegmentBuildOutcome {
             // engine.rs:6016-6024 — TS option per RFC 7323 §3 MUST-22.
+            // PO7: tsval derived from the caller's pre-loop now_ns
+            // snapshot, not a per-segment TSC read (see param doc).
+            let tsval_at_send = (now_ns_at_send / 1000) as u32;
             let options = if snapshot.ts_enabled {
-                let tsval = (crate::clock::now_ns() / 1000) as u32;
                 TcpOpts {
-                    timestamps: Some((tsval, snapshot.ts_recent)),
+                    timestamps: Some((tsval_at_send, snapshot.ts_recent)),
                     ..Default::default()
                 }
             } else {
@@ -459,7 +471,9 @@ pub mod test_support {
             // Stage-1 harness uses `&mut FlowTable` directly, omitting
             // ~5 ns of RefCell tracking but otherwise mirroring the
             // get_mut + slot-indexing cost.
-            let first_tx_ts_ns = crate::clock::now_ns();
+            // PO7: reuse caller-supplied now_ns_at_send rather than
+            // re-reading TSC per segment (mirrors engine.rs:6429).
+            let first_tx_ts_ns = now_ns_at_send;
             let hdrs_len = (n - payload.len()) as u16;
             let entry = RetransEntry {
                 seq: cur_seq,
@@ -6261,16 +6275,40 @@ impl Engine {
         if current_cap < initial_cap_needed {
             frame.reserve(initial_cap_needed - current_cap);
         }
+        // PO7: hoist `crate::clock::now_ns()` out of the per-segment loop.
+        // The loop previously paid two TSC reads (+ scaled-multiply
+        // ns-conversion) per segment — one for the TS-option `tsval`,
+        // one for the `RetransEntry::{first_tx_ts_ns, xmit_ts_ns}` —
+        // costing ~30 ns/segment (~180 ns at the 6-segment MSS burst).
+        // A single now_ns snapshot per `send_bytes` call is faithful to:
+        //   * RFC 7323 §4.1 — TSval is the "approximate time of
+        //     transmission". Within-burst variation is microseconds, two
+        //     orders of magnitude below the §2.4 recommended TS clock
+        //     granularity (1 ms). Linux's TS source is `jiffies_to_msecs`
+        //     of the syscall-entry time, not per-segment reads, and
+        //     wire-equivalence with Linux is the bench peer baseline.
+        //   * RFC 8985 §6.2 RACK loss detection — uses entry.xmit_ts_ns
+        //     with a min RTT floor of 1 ms (`compute_reo_wnd_us` clamp).
+        //     µs-scale within-burst time deltas are below detection
+        //     resolution. The RACK ordering checks
+        //     (`update_on_ack` / `detect_lost`) fall through equal-time
+        //     ties to seq comparison, and burst segments have strictly
+        //     monotonic seq, so ordering remains well-defined.
+        //   * Retransmit hot path (engine.rs:7242) already uses this
+        //     "one TSC read shared across both consumers" pattern.
+        let now_ns_at_send = crate::clock::now_ns();
+        let tsval_at_send = (now_ns_at_send / 1000) as u32;
         while remaining > 0 {
             let take = remaining.min(mss_cap as usize);
             let payload = &bytes[offset..offset + take];
             // F-6 RFC 7323 §3 MUST-22: once TS is negotiated, every
             // non-RST segment MUST carry TSopt. TSval = now_µs per
-            // §4.1; TSecr = the ts_recent we snapshot'd pre-loop.
+            // §4.1; TSecr = the ts_recent we snapshot'd pre-loop. PO7:
+            // `tsval_at_send` is the pre-loop snapshot (see hoisting
+            // rationale above).
             let options = if ts_enabled {
-                let tsval = (crate::clock::now_ns() / 1000) as u32;
                 crate::tcp_options::TcpOpts {
-                    timestamps: Some((tsval, ts_recent)),
+                    timestamps: Some((tsval_at_send, ts_recent)),
                     ..Default::default()
                 }
             } else {
@@ -6420,7 +6458,9 @@ impl Engine {
             // before chaining a fresh header mbuf — otherwise the on-wire
             // retrans frame would carry a duplicate L2+L3+TCP header.
             // `n - take` = ETH_HDR_LEN + IPV4_HDR_MIN + tcp_hdr_len_inc_opts.
-            let first_tx_ts_ns = crate::clock::now_ns();
+            // PO7: reuse `now_ns_at_send` rather than re-reading TSC per
+            // segment (see pre-loop hoisting rationale above).
+            let first_tx_ts_ns = now_ns_at_send;
             let hdrs_len = (n - take) as u16;
             let new_entry = crate::tcp_retrans::RetransEntry {
                 seq: cur_seq,
@@ -9328,6 +9368,11 @@ mod send_bytes_segment_build_step_drift_guard {
             // suffices to mirror the production code shape.
             fake_mbuf_ptr: 0x1usize as *mut dpdk_net_sys::rte_mbuf,
         };
+        // PO7: drift-guard mirrors the caller-supplied pre-loop now_ns
+        // snapshot (engine.rs:6262). A deterministic non-zero fixture
+        // value lets assertions on `e.xmit_ts_ns` / `e.first_tx_ts_ns`
+        // stay reproducible across runs without sampling the real TSC.
+        let now_ns_at_send: u64 = 1_000_000_000_000;
         let outcome = EngineNoEalHarness::send_bytes_segment_build_step(
             &mut flow_table,
             handle,
@@ -9336,6 +9381,7 @@ mod send_bytes_segment_build_step_drift_guard {
             &snap,
             &mut scratch,
             false,
+            now_ns_at_send,
         );
 
         // (1) frame_len is L2+L3+TCP(20)+TS-opt(12)+payload(128) = 14+20+32+128 = 194.
@@ -9380,6 +9426,16 @@ mod send_bytes_segment_build_step_drift_guard {
         assert_eq!(e.len, 128);
         assert_eq!(e.xmit_count, 1);
         assert_eq!(e.hdrs_len, (n - 128) as u16);
+        // PO7: entry inherits the caller-supplied pre-loop now_ns
+        // snapshot (no per-segment TSC reads inside the helper).
+        assert_eq!(
+            e.first_tx_ts_ns, now_ns_at_send,
+            "first_tx_ts_ns must inherit the caller's pre-loop snapshot"
+        );
+        assert_eq!(
+            e.xmit_ts_ns, now_ns_at_send,
+            "xmit_ts_ns must inherit the caller's pre-loop snapshot"
+        );
 
         // (7) First-burst RTO arm fired (was_empty && rto_timer_id.is_none()).
         assert!(outcome.armed_rto, "first-burst RTO arm must fire");
@@ -9462,6 +9518,8 @@ mod send_bytes_segment_build_step_drift_guard {
             counters: &counters,
             fake_mbuf_ptr: 0x1usize as *mut dpdk_net_sys::rte_mbuf,
         };
+        // PO7: mirror caller-supplied pre-loop now_ns snapshot.
+        let now_ns_at_send: u64 = 2_000_000_000_000;
         let outcome = EngineNoEalHarness::send_bytes_segment_build_step(
             &mut flow_table,
             handle,
@@ -9470,6 +9528,7 @@ mod send_bytes_segment_build_step_drift_guard {
             &snap,
             &mut scratch,
             false,
+            now_ns_at_send,
         );
 
         assert!(outcome.frame_len.is_some());

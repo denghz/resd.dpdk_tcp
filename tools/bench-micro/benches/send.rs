@@ -328,6 +328,13 @@ fn run_segment_build_loop(
         ts_recent,
     };
 
+    // PO7: hoist a single `now_ns` read above the per-segment loop —
+    // mirrors the production hoisting at engine.rs:6262 (one snapshot
+    // shared across every burst segment for tsval + xmit_ts_ns).
+    // Within-burst µs-scale variation is below the RFC 7323 §2.4 TS
+    // clock granularity and the RFC 8985 RACK min-RTT floor.
+    let now_ns_at_send = dpdk_net_core::clock::now_ns();
+
     // Accumulate an observable side effect of every byte of the
     // per-segment writes so LLVM cannot DCE the `copy_nonoverlapping`
     // inside the helper (codex C1 round 2). A 3-byte xor would let
@@ -360,6 +367,7 @@ fn run_segment_build_loop(
             // bench_build_segment_data_mss_offload in
             // tools/bench-micro/benches/build_segment.rs.
             false,
+            now_ns_at_send,
         );
         let Some(n) = outcome.frame_len else {
             break;
