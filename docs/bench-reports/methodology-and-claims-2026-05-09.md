@@ -283,3 +283,33 @@ Implication for comparisons: cross-stack deltas in a single run are now
 order-symmetric in expectation (no stack is systematically last); for
 absolute-numbers-grade comparisons, average over multiple runs with
 different seeds to marginalize out the per-run order effect.
+
+## Known issues — measurements that are broken or partial
+
+These are real defects surfaced by the T59 + T60 statistical-rigor passes
+and the codex re-reviews. Documented here so consumers of the suite
+output know which columns to trust.
+
+- **`bench-tx-burst` fstack `burst_steady_bps` denominator is broken.**
+  T60 N=10 reports fstack `burst_steady_bps` in the 10¹³–10¹⁴ bps range
+  (16 Tbps at K=64 KiB, 119 Tbps at K=1 MiB). A 5 Gbps ENA cannot deliver
+  those rates; the calculation in `tools/bench-tx-burst/src/fstack.rs`
+  almost certainly has a `bytes / very-short-elapsed-ns` collapse for
+  fstack's loop-bookkeeping. Treat the fstack `burst_steady_bps` column
+  as **unreliable**; the trustworthy fstack sustained-throughput row is
+  `bench-tx-maxtp`'s `sustained_goodput_bps` (~2–3 Gbps).
+- **fstack RTT residual bimodality.** Codex IMPORTANT I1 fix
+  (`pkt_tx_delay=0`) reduced but did not eliminate fstack's bimodal RTT
+  distribution. T60 N=10 shows CV 17–21 % on fstack RTT vs CV 4–7 % for
+  dpdk_net / linux_kernel. Suspected second source: another
+  F-Stack-internal poll interval (RX-side, not the 100 µs TX drain). See
+  [fstack-bimodality-investigation-2026-05-13.md](fstack-bimodality-investigation-2026-05-13.md).
+- **fstack `bench-tx-maxtp` connect-timeout buckets** at large W.
+  W=65,536 sees 4–6 of 10 runs flagged `bucket_invalid: connect timeout`
+  at C=1 / C=4. Reported `sustained_goodput_bps` rows are mean of the
+  successful runs only; paired-comparison `n_paired` drops accordingly.
+- **fstack `tx_pps` reports 0** in the maxtp arm — known accounting
+  gap; the `sustained_goodput_bps` column is the trustworthy fstack
+  maxtp metric.
+- **linux_kernel RTT p999 spikes** (~1–2.4 ms) in T60 — kernel
+  scheduling tail; reproducible across runs.
