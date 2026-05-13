@@ -265,7 +265,11 @@ pub mod test_support {
     ///   does at engine.rs:6076-6078. Must be at least
     ///   `FRAME_HDRS_MIN + 40 + payload.len()` bytes (one segment's worth).
     /// * `wheel` accepts the first-segment RTO arm.
-    /// * `counters` receives the `eth.tx_bytes` + `tcp.tx_data` updates.
+    /// * `counters` is referenced for sub-counter atomics that the
+    ///   helper still performs internally (e.g. `tcp.tx_payload_bytes`
+    ///   under `obs-byte-counters`). PO8 moved `eth.tx_bytes` and
+    ///   `tcp.tx_data` to caller-side per-burst accumulation; the
+    ///   helper no longer touches those two fields.
     /// * `fake_mbuf_ptr` is stashed in the `RetransEntry::mbuf` field;
     ///   the helper never dereferences it. In production this is the
     ///   freshly-allocated `rte_pktmbuf_alloc` return value.
