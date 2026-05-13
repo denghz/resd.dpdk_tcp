@@ -856,10 +856,13 @@ run_verify_rack_tlp() {
     local artifacts="$RESULTS_DIR/verify-rack-tlp"
     mkdir -p "$artifacts"
 
-    # verify-rack-tlp runs 5 netem scenarios sequentially. Post-2026-05-13
-    # iter trim the 5 scenarios total ~13-16 min; allow 35 min before SIGKILL
-    # to leave generous slack (RTO-bound scenarios have wide per-run spread).
-    # Override via VERIFY_RACK_TLP_TIMEOUT env if needed.
+    # verify-rack-tlp runs 6 scenarios sequentially (5 peer-egress loss +
+    # 1 peer-ingress reorder via ifb — the rack_reorder_4k cell added by
+    # codex B3 repair, 2026-05-13). Post-trim the 6 scenarios total
+    # ~13-16 min; allow 35 min before SIGKILL to leave generous slack
+    # (RTO-bound scenarios have wide per-run spread, and the rack_reorder
+    # setup adds ~10 s for ifb load + tcp_sack flip on top of the ~30 s
+    # bench run). Override via VERIFY_RACK_TLP_TIMEOUT env if needed.
     local prev_timeout="$RUN_ONE_TIMEOUT"
     RUN_ONE_TIMEOUT="${VERIFY_RACK_TLP_TIMEOUT:-2100}"
     run_one "verify-rack-tlp" \

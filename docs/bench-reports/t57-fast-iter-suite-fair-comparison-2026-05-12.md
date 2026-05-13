@@ -200,7 +200,32 @@ Per-arm rationale + the `Stack::throughput_metric_name` helper:
 | `symmetric_3pct` | `loss 3%` | 7 527 | 0 | 1 496 | 9 023 | PASS |
 | `high_loss_5pct` | `loss 5% 25%` | 300 | 0 | 60 | 360 | PASS |
 
-Phase 11 RTO/RACK/TLP counter split validated against real netem loss on AWS ENA. Empirical: **RACK never fires on this NIC/wire** (sparse ACK information) — the ANY-of assertion saves the low-loss scenarios via TLP.
+Phase 11 RTO/TLP counter split validated against real netem loss on AWS ENA. The RACK column above is **zero across every peer-egress loss scenario** — see codex BLOCKER B3 (2026-05-13) + the §"verify-rack-tlp — codex B3 repair (rack_reorder_4k)" section below for the root cause and the repair scenario that validates RACK separately.
+
+## verify-rack-tlp — codex B3 repair (rack_reorder_4k)
+
+Codex's 2026-05-13 adversarial review flagged BLOCKER B3 against the v2 assertion-set above: the low-loss ANY-of `rack | tlp` passed entirely via TLP because RACK never fired, so the "RACK validated" claim was vacuous. Investigation found two structural reasons:
+
+1. **Peer's `tcp_sack` is 0** (HFT latency tuning, `/etc/sysctl.d/99-hft-latency.conf` on the fast-iter peer AMI). Without SACK from the peer, RACK on the DUT has no out-of-order delivery information to detect with — RFC 8985 §6.2's detect-lost rule requires SACK blocks.
+2. **bench-rtt's default 128 B payload is one segment per RPC iter.** Even with SACK enabled, RACK needs multiple in-flight segments per RPC so that a later one can be SACKed before an earlier one is ACKed.
+
+The repair is a new scenario `rack_reorder_4k` (assertion-set v3, 2026-05-13):
+
+- Loads `ifb` on the peer + redirects `ens5` ingress through `ifb0` (peer-INGRESS reorder; peer-egress reorder cannot produce SACK misorder because the peer receives DUT data in order).
+- Applies netem `delay 5ms reorder 50% gap 3` on `ifb0`.
+- Flips peer `tcp_sack=1` for the run; restores the saved baseline at teardown.
+- Runs bench-rtt at 4096 B payload (~3 segments at 1448-B MSS).
+- Asserts ALL-of `tcp.tx_retrans_rack > 0`.
+
+Empirical (2026-05-13 three back-to-back runs via `SCENARIOS_FILTER=rack_reorder_4k ./scripts/verify-rack-tlp.sh`, all on the same fast-iter peer, ifb teardown between runs):
+
+| run | rto | rack | tlp | agg | result |
+|---:|---:|---:|---:|---:|:---|
+| 1 | 3 | 1965 | 9 | 1977 | PASS |
+| 2 | 1 | 1876 | 1 | 1878 | PASS |
+| 3 | 2 | 1802 | 0 | 1804 | PASS |
+
+The low-loss scenarios' ANY-of was also tightened: the `rack | tlp` clause is now just `tlp`, so a PASS there is a real TLP-fired assertion rather than an either-or that masks RACK absence. Assertion-set v3 details in `docs/bench-reports/verify-rack-tlp.md` + `scripts/verify-rack-tlp.sh` (script header comment "Scenario × expected-counter table"). Codex B3 is closed.
 
 ## Wallclock breakdown
 
