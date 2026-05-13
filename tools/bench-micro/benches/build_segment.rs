@@ -133,7 +133,8 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use dpdk_net_core::tcp_options::TcpOpts;
 use dpdk_net_core::tcp_output::{
-    build_segment, tcp_pseudo_header_checksum, SegmentTx, FRAME_HDRS_MIN, TCP_ACK, TCP_PSH,
+    build_segment, build_segment_offload, tcp_pseudo_header_checksum, SegmentTx, FRAME_HDRS_MIN,
+    TCP_ACK, TCP_PSH,
 };
 use std::time::{Duration, Instant};
 
@@ -178,6 +179,21 @@ fn ts_opts() -> TcpOpts {
 #[inline(always)]
 fn build_and_fold(seg: &SegmentTx, out: &mut [u8]) -> u64 {
     let n = build_segment(black_box(seg), out).expect("bench setup sized out correctly");
+    let mut acc: u64 = n as u64;
+    for &b in &out[..n] {
+        acc ^= b as u64;
+    }
+    acc
+}
+
+/// PO4: same as `build_and_fold` but invokes `build_segment_offload` —
+/// the offload-active path skips the full TCP payload fold and writes
+/// the pseudo-only TCP cksum + zero IPv4 cksum directly. Used by the
+/// `_offload` bench variants to surface the per-byte savings.
+#[inline(always)]
+fn build_offload_and_fold(seg: &SegmentTx, out: &mut [u8]) -> u64 {
+    let n =
+        build_segment_offload(black_box(seg), out).expect("bench setup sized out correctly");
     let mut acc: u64 = n as u64;
     for &b in &out[..n] {
         acc ^= b as u64;
@@ -299,6 +315,52 @@ fn bench_build_segment_data_mss(c: &mut Criterion) {
     });
 }
 
+/// PO4 companion to `bench_build_segment_data_mss`: same SegmentTx
+/// shape (PSH+ACK, TS opts, 1460 B payload, total 1526 B frame) but
+/// calls `build_segment_offload` — the variant used on the
+/// `tx_cksum_offload_active` path in `Engine::send_bytes`. The TCP
+/// checksum field is set to the pseudo-header-only fold (no payload
+/// fold) and the IPv4 cksum field is set to 0; both fields are
+/// idempotently rewritten by `tx_offload_finalize` downstream, so the
+/// final wire bytes are bit-identical to the
+/// build_segment+tx_offload_finalize sequence (verified by
+/// `build_segment_offload_wire_equivalent_*` unit tests in tcp_output.rs).
+///
+/// Expected delta vs. `bench_build_segment_data_mss`: the per-byte TCP
+/// payload fold (~0.5 cycles/byte × 1460 B ≈ 250-400 ns at 5 GHz on
+/// Zen4) is gone. The remaining cost is options encode, IPv4 header
+/// pack, pseudo-header fold (~7-8 ns), the copy_from_slice of the
+/// payload into `out`, and the `build_and_fold` per-byte XOR
+/// accumulator (uniform across variants).
+fn bench_build_segment_data_mss_offload(c: &mut Criterion) {
+    c.bench_function("bench_build_segment_data_mss_offload", |b| {
+        let opts = ts_opts();
+        assert_eq!(opts.encoded_len(), 12, "TS-only options must be 12 bytes");
+        let payload_buf = vec![0x42u8; MSS_PAYLOAD];
+        let seg = SegmentTx {
+            src_mac: SRC_MAC,
+            dst_mac: DST_MAC,
+            src_ip: SRC_IP,
+            dst_ip: DST_IP,
+            src_port: SRC_PORT,
+            dst_port: DST_PORT,
+            seq: SEQ,
+            ack: ACK,
+            flags: TCP_PSH | TCP_ACK,
+            window: WINDOW,
+            options: opts,
+            payload: &payload_buf,
+        };
+        let mut out: Vec<u8> = vec![0u8; FRAME_HDRS_MIN + 40 + payload_buf.len()];
+        let _ = build_segment_offload(&seg, &mut out).expect("bench setup must succeed");
+
+        b.iter(|| {
+            let acc = build_offload_and_fold(&seg, &mut out);
+            black_box(acc);
+        });
+    });
+}
+
 /// Pseudo-header-only checksum: the 12-byte fold over src_ip + dst_ip +
 /// proto + tcp_seg_len. Used by the A-HW TX-offload path
 /// (tcp_output.rs:223) where the PMD folds in the TCP header + payload
@@ -349,6 +411,7 @@ criterion_group! {
         bench_build_segment_bare_ack,
         bench_build_segment_data_64b,
         bench_build_segment_data_mss,
+        bench_build_segment_data_mss_offload,
         bench_pseudo_header_checksum,
 }
 criterion_main!(benches);

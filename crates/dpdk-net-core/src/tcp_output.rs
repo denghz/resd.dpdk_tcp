@@ -45,7 +45,58 @@ pub fn build_segment(seg: &SegmentTx, out: &mut [u8]) -> Option<usize> {
     // checksum is computed over the header + the same bytes we write
     // to `out`, and the IPv4 total-length / TCP pseudo-header length
     // fields use `seg.payload.len()`.
-    build_segment_inner(seg, seg.payload, seg.payload.len() as u32, out)
+    build_segment_inner(seg, seg.payload, seg.payload.len() as u32, out, CsumStrategy::Full)
+}
+
+/// Same wire-bytes output as `build_segment` followed by
+/// `tx_offload_rewrite_cksums`, but written in one pass — the IPv4 cksum
+/// field is set to 0 (NIC computes at wire time) and the TCP cksum field
+/// is set to the pseudo-header-only fold (PMD folds in TCP header +
+/// payload at wire time when `RTE_MBUF_F_TX_TCP_CKSUM` is set on the
+/// mbuf via `tx_offload_finalize`).
+///
+/// PO4 (perf optimisation): on the `tx_cksum_offload_active == true`
+/// path the full TCP payload fold that `build_segment` performs is dead
+/// work — `tx_offload_finalize` runs immediately after and overwrites
+/// the TCP cksum with the pseudo-only value (and zeros the IPv4 cksum).
+/// `build_segment_offload` produces that final post-finalize cksum
+/// state directly, skipping the full payload fold (~250-400 ns at MSS).
+///
+/// Wire-equivalence invariant: after `build_segment_offload(seg, out)`
+/// followed by `tx_offload_rewrite_cksums(out, ...)`, the bytes in
+/// `out[..n]` are bit-identical to the bytes produced by
+/// `build_segment(seg, out)` followed by `tx_offload_rewrite_cksums`
+/// (verified by the
+/// `build_segment_offload_wire_equivalent_to_build_segment_plus_rewrite`
+/// unit test). `tx_offload_finalize` STILL runs on the offload-active
+/// path — its mbuf flag set + l2/l3/l4 length set are essential and are
+/// not provided by `build_segment_offload`. The redundant second write
+/// of the same TCP cksum + IPv4 cksum fields is deliberately left in
+/// place; the cost (two 16-bit stores) is negligible and removing it
+/// would split offload-active correctness across two functions.
+pub fn build_segment_offload(seg: &SegmentTx, out: &mut [u8]) -> Option<usize> {
+    build_segment_inner(
+        seg,
+        seg.payload,
+        seg.payload.len() as u32,
+        out,
+        CsumStrategy::Offload,
+    )
+}
+
+/// Selects the cksum-write strategy used by `build_segment_inner`.
+///
+/// * `Full` — SW IPv4 cksum + SW full TCP cksum (pseudo-header + TCP
+///   header + payload fold). Used by `build_segment` /
+///   `build_retrans_header` on the non-offload path; the NIC transmits
+///   the bytes unchanged.
+/// * `Offload` — IPv4 cksum field = 0; TCP cksum field = pseudo-header
+///   only. Skips the full payload fold; the NIC computes both checksums
+///   at wire time after `tx_offload_finalize` sets the mbuf flags.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CsumStrategy {
+    Full,
+    Offload,
 }
 
 /// Write L2+L3+TCP headers for a retransmit into `out`. The payload
@@ -83,7 +134,13 @@ pub fn build_retrans_header(
     if payload_for_csum.len() > u16::MAX as usize {
         return None;
     }
-    build_segment_inner(seg, payload_for_csum, payload_for_csum.len() as u32, out)
+    build_segment_inner(
+        seg,
+        payload_for_csum,
+        payload_for_csum.len() as u32,
+        out,
+        CsumStrategy::Full,
+    )
 }
 
 /// Shared implementation for `build_segment` and `build_retrans_header`.
@@ -103,6 +160,7 @@ fn build_segment_inner(
     payload_for_csum: &[u8],
     declared_payload_len: u32,
     out: &mut [u8],
+    csum_strategy: CsumStrategy,
 ) -> Option<usize> {
     let opts_len = seg.options.encoded_len();
     let tcp_hdr_len = TCP_HDR_MIN + opts_len;
@@ -136,9 +194,21 @@ fn build_segment_inner(
     ip[10..12].copy_from_slice(&0x0000u16.to_be_bytes());
     ip[12..16].copy_from_slice(&seg.src_ip.to_be_bytes());
     ip[16..20].copy_from_slice(&seg.dst_ip.to_be_bytes());
-    let ip_csum = internet_checksum(&[&out[ip_start..ip_start + IPV4_HDR_MIN]]);
-    out[ip_start + 10] = (ip_csum >> 8) as u8;
-    out[ip_start + 11] = (ip_csum & 0xff) as u8;
+    // PO4: on the offload path the NIC computes the IPv4 cksum at wire
+    // time (caller sets `RTE_MBUF_F_TX_IP_CKSUM` via `tx_offload_finalize`);
+    // the SW value here would be overwritten with zeros anyway.
+    match csum_strategy {
+        CsumStrategy::Full => {
+            let ip_csum = internet_checksum(&[&out[ip_start..ip_start + IPV4_HDR_MIN]]);
+            out[ip_start + 10] = (ip_csum >> 8) as u8;
+            out[ip_start + 11] = (ip_csum & 0xff) as u8;
+        }
+        CsumStrategy::Offload => {
+            // IPv4 cksum field already zero from the `0x0000u16` write
+            // at ip[10..12] above. No-op kept explicit so the offload
+            // contract is obvious at the call site.
+        }
+    }
 
     // TCP header + options + (possibly empty) payload
     let tcp_start = ip_start + IPV4_HDR_MIN;
@@ -161,18 +231,30 @@ fn build_segment_inner(
     let payload_start = tcp_start + tcp_hdr_len;
     out[payload_start..payload_start + seg.payload.len()].copy_from_slice(seg.payload);
 
-    // TCP checksum: pseudo-header + TCP header + payload (folded from
-    // `payload_for_csum`, which comes from either `seg.payload` or the
-    // chained-mbuf bytes). tcp_seg_len in the pseudo-header matches
-    // `declared_payload_len` + header length.
+    // TCP checksum.
+    // * Full: pseudo-header + TCP header + payload (folded from
+    //   `payload_for_csum`, which comes from either `seg.payload` or the
+    //   chained-mbuf bytes).
+    // * Offload: pseudo-header only. The PMD folds in TCP header +
+    //   payload at wire time when `RTE_MBUF_F_TX_TCP_CKSUM` is set on
+    //   the mbuf via `tx_offload_finalize`. This SKIPS the per-byte
+    //   payload fold — the PO4 optimisation.
+    //
+    // `tcp_seg_len` in the pseudo-header matches `declared_payload_len`
+    // + header length under both strategies.
     let tcp_seg_len = tcp_hdr_len as u32 + declared_payload_len;
-    let csum = tcp_checksum_split(
-        seg.src_ip,
-        seg.dst_ip,
-        tcp_seg_len,
-        &out[tcp_start..tcp_start + tcp_hdr_len],
-        payload_for_csum,
-    );
+    let csum = match csum_strategy {
+        CsumStrategy::Full => tcp_checksum_split(
+            seg.src_ip,
+            seg.dst_ip,
+            tcp_seg_len,
+            &out[tcp_start..tcp_start + tcp_hdr_len],
+            payload_for_csum,
+        ),
+        CsumStrategy::Offload => {
+            tcp_pseudo_header_checksum(seg.src_ip, seg.dst_ip, tcp_seg_len)
+        }
+    };
     out[tcp_start + 16] = (csum >> 8) as u8;
     out[tcp_start + 17] = (csum & 0xff) as u8;
 
@@ -671,5 +753,177 @@ mod tests {
             tx_offload_finalize(std::ptr::null_mut(), &seg, 128, true);
             tx_offload_finalize(std::ptr::null_mut(), &seg, 128, false);
         }
+    }
+
+    // PO4 wire-equivalence test: `build_segment_offload` MUST produce
+    // the same final post-`tx_offload_rewrite_cksums` mbuf state as the
+    // old `build_segment` + `tx_offload_rewrite_cksums` sequence, on
+    // every offload-active TX. The mbuf bytes go to the NIC unchanged,
+    // so byte-by-byte equality is the correctness gate.
+    //
+    // Why test both with payload and without: the payload path is the
+    // common case (MSS-sized data segments); the empty-payload case
+    // covers ACKs / RSTs / SYNs where the pseudo-header tcp_seg_len
+    // collapses to just the TCP header length.
+    #[cfg(feature = "hw-offload-tx-cksum")]
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
+    #[test]
+    fn build_segment_offload_wire_equivalent_to_build_segment_plus_rewrite() {
+        // Data segment with a non-trivial payload (so the full fold has
+        // real work, and the pseudo-only fold is provably different
+        // before the rewrite).
+        let mut seg = base();
+        seg.flags = TCP_ACK | TCP_PSH;
+        seg.options = crate::tcp_options::TcpOpts::default();
+        let payload = b"PO4-wire-equivalence-fixture-bytes";
+        seg.payload = payload;
+
+        // Path A: build_segment (full fold) then tx_offload_rewrite_cksums.
+        let mut a = [0u8; 256];
+        let n_a = build_segment(&seg, &mut a).expect("build_segment");
+        let opts_len = seg.options.encoded_len();
+        let tcp_hdr_len = TCP_HDR_MIN + opts_len;
+        let payload_len = seg.payload.len() as u32;
+        let ok_a = tx_offload_rewrite_cksums(
+            &mut a[..n_a],
+            seg.src_ip,
+            seg.dst_ip,
+            tcp_hdr_len,
+            payload_len,
+        );
+        assert!(ok_a);
+
+        // Path B: build_segment_offload directly (no rewrite needed for
+        // wire bytes, but production calls rewrite again via
+        // tx_offload_finalize — that rewrite is idempotent for these
+        // fields, so include it here too to mirror the call sequence).
+        let mut b = [0u8; 256];
+        let n_b = build_segment_offload(&seg, &mut b).expect("build_segment_offload");
+        let ok_b = tx_offload_rewrite_cksums(
+            &mut b[..n_b],
+            seg.src_ip,
+            seg.dst_ip,
+            tcp_hdr_len,
+            payload_len,
+        );
+        assert!(ok_b);
+
+        // Same number of bytes, same bytes.
+        assert_eq!(n_a, n_b, "frame length must match");
+        assert_eq!(
+            &a[..n_a],
+            &b[..n_b],
+            "wire bytes must be bit-identical after build_segment_offload + rewrite vs build_segment + rewrite"
+        );
+
+        // Spot-check the cksum fields explicitly: TCP cksum =
+        // pseudo-only fold, IPv4 cksum = 0.
+        let ip_cksum_off = ETH_HDR_LEN + 10;
+        assert_eq!(b[ip_cksum_off], 0);
+        assert_eq!(b[ip_cksum_off + 1], 0);
+        let tcp_cksum_off = ETH_HDR_LEN + IPV4_HDR_MIN + 16;
+        let pseudo_len = tcp_hdr_len as u32 + payload_len;
+        let expected_tcp = tcp_pseudo_header_checksum(seg.src_ip, seg.dst_ip, pseudo_len);
+        let actual_tcp = u16::from_be_bytes([b[tcp_cksum_off], b[tcp_cksum_off + 1]]);
+        assert_eq!(actual_tcp, expected_tcp);
+    }
+
+    // Wire-equivalence on the empty-payload shape (ACK / SYN / RST). The
+    // pseudo-only fold collapses to just (src_ip || dst_ip || 0 || proto
+    // || tcp_hdr_len) but the test invariant is unchanged: same final
+    // bytes after the rewrite. Catches off-by-one in the
+    // pseudo-header-length argument or any divergence in the empty-
+    // payload code path that escapes the data-segment test above.
+    #[cfg(feature = "hw-offload-tx-cksum")]
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
+    #[test]
+    fn build_segment_offload_wire_equivalent_for_empty_payload() {
+        let seg = base(); // SYN, no payload.
+
+        let mut a = [0u8; 128];
+        let n_a = build_segment(&seg, &mut a).expect("build_segment");
+        let opts_len = seg.options.encoded_len();
+        let tcp_hdr_len = TCP_HDR_MIN + opts_len;
+        let payload_len = seg.payload.len() as u32;
+        let ok_a = tx_offload_rewrite_cksums(
+            &mut a[..n_a],
+            seg.src_ip,
+            seg.dst_ip,
+            tcp_hdr_len,
+            payload_len,
+        );
+        assert!(ok_a);
+
+        let mut b = [0u8; 128];
+        let n_b = build_segment_offload(&seg, &mut b).expect("build_segment_offload");
+        let ok_b = tx_offload_rewrite_cksums(
+            &mut b[..n_b],
+            seg.src_ip,
+            seg.dst_ip,
+            tcp_hdr_len,
+            payload_len,
+        );
+        assert!(ok_b);
+
+        assert_eq!(n_a, n_b);
+        assert_eq!(&a[..n_a], &b[..n_b]);
+    }
+
+    // Feature-off build of `build_segment_offload`: still produces the
+    // same wire shape (pseudo-only TCP cksum + zero IPv4 cksum) — the
+    // function is feature-agnostic (it does not call the gated
+    // `tx_offload_rewrite_cksums`). Exercise the bytes-match invariant
+    // by recomputing the expected fields manually.
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
+    #[test]
+    fn build_segment_offload_writes_pseudo_only_and_zero_ip_csum() {
+        let mut seg = base();
+        seg.flags = TCP_ACK | TCP_PSH;
+        seg.options = crate::tcp_options::TcpOpts::default();
+        let payload = b"hello";
+        seg.payload = payload;
+
+        let mut out = [0u8; 128];
+        let n = build_segment_offload(&seg, &mut out).expect("build_segment_offload");
+
+        // IPv4 cksum field = 0.
+        let ip_cksum_off = ETH_HDR_LEN + 10;
+        assert_eq!(out[ip_cksum_off], 0, "IPv4 cksum hi byte must be 0");
+        assert_eq!(out[ip_cksum_off + 1], 0, "IPv4 cksum lo byte must be 0");
+
+        // TCP cksum field = pseudo-header-only fold.
+        let opts_len = seg.options.encoded_len();
+        let tcp_hdr_len = TCP_HDR_MIN + opts_len;
+        let pseudo_len = tcp_hdr_len as u32 + payload.len() as u32;
+        let expected = tcp_pseudo_header_checksum(seg.src_ip, seg.dst_ip, pseudo_len);
+        let tcp_cksum_off = ETH_HDR_LEN + IPV4_HDR_MIN + 16;
+        let actual = u16::from_be_bytes([out[tcp_cksum_off], out[tcp_cksum_off + 1]]);
+        assert_eq!(actual, expected, "TCP cksum must be pseudo-header-only fold");
+
+        // Payload bytes still at the tail of the frame.
+        assert_eq!(&out[n - payload.len()..n], &payload[..]);
+    }
+
+    // build_segment (unchanged) MUST still produce a verifiable full-fold
+    // TCP cksum on the offload-off path — this regression-guards the
+    // CsumStrategy::Full branch after the inner refactor.
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
+    #[test]
+    fn build_segment_full_fold_still_verifies_with_rfc_recompute() {
+        let mut seg = base();
+        seg.flags = TCP_ACK | TCP_PSH;
+        seg.options = crate::tcp_options::TcpOpts::default();
+        let payload = b"po4-regression-fixture";
+        seg.payload = payload;
+
+        let mut out = [0u8; 128];
+        let n = build_segment(&seg, &mut out).expect("build_segment");
+        let tcp_start = ETH_HDR_LEN + IPV4_HDR_MIN;
+        let mut scratch = out[tcp_start..n].to_vec();
+        scratch[16] = 0;
+        scratch[17] = 0;
+        let expected = tcp_checksum(seg.src_ip, seg.dst_ip, scratch.len() as u32, &scratch);
+        let actual = u16::from_be_bytes([out[tcp_start + 16], out[tcp_start + 17]]);
+        assert_eq!(expected, actual);
     }
 }

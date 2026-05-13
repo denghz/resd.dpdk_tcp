@@ -354,6 +354,12 @@ fn run_segment_build_loop(
                 counters,
                 fake_mbuf_ptr,
             },
+            // PO4: keep the existing bench targets on the non-offload
+            // build_segment path (full SW IPv4 + TCP cksum). The
+            // offload-path delta is covered separately by
+            // bench_build_segment_data_mss_offload in
+            // tools/bench-micro/benches/build_segment.rs.
+            false,
         );
         let Some(n) = outcome.frame_len else {
             break;

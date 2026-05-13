@@ -89,7 +89,7 @@ pub mod test_support {
     use crate::tcp_conn::TcpConn;
     use crate::tcp_events::EventQueue;
     use crate::tcp_options::TcpOpts;
-    use crate::tcp_output::{build_segment, SegmentTx, TCP_ACK, TCP_PSH};
+    use crate::tcp_output::{build_segment, build_segment_offload, SegmentTx, TCP_ACK, TCP_PSH};
     use crate::tcp_retrans::RetransEntry;
     use crate::tcp_send_ack_log::SeqRange;
     use crate::tcp_timer_wheel::{TimerId, TimerKind, TimerNode, TimerWheel};
@@ -372,6 +372,18 @@ pub mod test_support {
         /// `flow_table` + `handle` mirror production's per-segment
         /// `borrow_mut + get_mut` (Q8): the lookup happens inside this
         /// helper so each call pays the get_mut + slot-indexing cost.
+        ///
+        /// `tx_csum_offload_active` selects between `build_segment`
+        /// (full SW IPv4 + TCP cksum, non-offload path) and
+        /// `build_segment_offload` (pseudo-only TCP cksum + zero IPv4
+        /// cksum, offload-active path). Mirrors the production branch on
+        /// `Engine::tx_cksum_offload_active` at engine.rs:6233. PO4: the
+        /// offload variant skips the full TCP payload fold (~250-400 ns
+        /// at MSS) — the value is overwritten downstream by
+        /// `tx_offload_finalize` on the offload path, so the SW fold is
+        /// dead work. Bench drives both variants to surface the delta
+        /// (`bench_build_segment_data_mss` vs `_mss_offload`).
+        #[allow(clippy::too_many_arguments)]
         pub fn send_bytes_segment_build_step(
             flow_table: &mut FlowTable,
             handle: ConnHandle,
@@ -379,6 +391,7 @@ pub mod test_support {
             payload: &[u8],
             snapshot: &SegmentBuildSnapshot,
             scratch: &mut SegmentBuildScratch<'_>,
+            tx_csum_offload_active: bool,
         ) -> SegmentBuildOutcome {
             // engine.rs:6016-6024 — TS option per RFC 7323 §3 MUST-22.
             let options = if snapshot.ts_enabled {
@@ -409,8 +422,15 @@ pub mod test_support {
             let needed = crate::tcp_output::FRAME_HDRS_MIN + 40 + payload.len();
             scratch.frame.clear();
             scratch.frame.resize(needed, 0);
-            // engine.rs:6050 — the dominant per-segment cost.
-            let Some(n) = build_segment(&seg, scratch.frame.as_mut_slice()) else {
+            // engine.rs:6233-6240 — the dominant per-segment cost.
+            // PO4: pick build_segment vs build_segment_offload to mirror
+            // the production branch on Engine::tx_cksum_offload_active.
+            let n_opt = if tx_csum_offload_active {
+                build_segment_offload(&seg, scratch.frame.as_mut_slice())
+            } else {
+                build_segment(&seg, scratch.frame.as_mut_slice())
+            };
+            let Some(n) = n_opt else {
                 return SegmentBuildOutcome {
                     frame_len: None,
                     armed_rto: false,
@@ -6113,7 +6133,7 @@ impl Engine {
     /// `snd_retrans` mbufs back to the pool.
     pub fn send_bytes(&self, handle: ConnHandle, bytes: &[u8]) -> Result<u32, Error> {
         use crate::counters::inc;
-        use crate::tcp_output::{build_segment, SegmentTx, TCP_ACK, TCP_PSH};
+        use crate::tcp_output::{build_segment, build_segment_offload, SegmentTx, TCP_ACK, TCP_PSH};
 
         let (
             tuple,
@@ -6230,7 +6250,23 @@ impl Engine {
             // build_segment will overwrite.
             frame.clear();
             frame.resize(needed, 0);
-            let Some(n) = build_segment(&seg, frame.as_mut_slice()) else {
+            // PO4: when the NIC's TX cksum offload is active, skip the
+            // dead SW full TCP fold inside build_segment — the value is
+            // overwritten downstream by `tx_offload_finalize`'s call to
+            // `tx_offload_rewrite_cksums`. `build_segment_offload` writes
+            // the pseudo-only TCP cksum + zero IPv4 cksum directly,
+            // producing the same final post-finalize wire bytes
+            // (verified by the `build_segment_offload_wire_equivalent_*`
+            // unit tests in tcp_output.rs). Saves ~250-400 ns at MSS.
+            // tx_offload_finalize still runs below — its mbuf flag set
+            // + l2/l3/l4_len writes are essential and idempotent over
+            // the cksum fields.
+            let n_opt = if self.tx_cksum_offload_active {
+                build_segment_offload(&seg, frame.as_mut_slice())
+            } else {
+                build_segment(&seg, frame.as_mut_slice())
+            };
+            let Some(n) = n_opt else {
                 // Shouldn't happen; buf is sized for hdrs+opts+take.
                 break;
             };
@@ -9208,6 +9244,7 @@ mod send_bytes_segment_build_step_drift_guard {
             &payload,
             &snap,
             &mut scratch,
+            false,
         );
 
         // (1) frame_len is L2+L3+TCP(20)+TS-opt(12)+payload(128) = 14+20+32+128 = 194.
@@ -9341,6 +9378,7 @@ mod send_bytes_segment_build_step_drift_guard {
             &payload,
             &snap,
             &mut scratch,
+            false,
         );
 
         assert!(outcome.frame_len.is_some());
