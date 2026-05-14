@@ -1232,6 +1232,17 @@ pub struct Engine {
     /// `tx_data_frame` inline paths.
     pub(crate) tx_pending_data: RefCell<Vec<std::ptr::NonNull<sys::rte_mbuf>>>,
 
+    /// PO14: pre-allocated mbuf cache for control-frame (ACK/SYN/RST/FIN)
+    /// emits. Populated in bulk via `shim_rte_pktmbuf_alloc_bulk` from
+    /// `tx_hdr_mempool` when below the refill watermark; each
+    /// `tx_tcp_frame` (and related) call pops one entry instead of
+    /// invoking the single-mbuf alloc FFI. fstack-diff PO-Idea-3 +
+    /// PO-Idea-5 composed: replaces ~45 single FFI hops per K=65 KiB
+    /// burst with one bulk refill per 16 ACKs. Drained back to mempool
+    /// in `Engine::drop` (see drop step 2.5) so the pool is never
+    /// leaked. Capacity is `Self::TX_HDR_CACHE_CAP`.
+    pub(crate) tx_hdr_cache: RefCell<Vec<std::ptr::NonNull<sys::rte_mbuf>>>,
+
     /// Per-poll scratch for copying a connection's timer-id list out
     /// before cancel operations that would re-borrow the conn. A6.5
     /// §7.6. N=8 covers observed P99 per-connection timer depth.
@@ -1685,6 +1696,18 @@ pub enum InjectErr {
 }
 
 impl Engine {
+    /// PO14: capacity of the control-frame mbuf pre-alloc cache.
+    /// Sized at 16 so one bulk refill amortises across ~16 ACKs (the
+    /// typical inbound-ACK count per K=65 KiB burst in the bench shape).
+    /// Refill triggers when the cache holds fewer than
+    /// `TX_HDR_CACHE_REFILL_WATERMARK` entries; refill targets a full
+    /// cache (refills the difference up to `TX_HDR_CACHE_CAP`).
+    pub(crate) const TX_HDR_CACHE_CAP: usize = 16;
+    /// PO14: low-water mark at which `refill_tx_hdr_cache` runs. Set
+    /// below 4 so a poll that emits 12 ACKs (3-burst peer) refills
+    /// once, not three times.
+    pub(crate) const TX_HDR_CACHE_REFILL_WATERMARK: usize = 4;
+
     pub fn new(cfg: EngineConfig) -> Result<Self, Error> {
         // Fail fast on non-invariant-TSC hosts (spec §7.5). Also primes
         // the global TscEpoch so later now_ns() calls don't pay the
@@ -2049,6 +2072,9 @@ impl Engine {
                 },
             )),
             tx_pending_data: RefCell::new(Vec::with_capacity(cfg.tx_ring_size as usize)),
+            // PO14: pre-size to cap so push/pop stays in inline storage
+            // and never reallocs at steady state.
+            tx_hdr_cache: RefCell::new(Vec::with_capacity(Self::TX_HDR_CACHE_CAP)),
             timer_ids_scratch: RefCell::new(SmallVec::new()),
             conn_handles_scratch: RefCell::new(SmallVec::new()),
             // Pre-allocate the heap-spill past inline-16 at creation
@@ -2767,8 +2793,18 @@ impl Engine {
             inc(&self.counters.eth.tx_drop_nomem);
             return false;
         }
-        // Safety: tx_hdr_mempool was created in Engine::new and is alive.
-        let m = unsafe { sys::shim_rte_pktmbuf_alloc(self.tx_hdr_mempool.as_ptr()) };
+        // PO14: pop a pre-allocated header mbuf from the bulk cache
+        // when available; fall back to single-mbuf alloc on cache miss
+        // (cold start, refill-not-yet-due-this-poll). Refill runs at
+        // end-of-poll via `refill_tx_hdr_cache_if_low`. Safety:
+        // tx_hdr_mempool was created in Engine::new and is alive.
+        let m = {
+            let mut cache = self.tx_hdr_cache.borrow_mut();
+            match cache.pop() {
+                Some(p) => p.as_ptr(),
+                None => unsafe { sys::shim_rte_pktmbuf_alloc(self.tx_hdr_mempool.as_ptr()) },
+            }
+        };
         if m.is_null() {
             inc(&self.counters.eth.tx_drop_nomem);
             return false;
@@ -3163,6 +3199,12 @@ impl Engine {
             // A6 (spec §3.2): drain any data-segment TX batched by
             // timer-driven retransmit paths. No-op on empty ring.
             self.drain_tx_pending_data();
+            // PO14: refill the control-frame mbuf cache so the next
+            // poll's ACK / SYN / RST emits hit the cache instead of
+            // single-mbuf alloc. Runs even on idle polls so a quiet
+            // poll re-arms the cache after a timer-driven RST burst.
+            #[cfg(not(feature = "test-server"))]
+            self.refill_tx_hdr_cache_if_low();
             // A6 (spec §3.6 Site 3): edge-triggered RX-mempool-drop
             // Error event. Sited after the drain so it runs on every
             // exit path.
@@ -3252,6 +3294,12 @@ impl Engine {
         // after all emit sites so the burst coalesces everything.
         // No-op on empty ring.
         self.drain_tx_pending_data();
+        // PO14: refill the control-frame mbuf cache so the next
+        // poll's ACK / SYN / RST emits hit the cache instead of
+        // single-mbuf alloc. Sited after the drain so the cache
+        // refill doesn't compete with the TX burst's mempool gets.
+        #[cfg(not(feature = "test-server"))]
+        self.refill_tx_hdr_cache_if_low();
         // A6 (spec §3.6 Site 3): edge-triggered RX-mempool-drop Error
         // event. Sited after the drain so it runs on every exit path.
         self.check_and_emit_rx_enomem();
@@ -3274,6 +3322,51 @@ impl Engine {
     #[allow(dead_code)]
     pub(crate) fn rx_drop_nomem_prev(&self) -> u64 {
         self.rx_drop_nomem_prev.get()
+    }
+
+    /// PO14: refill the `tx_hdr_cache` from `tx_hdr_mempool` in bulk
+    /// when below the refill watermark. Called once at end-of-poll
+    /// alongside `drain_tx_pending_data`. On bulk-alloc failure
+    /// (mempool exhausted) the cache stays at its current depth; the
+    /// next `tx_tcp_frame` will fall back to single-mbuf alloc which
+    /// has its own failure-path counter bump. Slow-path (runs at most
+    /// once per poll).
+    pub(crate) fn refill_tx_hdr_cache_if_low(&self) {
+        let mut cache = self.tx_hdr_cache.borrow_mut();
+        let cur = cache.len();
+        if cur >= Self::TX_HDR_CACHE_REFILL_WATERMARK {
+            return;
+        }
+        let want = Self::TX_HDR_CACHE_CAP - cur;
+        // Bulk-alloc straight into a stack array to avoid heap
+        // pointer-array churn. Cap at TX_HDR_CACHE_CAP so the array
+        // size is a compile-time constant.
+        let mut slots: [*mut sys::rte_mbuf; Self::TX_HDR_CACHE_CAP] =
+            [std::ptr::null_mut(); Self::TX_HDR_CACHE_CAP];
+        // Safety: `tx_hdr_mempool` is alive (engine-owned); writing
+        // `want` pointers in-bounds (want <= TX_HDR_CACHE_CAP).
+        // DPDK `rte_mempool_get_bulk` is all-or-nothing: on non-zero
+        // return `slots[..]` is untouched.
+        let ret = unsafe {
+            sys::shim_rte_pktmbuf_alloc_bulk(
+                self.tx_hdr_mempool.as_ptr(),
+                slots.as_mut_ptr(),
+                want as u32,
+            )
+        };
+        if ret != 0 {
+            // Mempool can't satisfy the whole refill — leave cache at
+            // its current depth. Don't bump a counter here: the
+            // counter belongs to the consumer (`tx_tcp_frame`), and
+            // it'll bump `tx_drop_nomem` if its own fallback alloc
+            // also fails. No false-positive at the refill site.
+            return;
+        }
+        for &p in slots[..want].iter() {
+            if let Some(nn) = std::ptr::NonNull::new(p) {
+                cache.push(nn);
+            }
+        }
     }
 
     /// Edge-triggered RX-mempool-drop Error emission. Called at end of
@@ -7994,6 +8087,18 @@ impl Drop for Engine {
                 // `tx_data_mempool` (still alive at this point);
                 // `rte_pktmbuf_free` decs refcount and returns the
                 // mbuf to its pool.
+                unsafe { sys::shim_rte_pktmbuf_free(ptr.as_ptr()) };
+            }
+        }
+        // PO14: drain pre-allocated control-frame mbufs back to the
+        // mempool. Each entry is a fresh (refcnt=1, no headers
+        // written) mbuf claimed via `shim_rte_pktmbuf_alloc_bulk`;
+        // `rte_pktmbuf_free` returns each to `tx_hdr_mempool` cleanly
+        // without writing a packet to the wire. Runs before the
+        // mempool drop in struct-field order.
+        {
+            let mut cache = self.tx_hdr_cache.borrow_mut();
+            for ptr in cache.drain(..) {
                 unsafe { sys::shim_rte_pktmbuf_free(ptr.as_ptr()) };
             }
         }
