@@ -97,14 +97,18 @@ pub unsafe fn mbuf_data_slice<'a>(m: *mut dpdk_net_sys::rte_mbuf) -> &'a [u8] {
 /// `m` must be a valid mbuf pointer OR null (null is benign — the FFI
 /// returns null which the prefetch instruction discards). The caller
 /// must not rely on prefetch ordering — it is a CPU hint only.
+/// The function passes `m` to `shim_rte_pktmbuf_data` which dereferences
+/// the mbuf header — marking the function `unsafe` keeps that contract
+/// visible at every callsite (per clippy::not_unsafe_ptr_arg_deref).
 #[inline]
-pub fn prefetch_mbuf_data(m: *mut dpdk_net_sys::rte_mbuf) {
+pub unsafe fn prefetch_mbuf_data(m: *mut dpdk_net_sys::rte_mbuf) {
     if m.is_null() {
         return;
     }
-    // Safety: shim_rte_pktmbuf_data is safe on any valid mbuf pointer;
-    // the returned pointer is a hint target only — no read or write
-    // through it occurs.
+    // Safety: caller guarantees `m` is a valid mbuf pointer (or null,
+    // checked above). `shim_rte_pktmbuf_data` reads the mbuf header
+    // fields to compute the data-area pointer; the returned pointer
+    // is a hint target only — no read or write through it occurs.
     let ptr = unsafe { dpdk_net_sys::shim_rte_pktmbuf_data(m) };
     #[cfg(target_arch = "x86_64")]
     unsafe {

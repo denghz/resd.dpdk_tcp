@@ -3343,16 +3343,23 @@ impl Engine {
         // before processing `mbufs[i]`, so by the time decode actually
         // reads the bytes the cache line is warm in L1.
         const PREFETCH_OFFSET: usize = 3;
+        // Safety: `mbufs[..n]` was populated by `shim_rte_eth_rx_burst`
+        // above — every non-null slot points to a valid mbuf the PMD
+        // just DMA'd, and `prefetch_mbuf_data` defensively no-ops on
+        // null entries before any deref.
         for &m in mbufs[..n].iter().take(PREFETCH_OFFSET) {
-            crate::prefetch_mbuf_data(m);
+            unsafe { crate::prefetch_mbuf_data(m) };
         }
 
         for (i, &m) in mbufs[..n].iter().enumerate() {
             // PO12: prefetch the data area of mbufs[i+PREFETCH_OFFSET]
             // before processing mbufs[i]. The +3 lookahead hides ~70-100
             // cycles of L3-miss latency per mbuf on cold-DMA bursts.
+            // Safety: same as the pre-loop prefetch — the slot was
+            // written by the PMD's rx_burst and is either a valid mbuf
+            // pointer or null (the helper handles null itself).
             if let Some(next_m) = mbufs.get(i + PREFETCH_OFFSET) {
-                crate::prefetch_mbuf_data(*next_m);
+                unsafe { crate::prefetch_mbuf_data(*next_m) };
             }
             // A9 Task 2: per-mbuf RX dispatch extracted into
             // `dispatch_one_rx_mbuf` so the `test-inject` hook can share
