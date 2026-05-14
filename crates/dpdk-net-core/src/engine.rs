@@ -1306,6 +1306,25 @@ pub struct Engine {
     /// `tx_tcp_frame`. Flushed in parallel with `tx_tcp_frame_bytes_acc`.
     pub(crate) tx_tcp_frame_pkts_acc: std::cell::Cell<u64>,
 
+    /// PO16: cached `rte_get_tsc_hz()` captured once at `Engine::new`.
+    /// The value is constant after EAL init; caching avoids the
+    /// per-poll FFI hop (10-15 ns) inside the mempool-sampling block in
+    /// `poll_once`. Stored as `u64` (matches DPDK signature). Zero
+    /// indicates the FFI call returned 0 at construction (degenerate
+    /// host without an invariant TSC) — `poll_once` treats this the
+    /// same way the previous per-poll call did: skip the sample.
+    pub(crate) tsc_hz: u64,
+
+    /// PO16: per-poll cache of `crate::clock::now_ns()`. Written once at
+    /// the top of `poll_once`; downstream sites inside the same poll
+    /// iteration (`advance_timer_wheel`, the wheel-fire dispatcher's
+    /// emitted_ts_ns) read this instead of paying another `rdtsc + mul +
+    /// shift` per call. Sub-µs drift across one poll iter is invisible
+    /// to RTO / TLP / wheel math. Single-lcore engine ⇒ `Cell<u64>`.
+    /// A value of 0 means "uninitialised this poll" (no callers should
+    /// observe 0 since poll_once writes a fresh `now_ns` at entry).
+    pub(crate) poll_now_ns: std::cell::Cell<u64>,
+
     /// Phase 6 (bench instrumentation): default capacity for new conns'
     /// `send_ack_log`. `0` (the default) means logging is disabled and
     /// the per-conn log is left at `disabled()`. A non-zero value (set
@@ -2106,6 +2125,17 @@ impl Engine {
             // PO15: accumulators start at 0; flushed at end-of-poll.
             tx_tcp_frame_bytes_acc: std::cell::Cell::new(0),
             tx_tcp_frame_pkts_acc: std::cell::Cell::new(0),
+            // PO16: snapshot `rte_get_tsc_hz()` once. Safe because EAL
+            // init must have run for any reachable Engine::new path
+            // (Engine::new asserts clock::init upstream, which itself
+            // pre-warms TscEpoch). On a degenerate host without an
+            // invariant TSC the FFI returns 0; we propagate 0 through
+            // to the consumer site so the sample is skipped instead of
+            // dividing by zero.
+            tsc_hz: unsafe { sys::rte_get_tsc_hz() },
+            // PO16: per-poll now_ns cache. Written at the top of
+            // poll_once; downstream sites read instead of re-rdtsc.
+            poll_now_ns: std::cell::Cell::new(0),
             // Phase 6 (bench instrumentation): logging disabled by default.
             // `enable_send_ack_logging` switches it on for bench tooling.
             send_ack_log_default_cap: std::cell::Cell::new(0),
@@ -3148,6 +3178,12 @@ impl Engine {
         use std::sync::atomic::Ordering;
         inc(&self.counters.poll.iters);
 
+        // PO16: snapshot now_ns once at the top of the poll. Downstream
+        // callers (advance_timer_wheel, etc.) read this Cell instead of
+        // re-paying `rdtsc + scale-multiply` (~30 cycles each). Sub-µs
+        // drift within one poll iter is invisible to RTO/TLP math.
+        self.poll_now_ns.set(crate::clock::now_ns());
+
         // A10 Stage A: at most once per second, sample the RX mempool's
         // free-mbuf count. Cliff hypothesis: a steady drain across many
         // iterations would surface as a monotonically-decreasing series
@@ -3164,7 +3200,9 @@ impl Engine {
         {
             let now_tsc = crate::clock::rdtsc();
             let last = self.rx_mempool_avail_last_sample_tsc.get();
-            let tsc_hz = unsafe { sys::rte_get_tsc_hz() };
+            // PO16: use the snapshot from Engine::new instead of paying
+            // the FFI hop every poll. The value is constant post-EAL-init.
+            let tsc_hz = self.tsc_hz;
             if tsc_hz > 0 && now_tsc.wrapping_sub(last) >= tsc_hz {
                 let rx_avail = unsafe {
                     sys::shim_rte_mempool_avail_count(self._rx_mempool.as_ptr())
@@ -3630,7 +3668,17 @@ impl Engine {
     /// borrow on a TSC tick comparison. On idle polls (most of bench-
     /// rx-burst's between-burst polling), this skips the borrow entirely.
     fn advance_timer_wheel(&self) {
-        let now_ns = crate::clock::now_ns();
+        // PO16: reuse the per-poll cached now_ns rather than re-reading
+        // TSC. `poll_once` writes a fresh value at entry; callers from
+        // outside `poll_once` (none today; this is `fn`-private) would
+        // need to set it first. Fall back to a fresh read if the cache
+        // is zero (defensive — should never be zero inside poll_once).
+        let cached = self.poll_now_ns.get();
+        let now_ns = if cached == 0 {
+            crate::clock::now_ns()
+        } else {
+            cached
+        };
         let now_tick = now_ns / crate::tcp_timer_wheel::TICK_NS;
         if now_tick <= self.advance_last_tick.get() {
             return;
