@@ -6,14 +6,30 @@
 # Iteration time: ~3-5 min (vs 60+ min for full bench-nightly).
 #
 # Usage:
-#   ./scripts/bench-quick.sh setup               spin up peer + bind DUT NIC
-#   ./scripts/bench-quick.sh run [workload] ...   build + run bench
-#   ./scripts/bench-quick.sh teardown             terminate peer + rebind DUT NIC
+#   ./scripts/bench-quick.sh setup
+#   ./scripts/bench-quick.sh run [burst|maxtp|rtt|rx-burst] [extra-args...]
+#   ./scripts/bench-quick.sh teardown
+#
+# Workloads (all --stack dpdk_net; see fast-iter-suite.sh for cross-stack):
+#   burst     bench-tx-burst    K × G one-shot burst grid     (echo-server :10001)
+#   maxtp     bench-tx-maxtp    W × C sustained-rate grid     (echo-server :10001)
+#   rtt       bench-rtt         req/resp p50/p99 payload sweep (echo-server :10001)
+#   rx-burst  bench-rx-burst    RX-side W × N segment-absorb   (burst-echo-server :10003)
 #
 # Env overrides:
-#   BENCH_ITERATIONS   per-bucket iterations (default: 200)
-#   BENCH_WARMUP       warmup iterations     (default: 20)
-#   AWS_PROFILE        AWS credential profile (default: resd-infra-operator)
+#   AWS_PROFILE                AWS credential profile (default: resd-infra-operator)
+#   BENCH_BURSTS_PER_BUCKET    burst:    bursts per bucket post-warmup (default: 200)
+#   BENCH_BURST_WARMUP         burst:    discarded warm-up bursts      (default: 20)
+#   BENCH_MAXTP_WARMUP_SECS    maxtp:    warmup duration s             (default: 3)
+#   BENCH_MAXTP_DURATION_SECS  maxtp:    measurement duration s        (default: 10)
+#   BENCH_RTT_ITERATIONS       rtt:      iterations per payload        (default: 20000)
+#   BENCH_RTT_WARMUP           rtt:      warmup iterations             (default: 100)
+#   BENCH_RTT_PAYLOADS         rtt:      payload-bytes sweep CSV       (default: 64,128,256,1024)
+#   BENCH_RX_MEASURE_BURSTS    rx-burst: bursts per (W,N) bucket       (default: 1000)
+#   BENCH_RX_WARMUP_BURSTS     rx-burst: discarded warm-up bursts      (default: 100)
+#   BENCH_RX_SEGMENT_SIZES     rx-burst: W (segment-size) CSV          (default: 64,128,256)
+#   BENCH_RX_BURST_COUNTS      rx-burst: N (burst-count) CSV           (default: 16,64,256,4096,10240)
+#   BENCH_PRECONDITION_MODE    shared:   strict|lenient                (default: strict)
 
 set -euo pipefail
 
@@ -32,6 +48,7 @@ PEER_SUBNET="subnet-05d4a1cf65e5df23c"
 PEER_SG="sg-093d563579a51ca88"
 PEER_INSTANCE_TYPE="c6a.xlarge"
 PEER_ECHO_PORT=10001
+PEER_BURST_PORT=10003
 
 # ── AWS / SSH ─────────────────────────────────────────────────────────────────
 AWS_PROFILE="${AWS_PROFILE:-resd-infra-operator}"
@@ -47,6 +64,23 @@ BENCH_BURST_WARMUP="${BENCH_BURST_WARMUP:-20}"
 # maxtp workload
 BENCH_MAXTP_WARMUP_SECS="${BENCH_MAXTP_WARMUP_SECS:-3}"
 BENCH_MAXTP_DURATION_SECS="${BENCH_MAXTP_DURATION_SECS:-10}"
+# rtt workload — default 20k iters gives ~200 samples in the p99 tail
+# (binary default is 100k; 2k was too few for any p99 credibility).
+BENCH_RTT_ITERATIONS="${BENCH_RTT_ITERATIONS:-20000}"
+BENCH_RTT_WARMUP="${BENCH_RTT_WARMUP:-100}"
+BENCH_RTT_PAYLOADS="${BENCH_RTT_PAYLOADS:-64,128,256,1024}"
+# rx-burst workload — 1000 bursts × 16-256 segments ≈ 16k-256k samples
+# per bucket; matches the per-cell budget bench-nightly uses under netem.
+BENCH_RX_MEASURE_BURSTS="${BENCH_RX_MEASURE_BURSTS:-1000}"
+BENCH_RX_WARMUP_BURSTS="${BENCH_RX_WARMUP_BURSTS:-100}"
+BENCH_RX_SEGMENT_SIZES="${BENCH_RX_SEGMENT_SIZES:-64,128,256}"
+BENCH_RX_BURST_COUNTS="${BENCH_RX_BURST_COUNTS:-16,64,256,4096,10240}"
+
+# Precondition gate (shared across all workloads). Strict by default to
+# match nightly behaviour — flips precondition violations from warnings
+# to aborts so a drifted DUT can't silently taint a perf comparison.
+# Drop to lenient if the dev host has known/permanent precondition gaps.
+BENCH_PRECONDITION_MODE="${BENCH_PRECONDITION_MODE:-strict}"
 
 WORKDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export AWS_PROFILE AWS_REGION
@@ -70,14 +104,26 @@ load_state() {
     PEER_INSTANCE_ID=$(python3 -c "import json; print(json.load(open('$STATE_FILE'))['instance_id'])")
 }
 
+# Sweep zombie bench processes + clear stale hugepages left by a prior
+# SIGKILL'd EAL init. Cribbed from fast-iter-suite.sh — without this,
+# a previous run that Ctrl-C'd mid-init can leave `/dev/hugepages/rtemap_*`
+# wedged and the next EAL init either fails or silently maps tainted state.
+# Idempotent + safe to call repeatedly. Never aborts the script.
+reset_dpdk_state() {
+    log "  reset_dpdk_state: sweep zombie bench-* + clear stale hugepages"
+    sudo pkill -9 -f '/target/release/bench-(rtt|tx-burst|tx-maxtp|rx-burst)' 2>/dev/null || true
+    sleep 2  # let kernel release DMA mappings / IOMMU
+    sudo rm -f /dev/hugepages/* 2>/dev/null || true
+}
+
 # ── setup ─────────────────────────────────────────────────────────────────────
 cmd_setup() {
     log "=== bench-quick setup ==="
     cd "$WORKDIR"
 
-    # [1] echo-server
-    log "[1/5] Building echo-server peer binary..."
-    make -C tools/bench-e2e/peer echo-server
+    # [1] peer C binaries
+    log "[1/5] Building peer binaries (echo-server + burst-echo-server)..."
+    make -C tools/bench-e2e/peer echo-server burst-echo-server
 
     # [2] hugepages
     log "[2/5] Checking hugepages..."
@@ -152,12 +198,19 @@ echo "peer-prep: done"
 REMOTE_EOF
 
     push_ic_pubkey "$instance_id"
-    scp "${SSH_OPTS[@]}" tools/bench-e2e/peer/echo-server "ubuntu@${peer_ip}:/tmp/echo-server"
+    scp "${SSH_OPTS[@]}" \
+        tools/bench-e2e/peer/echo-server \
+        tools/bench-e2e/peer/burst-echo-server \
+        "ubuntu@${peer_ip}:/tmp/"
 
     push_ic_pubkey "$instance_id"
     ssh "${SSH_OPTS[@]}" "ubuntu@$peer_ip" \
-        "chmod +x /tmp/echo-server; nohup /tmp/echo-server ${PEER_ECHO_PORT} >/tmp/echo-server.log 2>&1 </dev/null & sleep 1; pgrep -a echo-server && echo ok"
+        "chmod +x /tmp/echo-server /tmp/burst-echo-server; \
+         nohup /tmp/echo-server ${PEER_ECHO_PORT} >/tmp/echo-server.log 2>&1 </dev/null & \
+         nohup /tmp/burst-echo-server ${PEER_BURST_PORT} >/tmp/burst-echo-server.log 2>&1 </dev/null & \
+         sleep 1; pgrep -a echo-server && pgrep -a burst-echo-server && echo ok"
     log "  echo-server listening on :${PEER_ECHO_PORT}"
+    log "  burst-echo-server listening on :${PEER_BURST_PORT}"
 
     # Save state
     python3 -c "
@@ -167,8 +220,8 @@ json.dump({'instance_id': '$instance_id', 'peer_ip': '$peer_ip'}, open('$STATE_F
     log "State → $STATE_FILE"
     log "=== Setup complete ==="
     log "    DUT:  $DUT_IP  (this machine, data NIC vfio-pci)"
-    log "    Peer: $peer_ip (echo-server :${PEER_ECHO_PORT})"
-    log "    Run:  ./scripts/bench-quick.sh run [burst|maxtp]"
+    log "    Peer: $peer_ip (echo-server :${PEER_ECHO_PORT}, burst-echo-server :${PEER_BURST_PORT})"
+    log "    Run:  ./scripts/bench-quick.sh run [burst|maxtp|rtt|rx-burst]"
 }
 
 # ── run ───────────────────────────────────────────────────────────────────────
@@ -182,32 +235,76 @@ cmd_run() {
     # Phase 5 of the 2026-05-09 bench-suite overhaul split the legacy
     # bench-vs-mtcp into bench-tx-burst (one-shot K x G grid) and
     # bench-tx-maxtp (sustained-rate W x C grid). One binary per
-    # workload; one --stack per invocation.
+    # workload; one --stack per invocation. `rtt` + `rx-burst` added
+    # later so a single dev loop covers TX-burst / TX-maxtp / RTT / RX
+    # without dropping to fast-iter-suite (~35 min).
     local bin
     case "$workload" in
-        burst) bin=bench-tx-burst ;;
-        maxtp) bin=bench-tx-maxtp ;;
+        burst)    bin=bench-tx-burst ;;
+        maxtp)    bin=bench-tx-maxtp ;;
+        rtt)      bin=bench-rtt ;;
+        rx-burst) bin=bench-rx-burst ;;
         *)
-            log "ERROR unknown workload `$workload` (valid: burst, maxtp)"
+            log "ERROR unknown workload \`$workload\` (valid: burst, maxtp, rtt, rx-burst)"
             return 2
             ;;
     esac
 
-    log "[1/2] Building $bin (incremental)..."
+    log "[1/3] Building $bin (incremental)..."
     cargo build --release -p "$bin" 2>&1 \
         | grep -E "^error|Compiling $bin|Finished" | tail -5
 
-    local csv_out="/tmp/bench-quick-${workload}.csv"
-    log "[2/2] Running $bin ${workload} → $csv_out"
+    log "[2/3] Resetting DPDK state (zombie sweep + hugepage clear)..."
+    reset_dpdk_state
 
+    # Tail-credibility warning: if iteration count is below the floor for
+    # p99 stability, print a banner so the operator doesn't read p99/p999
+    # CSV columns as meaningful. ~10k samples gets ~100 samples in the
+    # p99 tail — workable. Below that, p99 is mostly noise.
+    case "$workload" in
+        rtt)
+            if [ "$BENCH_RTT_ITERATIONS" -lt 10000 ]; then
+                log "  WARN BENCH_RTT_ITERATIONS=$BENCH_RTT_ITERATIONS < 10000 — p99/p999 columns will be noisy; only trust p50/mean"
+            fi
+            ;;
+        rx-burst)
+            if [ "$BENCH_RX_MEASURE_BURSTS" -lt 500 ]; then
+                log "  WARN BENCH_RX_MEASURE_BURSTS=$BENCH_RX_MEASURE_BURSTS < 500 — p99/p999 will be noisy; only trust p50/mean"
+            fi
+            ;;
+    esac
+
+    local csv_out="/tmp/bench-quick-${workload}.csv"
+    log "[3/3] Running $bin ${workload} → $csv_out"
+
+    # Per-workload args: peer-port vs peer-control-port and the
+    # nic-max-bps saturation guard differ across bins. Common
+    # stack-level args (--stack, --local-ip, --eal-args, …) stay
+    # shared in the invocation below.
     local workload_args=()
     case "$workload" in
         burst)
-            workload_args+=(--bursts-per-bucket "$BENCH_BURSTS_PER_BUCKET"
+            workload_args+=(--peer-port         "$PEER_ECHO_PORT"
+                            --nic-max-bps       "$DUT_NIC_MAX_BPS"
+                            --bursts-per-bucket "$BENCH_BURSTS_PER_BUCKET"
                             --warmup            "$BENCH_BURST_WARMUP") ;;
         maxtp)
-            workload_args+=(--warmup-secs   "$BENCH_MAXTP_WARMUP_SECS"
-                            --duration-secs "$BENCH_MAXTP_DURATION_SECS") ;;
+            workload_args+=(--peer-port         "$PEER_ECHO_PORT"
+                            --nic-max-bps       "$DUT_NIC_MAX_BPS"
+                            --warmup-secs       "$BENCH_MAXTP_WARMUP_SECS"
+                            --duration-secs     "$BENCH_MAXTP_DURATION_SECS") ;;
+        rtt)
+            workload_args+=(--peer-port         "$PEER_ECHO_PORT"
+                            --connections       1
+                            --payload-bytes-sweep "$BENCH_RTT_PAYLOADS"
+                            --iterations        "$BENCH_RTT_ITERATIONS"
+                            --warmup            "$BENCH_RTT_WARMUP") ;;
+        rx-burst)
+            workload_args+=(--peer-control-port "$PEER_BURST_PORT"
+                            --segment-sizes     "$BENCH_RX_SEGMENT_SIZES"
+                            --burst-counts      "$BENCH_RX_BURST_COUNTS"
+                            --warmup-bursts     "$BENCH_RX_WARMUP_BURSTS"
+                            --measure-bursts    "$BENCH_RX_MEASURE_BURSTS") ;;
     esac
 
     sudo "target/release/$bin" \
@@ -215,14 +312,12 @@ cmd_run() {
         --local-ip            "$DUT_IP" \
         --gateway-ip          "$DUT_GATEWAY" \
         --peer-ip             "$PEER_IP" \
-        --peer-port           "$PEER_ECHO_PORT" \
         --eal-args            "$DUT_EAL_ARGS" \
         --lcore               "$DUT_LCORE" \
         "${workload_args[@]}" \
-        --nic-max-bps         "$DUT_NIC_MAX_BPS" \
         --tool                "$bin" \
         --feature-set         trading-latency \
-        --precondition-mode   lenient \
+        --precondition-mode   "$BENCH_PRECONDITION_MODE" \
         --output-csv          "$csv_out" \
         "$@"
     log "CSV written: $csv_out"
@@ -267,23 +362,38 @@ Usage: bench-quick.sh <command> [args]
 
 Commands:
   setup               spin up peer EC2 + bind DUT data NIC to vfio-pci
-  run [workload] ...  incremental build + run bench-tx-burst (workload=burst)
-                      or bench-tx-maxtp (workload=maxtp). Default: burst.
+  run [workload] ...  incremental build + run the selected workload (default: burst).
+                      Workloads (all --stack dpdk_net):
+                        burst     bench-tx-burst    K × G one-shot burst grid
+                        maxtp     bench-tx-maxtp    W × C sustained-rate grid
+                        rtt       bench-rtt         req/resp p50/p99 payload sweep
+                        rx-burst  bench-rx-burst    RX-side W × N segment-absorb
                       Remaining args forwarded to the selected binary.
   teardown            terminate peer instance + rebind DUT NIC to ena
 
 Env overrides (export before calling):
-  BENCH_BURSTS_PER_BUCKET=200   burst: bursts per bucket post-warmup
-  BENCH_BURST_WARMUP=20         burst: discarded warm-up bursts
-  BENCH_MAXTP_WARMUP_SECS=3     maxtp: warmup duration in seconds
-  BENCH_MAXTP_DURATION_SECS=10  maxtp: measurement duration in seconds
   AWS_PROFILE=resd-infra-operator
+  BENCH_BURSTS_PER_BUCKET=200      burst:    bursts per bucket post-warmup
+  BENCH_BURST_WARMUP=20            burst:    discarded warm-up bursts
+  BENCH_MAXTP_WARMUP_SECS=3        maxtp:    warmup duration in seconds
+  BENCH_MAXTP_DURATION_SECS=10     maxtp:    measurement duration in seconds
+  BENCH_RTT_ITERATIONS=20000       rtt:      iterations per payload
+  BENCH_RTT_WARMUP=100             rtt:      warmup iterations
+  BENCH_RTT_PAYLOADS=64,128,256,1024  rtt:   payload-bytes sweep CSV
+  BENCH_RX_MEASURE_BURSTS=1000     rx-burst: bursts per (W,N) bucket
+  BENCH_RX_WARMUP_BURSTS=100       rx-burst: discarded warm-up bursts
+  BENCH_RX_SEGMENT_SIZES=64,128,256  rx-burst: W (segment-size) CSV
+  BENCH_RX_BURST_COUNTS=16,64,256,4096,10240  rx-burst: N (burst-count) CSV
+  BENCH_PRECONDITION_MODE=strict   shared:   strict|lenient (drop to lenient
+                                             only on hosts with known precondition gaps)
 
 Examples:
   ./scripts/bench-quick.sh setup
   ./scripts/bench-quick.sh run burst
   ./scripts/bench-quick.sh run maxtp
-  BENCH_ITERATIONS=1000 ./scripts/bench-quick.sh run burst
+  ./scripts/bench-quick.sh run rtt
+  ./scripts/bench-quick.sh run rx-burst
+  BENCH_RTT_PAYLOADS=64,1500 ./scripts/bench-quick.sh run rtt
   ./scripts/bench-quick.sh teardown
 EOF
         exit 1
