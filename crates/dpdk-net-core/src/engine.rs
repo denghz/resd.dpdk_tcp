@@ -1277,6 +1277,13 @@ pub struct Engine {
     /// `&self` like every other engine method.
     pub(crate) rx_drop_nomem_prev: std::cell::Cell<u64>,
 
+    /// PO13: monotone-mirror of `TimerWheel::last_tick`, maintained outside
+    /// the `RefCell<TimerWheel>` so the per-poll `advance_timer_wheel`
+    /// idle-skip check avoids the inner `borrow_mut`. Updated only inside
+    /// `advance_timer_wheel` after a successful `fire_timers_at`. Single-
+    /// lcore engine ⇒ `Cell<u64>` is sufficient (no cross-thread access).
+    pub(crate) advance_last_tick: std::cell::Cell<u64>,
+
     /// Phase 6 (bench instrumentation): default capacity for new conns'
     /// `send_ack_log`. `0` (the default) means logging is disabled and
     /// the per-conn log is left at `disabled()`. A non-zero value (set
@@ -2056,6 +2063,9 @@ impl Engine {
             // the P99 without visibly warming.
             rack_lost_idxs_scratch: RefCell::new(Vec::with_capacity(64)),
             rx_drop_nomem_prev: std::cell::Cell::new(0),
+            // PO13: start at 0; first poll's TSC tick will be strictly
+            // greater so the wheel advances normally on entry.
+            advance_last_tick: std::cell::Cell::new(0),
             // Phase 6 (bench instrumentation): logging disabled by default.
             // `enable_send_ack_logging` switches it on for bench tooling.
             send_ack_log_default_cap: std::cell::Cell::new(0),
@@ -3460,8 +3470,28 @@ impl Engine {
     /// (A6.5 Task 4; typical per-tick fire count ≤ 8 stays on the stack),
     /// so the `timer_wheel` borrow ends at the semicolon — per-timer
     /// handlers are free to re-borrow the wheel (e.g. `on_rto_fire` re-arms).
+    ///
+    /// PO13: TSC-tick early-exit. The wheel's internal `advance()` already
+    /// early-returns when `now_ns / TICK_NS <= last_tick` (see
+    /// tcp_timer_wheel.rs:150-152), but that check is paid AFTER taking a
+    /// `RefCell::borrow_mut` on the wheel — ~5 ns + cache-line traffic
+    /// every poll regardless of whether a tick elapsed. Mirror the
+    /// monotone `last_tick` in an engine-side `Cell<u64>` and gate the
+    /// borrow on a TSC tick comparison. On idle polls (most of bench-
+    /// rx-burst's between-burst polling), this skips the borrow entirely.
     fn advance_timer_wheel(&self) {
-        let _ = self.fire_timers_at(crate::clock::now_ns());
+        let now_ns = crate::clock::now_ns();
+        let now_tick = now_ns / crate::tcp_timer_wheel::TICK_NS;
+        if now_tick <= self.advance_last_tick.get() {
+            return;
+        }
+        let _ = self.fire_timers_at(now_ns);
+        // `fire_timers_at` always advances the wheel to at most `now_ns`
+        // (the inner wheel may set `last_tick` higher if it cascades),
+        // and `now_tick` is monotone — store it after the fire so a
+        // concurrent observer in the same lcore (none today; single-
+        // lcore engine) sees a consistent value.
+        self.advance_last_tick.set(now_tick);
     }
 
     /// A7 Task 8 fixup: shared fire-loop used by both `advance_timer_wheel`
