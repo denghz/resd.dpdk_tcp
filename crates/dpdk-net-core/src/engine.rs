@@ -1803,7 +1803,14 @@ impl Engine {
         let tx_hdr_mempool = Mempool::new_pktmbuf(
             &format!("tx_hdr_mp_{}", cfg.lcore_id),
             2048,
-            64,
+            // PO17: bump per-lcore cache 64 → 256 to match fstack's
+            // MEMPOOL_CACHE_SIZE=256 (lib/ff_memory.h:34). The
+            // tx_hdr_mempool feeds the ACK / SYN / RST / FIN emitter
+            // path (tx_tcp_frame) — at a sustained ACK rate the prior
+            // 64-entry cache missed every 64 emits, paying ~600-900 ns
+            // of mempool-refill latency per miss. 256 mbufs × ~256 B
+            // pkt-room ≈ 64 KiB per pool, comfortably under L2.
+            256,
             0,
             256,
             socket_id,
@@ -1847,7 +1854,12 @@ impl Engine {
         let tx_data_mempool = Mempool::new_pktmbuf(
             &format!("tx_data_mp_{}", cfg.lcore_id),
             tx_data_mempool_size,
-            128,
+            // PO17: bump per-lcore cache 128 → 256 to match fstack's
+            // MEMPOOL_CACHE_SIZE=256. Sustained `send_bytes` bursts
+            // refill the cache every 128 segments; doubling it halves
+            // the refill rate. 256 × ~2 KiB = 512 KiB per pool — within
+            // L2 budget on Zen / Sapphire Rapids.
+            256,
             0,
             cfg.mbuf_data_room + sys::RTE_PKTMBUF_HEADROOM as u16,
             socket_id,
