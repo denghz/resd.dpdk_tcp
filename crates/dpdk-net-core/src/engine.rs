@@ -1505,6 +1505,24 @@ pub fn eal_init(args: &[&str]) -> Result<(), Error> {
     if rc < 0 {
         return Err(Error::EalInit(unsafe { sys::shim_rte_errno() }));
     }
+
+    // PO11: silence ENA driver's DEBUG-level doorbell-tracepoint log calls.
+    // The ENA PMD calls `ena_trc_dbg(...)` from `ena_com_write_sq_doorbell`
+    // on every TX doorbell write; the macro expands to a full
+    // `rte_log(DEBUG, ena_logtype_com, ...)` call that builds a `va_list`
+    // and dispatches into `rte_vlog`, which only THEN checks the runtime
+    // level and bails. Profiling (`docs/bench-reports/po-investigate-uprof-2026-05-14.md`)
+    // shows ~4-5% of bench-tx-burst CPU in this dead-log path. Pinning
+    // the `lib.eal.ena.com` logtype to WARNING short-circuits the
+    // dispatch at the level check inside `rte_log` itself (one branch
+    // mispredict at worst) — saves ~80-150 ns per `rte_eth_tx_burst`
+    // and per-doorbell-write call. Pattern is `lib.eal.ena.com`
+    // matching the DPDK ENA driver registration string. Ignore the
+    // return: any miss (pattern doesn't match a registered logtype on
+    // non-ENA NICs, e.g. virtio in CI) is a no-op and not an error.
+    let pat = CString::new("lib.eal.ena.com").unwrap();
+    let _ = unsafe { sys::rte_log_set_level_pattern(pat.as_ptr(), sys::RTE_LOG_WARNING) };
+
     *guard = true;
     Ok(())
 }
