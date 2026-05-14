@@ -6688,7 +6688,16 @@ impl Engine {
         // returns -ENOENT without retrieving any mbufs on insufficient
         // mempool, so any non-zero return implies `mbufs[..]` is
         // untouched and no free is needed).
-        const BULK_MAX: usize = 32;
+        // PO18: lift from 32 to 96. At MSS=1460 and K=65 KiB,
+        // total_segments=45 > 32 used to clamp the per-call bulk to 32
+        // mbufs, forcing the caller to loop and pay a second
+        // bulk_alloc + drain_tx_pending_data cycle for the remaining
+        // ~13 segments. 96 ≥ 45 fits one K=65 KiB burst entirely in one
+        // shot. On-stack array size: 96 × 8 B = 768 B (well within the
+        // stack-safe budget; was 256 B). DPDK
+        // `rte_mempool_get_bulk` is all-or-nothing, so a single
+        // alloc-cycle satisfies the burst atomically.
+        const BULK_MAX: usize = 96;
         let total_segments = (remaining as u32).div_ceil(mss_cap);
         let bulk_n = (total_segments as usize).min(BULK_MAX);
         // Cap the byte budget at exactly bulk_n * mss_cap so the loop
