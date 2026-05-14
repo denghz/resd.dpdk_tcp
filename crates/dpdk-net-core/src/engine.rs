@@ -8008,6 +8008,13 @@ impl Engine {
         // Dispatch through the same per-mbuf RX path `poll_once` uses;
         // `dispatch_one_rx_mbuf` frees the mbuf before returning.
         let _accepted = self.dispatch_one_rx_mbuf(mbuf);
+        // PO15: flush any control-frame counter accumulators that the
+        // RX dispatch triggered (e.g. SYN-to-closed-port -> RST emit
+        // via tx_tcp_frame). poll_once flushes at end-of-poll; the
+        // inject path skips poll_once but tests expect post-inject
+        // counter consistency. Mirrors PO8's invariant: any test-only
+        // path that simulates one poll iteration must flush.
+        self.flush_tx_tcp_frame_counters();
         Ok(())
     }
 
@@ -8138,6 +8145,9 @@ impl Engine {
         // and frees the head — `rte_pktmbuf_free` on a chain head walks
         // `next` and frees every link.
         let _accepted = self.dispatch_one_rx_mbuf(mbufs[0]);
+        // PO15: see `inject_rx_frame` — flush so post-inject counter
+        // assertions observe wire-emit increments from this iteration.
+        self.flush_tx_tcp_frame_counters();
         Ok(())
     }
 
@@ -8407,6 +8417,12 @@ impl Engine {
         // (parallel to poll_once's behavior), the reorder queue still
         // holds a live ref and the mbuf survives until drained.
         unsafe { sys::shim_rte_pktmbuf_free(m) };
+        // PO15: flush any control-frame counter accumulators that the
+        // RX dispatch triggered (e.g. SYN-to-closed-port -> RST emit
+        // via tx_tcp_frame). poll_once flushes at end-of-poll; the
+        // test-server inject path skips poll_once, but counter-coverage
+        // tests expect post-inject counter consistency.
+        self.flush_tx_tcp_frame_counters();
         Ok(())
     }
 
