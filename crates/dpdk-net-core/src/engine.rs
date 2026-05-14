@@ -3186,7 +3186,26 @@ impl Engine {
         #[cfg(feature = "obs-byte-counters")]
         let mut rx_bytes_acc: u64 = 0;
 
-        for &m in &mbufs[..n] {
+        // PO12: prefetch the data area of the first 3 mbufs into L1
+        // before the decode loop starts; the NIC's DMA writes are
+        // cold of every CPU cache, so the first touch in the L2/L3/TCP
+        // pipeline pays the full memory-side miss without this hint.
+        // Mirrors fstack's `lib/ff_dpdk_if.c:2392-2408` (PREFETCH_OFFSET=3
+        // pattern). Inside the loop below we prefetch `mbufs[i+3]`
+        // before processing `mbufs[i]`, so by the time decode actually
+        // reads the bytes the cache line is warm in L1.
+        const PREFETCH_OFFSET: usize = 3;
+        for &m in mbufs[..n].iter().take(PREFETCH_OFFSET) {
+            crate::prefetch_mbuf_data(m);
+        }
+
+        for (i, &m) in mbufs[..n].iter().enumerate() {
+            // PO12: prefetch the data area of mbufs[i+PREFETCH_OFFSET]
+            // before processing mbufs[i]. The +3 lookahead hides ~70-100
+            // cycles of L3-miss latency per mbuf on cold-DMA bursts.
+            if let Some(next_m) = mbufs.get(i + PREFETCH_OFFSET) {
+                crate::prefetch_mbuf_data(*next_m);
+            }
             // A9 Task 2: per-mbuf RX dispatch extracted into
             // `dispatch_one_rx_mbuf` so the `test-inject` hook can share
             // the identical decode / offload-read / rx_frame / mbuf-free

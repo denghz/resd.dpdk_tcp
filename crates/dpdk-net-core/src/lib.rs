@@ -77,3 +77,59 @@ pub unsafe fn mbuf_data_slice<'a>(m: *mut dpdk_net_sys::rte_mbuf) -> &'a [u8] {
     let len = unsafe { dpdk_net_sys::shim_rte_pktmbuf_data_len(m) } as usize;
     unsafe { std::slice::from_raw_parts(ptr, len) }
 }
+
+/// PO12: prefetch the data area of `m` into L1 (`_MM_HINT_T0`). Used by
+/// the RX burst dispatch loop to hide the L2/L3 miss latency of the
+/// just-DMA'd mbuf payload — the NIC writes the payload bytes to host
+/// memory cold of every CPU cache, so the first touch in the decode path
+/// pays a full memory-side miss otherwise. Mirrors fstack's
+/// `lib/ff_dpdk_if.c:2392-2408` `PREFETCH_OFFSET=3` pattern.
+///
+/// Calls `shim_rte_pktmbuf_data` to materialise the data-area pointer
+/// (one cheap FFI hop into a single load + add inside the shim), then
+/// emits a non-locking, non-fault-checking prefetch hint. A null
+/// `m` yields a null data pointer; the prefetch instruction is a
+/// no-op for unmapped / invalid addresses on x86_64, and the
+/// fallback no-op path on non-x86_64 simply discards the pointer.
+///
+/// # Safety
+///
+/// `m` must be a valid mbuf pointer OR null (null is benign — the FFI
+/// returns null which the prefetch instruction discards). The caller
+/// must not rely on prefetch ordering — it is a CPU hint only.
+#[inline]
+pub fn prefetch_mbuf_data(m: *mut dpdk_net_sys::rte_mbuf) {
+    if m.is_null() {
+        return;
+    }
+    // Safety: shim_rte_pktmbuf_data is safe on any valid mbuf pointer;
+    // the returned pointer is a hint target only — no read or write
+    // through it occurs.
+    let ptr = unsafe { dpdk_net_sys::shim_rte_pktmbuf_data(m) };
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::x86_64::_mm_prefetch(
+            ptr as *const i8,
+            core::arch::x86_64::_MM_HINT_T0,
+        );
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        // `prfm pldl1keep` mirrors x86's `_MM_HINT_T0`: prefetch into
+        // L1 for keep (read-stream hint). ARM intrinsics are
+        // stable-since-1.59. Project has ARM on the roadmap (see
+        // `feedback/project_arm_roadmap.md`); keeping the prefetch
+        // active on ARM avoids a perf regression after the port.
+        core::arch::aarch64::_prefetch(
+            ptr as *const i8,
+            core::arch::aarch64::_PREFETCH_READ,
+            core::arch::aarch64::_PREFETCH_LOCALITY3,
+        );
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        // No-op fallback on other archs: explicitly discard the
+        // pointer so `unused_variables` doesn't lint.
+        let _ = ptr;
+    }
+}
