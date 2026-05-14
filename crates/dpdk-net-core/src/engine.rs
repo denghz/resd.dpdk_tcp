@@ -1295,6 +1295,17 @@ pub struct Engine {
     /// lcore engine ⇒ `Cell<u64>` is sufficient (no cross-thread access).
     pub(crate) advance_last_tick: std::cell::Cell<u64>,
 
+    /// PO15: per-poll accumulator for `eth.tx_bytes` increments from
+    /// `tx_tcp_frame` (and any future control-frame TX path). Flushed
+    /// at end-of-poll alongside the PO8 data-segment flush. Same
+    /// observability tradeoff: snapshot cadence is ≤1 Hz per spec
+    /// §9.1.1 rule 2 so within-poll delay is invisible. Single-lcore
+    /// ⇒ Cell<u64>.
+    pub(crate) tx_tcp_frame_bytes_acc: std::cell::Cell<u64>,
+    /// PO15: per-poll accumulator for `eth.tx_pkts` increments from
+    /// `tx_tcp_frame`. Flushed in parallel with `tx_tcp_frame_bytes_acc`.
+    pub(crate) tx_tcp_frame_pkts_acc: std::cell::Cell<u64>,
+
     /// Phase 6 (bench instrumentation): default capacity for new conns'
     /// `send_ack_log`. `0` (the default) means logging is disabled and
     /// the per-conn log is left at `disabled()`. A non-zero value (set
@@ -2092,6 +2103,9 @@ impl Engine {
             // PO13: start at 0; first poll's TSC tick will be strictly
             // greater so the wheel advances normally on entry.
             advance_last_tick: std::cell::Cell::new(0),
+            // PO15: accumulators start at 0; flushed at end-of-poll.
+            tx_tcp_frame_bytes_acc: std::cell::Cell::new(0),
+            tx_tcp_frame_pkts_acc: std::cell::Cell::new(0),
             // Phase 6 (bench instrumentation): logging disabled by default.
             // `enable_send_ack_logging` switches it on for bench tooling.
             send_ack_log_default_cap: std::cell::Cell::new(0),
@@ -2863,13 +2877,42 @@ impl Engine {
             }
         };
         if sent == 1 {
-            add(&self.counters.eth.tx_bytes, bytes.len() as u64);
-            inc(&self.counters.eth.tx_pkts);
+            // PO15: accumulate per-call counter bumps into engine-level
+            // Cells; the post-poll flush in `poll_once` collapses these
+            // into one fetch_add per counter per poll. Mirrors PO8's
+            // batching pattern for the data-segment path. Two LOCK ADDs
+            // (~24-30 ns total on Sapphire Rapids) become two Cell.set
+            // writes (~3 ns). Snapshot cadence is ≤1 Hz per spec §9.1.1
+            // rule 2 so within-poll delay is invisible to consumers.
+            // `add` import remains in scope for the failure-path
+            // counters; `inc` is used on the failure branch.
+            let _ = add;
+            self.tx_tcp_frame_bytes_acc
+                .set(self.tx_tcp_frame_bytes_acc.get().wrapping_add(bytes.len() as u64));
+            self.tx_tcp_frame_pkts_acc
+                .set(self.tx_tcp_frame_pkts_acc.get().wrapping_add(1));
             true
         } else {
             unsafe { sys::shim_rte_pktmbuf_free(m) };
             inc(&self.counters.eth.tx_drop_full_ring);
             false
+        }
+    }
+
+    /// PO15: flush the `tx_tcp_frame` counter accumulators. Called at
+    /// end-of-poll alongside the existing PO8 data-segment flush. Guards
+    /// on `> 0` so a poll with no control-frame emits performs zero
+    /// atomic ops (matches the PO8 pattern). Single-lcore engine ⇒ the
+    /// `Cell::get` + `Cell::set` ordering is safe; no cross-thread reader
+    /// can observe a torn intermediate.
+    pub(crate) fn flush_tx_tcp_frame_counters(&self) {
+        let b = self.tx_tcp_frame_bytes_acc.replace(0);
+        let p = self.tx_tcp_frame_pkts_acc.replace(0);
+        if b > 0 {
+            crate::counters::add(&self.counters.eth.tx_bytes, b);
+        }
+        if p > 0 {
+            crate::counters::add(&self.counters.eth.tx_pkts, p);
         }
     }
 
@@ -3199,6 +3242,9 @@ impl Engine {
             // A6 (spec §3.2): drain any data-segment TX batched by
             // timer-driven retransmit paths. No-op on empty ring.
             self.drain_tx_pending_data();
+            // PO15: flush the batched `tx_tcp_frame` counter
+            // accumulators; the per-call sites only touch Cells now.
+            self.flush_tx_tcp_frame_counters();
             // PO14: refill the control-frame mbuf cache so the next
             // poll's ACK / SYN / RST emits hit the cache instead of
             // single-mbuf alloc. Runs even on idle polls so a quiet
@@ -3294,6 +3340,9 @@ impl Engine {
         // after all emit sites so the burst coalesces everything.
         // No-op on empty ring.
         self.drain_tx_pending_data();
+        // PO15: flush the batched `tx_tcp_frame` counter accumulators
+        // after all emit sites have run this iter.
+        self.flush_tx_tcp_frame_counters();
         // PO14: refill the control-frame mbuf cache so the next
         // poll's ACK / SYN / RST emits hit the cache instead of
         // single-mbuf alloc. Sited after the drain so the cache
@@ -3526,6 +3575,14 @@ impl Engine {
     /// Spec §4.2: idempotent; no-op on empty ring.
     pub fn flush_tx_pending_data(&self) {
         self.drain_tx_pending_data();
+        // PO15: drain the per-call `tx_tcp_frame` counter accumulators
+        // alongside the data-segment ring drain so a caller that flushes
+        // outside the poll loop (`dpdk_net_flush`) sees a consistent
+        // counter snapshot. A snapshot taken between `drain_tx_pending_data`
+        // and `flush_tx_tcp_frame_counters` could otherwise show
+        // tx_bytes / tx_pkts trailing the wire — same observability
+        // bound as PO8 already has on the data path.
+        self.flush_tx_tcp_frame_counters();
     }
 
     /// A6 (spec §3.1): schedule a public API timer. Returns the wheel's
@@ -8102,6 +8159,10 @@ impl Drop for Engine {
                 unsafe { sys::shim_rte_pktmbuf_free(ptr.as_ptr()) };
             }
         }
+        // PO15: flush any residual tx_tcp_frame counter accumulators
+        // before teardown so the final counter snapshot reflects every
+        // wire-emit, not just those that crossed a poll boundary.
+        self.flush_tx_tcp_frame_counters();
 
         // Step 3: take the optional FaultInjector so its own Drop runs
         // here (releasing any mbufs held in its reorder ring) instead
