@@ -6,12 +6,15 @@ publish = false
 
 # A10 Plan B Task 10: feature-matrix A/B driver over `hw-*` cargo flags.
 #
-# The driver rebuilds `bench-ab-runner` once per config (eight configs from
+# The driver rebuilds `bench-rtt` once per config (eight configs from
 # spec §9), invokes the runner as a sub-process with the matching
 # --features + --feature-set labels, captures the runner's CSV stdout,
 # appends every row into a per-run accumulated CSV, and then applies the
 # §9 decision rule + sanity invariant to produce
 # `docs/superpowers/reports/offload-ab.md`.
+#
+# Phase 4 of the 2026-05-09 bench-suite overhaul retired bench-ab-runner;
+# bench-rtt's `--stack dpdk_net` arm subsumes the measurement loop.
 #
 # The library surface (`lib.rs` → `matrix`, `decision`, `report`) is kept
 # deliberately generic so T11 (`bench-obs-overhead`) can reuse the
@@ -39,7 +42,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 uuid = { version = "1", features = ["v4"] }
 # wait-timeout is a tiny zero-dep crate (<200 LOC) that gives us a
 # portable `Child::wait_timeout(Duration)`. Without it, `Child::wait()`
-# blocks indefinitely if bench-ab-runner hangs (DPDK stall, missing NIC,
+# blocks indefinitely if bench-rtt hangs (DPDK stall, missing NIC,
 # runaway workload) and the sweep driver becomes unkillable short of
 # operator SIGTERM. See I3 in the T10 code-quality review.
 wait-timeout = "0.2"

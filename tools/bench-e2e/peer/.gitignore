@@ -1,3 +1,4 @@
-# Build artefact — produced by `make -C tools/bench-e2e/peer` or by
+# Build artefacts — produced by `make -C tools/bench-e2e/peer` or by
 # bench-nightly.sh's pre-provision build step.
 echo-server
+burst-echo-server

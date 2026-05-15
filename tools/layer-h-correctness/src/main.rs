@@ -1,8 +1,5 @@
 //! layer-h-correctness binary. Spec §7 (CLI), §3.4 (process model),
 //! §5.4 (per-scenario lifecycle).
-//!
-//! 2026-05-04: bin is `required-features = ["test-server"]` so workspace
-//! builds without it skip this entire file. See lib.rs for rationale.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -12,7 +9,7 @@ use clap::Parser;
 use uuid::Uuid;
 
 use bench_common::preconditions::PreconditionMode;
-use bench_stress::netem::NetemGuard;
+use layer_h_correctness::netem::NetemGuard;
 
 use dpdk_net_core::engine::{Engine, EngineConfig};
 

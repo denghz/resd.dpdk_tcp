@@ -1215,7 +1215,6 @@ fn load_known_knob_names() -> std::collections::HashSet<String> {
         "ena_large_llq_hdr",                    // knob_ena_large_llq_hdr_suppresses_overflow_risk_guard
         "ena_miss_txc_to_sec",                  // knob_ena_miss_txc_to_sec_projects_to_devargs_key
         "rx_mempool_size",                      // knob_rx_mempool_size_user_override
-        "tx_data_mempool_size",                 // knob_tx_data_mempool_size_user_override
         // `preset` covers these via knob_preset_{rfc_compliance,latency}_*
         // (apply_preset overrides five fields at once — the preset scenarios
         // pin the expected post-override value on EngineConfig directly,
@@ -1225,12 +1224,6 @@ fn load_known_knob_names() -> std::collections::HashSet<String> {
         "cc_mode",                              // same
         "tcp_min_rto_us",                       // same
         "tcp_initial_rto_us",                   // same
-        // A1 cross-phase: SYN-option negotiation toggles wired into
-        // `build_connect_syn_opts`. Behavioral coverage lives in
-        // `tests/cabi_field_wired.rs` (asserts non-default value of
-        // `tcp_timestamps`/`tcp_sack` actually suppresses the SYN option).
-        "tcp_timestamps",
-        "tcp_sack",
         // A6 close-flag behavioral knob. Not a struct field but covered
         // at the knob-coverage layer via knob_close_force_tw_skip_when_ts_enabled.
         "DPDK_NET_CLOSE_FORCE_TW_SKIP",

@@ -1,0 +1,55 @@
+bench-vs-mtcp: ff_init argv=["bench-vs-mtcp", "--conf=/etc/f-stack.conf", "--proc-id=0"]
+EAL: Detected CPU lcores: 8
+EAL: Detected NUMA nodes: 1
+EAL: Auto-detected process type: PRIMARY
+EAL: Detected shared linkage of DPDK
+EAL: Multi-process socket /var/run/dpdk/rte/mp_socket
+EAL: Selected IOVA mode 'PA'
+EAL: VFIO support initialized
+EAL: Using IOMMU type 8 (No-IOMMU)
+EAL: Probe PCI driver: net_ena (1d0f:ec20) device: 0000:00:06.0 (socket -1)
+ena_get_metrics_entries(): 0x6 customer metrics are supported
+TELEMETRY: No legacy callbacks, legacy socket not created
+lcore: 2, port: 0, queue: 0
+create mbuf pool on socket 0
+create ring:dispatch_ring_p0_q0 success, 2047 ring entries are now free!
+Port 0 MAC:02:94:4A:94:57:8B
+Port 0 modified RSS hash function based on hardware support,requested:0x2003ffffc configured:0xc30
+RX checksum offload supported
+TX ip checksum offload supported
+TX TCP&UDP checksum offload supported
+TSO is disabled
+port[0]: rss table size: 128
+ena_rss_hash_set(): Setting RSS hash fields is not supported. Using default values: 0xc30
+set port 0 to promiscuous mode error
+
+Checking link statusdone
+Port 0 Link Up - speed 0 Mbps - full-duplex
+link_elf_lookup_symbol: missing symbol hash table
+link_elf_lookup_symbol: missing symbol hash table
+Timecounters tick every 10.000 msec
+WARNING: Adding ifaddrs to all fibs has been turned off by default. Consider tuning net.add_addr_allfibs if needed
+Attempting to load tcp_bbr
+tcp_bbr is now available
+TCP Hpts created 1 swi interrupt threads and bound 0 to cpus
+Timecounter "ff_clock" frequency 100 Hz quality 1
+TCP_ratelimit: Is now initialized
+f-stack-0: No addr6 config found.
+f-stack-0: Ethernet address: 02:94:4a:94:57:8b
+f-stack-0: Successed to register dpdk interface
+bench-vs-mtcp: WARN --nic-max-bps unset and NIC_MAX_BPS env var unset; skipping post-run NIC-saturation check (spec §11.1 check 3). Pass `--nic-max-bps <bps>` or export `NIC_MAX_BPS=<bps>` to enable.
+Limiting closed port RST response from 442 to 200 packets/sec
+Limiting closed port RST response from 583 to 200 packets/sec
+Limiting closed port RST response from 633 to 200 packets/sec
+Limiting closed port RST response from 1469 to 200 packets/sec
+Limiting closed port RST response from 806 to 200 packets/sec
+Limiting closed port RST response from 785 to 200 packets/sec
+Limiting closed port RST response from 448 to 200 packets/sec
+Limiting closed port RST response from 1347 to 200 packets/sec
+Limiting closed port RST response from 420 to 200 packets/sec
+Limiting closed port RST response from 325 to 200 packets/sec
+Limiting closed port RST response from 1264 to 200 packets/sec
+ena_rx_queue_release(): Rx queue 0:0 released
+ena_tx_queue_release(): Tx queue 0:0 released
+bench-vs-mtcp: fstack maxtp bucket W=262144B,C=1 failed: connect timeout: connections did not complete within 30 s (DPDK/ARP state may be dirty — clean /run/dpdk/rte/ and retry)
+bench-vs-mtcp: fstack maxtp bucket W=262144B,C=4 failed: connect timeout: connections did not complete within 30 s (DPDK/ARP state may be dirty — clean /run/dpdk/rte/ and retry)

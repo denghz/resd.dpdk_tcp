@@ -1,0 +1,80 @@
+[package]
+name = "bench-tx-maxtp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# bench-tx-maxtp — sustained max-throughput W x C grid (spec §11.2).
+#
+# Phase 5 of the 2026-05-09 bench-suite overhaul split the legacy
+# bench-vs-mtcp tool into bench-tx-burst (one-shot K x G grid) and
+# bench-tx-maxtp (this crate; sustained-rate W x C grid).
+#
+# The mTCP arm was removed in Phase 2; the live comparator triplet is
+# `dpdk_net` + `linux_kernel` + `fstack`.
+#
+# Peer expectations:
+#   * dpdk_net : echo-server on port 10001 (drains via the dpdk-net
+#     stack peer) — spec §11.2 measures sustained goodput.
+#   * linux_kernel : `linux-tcp-sink` on port 10002 (DISCARDS bytes;
+#     pointing at echo-server back-pressures the kernel TCP recv buffer
+#     to ~0 Gbps). Task 5.5 asserts peer_port=10002 explicitly.
+#   * fstack : echo-server on port 10001 — F-Stack sends standard TCP
+#     so the dpdk echo-server handles it transparently.
+#
+# Measurement contract (spec §11.2):
+#   * Warmup: 10 s per bucket.
+#   * Measurement window: 60 s per bucket.
+#   * Primary metric: sustained goodput = ACKed bytes / window, bps.
+#   * Secondary metric: tx_pps = eth.tx_pkts delta / window.
+#   * Phase 5 Task 5.3 adds per-conn raw-sample emission at
+#     SAMPLE_INTERVAL granularity for percentile + queue-depth analysis.
+
+[lib]
+name = "bench_tx_maxtp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bench-tx-maxtp"
+path = "src/main.rs"
+
+[features]
+default = []
+# Enables the F-Stack arm (fstack.rs). Requires libfstack.a +
+# DPDK 23.11 + F-Stack headers at /opt/f-stack on the bench-pair AMI
+# (image-builder component 04b-install-f-stack.yaml). Default builds
+# skip the F-Stack arm so the workspace compiles on dev hosts without
+# F-Stack.
+#
+# The FFI bindings come from the shared `bench-fstack-ffi` crate
+# (Phase 5 Task 5.4 consolidation); this crate's own build.rs still
+# owns the link-arg recipe.
+fstack = ["bench-fstack-ffi/fstack"]
+
+[dependencies]
+bench-common = { path = "../bench-common" }
+bench-fstack-ffi = { path = "../bench-fstack-ffi" }
+# bench-rtt provides workload helpers (open_connection,
+# drain_and_accumulate_readable) used by the dpdk arm.
+bench-rtt = { path = "../bench-rtt" }
+dpdk-net-core = { path = "../../crates/dpdk-net-core" }
+dpdk-net-sys = { path = "../../crates/dpdk-net-sys" }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+csv = "1.3"
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+hostname = "0.4"
+uuid = { version = "1", features = ["v4"] }
+thiserror = { workspace = true }
+# Phase 6 Task 6.2: TCP_INFO getsockopt for the linux_kernel arm.
+libc = "0.2"
+
+[build-dependencies]
+# T51 deferred-work item 2: shared libfstack.a + DPDK link-arg emit.
+# build.rs delegates to bench_build_helpers::emit_fstack_link_args_if_enabled().
+bench-build-helpers = { path = "../bench-build-helpers" }
+
+[dev-dependencies]
+tempfile = "3"

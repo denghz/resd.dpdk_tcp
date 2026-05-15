@@ -102,17 +102,32 @@ pub fn hash_bucket_for_lookup(
 pub struct FlowTable {
     slots: Vec<Option<TcpConn>>,
     by_tuple: HashMap<FourTuple, u32>,
+    /// LIFO stack of slot indices currently free. `insert` pops, `remove`
+    /// pushes. Avoids the O(N) `slots.iter().position(is_none)` scan that
+    /// the previous implementation paid on every accept.
+    ///
+    /// Invariant: an index `i` is in `free_slots` ⟺ `slots[i].is_none()`.
+    /// No index ever appears twice — `insert` pops (removes from stack,
+    /// fills slot), `remove` pushes only when `slot.take()` actually
+    /// returned a connection (slot was occupied), `clear_all` rebuilds
+    /// both to a consistent state.
+    free_slots: Vec<u32>,
 }
 
 impl FlowTable {
     pub fn new(max_connections: u32) -> Self {
-        let mut slots = Vec::with_capacity(max_connections as usize);
-        for _ in 0..max_connections {
+        let n = max_connections as usize;
+        let mut slots = Vec::with_capacity(n);
+        for _ in 0..n {
             slots.push(None);
         }
+        // Pushed in reverse so pop() yields 0, 1, 2, ... — keeps the
+        // first-insert-gets-slot-0 behavior the old linear-scan had.
+        let free_slots: Vec<u32> = (0..max_connections).rev().collect();
         Self {
             slots,
-            by_tuple: HashMap::with_capacity(max_connections as usize),
+            by_tuple: HashMap::with_capacity(n),
+            free_slots,
         }
     }
 
@@ -128,7 +143,11 @@ impl FlowTable {
         if self.by_tuple.contains_key(&tuple) {
             return None;
         }
-        let slot_idx = self.slots.iter().position(|s| s.is_none())?;
+        let slot_idx = self.free_slots.pop()? as usize; // O(1)
+        debug_assert!(
+            self.slots[slot_idx].is_none(),
+            "free_slots stack points at an occupied slot"
+        );
         self.slots[slot_idx] = Some(conn);
         self.by_tuple.insert(tuple, slot_idx as u32);
         Some(slot_idx as u32 + 1)
@@ -190,6 +209,10 @@ impl FlowTable {
         let slot = self.slots.get_mut(idx)?;
         let conn = slot.take()?;
         self.by_tuple.remove(&conn.four_tuple());
+        // Reclaim the slot. `slot.take()?` already returned (so the slot
+        // was occupied and is now empty) — pushing here cannot create a
+        // duplicate index in `free_slots`.
+        self.free_slots.push(idx as u32);
         Some(conn)
     }
 
@@ -205,52 +228,6 @@ impl FlowTable {
         })
     }
 
-    /// Test-only diagnostic: number of currently-occupied slots. Slow-path
-    /// (linear scan over the full slot vector). Gated by `pressure-test`
-    /// cargo feature; do NOT call from production code.
-    ///
-    /// Pressure-test suites use this to assert that conn-table drought
-    /// scenarios actually fill the table (or that GC scenarios actually
-    /// drain it) — direct visibility avoids depending on derived deltas
-    /// of `tcp.conn_open` / `tcp.conn_close` which can mask off-by-one
-    /// FSM bugs.
-    #[cfg(feature = "pressure-test")]
-    pub fn active_conns(&self) -> usize {
-        self.slots.iter().filter(|s| s.is_some()).count()
-    }
-
-    /// Test-only diagnostic: iterate `(ConnHandle, TcpState)` for every
-    /// occupied slot. Slow-path; gated by `pressure-test`. Used by the
-    /// FSM-trajectory pressure suite to record the per-conn state vector
-    /// at each step and detect illegal transitions or stuck states that
-    /// the 121-cell state-trans counter matrix would not visibly surface
-    /// (e.g. a long-lived TIME_WAIT congealing because the reaper is
-    /// behind).
-    #[cfg(feature = "pressure-test")]
-    pub fn states(&self) -> impl Iterator<Item = (ConnHandle, crate::tcp_state::TcpState)> + '_ {
-        self.slots.iter().enumerate().filter_map(|(i, slot)| {
-            slot.as_ref().map(|c| (i as ConnHandle + 1, c.state))
-        })
-    }
-
-    /// Test-only diagnostic: total bytes currently held in every conn's
-    /// out-of-order reorder queue (sum of `ReorderQueue::total_bytes`
-    /// over all occupied slots). Slow-path; gated by `pressure-test`.
-    ///
-    /// Pressure-test suites use this to drive reorder-queue overflow
-    /// scenarios to a precise byte threshold and confirm the surfacing
-    /// drop / counter delta lines up with the configured reassembly cap.
-    /// Returns a global sum (not per-conn); callers needing per-conn
-    /// detail iterate `iter_handles` + `get`.
-    #[cfg(feature = "pressure-test")]
-    pub fn reassembly_byte_occupancy(&self) -> u64 {
-        self.slots
-            .iter()
-            .filter_map(|s| s.as_ref())
-            .map(|c| c.recv.reorder.total_bytes() as u64)
-            .sum()
-    }
-
     /// Drop every connection slot. Used during `Engine::drop` to
     /// release all mbuf-owning state (recv segments, OOO reorder ring,
     /// snd_retrans entries) BEFORE the engine's mempool fields drop.
@@ -262,6 +239,10 @@ impl FlowTable {
     pub fn clear_all(&mut self) {
         self.slots.iter_mut().for_each(|s| *s = None);
         self.by_tuple.clear();
+        // Rebuild the free-slot stack to match: every slot is now empty.
+        // Reverse order so pop() yields 0, 1, 2, ... like a fresh table.
+        self.free_slots.clear();
+        self.free_slots.extend((0..self.slots.len() as u32).rev());
     }
 }
 
@@ -399,6 +380,110 @@ mod tests {
         ft.remove(h2);
         let got: Vec<_> = ft.iter_handles().collect();
         assert_eq!(got, vec![h1, h3]);
+    }
+
+    /// Randomized insert/remove/clear sequence against a shadow oracle.
+    /// Guards the free-slot invariant `i ∈ free_slots ⟺ slots[i].is_none()`
+    /// plus the no-duplicate-index property — the thing that, if violated,
+    /// would alias two connections to one slot.
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
+    #[test]
+    fn free_slot_invariant_holds_under_random_ops() {
+        const CAP: u32 = 8;
+        let mut ft = FlowTable::new(CAP);
+        // Shadow: 4-tuple -> handle for every connection we believe is live.
+        let mut shadow: std::collections::HashMap<FourTuple, ConnHandle> =
+            std::collections::HashMap::new();
+        // Deterministic xorshift64* PRNG — no external dep, reproducible.
+        let mut rng: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+
+        let check_invariant = |ft: &FlowTable, shadow: &std::collections::HashMap<FourTuple, ConnHandle>| {
+            // free_slots has no duplicates.
+            let mut seen = vec![false; ft.slots.len()];
+            for &idx in &ft.free_slots {
+                let i = idx as usize;
+                assert!(!seen[i], "free_slots contains duplicate index {i}");
+                seen[i] = true;
+                assert!(ft.slots[i].is_none(), "free_slots[{i}] points at an OCCUPIED slot");
+            }
+            // Every occupied slot's index is NOT free.
+            for (i, s) in ft.slots.iter().enumerate() {
+                if s.is_some() {
+                    assert!(!seen[i], "occupied slot {i} is ALSO in free_slots");
+                }
+            }
+            // Counts add up.
+            let occupied = ft.slots.iter().filter(|s| s.is_some()).count();
+            assert_eq!(occupied + ft.free_slots.len(), ft.slots.len(), "occupied + free != capacity");
+            // Lookups match the shadow.
+            for (t, &h) in shadow {
+                assert_eq!(ft.lookup_by_tuple(t), Some(h), "shadow says {t:?}->{h} but table disagrees");
+            }
+            assert_eq!(shadow.len(), occupied, "shadow size != occupied slots");
+            // iter_handles set matches the shadow handle set.
+            let mut got: Vec<ConnHandle> = ft.iter_handles().collect();
+            got.sort_unstable();
+            let mut want: Vec<ConnHandle> = shadow.values().copied().collect();
+            want.sort_unstable();
+            assert_eq!(got, want, "iter_handles set != shadow handle set");
+        };
+
+        for step in 0..2000u32 {
+            check_invariant(&ft, &shadow);
+            match next() % 10 {
+                // ~50%: insert a fresh tuple (peer_port unique-ish).
+                0..=4 => {
+                    let pp = (next() % 4096) as u16;
+                    let t = tuple(pp);
+                    if shadow.contains_key(&t) {
+                        // Re-inserting a live tuple must be rejected.
+                        let c = TcpConn::new_client(t, step, 1460, 1024, 2048, 5000, 5000, 1_000_000);
+                        assert!(ft.insert(c).is_none(), "duplicate-tuple insert should fail");
+                    } else if ft.free_slots.is_empty() {
+                        // Table full: insert must fail.
+                        let c = TcpConn::new_client(t, step, 1460, 1024, 2048, 5000, 5000, 1_000_000);
+                        assert!(ft.insert(c).is_none(), "full-table insert should fail");
+                    } else {
+                        let c = TcpConn::new_client(t, step, 1460, 1024, 2048, 5000, 5000, 1_000_000);
+                        let h = ft.insert(c).expect("insert into non-full table");
+                        assert!(h >= 1 && (h as usize) <= ft.slots.len());
+                        assert!(shadow.insert(t, h).is_none());
+                    }
+                }
+                // ~30%: remove a random live handle (or a bogus one).
+                5..=7 => {
+                    if shadow.is_empty() {
+                        // Removing from empty table → None.
+                        assert!(ft.remove(1).is_none() || ft.slots.is_empty());
+                    } else {
+                        let keys: Vec<FourTuple> = shadow.keys().copied().collect();
+                        let t = keys[(next() as usize) % keys.len()];
+                        let h = shadow.remove(&t).unwrap();
+                        assert!(ft.remove(h).is_some(), "remove of live handle should succeed");
+                        // Double-remove must NOT push the index a second time.
+                        assert!(ft.remove(h).is_none(), "double-remove should return None");
+                    }
+                }
+                // ~10%: clear_all.
+                8 => {
+                    ft.clear_all();
+                    shadow.clear();
+                }
+                // ~10%: remove a definitely-invalid handle.
+                _ => {
+                    assert!(ft.remove(INVALID_HANDLE).is_none());
+                    let bogus = ft.slots.len() as u32 + 1 + (next() % 100) as u32;
+                    assert!(ft.remove(bogus).is_none());
+                }
+            }
+        }
+        check_invariant(&ft, &shadow);
     }
 
     #[cfg(feature = "hw-offload-rss-hash")]

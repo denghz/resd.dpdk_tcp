@@ -1,0 +1,534 @@
+//! Integration tests for the `burst` workload (spec §11.1).
+//!
+//! These tests don't touch DPDK / a live peer. They cover the
+//! pure-Rust primitives: grid enumeration, per-burst sample
+//! aggregation, and preflight check helpers.
+//!
+//! Phase 5 of the 2026-05-09 bench-suite overhaul moved the burst
+//! workload out of bench-vs-mtcp into this `bench-tx-burst` crate;
+//! the test file moved with it.
+
+use bench_common::preflight::{
+    check_mss_and_burst_agreement, check_nic_saturation_bps, check_peer_window,
+    check_sanity_invariant, BucketVerdict,
+};
+use bench_tx_burst::burst::{
+    enumerate_filtered_grid, enumerate_grid, Bucket, BucketAggregate, BurstSample, BUCKET_COUNT,
+    G_MS, K_BYTES,
+};
+use bench_tx_burst::dpdk::TxTsMode;
+use bench_tx_burst::Stack;
+
+// ---------------------------------------------------------------------------
+// Stack enum.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn stack_parse_covers_all_stacks() {
+    assert_eq!(Stack::parse("dpdk").unwrap(), Stack::DpdkNet);
+    assert_eq!(Stack::parse("dpdk_net").unwrap(), Stack::DpdkNet);
+    assert_eq!(Stack::parse("linux").unwrap(), Stack::LinuxKernel);
+    assert_eq!(Stack::parse("linux_kernel").unwrap(), Stack::LinuxKernel);
+    assert_eq!(Stack::parse("fstack").unwrap(), Stack::Fstack);
+    // 2026-05-09 bench-suite overhaul — mTCP and afpacket dropped.
+    assert!(Stack::parse("mtcp").is_err());
+    assert!(Stack::parse("afpacket").is_err());
+}
+
+#[test]
+fn stack_as_dimension_is_the_documented_string() {
+    assert_eq!(Stack::DpdkNet.as_dimension(), "dpdk_net");
+    assert_eq!(Stack::LinuxKernel.as_dimension(), "linux_kernel");
+    assert_eq!(Stack::Fstack.as_dimension(), "fstack");
+}
+
+// ---------------------------------------------------------------------------
+// Grid enumeration — spec §11.1 K × G = 20 buckets.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn grid_has_exactly_20_buckets_per_spec() {
+    assert_eq!(BUCKET_COUNT, 20);
+    assert_eq!(K_BYTES.len() * G_MS.len(), 20);
+    let grid = enumerate_grid();
+    assert_eq!(grid.len(), 20);
+}
+
+#[test]
+fn grid_k_axis_values_match_spec_11_1() {
+    // 64 KiB, 256 KiB, 1 MiB, 4 MiB, 16 MiB.
+    assert_eq!(K_BYTES.len(), 5);
+    assert_eq!(K_BYTES[0], 64 * 1024);
+    assert_eq!(K_BYTES[1], 256 * 1024);
+    assert_eq!(K_BYTES[2], 1 << 20);
+    assert_eq!(K_BYTES[3], 4 << 20);
+    assert_eq!(K_BYTES[4], 16 << 20);
+}
+
+#[test]
+fn grid_g_axis_values_match_spec_11_1() {
+    // 0 ms, 1 ms, 10 ms, 100 ms.
+    assert_eq!(G_MS, &[0, 1, 10, 100]);
+}
+
+#[test]
+fn grid_has_no_duplicate_buckets() {
+    let grid = enumerate_grid();
+    let unique: std::collections::HashSet<_> = grid.iter().collect();
+    assert_eq!(unique.len(), grid.len(), "duplicate bucket in grid");
+}
+
+#[test]
+fn grid_subset_filter_accepts_partial_k() {
+    // Run only K=1MiB — 4 buckets.
+    let grid = enumerate_filtered_grid(Some(&[1 << 20]), None).unwrap();
+    assert_eq!(grid.len(), 4);
+    for b in &grid {
+        assert_eq!(b.burst_bytes, 1 << 20);
+    }
+}
+
+#[test]
+fn grid_subset_filter_accepts_partial_g() {
+    // Run only G=0ms (back-to-back) — 5 buckets.
+    let grid = enumerate_filtered_grid(None, Some(&[0])).unwrap();
+    assert_eq!(grid.len(), 5);
+    for b in &grid {
+        assert_eq!(b.gap_ms, 0);
+    }
+}
+
+#[test]
+fn grid_subset_filter_accepts_intersection() {
+    // Run only K=1MiB and G=100ms — 1 bucket.
+    let grid = enumerate_filtered_grid(Some(&[1 << 20]), Some(&[100])).unwrap();
+    assert_eq!(grid.len(), 1);
+    assert_eq!(grid[0], Bucket::new(1 << 20, 100));
+}
+
+#[test]
+fn grid_subset_filter_rejects_unknown_k() {
+    let err = enumerate_filtered_grid(Some(&[12345]), None).unwrap_err();
+    assert!(err.contains("no K values match"));
+}
+
+#[test]
+fn grid_subset_filter_rejects_unknown_g() {
+    let err = enumerate_filtered_grid(None, Some(&[5])).unwrap_err();
+    assert!(err.contains("no G values match"));
+}
+
+// ---------------------------------------------------------------------------
+// Sample aggregation.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn burst_sample_from_timestamps_matches_spec_11_1_contract() {
+    // 4 MiB burst in exactly 1 ms. t_first_wire = t0 + 50 µs.
+    let k = 4 << 20;
+    let t0 = 10u64 * 1_000_000_000;
+    let t_first_wire = t0 + 50_000;
+    let t1 = t0 + 1_000_000;
+    let s = BurstSample::from_timestamps(k, t0, t_first_wire, t1);
+    // throughput_bps = K·8 / (t1 - t0 in seconds).
+    let expect = (k as f64) * 8.0 / 0.001;
+    assert!(
+        (s.throughput_bps - expect).abs() < 1.0,
+        "throughput = {}",
+        s.throughput_bps
+    );
+    // initiation = t_first_wire - t0 = 50_000 ns.
+    assert_eq!(s.initiation_ns, 50_000.0);
+    // steady > throughput since the initiation portion is excluded.
+    assert!(s.steady_bps > s.throughput_bps);
+}
+
+#[test]
+fn bucket_aggregate_happy_path_summarises_all_metrics() {
+    let bucket = Bucket::new(64 * 1024, 0);
+    let samples: Vec<BurstSample> = (0..10_000)
+        .map(|i| {
+            let t0 = 1_000_000u64 + i as u64 * 1_000_000;
+            let t_first_wire = t0 + 500;
+            let t1 = t_first_wire + 500 + (i as u64 % 50);
+            BurstSample::from_timestamps(64 * 1024, t0, t_first_wire, t1)
+        })
+        .collect();
+    let agg = BucketAggregate::from_samples(
+        bucket,
+        Stack::DpdkNet,
+        &samples,
+        BucketVerdict::Ok,
+        Some(TxTsMode::TscFallback),
+    );
+    assert!(agg.throughput_bps.is_some());
+    assert!(agg.initiation_ns.is_some());
+    assert!(agg.steady_bps.is_some());
+    let t = agg.throughput_bps.unwrap();
+    assert!(t.p50 <= t.p99);
+    assert!(t.p99 <= t.p999);
+}
+
+#[test]
+fn bucket_aggregate_invalid_verdict_skips_all_summaries() {
+    let bucket = Bucket::new(16 << 20, 100);
+    let samples: Vec<BurstSample> = vec![];
+    let agg = BucketAggregate::from_samples(
+        bucket,
+        Stack::DpdkNet,
+        &samples,
+        BucketVerdict::Invalid("NIC-bound".to_string()),
+        Some(TxTsMode::TscFallback),
+    );
+    assert!(agg.throughput_bps.is_none());
+    assert!(agg.initiation_ns.is_none());
+    assert!(agg.steady_bps.is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Pre-run check logic.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn preflight_peer_window_gate_matches_spec() {
+    // Pass: peer rwnd ≥ K.
+    assert!(check_peer_window(64 * 1024, 64 * 1024).is_ok());
+    assert!(check_peer_window(1 << 20, 64 * 1024).is_ok());
+    // Fail: peer rwnd < K.
+    assert!(!check_peer_window(32 * 1024, 64 * 1024).is_ok());
+}
+
+#[test]
+fn preflight_mss_and_burst_agreement_gate_matches_spec() {
+    // Both stacks at MSS=1460, TX burst=32 → pass.
+    assert!(check_mss_and_burst_agreement(1460, 1460, 32, 32).is_ok());
+    // MSS mismatch → fail.
+    assert!(!check_mss_and_burst_agreement(1460, 1500, 32, 32).is_ok());
+    // TX burst mismatch → fail.
+    assert!(!check_mss_and_burst_agreement(1460, 1460, 32, 64).is_ok());
+}
+
+#[test]
+fn preflight_nic_saturation_gate_uses_70pct_ceiling_per_spec() {
+    // 69% utilization → pass.
+    assert!(check_nic_saturation_bps(69_000_000_000, 100_000_000_000).is_ok());
+    // Exactly 70% → pass (spec says ≤ 70%).
+    assert!(check_nic_saturation_bps(70_000_000_000, 100_000_000_000).is_ok());
+    // 71% → fail.
+    assert!(!check_nic_saturation_bps(71_000_000_000, 100_000_000_000).is_ok());
+}
+
+#[test]
+fn preflight_sanity_invariant_gate_enforces_exact_equality() {
+    assert!(check_sanity_invariant(1_048_576_000, 1_048_576_000).is_ok());
+    assert!(check_sanity_invariant(1_048_576_000, 1_048_575_999).is_err());
+    assert!(check_sanity_invariant(1_048_576_000, 1_048_576_001).is_err());
+}
+
+// ---------------------------------------------------------------------------
+// CSV row shape — one bucket's emit path produces the expected
+// (dimensions_json, metric_name, metric_unit) tuples.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn emit_bucket_rows_dimensions_json_matches_spec_11_3_shape() {
+    let bucket = Bucket::new(1 << 20, 10);
+    let samples: Vec<BurstSample> = (0..100)
+        .map(|i| {
+            let t0 = i as u64 * 1_000;
+            BurstSample::from_timestamps(1 << 20, t0, t0 + 100, t0 + 1_000)
+        })
+        .collect();
+    let agg = BucketAggregate::from_samples(
+        bucket,
+        Stack::DpdkNet,
+        &samples,
+        BucketVerdict::Ok,
+        Some(TxTsMode::TscFallback),
+    );
+    let metadata = sample_metadata();
+    let mut buf = Vec::new();
+    {
+        let mut w = csv::Writer::from_writer(&mut buf);
+        bench_tx_burst::burst::emit_bucket_rows(&mut w, &metadata, "bench-tx-burst", "trading-latency", &agg)
+            .unwrap();
+        w.flush().unwrap();
+    }
+    // Parse back and verify the dimensions_json shape on at least one row.
+    let mut reader = csv::Reader::from_reader(buf.as_slice());
+    let headers = reader.headers().unwrap().clone();
+    let dims_idx = headers
+        .iter()
+        .position(|h| h == "dimensions_json")
+        .expect("dimensions_json column present");
+    let metric_name_idx = headers.iter().position(|h| h == "metric_name").unwrap();
+    let metric_unit_idx = headers.iter().position(|h| h == "metric_unit").unwrap();
+    let mut seen_throughput = false;
+    let mut seen_initiation = false;
+    let mut seen_steady = false;
+    for rec in reader.records() {
+        let rec = rec.unwrap();
+        let dims: serde_json::Value = serde_json::from_str(rec.get(dims_idx).unwrap()).unwrap();
+        assert_eq!(dims["workload"], "burst");
+        assert_eq!(dims["K_bytes"], serde_json::json!(1_048_576i64));
+        // G_ms: either 10.0 or 10 (serde_json collapses integer-valued
+        // f64 in Display, accept both).
+        assert!(
+            dims["G_ms"] == serde_json::json!(10.0)
+                || dims["G_ms"] == serde_json::json!(10),
+            "G_ms = {:?}",
+            dims["G_ms"]
+        );
+        assert_eq!(dims["stack"], "dpdk_net");
+        assert!(dims.get("bucket_invalid").is_none());
+        // Every dpdk_net row tags the TX-TS measurement source so
+        // CSV consumers can filter HW-TS vs TSC-fallback rows.
+        assert_eq!(dims["tx_ts_mode"], "tsc_fallback");
+        let metric_name = rec.get(metric_name_idx).unwrap();
+        let metric_unit = rec.get(metric_unit_idx).unwrap();
+        match metric_name {
+            "pmd_handoff_rate_bps" => {
+                // Throughput unit is spelled out as `bits_per_sec`
+                // (not the ambiguous `bps`) per spec §14.1.
+                assert_eq!(metric_unit, "bits_per_sec");
+                seen_throughput = true;
+            }
+            "burst_initiation_ns" => {
+                assert_eq!(metric_unit, "ns");
+                seen_initiation = true;
+            }
+            "burst_steady_bps" => {
+                assert_eq!(metric_unit, "bits_per_sec");
+                seen_steady = true;
+            }
+            other => panic!("unexpected metric_name {other}"),
+        }
+    }
+    assert!(seen_throughput, "pmd_handoff_rate_bps row missing");
+    assert!(seen_initiation, "burst_initiation_ns row missing");
+    assert!(seen_steady, "burst_steady_bps row missing");
+}
+
+// ---------------------------------------------------------------------------
+// T57 follow-up #2 + codex I2 (2026-05-13): per-arm metric-name labelling.
+//
+// History:
+//
+//   Phase 1 (legacy): `throughput_per_burst_bps` was emitted on EVERY
+//   arm, but the linux_kernel and fstack arms capture t1 after
+//   `write()` / `ff_write()` returns — i.e. when bytes are accepted
+//   into the kernel/F-Stack send buffer, NOT when bytes leave the
+//   NIC. Emitting the same metric_name on both arms led readers to
+//   compare buffer-fill rates against wire rates (linux/fstack
+//   "65 Gbps" vs dpdk_net "1 Gbps" on a 10 Gbps line).
+//
+//   Phase 2 (T57 follow-up #2): linux_kernel + fstack rows renamed to
+//   `write_acceptance_rate_bps`; dpdk_net kept `throughput_per_burst_bps`
+//   under the (mistaken) framing that `rte_eth_tx_burst`-return was
+//   a wire-rate proxy.
+//
+//   Phase 3 (codex I2 2026-05-13, this rename): dpdk_net renamed
+//   `throughput_per_burst_bps` → `pmd_handoff_rate_bps`. Codex
+//   adversarial review pointed out that `rte_eth_tx_burst` returning
+//   only means the mbuf was enqueued onto the PMD send ring; the
+//   PMD ring buffers, and on low-payload, low-iteration counts the
+//   reported value can exceed line rate (e.g. 18 Gbps on a 5 Gbps
+//   NIC). The dpdk_net row is therefore an application-to-PMD
+//   handoff rate, not wire rate.
+//
+// All three labels (`pmd_handoff_rate_bps`, `write_acceptance_rate_bps`)
+// share the `bits_per_sec` unit and the same per-bucket aggregation
+// count (7 rows × 3 metrics = 21). None is wire-rate; the labels
+// distinguish which handoff boundary was measured.
+// ---------------------------------------------------------------------------
+
+fn emit_one_bucket_and_collect_metric_names(stack: Stack) -> Vec<String> {
+    let bucket = Bucket::new(64 * 1024, 0);
+    let samples: Vec<BurstSample> = (0..100)
+        .map(|i| {
+            let t0 = (i as u64) * 1_000;
+            BurstSample::from_timestamps(64 * 1024, t0, t0 + 100, t0 + 1_000)
+        })
+        .collect();
+    // Linux + fstack rows historically carry no tx_ts_mode; dpdk_net
+    // rows carry one. Both shapes are valid for this test.
+    let tx_ts_mode = match stack {
+        Stack::DpdkNet => Some(TxTsMode::TscFallback),
+        _ => None,
+    };
+    let agg = BucketAggregate::from_samples(bucket, stack, &samples, BucketVerdict::Ok, tx_ts_mode);
+    let metadata = sample_metadata();
+    let mut buf = Vec::new();
+    {
+        let mut w = csv::Writer::from_writer(&mut buf);
+        bench_tx_burst::burst::emit_bucket_rows(
+            &mut w,
+            &metadata,
+            "bench-tx-burst",
+            "trading-latency",
+            &agg,
+        )
+        .unwrap();
+        w.flush().unwrap();
+    }
+    let mut reader = csv::Reader::from_reader(buf.as_slice());
+    let headers = reader.headers().unwrap().clone();
+    let metric_name_idx = headers.iter().position(|h| h == "metric_name").unwrap();
+    let mut metric_names = Vec::new();
+    for rec in reader.records() {
+        let rec = rec.unwrap();
+        metric_names.push(rec.get(metric_name_idx).unwrap().to_string());
+    }
+    metric_names
+}
+
+#[test]
+fn linux_arm_emits_write_acceptance_rate_not_pmd_handoff() {
+    // T57 follow-up #2 + codex I2 (2026-05-13): linux_kernel rows
+    // MUST NOT carry `pmd_handoff_rate_bps` (that name names the
+    // dpdk_net PMD send-ring handoff which the linux arm doesn't
+    // perform). Instead, the linux arm's primary metric is
+    // `write_acceptance_rate_bps` (bytes accepted into the kernel
+    // send buffer).
+    let names = emit_one_bucket_and_collect_metric_names(Stack::LinuxKernel);
+    assert!(
+        !names.iter().any(|n| n == "pmd_handoff_rate_bps"),
+        "linux_kernel row should NOT emit pmd_handoff_rate_bps; got names: {names:?}"
+    );
+    // Defensive: also reject the long-retired pre-T57 label.
+    assert!(
+        !names.iter().any(|n| n == "throughput_per_burst_bps"),
+        "linux_kernel row should NOT emit retired throughput_per_burst_bps; got names: {names:?}"
+    );
+    let primary_count = names
+        .iter()
+        .filter(|n| *n == "write_acceptance_rate_bps")
+        .count();
+    assert_eq!(
+        primary_count, 7,
+        "linux_kernel row should emit 7 write_acceptance_rate_bps rows (p50/p99/p999/mean/stddev/ci95_lo/ci95_hi); got names: {names:?}"
+    );
+    // Secondary metrics keep their historical names — the
+    // initiation/steady decomposition is the same shape across arms.
+    assert!(
+        names.iter().any(|n| n == "burst_initiation_ns"),
+        "linux_kernel row should still emit burst_initiation_ns; got names: {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n == "burst_steady_bps"),
+        "linux_kernel row should still emit burst_steady_bps; got names: {names:?}"
+    );
+}
+
+#[test]
+fn fstack_arm_emits_write_acceptance_rate_not_pmd_handoff() {
+    // Same shape as the linux assertion: fstack captures t1 after
+    // `ff_write` returns → buffer-fill rate → same metric label
+    // `write_acceptance_rate_bps`.
+    let names = emit_one_bucket_and_collect_metric_names(Stack::Fstack);
+    assert!(
+        !names.iter().any(|n| n == "pmd_handoff_rate_bps"),
+        "fstack row should NOT emit pmd_handoff_rate_bps; got names: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n == "throughput_per_burst_bps"),
+        "fstack row should NOT emit retired throughput_per_burst_bps; got names: {names:?}"
+    );
+    let primary_count = names
+        .iter()
+        .filter(|n| *n == "write_acceptance_rate_bps")
+        .count();
+    assert_eq!(
+        primary_count, 7,
+        "fstack row should emit 7 write_acceptance_rate_bps rows; got names: {names:?}"
+    );
+}
+
+#[test]
+fn dpdk_arm_emits_pmd_handoff_rate_bps() {
+    // Codex I2 (2026-05-13): dpdk_net's t1 is captured at
+    // `rte_eth_tx_burst`-return — bytes handed to the PMD send ring,
+    // NOT on the wire. The metric_name `pmd_handoff_rate_bps` makes
+    // the measurement boundary explicit. Asymmetric on purpose vs
+    // linux/fstack's `write_acceptance_rate_bps`: same physical
+    // K / (t1 − t0) concept, different handoff boundary, different
+    // name. Readers can grep on metric_name to tell them apart. The
+    // retired `throughput_per_burst_bps` label is also rejected to
+    // catch regressions.
+    let names = emit_one_bucket_and_collect_metric_names(Stack::DpdkNet);
+    assert!(
+        !names.iter().any(|n| n == "write_acceptance_rate_bps"),
+        "dpdk_net row should NOT emit write_acceptance_rate_bps; got names: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n == "throughput_per_burst_bps"),
+        "dpdk_net row should NOT emit retired throughput_per_burst_bps; got names: {names:?}"
+    );
+    let primary_count = names
+        .iter()
+        .filter(|n| *n == "pmd_handoff_rate_bps")
+        .count();
+    assert_eq!(
+        primary_count, 7,
+        "dpdk_net row should emit 7 pmd_handoff_rate_bps rows; got names: {names:?}"
+    );
+}
+
+#[test]
+fn invalid_bucket_marker_row_uses_per_arm_metric_name() {
+    // The invalid-verdict marker row also picks up the per-arm
+    // metric name — otherwise the linux/fstack invalid markers would
+    // still claim wire-rate calibration even though they record
+    // metric_value=0.0.
+    let bucket = Bucket::new(16 << 20, 100);
+    let agg = BucketAggregate::from_samples(
+        bucket,
+        Stack::LinuxKernel,
+        &[],
+        BucketVerdict::Invalid("NIC-bound".to_string()),
+        None,
+    );
+    let metadata = sample_metadata();
+    let mut buf = Vec::new();
+    {
+        let mut w = csv::Writer::from_writer(&mut buf);
+        bench_tx_burst::burst::emit_bucket_rows(
+            &mut w,
+            &metadata,
+            "bench-tx-burst",
+            "trading-latency",
+            &agg,
+        )
+        .unwrap();
+        w.flush().unwrap();
+    }
+    let mut reader = csv::Reader::from_reader(buf.as_slice());
+    let headers = reader.headers().unwrap().clone();
+    let metric_name_idx = headers.iter().position(|h| h == "metric_name").unwrap();
+    let rec = reader.records().next().unwrap().unwrap();
+    assert_eq!(
+        rec.get(metric_name_idx).unwrap(),
+        "write_acceptance_rate_bps",
+        "linux_kernel invalid-bucket marker row should use the buffer-fill metric name"
+    );
+}
+
+fn sample_metadata() -> bench_common::run_metadata::RunMetadata {
+    use bench_common::preconditions::{PreconditionMode, Preconditions};
+    bench_common::run_metadata::RunMetadata {
+        run_id: uuid::Uuid::nil(),
+        run_started_at: "2026-04-21T00:00:00Z".to_string(),
+        commit_sha: "0".repeat(40),
+        branch: "phase-a10".to_string(),
+        host: "test-host".to_string(),
+        instance_type: "c6in.metal".to_string(),
+        cpu_model: "test-cpu".to_string(),
+        dpdk_version: "23.11.2".to_string(),
+        kernel: "6.8.0".to_string(),
+        nic_model: "ENA".to_string(),
+        nic_fw: String::new(),
+        ami_id: String::new(),
+        precondition_mode: PreconditionMode::Strict,
+        preconditions: Preconditions::default(),
+    }
+}

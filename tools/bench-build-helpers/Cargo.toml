@@ -1,0 +1,35 @@
+[package]
+name = "bench-build-helpers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# bench-build-helpers — build-time emit helpers for bench-* binaries
+# that link libfstack.a + DPDK with a specific argument ORDER.
+#
+# Consumed via `[build-dependencies]` on each consumer crate's
+# Cargo.toml, called from each consumer's build.rs. The helper exists
+# because Cargo's `cargo:rustc-link-lib=...` emit cannot express the
+# ORDER required (push-state / --no-as-needed / --whole-archive /
+# -lfstack / --no-whole-archive / DPDK rte_* under push-state /
+# --pop-state). The pragmas must be emitted as `rustc-link-arg=...`
+# in sequence — mechanical but error-prone if duplicated across N
+# consumers.
+#
+# Closes T51 deferred-work item 2 (the four near-identical build.rs
+# files in bench-rtt, bench-tx-burst, bench-tx-maxtp, bench-rx-burst).
+#
+# # Why a separate crate (vs extending bench-fstack-ffi)
+#
+# bench-fstack-ffi is the runtime FFI bindings crate; pulling in
+# build-time helpers under a feature gate would muddy its feature
+# surface. A dedicated crate keeps build-deps from bleeding into
+# runtime deps and makes the separation of concerns clear.
+
+[lib]
+name = "bench_build_helpers"
+path = "src/lib.rs"
+
+[dependencies]
+# Intentionally none. This crate is std-only build-time helpers.

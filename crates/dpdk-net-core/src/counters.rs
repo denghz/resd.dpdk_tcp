@@ -104,19 +104,10 @@ pub struct EthCounters {
     /// ENA xstat: `rx_q0_mbuf_alloc_fail` — RX mbuf allocation failed at
     /// refill time. Correlates with `rx_drop_nomem`.
     pub rx_q0_mbuf_alloc_fail: AtomicU64,
-    // C2 cross-phase retro fix — slow-path per spec §9.1.1. Bumped exactly
-    // once per multi-segment RX mbuf chain that we copy into a contiguous
-    // scratch buffer before handing it to the L2/L3/L4 decoder. A nonzero
-    // value indicates the NIC is delivering jumbo / scattered frames; the
-    // application can use this signal to size its mempool data_room or to
-    // confirm RX_OFFLOAD_SCATTER expectations. Single-segment RX traffic
-    // never bumps. Increment site lives in `crate::mbuf_data_slice_for_rx`
-    // (lib.rs); zero-cost for the steady-state single-segment fast path.
-    pub rx_multi_seg_linearized: AtomicU64,
     // _pad sized to keep the struct on a 64-byte multiple.
-    // 12 (pre-A-HW) + 11 (A-HW) + 15 (A-HW+) + 1 (C2) = 39 u64s → 312 B;
-    // next 64-multiple is 320 B → pad with 1 u64.
-    _pad: [AtomicU64; 1],
+    // 12 (pre-A-HW) + 11 (A-HW) + 15 (A-HW+) = 38 u64s → 304 B;
+    // next 64-multiple is 320 B → pad with 2 u64s.
+    _pad: [AtomicU64; 2],
 }
 
 #[repr(C, align(64))]
@@ -146,6 +137,18 @@ pub struct TcpCounters {
     pub tx_retrans: AtomicU64,
     pub tx_rto: AtomicU64,
     pub tx_tlp: AtomicU64,
+    /// Phase 11 (C-E2): per-trigger retransmit sub-counters. The aggregate
+    /// `tx_retrans` above is partitioned across these three so bench tools
+    /// can distinguish RTO recoveries (~200 ms tail) from RACK / TLP
+    /// recoveries (~¼ RTT). Every retransmit emit site bumps both its
+    /// sub-counter AND the aggregate via the `inc_tx_retrans_{rto,rack,tlp}`
+    /// helpers — the aggregate is not derived. Slow-path per §9.1.1
+    /// (retransmit fires only on packet loss recovery; no hot-path cost).
+    pub tx_retrans_rto: AtomicU64,
+    /// See `tx_retrans_rto` doc — RACK loss-detection driven retransmit.
+    pub tx_retrans_rack: AtomicU64,
+    /// See `tx_retrans_rto` doc — TLP probe-fire driven retransmit.
+    pub tx_retrans_tlp: AtomicU64,
     pub conn_open: AtomicU64,
     pub conn_close: AtomicU64,
     pub conn_rst: AtomicU64,
@@ -277,6 +280,8 @@ pub struct TcpCounters {
     /// consumer is draining non-segment-aligned byte counts, which is
     /// the common case for byte-stream protocols.
     pub rx_partial_read_splits: AtomicU64,
+    /// RFC 9293 §3.8.6.1: persist probe sent (zero-window probe TX).
+    pub tx_persist: AtomicU64,
     // --- A10 deferred-fix Stage A: RX-side leak diagnostics (slow-path) ---
     // Forensic-only: intentionally NOT mirrored in `dpdk_net_tcp_counters_t`
     // (crates/dpdk-net/src/api.rs). Consumed by the Rust-side bench-stress
@@ -374,13 +379,18 @@ const _: () = {
 // line below whose struct you changed.
 const _: () = {
     use std::mem::size_of;
-    // EthCounters: 39 named AtomicU64 + _pad: [AtomicU64; 1] = 40 * 8 = 320 bytes.
+    // EthCounters: 38 named AtomicU64 + _pad: [AtomicU64; 2] = 40 * 8 = 320 bytes.
     assert!(size_of::<EthCounters>() == 320);
     // IpCounters: 12 named AtomicU64 + _pad: [u64; 4] = 16 * 8 = 128 bytes.
     assert!(size_of::<IpCounters>() == 128);
-    // TcpCounters: 56 named scalar AtomicU64 + state_trans[11][11] matrix of
-    // 121 AtomicU64 = 177 u64s = 1416 bytes; cacheline-align tail pads to
-    // next 64-byte multiple = 1472 bytes.
+    // TcpCounters: pre-A10 named scalar AtomicU64 fields (56) + Phase 11
+    // tx_retrans_{rto,rack,tlp} split (3) = 59 named u64 + state_trans[11]
+    // [11] matrix (121 AtomicU64) + tx_persist (u64) + mbuf_refcnt_drop_un-
+    // expected (u64) + rx_mempool_avail (u32) + tx_data_mempool_avail (u32)
+    // = 59*8 + 121*8 + 8 + 8 + 4 + 4 = 1464 bytes; cacheline-align tail
+    // pads to next 64-byte multiple = 1472 bytes. Phase 11 split fits in
+    // the existing tail-padding (32 bytes pre-Phase-11 → 8 bytes post),
+    // preserving the C-ABI mirror size assertion in dpdk-net/src/api.rs.
     assert!(size_of::<TcpCounters>() == 1472);
     // PollCounters: 5 named AtomicU64 + _pad: [u64; 11] = 16 * 8 = 128 bytes.
     assert!(size_of::<PollCounters>() == 128);
@@ -420,34 +430,6 @@ impl Counters {
             poll: PollCounters::default(),
             obs: ObsCounters::default(),
             fault_injector: FaultInjectorCounters::default(),
-        }
-    }
-
-    /// Test-only typed accessor for `AtomicU32` **level** counters
-    /// (last-sampled value, not a delta). Slow-path only — gated by the
-    /// `pressure-test` cargo feature; do NOT call from production code.
-    ///
-    /// The generic `lookup_counter` (`counters.rs:609`) returns
-    /// `&AtomicU64` and therefore cannot read these `AtomicU32` fields:
-    ///
-    ///   * `tcp.tx_data_mempool_avail` — last `rte_mempool_avail_count`
-    ///     sample of the TX-data mempool, taken inside `poll_once`'s
-    ///     once-per-second sampler. Pressure-test consumers watch this
-    ///     to confirm that mempool drought scenarios actually drain the
-    ///     pool to (near-)zero on the surfacing iteration.
-    ///   * `tcp.rx_mempool_avail` — same shape, RX side. Pressure-test
-    ///     consumers cross-check `rx_drop_nomem` deltas against a
-    ///     visibly-drained pool.
-    ///
-    /// Cost rationale: a single `Relaxed` load + a string match on a
-    /// 2-arm switch — far below counter-policy hot-path threshold and
-    /// only callable when the `pressure-test` feature is on.
-    #[cfg(feature = "pressure-test")]
-    pub fn read_level_counter_u32(&self, name: &str) -> Option<u32> {
-        match name {
-            "tcp.tx_data_mempool_avail" => Some(self.tcp.tx_data_mempool_avail.load(Ordering::Relaxed)),
-            "tcp.rx_mempool_avail" => Some(self.tcp.rx_mempool_avail.load(Ordering::Relaxed)),
-            _ => None,
         }
     }
 }
@@ -508,7 +490,6 @@ pub const ALL_COUNTER_NAMES: &[&str] = &[
     "eth.rx_q0_bad_desc_num",
     "eth.rx_q0_bad_req_id",
     "eth.rx_q0_mbuf_alloc_fail",
-    "eth.rx_multi_seg_linearized",
     // --- ip (_pad excluded) ---
     "ip.rx_csum_bad",
     "ip.rx_ttl_zero",
@@ -530,6 +511,11 @@ pub const ALL_COUNTER_NAMES: &[&str] = &[
     "tcp.tx_retrans",
     "tcp.tx_rto",
     "tcp.tx_tlp",
+    // Phase 11 (C-E2): per-trigger retransmit split. Aggregate is preserved
+    // above for back-compat. See TcpCounters::tx_retrans_{rto,rack,tlp}.
+    "tcp.tx_retrans_rto",
+    "tcp.tx_retrans_rack",
+    "tcp.tx_retrans_tlp",
     "tcp.conn_open",
     "tcp.conn_close",
     "tcp.conn_rst",
@@ -581,6 +567,7 @@ pub const ALL_COUNTER_NAMES: &[&str] = &[
     "tcp.rx_iovec_segs_total",
     "tcp.rx_multi_seg_events",
     "tcp.rx_partial_read_splits",
+    "tcp.tx_persist",
     // A10 deferred-fix Stage A: leak-detect diagnostic. Forensic-only,
     // not mirrored on the C-ABI side. tcp.rx_mempool_avail is AtomicU32
     // (last-sampled value) and is intentionally absent from this list —
@@ -626,7 +613,7 @@ pub const ALL_COUNTER_NAMES: &[&str] = &[
 /// compile-time `size_of::<*Counters>()` pins above — they fail at
 /// compile time when a new field shifts struct size past the pinned
 /// byte count.
-pub const KNOWN_COUNTER_COUNT: usize = 119;
+pub const KNOWN_COUNTER_COUNT: usize = 122;
 
 /// Resolve a counter path from ALL_COUNTER_NAMES to a live &AtomicU64
 /// on the given Counters. Returns None for typos or paths that have
@@ -685,7 +672,6 @@ pub fn lookup_counter<'a>(c: &'a Counters, name: &str) -> Option<&'a AtomicU64> 
         "eth.rx_q0_bad_desc_num" => &c.eth.rx_q0_bad_desc_num,
         "eth.rx_q0_bad_req_id" => &c.eth.rx_q0_bad_req_id,
         "eth.rx_q0_mbuf_alloc_fail" => &c.eth.rx_q0_mbuf_alloc_fail,
-        "eth.rx_multi_seg_linearized" => &c.eth.rx_multi_seg_linearized,
         // --- ip ---
         "ip.rx_csum_bad" => &c.ip.rx_csum_bad,
         "ip.rx_ttl_zero" => &c.ip.rx_ttl_zero,
@@ -707,6 +693,11 @@ pub fn lookup_counter<'a>(c: &'a Counters, name: &str) -> Option<&'a AtomicU64> 
         "tcp.tx_retrans" => &c.tcp.tx_retrans,
         "tcp.tx_rto" => &c.tcp.tx_rto,
         "tcp.tx_tlp" => &c.tcp.tx_tlp,
+        // Phase 11 (C-E2): per-trigger retransmit sub-counters. The split
+        // helpers below also bump the aggregate `tcp.tx_retrans`.
+        "tcp.tx_retrans_rto" => &c.tcp.tx_retrans_rto,
+        "tcp.tx_retrans_rack" => &c.tcp.tx_retrans_rack,
+        "tcp.tx_retrans_tlp" => &c.tcp.tx_retrans_tlp,
         "tcp.conn_open" => &c.tcp.conn_open,
         "tcp.conn_close" => &c.tcp.conn_close,
         "tcp.conn_rst" => &c.tcp.conn_rst,
@@ -756,6 +747,7 @@ pub fn lookup_counter<'a>(c: &'a Counters, name: &str) -> Option<&'a AtomicU64> 
         "tcp.rx_iovec_segs_total" => &c.tcp.rx_iovec_segs_total,
         "tcp.rx_multi_seg_events" => &c.tcp.rx_multi_seg_events,
         "tcp.rx_partial_read_splits" => &c.tcp.rx_partial_read_splits,
+        "tcp.tx_persist" => &c.tcp.tx_persist,
         // A10 deferred-fix Stage A leak-detect (rx_mempool_avail is
         // AtomicU32, absent from this u64-typed lookup — see
         // ALL_COUNTER_NAMES site comment).
@@ -847,6 +839,57 @@ pub fn inc(a: &AtomicU64) {
 #[inline(always)]
 pub fn add(a: &AtomicU64, n: u64) {
     a.fetch_add(n, Ordering::Relaxed);
+}
+
+/// Phase 11 (C-E2): bump the per-trigger `tcp.tx_retrans_rto` sub-counter
+/// alongside the aggregate `tcp.tx_retrans`. These helpers bump BOTH the
+/// per-trigger sub-counter AND the aggregate `tcp.tx_retrans`. The
+/// `retransmit()` primitive in `engine.rs::retransmit_inner` no longer
+/// bumps `tx_retrans` itself (Phase 11 split) — every
+/// `engine.retransmit(...)` callsite must be paired with exactly one of
+/// these helpers, with the sole exceptions of:
+///   - SYN-retrans paths (`engine.rs:3571` passive, `engine.rs:7363`
+///     active replay) which use `emit_syn_with_flags` and bump
+///     `tcp.tx_retrans` directly — these are not partitioned across
+///     RTO/RACK/TLP since they fire only during handshake.
+///   - `engine.rs::debug_retransmit_for_test` which calls
+///     `retransmit_inner` directly with a compensating aggregate
+///     bump for the `multiseg_retrans_tap` test invariant.
+/// Pairing the helper call with each `engine.retransmit(...)` call keeps
+/// the partition invariant `tx_retrans_rto + tx_retrans_rack +
+/// tx_retrans_tlp + (SYN-retrans-only-aggregate-bumps) == tx_retrans`
+/// valid at every quiescent observation.
+///
+/// Slow-path: retransmit fires only on packet loss recovery; no hot-path
+/// cost. Distinct from `tx_rto` (which counts RTO timer fire events, not
+/// retransmitted segments — a single RTO fire can retransmit N segments
+/// per RFC 8985 §6.3 RACK_mark_losses_on_RTO).
+#[inline]
+pub fn inc_tx_retrans_rto(t: &TcpCounters) {
+    inc(&t.tx_retrans_rto);
+    inc(&t.tx_retrans);
+}
+
+/// Phase 11 (C-E2): bump the per-trigger `tcp.tx_retrans_rack` sub-counter
+/// alongside the aggregate. See `inc_tx_retrans_rto` for the partition
+/// rationale. Distinct from `tx_rack_loss` (counts RACK loss-detection
+/// events, not retransmitted segments — same value in the simple path,
+/// but split lets future dedupe-on-retransmit semantics diverge cleanly).
+#[inline]
+pub fn inc_tx_retrans_rack(t: &TcpCounters) {
+    inc(&t.tx_retrans_rack);
+    inc(&t.tx_retrans);
+}
+
+/// Phase 11 (C-E2): bump the per-trigger `tcp.tx_retrans_tlp` sub-counter
+/// alongside the aggregate. See `inc_tx_retrans_rto` for the partition
+/// rationale. Distinct from `tx_tlp` (counts TLP probe-fire events; this
+/// counts retransmitted segments, currently always 1 per fire in Stage 1
+/// since TLP probes a single segment).
+#[inline]
+pub fn inc_tx_retrans_tlp(t: &TcpCounters) {
+    inc(&t.tx_retrans_tlp);
+    inc(&t.tx_retrans);
 }
 
 #[cfg(test)]
@@ -1095,7 +1138,7 @@ mod a5_5_tests {
         assert_eq!(c.tcp.tx_flush_batched_pkts.load(Ordering::Relaxed), 0);
     }
 }
-
+#[cfg(test)]
 mod a10_diagnostic_counter_tests {
     use super::*;
     use std::sync::atomic::Ordering;

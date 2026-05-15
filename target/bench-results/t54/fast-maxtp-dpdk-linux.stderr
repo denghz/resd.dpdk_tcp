@@ -1,0 +1,690 @@
+dpdk_net: port 0 driver=net_ena rx_offload_capa=0x000000000000200e tx_offload_capa=0x000000000001800e dev_flags=0x00000042
+dpdk_net: port 0 WC verification skipped: cannot read /sys/kernel/debug/x86/pat_memtype_list: No such file or directory (os error 2)
+dpdk_net: port 0 on net_ena with ena_large_llq_hdr=0; worst-case header 94 B is within 6 B of the 96 B LLQ limit. Consider setting EngineConfig.ena_large_llq_hdr=1 + splicing dpdk_net_recommended_ena_devargs(...) into EAL args. See docs/references/ena-dpdk-readme.md §5.1.
+dpdk_net: PMD on port 0 does not advertise RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE (0x0000000000004000); degrading to software path for this offload
+dpdk_net: PMD on port 0 does not advertise RTE_ETH_RX_OFFLOAD_RSS_HASH (0x0000000000080000); degrading to software path for this offload
+dpdk_net: port 0 configured rx_offloads=0x000000000000000e tx_offloads=0x000000000000800e
+dpdk_net: RX timestamp dynfield/dynflag unavailable on port 0 (ENA steady state — see spec §10.5)
+bench-vs-mtcp: WARN --nic-max-bps unset and NIC_MAX_BPS env var unset; skipping post-run NIC-saturation check (spec §11.1 check 3). Pass `--nic-max-bps <bps>` or export `NIC_MAX_BPS=<bps>` to enable.
+bench-vs-mtcp: running dpdk_net maxtp bucket W=64B,C=1
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (64 B)
+POOL pre-open bucket(C=1,W=64): tx_data_avail=32768
+POOL post-open bucket(C=1,W=64): tx_data_avail=32768
+dpdk_maxtp POOL bucket(C=1, W=64) pre-measure: tx_data_avail=32736 tx_hdr_avail=2038 conn_states=[Established]
+bench-vs-mtcp: maxtp sanity invariant check skipped for bucket W=64B,C=1 (tx_payload_bytes counter is 0 — build with `--features obs-byte-counters` to enable)
+POOL post-close bucket(C=1,W=64): tx_data_avail=32768
+bench-vs-mtcp: running dpdk_net maxtp bucket W=64B,C=4
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (64 B)
+POOL pre-open bucket(C=4,W=64): tx_data_avail=32768
+POOL post-open bucket(C=4,W=64): tx_data_avail=32768
+dpdk_maxtp POOL bucket(C=4, W=64) pre-measure: tx_data_avail=32736 tx_hdr_avail=2018 conn_states=[Established,Established,Established,Established]
+bench-vs-mtcp: maxtp sanity invariant check skipped for bucket W=64B,C=4 (tx_payload_bytes counter is 0 — build with `--features obs-byte-counters` to enable)
+POOL post-close bucket(C=4,W=64): tx_data_avail=32768
+bench-vs-mtcp: running dpdk_net maxtp bucket W=64B,C=16
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (64 B)
+POOL pre-open bucket(C=16,W=64): tx_data_avail=32768
+POOL post-open bucket(C=16,W=64): tx_data_avail=32768
+dpdk_maxtp POOL bucket(C=16, W=64) pre-measure: tx_data_avail=32685 tx_hdr_avail=2035 conn_states=[Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established]
+bench-vs-mtcp: maxtp sanity invariant check skipped for bucket W=64B,C=16 (tx_payload_bytes counter is 0 — build with `--features obs-byte-counters` to enable)
+POOL post-close bucket(C=16,W=64): tx_data_avail=32768
+bench-vs-mtcp: running dpdk_net maxtp bucket W=64B,C=64
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (64 B)
+POOL pre-open bucket(C=64,W=64): tx_data_avail=32768
+POOL post-open bucket(C=64,W=64): tx_data_avail=32768
+dpdk_maxtp POOL bucket(C=64, W=64) pre-measure: tx_data_avail=32475 tx_hdr_avail=2040 conn_states=[Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established]
+bench-vs-mtcp: maxtp sanity invariant check skipped for bucket W=64B,C=64 (tx_payload_bytes counter is 0 — build with `--features obs-byte-counters` to enable)
+POOL post-close bucket(C=64,W=64): tx_data_avail=32768
+bench-vs-mtcp: running dpdk_net maxtp bucket W=256B,C=1
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (256 B)
+POOL pre-open bucket(C=1,W=256): tx_data_avail=32768
+POOL post-open bucket(C=1,W=256): tx_data_avail=32768
+dpdk_maxtp POOL bucket(C=1, W=256) pre-measure: tx_data_avail=32739 tx_hdr_avail=2036 conn_states=[Established]
+bench-vs-mtcp: maxtp sanity invariant check skipped for bucket W=256B,C=1 (tx_payload_bytes counter is 0 — build with `--features obs-byte-counters` to enable)
+POOL post-close bucket(C=1,W=256): tx_data_avail=32768
+bench-vs-mtcp: running dpdk_net maxtp bucket W=256B,C=4
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (256 B)
+POOL pre-open bucket(C=4,W=256): tx_data_avail=32768
+POOL post-open bucket(C=4,W=256): tx_data_avail=32768
+dpdk_maxtp POOL bucket(C=4, W=256) pre-measure: tx_data_avail=32735 tx_hdr_avail=2016 conn_states=[Established,Established,Established,Established]
+bench-vs-mtcp: maxtp sanity invariant check skipped for bucket W=256B,C=4 (tx_payload_bytes counter is 0 — build with `--features obs-byte-counters` to enable)
+POOL post-close bucket(C=4,W=256): tx_data_avail=32768
+bench-vs-mtcp: running dpdk_net maxtp bucket W=256B,C=16
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (256 B)
+POOL pre-open bucket(C=16,W=256): tx_data_avail=32768
+POOL post-open bucket(C=16,W=256): tx_data_avail=32768
+dpdk_maxtp POOL bucket(C=16, W=256) pre-measure: tx_data_avail=32455 tx_hdr_avail=2036 conn_states=[Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established]
+bench-vs-mtcp: maxtp sanity invariant check skipped for bucket W=256B,C=16 (tx_payload_bytes counter is 0 — build with `--features obs-byte-counters` to enable)
+POOL post-close bucket(C=16,W=256): tx_data_avail=32768
+bench-vs-mtcp: running dpdk_net maxtp bucket W=256B,C=64
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (256 B)
+POOL pre-open bucket(C=64,W=256): tx_data_avail=32768
+dpdk_maxtp: open connection 14 attempt 0 failed: connection closed during handshake: err=0; retrying after drain
+dpdk_maxtp: open connection 29 attempt 0 failed: connection closed during handshake: err=0; retrying after drain
+dpdk_maxtp: open connection 48 attempt 0 failed: connection closed during handshake: err=0; retrying after drain
+POOL post-open bucket(C=64,W=256): tx_data_avail=32768
+dpdk_maxtp POOL bucket(C=64, W=256) pre-measure: tx_data_avail=0 tx_hdr_avail=2048 conn_states=[Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established]
+bench-vs-mtcp: maxtp sanity invariant check skipped for bucket W=256B,C=64 (tx_payload_bytes counter is 0 — build with `--features obs-byte-counters` to enable)
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=25 rx_mempool_avail=265318 (capacity=266240) tx_data_mempool_avail=20784 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=1 tx_rto=4904 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=56 rx_mempool_avail=265357 (capacity=266240) tx_data_mempool_avail=21696 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=2 tx_rto=4915 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=23 rx_mempool_avail=265328 (capacity=266240) tx_data_mempool_avail=22544 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=3 tx_rto=4924 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=54 rx_mempool_avail=265367 (capacity=266240) tx_data_mempool_avail=23568 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=4 tx_rto=4925 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=12 rx_mempool_avail=265457 (capacity=266240) tx_data_mempool_avail=24592 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=5 tx_rto=4926 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=20 rx_mempool_avail=265507 (capacity=266240) tx_data_mempool_avail=25616 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=6 tx_rto=4927 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=62 rx_mempool_avail=265534 (capacity=266240) tx_data_mempool_avail=26640 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=7 tx_rto=4934 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=19 rx_mempool_avail=265574 (capacity=266240) tx_data_mempool_avail=27088 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=8 tx_rto=4937 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=1 rx_mempool_avail=265651 (capacity=266240) tx_data_mempool_avail=28112 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=9 tx_rto=4938 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=10 rx_mempool_avail=265662 (capacity=266240) tx_data_mempool_avail=29136 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=10 tx_rto=4949 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=35 rx_mempool_avail=265702 (capacity=266240) tx_data_mempool_avail=29920 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=11 tx_rto=4950 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=64 rx_mempool_avail=265754 (capacity=266240) tx_data_mempool_avail=30944 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=12 tx_rto=4952 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=48 rx_mempool_avail=265714 (capacity=266240) tx_data_mempool_avail=31744 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=12 tx_rto=4957 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_maxtp: close_persistent_connections: timed out; force-aborted 1/64 conns after 15s
+POOL post-close bucket(C=64,W=256): tx_data_avail=32768
+bench-vs-mtcp: running dpdk_net maxtp bucket W=1024B,C=1
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (1024 B)
+POOL pre-open bucket(C=1,W=1024): tx_data_avail=32768
+POOL post-open bucket(C=1,W=1024): tx_data_avail=32768
+dpdk_maxtp POOL bucket(C=1, W=1024) pre-measure: tx_data_avail=32758 tx_hdr_avail=2045 conn_states=[Established]
+bench-vs-mtcp: maxtp sanity invariant check skipped for bucket W=1024B,C=1 (tx_payload_bytes counter is 0 — build with `--features obs-byte-counters` to enable)
+POOL post-close bucket(C=1,W=1024): tx_data_avail=32768
+bench-vs-mtcp: running dpdk_net maxtp bucket W=1024B,C=4
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (1024 B)
+POOL pre-open bucket(C=4,W=1024): tx_data_avail=32768
+POOL post-open bucket(C=4,W=1024): tx_data_avail=32768
+dpdk_maxtp POOL bucket(C=4, W=1024) pre-measure: tx_data_avail=32754 tx_hdr_avail=2037 conn_states=[Established,Established,Established,Established]
+bench-vs-mtcp: maxtp sanity invariant check skipped for bucket W=1024B,C=4 (tx_payload_bytes counter is 0 — build with `--features obs-byte-counters` to enable)
+POOL post-close bucket(C=4,W=1024): tx_data_avail=32768
+bench-vs-mtcp: running dpdk_net maxtp bucket W=1024B,C=16
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (1024 B)
+POOL pre-open bucket(C=16,W=1024): tx_data_avail=32768
+POOL post-open bucket(C=16,W=1024): tx_data_avail=32768
+dpdk_maxtp POOL bucket(C=16, W=1024) pre-measure: tx_data_avail=32520 tx_hdr_avail=2017 conn_states=[Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established]
+bench-vs-mtcp: maxtp sanity invariant check skipped for bucket W=1024B,C=16 (tx_payload_bytes counter is 0 — build with `--features obs-byte-counters` to enable)
+POOL post-close bucket(C=16,W=1024): tx_data_avail=32768
+bench-vs-mtcp: running dpdk_net maxtp bucket W=1024B,C=64
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (1024 B)
+POOL pre-open bucket(C=64,W=1024): tx_data_avail=32768
+POOL post-open bucket(C=64,W=1024): tx_data_avail=32768
+dpdk_maxtp POOL bucket(C=64, W=1024) pre-measure: tx_data_avail=19334 tx_hdr_avail=2021 conn_states=[Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established]
+bench-vs-mtcp: maxtp sanity invariant check skipped for bucket W=1024B,C=64 (tx_payload_bytes counter is 0 — build with `--features obs-byte-counters` to enable)
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=56 rx_mempool_avail=265276 (capacity=266240) tx_data_mempool_avail=30751 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=13 tx_rto=11682 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=35 rx_mempool_avail=265365 (capacity=266240) tx_data_mempool_avail=31032 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=14 tx_rto=11693 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=37 rx_mempool_avail=265397 (capacity=266240) tx_data_mempool_avail=31288 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=15 tx_rto=11694 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=43 rx_mempool_avail=265383 (capacity=266240) tx_data_mempool_avail=31500 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=16 tx_rto=11696 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=45 rx_mempool_avail=265417 (capacity=266240) tx_data_mempool_avail=31576 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=17 tx_rto=11702 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=63 rx_mempool_avail=265493 (capacity=266240) tx_data_mempool_avail=31832 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=18 tx_rto=11703 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=48 rx_mempool_avail=265583 (capacity=266240) tx_data_mempool_avail=32088 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=19 tx_rto=11707 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=16 rx_mempool_avail=265552 (capacity=266240) tx_data_mempool_avail=32236 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=20 tx_rto=11713 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=60 rx_mempool_avail=265550 (capacity=266240) tx_data_mempool_avail=32492 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=21 tx_rto=11721 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=8 rx_mempool_avail=265554 (capacity=266240) tx_data_mempool_avail=32500 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=22 tx_rto=11722 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=1 rx_mempool_avail=265597 (capacity=266240) tx_data_mempool_avail=32564 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=23 tx_rto=11724 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=62 rx_mempool_avail=265702 (capacity=266240) tx_data_mempool_avail=32768 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=23 tx_rto=11724 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_maxtp: close_persistent_connections: timed out; force-aborted 1/64 conns after 15s
+POOL post-close bucket(C=64,W=1024): tx_data_avail=32768
+bench-vs-mtcp: running dpdk_net maxtp bucket W=4096B,C=1
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (4096 B)
+POOL pre-open bucket(C=1,W=4096): tx_data_avail=32768
+POOL post-open bucket(C=1,W=4096): tx_data_avail=32768
+dpdk_maxtp POOL bucket(C=1, W=4096) pre-measure: tx_data_avail=32744 tx_hdr_avail=2043 conn_states=[Established]
+bench-vs-mtcp: maxtp sanity invariant check skipped for bucket W=4096B,C=1 (tx_payload_bytes counter is 0 — build with `--features obs-byte-counters` to enable)
+POOL post-close bucket(C=1,W=4096): tx_data_avail=32768
+bench-vs-mtcp: running dpdk_net maxtp bucket W=4096B,C=4
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (4096 B)
+POOL pre-open bucket(C=4,W=4096): tx_data_avail=32768
+POOL post-open bucket(C=4,W=4096): tx_data_avail=32768
+dpdk_maxtp POOL bucket(C=4, W=4096) pre-measure: tx_data_avail=32744 tx_hdr_avail=2036 conn_states=[Established,Established,Established,Established]
+bench-vs-mtcp: maxtp sanity invariant check skipped for bucket W=4096B,C=4 (tx_payload_bytes counter is 0 — build with `--features obs-byte-counters` to enable)
+POOL post-close bucket(C=4,W=4096): tx_data_avail=32768
+bench-vs-mtcp: running dpdk_net maxtp bucket W=4096B,C=16
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (4096 B)
+POOL pre-open bucket(C=16,W=4096): tx_data_avail=32768
+POOL post-open bucket(C=16,W=4096): tx_data_avail=32768
+dpdk_maxtp POOL bucket(C=16, W=4096) pre-measure: tx_data_avail=30886 tx_hdr_avail=2032 conn_states=[Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established]
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=11 rx_mempool_avail=265512 (capacity=266240) tx_data_mempool_avail=31518 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=24 tx_rto=12979 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=4 rx_mempool_avail=265315 (capacity=266240) tx_data_mempool_avail=31487 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=25 tx_rto=13138 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+bench-vs-mtcp: maxtp sanity invariant check skipped for bucket W=4096B,C=16 (tx_payload_bytes counter is 0 — build with `--features obs-byte-counters` to enable)
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=4) returned InvalidConnHandle(4); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=11) returned InvalidConnHandle(11); will retry in drain loop
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=7 rx_mempool_avail=265591 (capacity=266240) tx_data_mempool_avail=32576 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=26 tx_rto=13154 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=13 rx_mempool_avail=265625 (capacity=266240) tx_data_mempool_avail=32768 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=26 tx_rto=13154 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_maxtp: close_persistent_connections: timed out; force-aborted 1/16 conns after 15s
+POOL post-close bucket(C=16,W=4096): tx_data_avail=32768
+bench-vs-mtcp: running dpdk_net maxtp bucket W=4096B,C=64
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (4096 B)
+POOL pre-open bucket(C=64,W=4096): tx_data_avail=32768
+dpdk_maxtp: open connection 56 attempt 0 failed: connection closed during handshake: err=0; retrying after drain
+POOL post-open bucket(C=64,W=4096): tx_data_avail=32768
+dpdk_maxtp POOL bucket(C=64, W=4096) pre-measure: tx_data_avail=22500 tx_hdr_avail=2016 conn_states=[Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established]
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=60 rx_mempool_avail=263337 (capacity=266240) tx_data_mempool_avail=26486 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=27 tx_rto=16358 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=57 rx_mempool_avail=263263 (capacity=266240) tx_data_mempool_avail=26447 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=28 tx_rto=16513 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=18 rx_mempool_avail=263539 (capacity=266240) tx_data_mempool_avail=26665 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=29 tx_rto=16759 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=52 rx_mempool_avail=263542 (capacity=266240) tx_data_mempool_avail=26946 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=30 tx_rto=16810 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=4 rx_mempool_avail=263577 (capacity=266240) tx_data_mempool_avail=27393 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=31 tx_rto=16828 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=36 rx_mempool_avail=263254 (capacity=266240) tx_data_mempool_avail=27098 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=32 tx_rto=16871 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=28 rx_mempool_avail=263388 (capacity=266240) tx_data_mempool_avail=27127 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=33 tx_rto=16922 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+bench-vs-mtcp: maxtp sanity invariant check skipped for bucket W=4096B,C=64 (tx_payload_bytes counter is 0 — build with `--features obs-byte-counters` to enable)
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=4) returned InvalidConnHandle(4); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=18) returned InvalidConnHandle(18); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=28) returned InvalidConnHandle(28); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=36) returned InvalidConnHandle(36); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=52) returned InvalidConnHandle(52); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=57) returned InvalidConnHandle(57); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=60) returned InvalidConnHandle(60); will retry in drain loop
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=16 rx_mempool_avail=263876 (capacity=266240) tx_data_mempool_avail=28926 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=34 tx_rto=17009 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=41 rx_mempool_avail=264308 (capacity=266240) tx_data_mempool_avail=29232 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=35 tx_rto=17011 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=53 rx_mempool_avail=264331 (capacity=266240) tx_data_mempool_avail=29616 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=36 tx_rto=17016 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=47 rx_mempool_avail=264408 (capacity=266240) tx_data_mempool_avail=29808 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=37 tx_rto=17017 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=11 rx_mempool_avail=264393 (capacity=266240) tx_data_mempool_avail=29817 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=38 tx_rto=17018 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=56 rx_mempool_avail=264439 (capacity=266240) tx_data_mempool_avail=29838 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=39 tx_rto=17020 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=20 rx_mempool_avail=264450 (capacity=266240) tx_data_mempool_avail=29943 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=40 tx_rto=17024 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=19 rx_mempool_avail=264454 (capacity=266240) tx_data_mempool_avail=30135 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=41 tx_rto=17025 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=1 rx_mempool_avail=264493 (capacity=266240) tx_data_mempool_avail=30327 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=42 tx_rto=17026 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=22 rx_mempool_avail=264464 (capacity=266240) tx_data_mempool_avail=30330 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=43 tx_rto=17027 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=15 rx_mempool_avail=264491 (capacity=266240) tx_data_mempool_avail=30522 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=44 tx_rto=17031 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=32 rx_mempool_avail=264494 (capacity=266240) tx_data_mempool_avail=30683 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=45 tx_rto=17033 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=23 rx_mempool_avail=264536 (capacity=266240) tx_data_mempool_avail=30875 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=46 tx_rto=17035 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=37 rx_mempool_avail=264524 (capacity=266240) tx_data_mempool_avail=31067 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=47 tx_rto=17045 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=13 rx_mempool_avail=264543 (capacity=266240) tx_data_mempool_avail=31259 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=48 tx_rto=17061 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=59 rx_mempool_avail=264603 (capacity=266240) tx_data_mempool_avail=31439 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=49 tx_rto=17062 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=48 rx_mempool_avail=264544 (capacity=266240) tx_data_mempool_avail=31631 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=50 tx_rto=17065 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=43 rx_mempool_avail=264546 (capacity=266240) tx_data_mempool_avail=31700 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=51 tx_rto=17066 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=3 rx_mempool_avail=264550 (capacity=266240) tx_data_mempool_avail=31787 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=52 tx_rto=17067 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=10 rx_mempool_avail=264561 (capacity=266240) tx_data_mempool_avail=31925 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=53 tx_rto=17072 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=49 rx_mempool_avail=264666 (capacity=266240) tx_data_mempool_avail=32117 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=54 tx_rto=17074 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=9 rx_mempool_avail=264681 (capacity=266240) tx_data_mempool_avail=32309 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=55 tx_rto=17076 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=6 rx_mempool_avail=264670 (capacity=266240) tx_data_mempool_avail=32420 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=56 tx_rto=17078 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=14 rx_mempool_avail=264673 (capacity=266240) tx_data_mempool_avail=32573 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=57 tx_rto=17083 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=21 rx_mempool_avail=264685 (capacity=266240) tx_data_mempool_avail=32576 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=58 tx_rto=17084 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=12 rx_mempool_avail=264684 (capacity=266240) tx_data_mempool_avail=32768 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=58 tx_rto=17084 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=24 rx_mempool_avail=264789 (capacity=266240) tx_data_mempool_avail=32768 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=58 tx_rto=17084 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=26 rx_mempool_avail=264789 (capacity=266240) tx_data_mempool_avail=32768 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=58 tx_rto=17084 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=27 rx_mempool_avail=264905 (capacity=266240) tx_data_mempool_avail=32768 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=58 tx_rto=17084 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=29 rx_mempool_avail=264988 (capacity=266240) tx_data_mempool_avail=32768 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=58 tx_rto=17084 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=34 rx_mempool_avail=264988 (capacity=266240) tx_data_mempool_avail=32768 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=58 tx_rto=17084 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=39 rx_mempool_avail=265088 (capacity=266240) tx_data_mempool_avail=32768 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=58 tx_rto=17084 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=42 rx_mempool_avail=265088 (capacity=266240) tx_data_mempool_avail=32768 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=58 tx_rto=17084 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=44 rx_mempool_avail=265097 (capacity=266240) tx_data_mempool_avail=32768 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=58 tx_rto=17084 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=45 rx_mempool_avail=265194 (capacity=266240) tx_data_mempool_avail=32768 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=58 tx_rto=17084 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=46 rx_mempool_avail=265297 (capacity=266240) tx_data_mempool_avail=32768 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=58 tx_rto=17084 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=50 rx_mempool_avail=265409 (capacity=266240) tx_data_mempool_avail=32768 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=58 tx_rto=17084 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=51 rx_mempool_avail=265458 (capacity=266240) tx_data_mempool_avail=32768 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=58 tx_rto=17084 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=55 rx_mempool_avail=265618 (capacity=266240) tx_data_mempool_avail=32768 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=58 tx_rto=17084 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=61 rx_mempool_avail=265618 (capacity=266240) tx_data_mempool_avail=32768 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=58 tx_rto=17084 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=62 rx_mempool_avail=265618 (capacity=266240) tx_data_mempool_avail=32768 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=58 tx_rto=17084 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=64 rx_mempool_avail=265715 (capacity=266240) tx_data_mempool_avail=32768 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=58 tx_rto=17084 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_maxtp: close_persistent_connections: timed out; force-aborted 17/64 conns after 15s
+POOL post-close bucket(C=64,W=4096): tx_data_avail=32768
+bench-vs-mtcp: running dpdk_net maxtp bucket W=16384B,C=1
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (16384 B)
+POOL pre-open bucket(C=1,W=16384): tx_data_avail=32768
+POOL post-open bucket(C=1,W=16384): tx_data_avail=32768
+dpdk_maxtp POOL bucket(C=1, W=16384) pre-measure: tx_data_avail=32737 tx_hdr_avail=2028 conn_states=[Established]
+bench-vs-mtcp: maxtp sanity invariant check skipped for bucket W=16384B,C=1 (tx_payload_bytes counter is 0 — build with `--features obs-byte-counters` to enable)
+POOL post-close bucket(C=1,W=16384): tx_data_avail=32768
+bench-vs-mtcp: running dpdk_net maxtp bucket W=16384B,C=4
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (16384 B)
+POOL pre-open bucket(C=4,W=16384): tx_data_avail=32768
+POOL post-open bucket(C=4,W=16384): tx_data_avail=32768
+dpdk_maxtp POOL bucket(C=4, W=16384) pre-measure: tx_data_avail=32144 tx_hdr_avail=2024 conn_states=[Established,Established,Established,Established]
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=4 rx_mempool_avail=265727 (capacity=266240) tx_data_mempool_avail=32366 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=59 tx_rto=17119 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+bench-vs-mtcp: maxtp sanity invariant check skipped for bucket W=16384B,C=4 (tx_payload_bytes counter is 0 — build with `--features obs-byte-counters` to enable)
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=4) returned InvalidConnHandle(4); will retry in drain loop
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=3 rx_mempool_avail=265615 (capacity=266240) tx_data_mempool_avail=32576 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=60 tx_rto=17197 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+POOL post-close bucket(C=4,W=16384): tx_data_avail=32753
+bench-vs-mtcp: running dpdk_net maxtp bucket W=16384B,C=16
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (16384 B)
+POOL pre-open bucket(C=16,W=16384): tx_data_avail=32753
+POOL post-open bucket(C=16,W=16384): tx_data_avail=32768
+dpdk_maxtp POOL bucket(C=16, W=16384) pre-measure: tx_data_avail=30757 tx_hdr_avail=2012 conn_states=[Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established]
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=4 rx_mempool_avail=265477 (capacity=266240) tx_data_mempool_avail=30897 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=61 tx_rto=17516 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=10 rx_mempool_avail=265445 (capacity=266240) tx_data_mempool_avail=31084 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=62 tx_rto=17517 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=12 rx_mempool_avail=265474 (capacity=266240) tx_data_mempool_avail=30874 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=63 tx_rto=17530 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=14 rx_mempool_avail=265296 (capacity=266240) tx_data_mempool_avail=31164 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=64 tx_rto=17536 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=9 rx_mempool_avail=265350 (capacity=266240) tx_data_mempool_avail=31367 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=65 tx_rto=17538 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=16 rx_mempool_avail=265360 (capacity=266240) tx_data_mempool_avail=31510 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=66 tx_rto=17541 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=7 rx_mempool_avail=265580 (capacity=266240) tx_data_mempool_avail=31748 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=67 tx_rto=17546 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=8 rx_mempool_avail=265498 (capacity=266240) tx_data_mempool_avail=31642 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=68 tx_rto=17551 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=11 rx_mempool_avail=265475 (capacity=266240) tx_data_mempool_avail=31952 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=69 tx_rto=17561 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+bench-vs-mtcp: maxtp sanity invariant check skipped for bucket W=16384B,C=16 (tx_payload_bytes counter is 0 — build with `--features obs-byte-counters` to enable)
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=4) returned InvalidConnHandle(4); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=7) returned InvalidConnHandle(7); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=8) returned InvalidConnHandle(8); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=9) returned InvalidConnHandle(9); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=10) returned InvalidConnHandle(10); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=11) returned InvalidConnHandle(11); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=12) returned InvalidConnHandle(12); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=14) returned InvalidConnHandle(14); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=16) returned InvalidConnHandle(16); will retry in drain loop
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=6 rx_mempool_avail=265716 (capacity=266240) tx_data_mempool_avail=32434 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=70 tx_rto=17634 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=2 rx_mempool_avail=265745 (capacity=266240) tx_data_mempool_avail=32494 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=71 tx_rto=17648 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=5 rx_mempool_avail=265772 (capacity=266240) tx_data_mempool_avail=32623 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=72 tx_rto=17651 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=3 rx_mempool_avail=265776 (capacity=266240) tx_data_mempool_avail=32765 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=73 tx_rto=17652 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=1 rx_mempool_avail=265746 (capacity=266240) tx_data_mempool_avail=32768 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=73 tx_rto=17652 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_maxtp: close_persistent_connections: timed out; force-aborted 1/16 conns after 15s
+POOL post-close bucket(C=16,W=16384): tx_data_avail=32768
+bench-vs-mtcp: running dpdk_net maxtp bucket W=16384B,C=64
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (16384 B)
+POOL pre-open bucket(C=64,W=16384): tx_data_avail=32768
+POOL post-open bucket(C=64,W=16384): tx_data_avail=32768
+dpdk_maxtp POOL bucket(C=64, W=16384) pre-measure: tx_data_avail=25093 tx_hdr_avail=2046 conn_states=[Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established]
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=4 rx_mempool_avail=264817 (capacity=266240) tx_data_mempool_avail=26135 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=74 tx_rto=19119 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=5 rx_mempool_avail=264834 (capacity=266240) tx_data_mempool_avail=26212 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=75 tx_rto=19135 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=24 rx_mempool_avail=264895 (capacity=266240) tx_data_mempool_avail=26374 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=76 tx_rto=19154 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=8 rx_mempool_avail=264871 (capacity=266240) tx_data_mempool_avail=26569 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=77 tx_rto=19163 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=13 rx_mempool_avail=264872 (capacity=266240) tx_data_mempool_avail=26765 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=78 tx_rto=19170 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=48 rx_mempool_avail=264871 (capacity=266240) tx_data_mempool_avail=26952 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=79 tx_rto=19174 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=47 rx_mempool_avail=264903 (capacity=266240) tx_data_mempool_avail=27157 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=80 tx_rto=19179 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=33 rx_mempool_avail=264940 (capacity=266240) tx_data_mempool_avail=27341 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=81 tx_rto=19181 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=29 rx_mempool_avail=265030 (capacity=266240) tx_data_mempool_avail=27540 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=82 tx_rto=19185 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=35 rx_mempool_avail=265062 (capacity=266240) tx_data_mempool_avail=27730 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=83 tx_rto=19186 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=44 rx_mempool_avail=265100 (capacity=266240) tx_data_mempool_avail=27927 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=84 tx_rto=19189 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=37 rx_mempool_avail=265150 (capacity=266240) tx_data_mempool_avail=27935 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=85 tx_rto=19194 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=39 rx_mempool_avail=265238 (capacity=266240) tx_data_mempool_avail=28124 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=86 tx_rto=19196 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=41 rx_mempool_avail=265238 (capacity=266240) tx_data_mempool_avail=28130 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=87 tx_rto=19197 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=19 rx_mempool_avail=265238 (capacity=266240) tx_data_mempool_avail=28323 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=88 tx_rto=19198 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=36 rx_mempool_avail=265331 (capacity=266240) tx_data_mempool_avail=28520 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=89 tx_rto=19202 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=12 rx_mempool_avail=265331 (capacity=266240) tx_data_mempool_avail=28711 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=90 tx_rto=19203 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=58 rx_mempool_avail=265299 (capacity=266240) tx_data_mempool_avail=28905 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=91 tx_rto=19205 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=62 rx_mempool_avail=265299 (capacity=266240) tx_data_mempool_avail=29099 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=92 tx_rto=19206 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=28 rx_mempool_avail=265100 (capacity=266240) tx_data_mempool_avail=28795 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=93 tx_rto=19220 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=61 rx_mempool_avail=264908 (capacity=266240) tx_data_mempool_avail=29406 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=94 tx_rto=19222 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=11 rx_mempool_avail=264887 (capacity=266240) tx_data_mempool_avail=29347 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=95 tx_rto=19223 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=17 rx_mempool_avail=264455 (capacity=266240) tx_data_mempool_avail=29822 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=96 tx_rto=19275 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=23 rx_mempool_avail=264423 (capacity=266240) tx_data_mempool_avail=29989 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=97 tx_rto=19285 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=21 rx_mempool_avail=264455 (capacity=266240) tx_data_mempool_avail=30172 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=98 tx_rto=19286 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=16 rx_mempool_avail=264550 (capacity=266240) tx_data_mempool_avail=30122 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=99 tx_rto=19288 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=9 rx_mempool_avail=264663 (capacity=266240) tx_data_mempool_avail=30331 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=100 tx_rto=19320 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+bench-vs-mtcp: maxtp sanity invariant check skipped for bucket W=16384B,C=64 (tx_payload_bytes counter is 0 — build with `--features obs-byte-counters` to enable)
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=4) returned InvalidConnHandle(4); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=5) returned InvalidConnHandle(5); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=8) returned InvalidConnHandle(8); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=9) returned InvalidConnHandle(9); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=11) returned InvalidConnHandle(11); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=12) returned InvalidConnHandle(12); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=13) returned InvalidConnHandle(13); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=16) returned InvalidConnHandle(16); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=17) returned InvalidConnHandle(17); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=19) returned InvalidConnHandle(19); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=21) returned InvalidConnHandle(21); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=23) returned InvalidConnHandle(23); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=24) returned InvalidConnHandle(24); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=28) returned InvalidConnHandle(28); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=29) returned InvalidConnHandle(29); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=33) returned InvalidConnHandle(33); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=35) returned InvalidConnHandle(35); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=36) returned InvalidConnHandle(36); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=37) returned InvalidConnHandle(37); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=39) returned InvalidConnHandle(39); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=41) returned InvalidConnHandle(41); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=44) returned InvalidConnHandle(44); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=47) returned InvalidConnHandle(47); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=48) returned InvalidConnHandle(48); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=58) returned InvalidConnHandle(58); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=61) returned InvalidConnHandle(61); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=62) returned InvalidConnHandle(62); will retry in drain loop
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=1 rx_mempool_avail=264614 (capacity=266240) tx_data_mempool_avail=30787 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=101 tx_rto=19345 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=7 rx_mempool_avail=265138 (capacity=266240) tx_data_mempool_avail=31711 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=102 tx_rto=19360 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=22 rx_mempool_avail=265113 (capacity=266240) tx_data_mempool_avail=31738 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=103 tx_rto=19367 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=2 rx_mempool_avail=265131 (capacity=266240) tx_data_mempool_avail=31741 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=104 tx_rto=19368 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=27 rx_mempool_avail=265130 (capacity=266240) tx_data_mempool_avail=31744 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=105 tx_rto=19370 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=15 rx_mempool_avail=265141 (capacity=266240) tx_data_mempool_avail=31747 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=106 tx_rto=19373 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=31 rx_mempool_avail=265091 (capacity=266240) tx_data_mempool_avail=31927 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=107 tx_rto=19381 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=10 rx_mempool_avail=265115 (capacity=266240) tx_data_mempool_avail=31930 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=108 tx_rto=19382 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=32 rx_mempool_avail=265106 (capacity=266240) tx_data_mempool_avail=31960 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=109 tx_rto=19388 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=57 rx_mempool_avail=265206 (capacity=266240) tx_data_mempool_avail=32152 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=110 tx_rto=19394 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=43 rx_mempool_avail=265298 (capacity=266240) tx_data_mempool_avail=32536 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=111 tx_rto=19402 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=45 rx_mempool_avail=265300 (capacity=266240) tx_data_mempool_avail=32686 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=112 tx_rto=19404 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=30 rx_mempool_avail=265303 (capacity=266240) tx_data_mempool_avail=32765 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=113 tx_rto=19409 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=3 rx_mempool_avail=265336 (capacity=266240) tx_data_mempool_avail=32768 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=113 tx_rto=19409 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=6 rx_mempool_avail=265358 (capacity=266240) tx_data_mempool_avail=32768 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=113 tx_rto=19409 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=25 rx_mempool_avail=265406 (capacity=266240) tx_data_mempool_avail=32768 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=113 tx_rto=19409 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=26 rx_mempool_avail=265406 (capacity=266240) tx_data_mempool_avail=32768 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=113 tx_rto=19409 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=34 rx_mempool_avail=265482 (capacity=266240) tx_data_mempool_avail=32768 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=113 tx_rto=19409 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=38 rx_mempool_avail=265482 (capacity=266240) tx_data_mempool_avail=32768 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=113 tx_rto=19409 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=40 rx_mempool_avail=265482 (capacity=266240) tx_data_mempool_avail=32768 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=113 tx_rto=19409 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=42 rx_mempool_avail=265482 (capacity=266240) tx_data_mempool_avail=32768 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=113 tx_rto=19409 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=49 rx_mempool_avail=265482 (capacity=266240) tx_data_mempool_avail=32768 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=113 tx_rto=19409 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=50 rx_mempool_avail=265482 (capacity=266240) tx_data_mempool_avail=32768 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=113 tx_rto=19409 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=51 rx_mempool_avail=265482 (capacity=266240) tx_data_mempool_avail=32768 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=113 tx_rto=19409 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=52 rx_mempool_avail=265501 (capacity=266240) tx_data_mempool_avail=32768 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=113 tx_rto=19409 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=53 rx_mempool_avail=265501 (capacity=266240) tx_data_mempool_avail=32768 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=113 tx_rto=19409 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=54 rx_mempool_avail=265674 (capacity=266240) tx_data_mempool_avail=32768 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=113 tx_rto=19409 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=55 rx_mempool_avail=265674 (capacity=266240) tx_data_mempool_avail=32768 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=113 tx_rto=19409 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=56 rx_mempool_avail=265674 (capacity=266240) tx_data_mempool_avail=32768 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=113 tx_rto=19409 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=64 rx_mempool_avail=265674 (capacity=266240) tx_data_mempool_avail=32768 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=113 tx_rto=19409 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_maxtp: close_persistent_connections: timed out; force-aborted 17/64 conns after 15s
+POOL post-close bucket(C=64,W=16384): tx_data_avail=32768
+bench-vs-mtcp: running dpdk_net maxtp bucket W=65536B,C=1
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (65536 B)
+POOL pre-open bucket(C=1,W=65536): tx_data_avail=32768
+POOL post-open bucket(C=1,W=65536): tx_data_avail=32768
+dpdk_maxtp POOL bucket(C=1, W=65536) pre-measure: tx_data_avail=32630 tx_hdr_avail=2021 conn_states=[Established]
+bench-vs-mtcp: maxtp sanity invariant check skipped for bucket W=65536B,C=1 (tx_payload_bytes counter is 0 — build with `--features obs-byte-counters` to enable)
+POOL post-close bucket(C=1,W=65536): tx_data_avail=32768
+bench-vs-mtcp: running dpdk_net maxtp bucket W=65536B,C=4
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (65536 B)
+POOL pre-open bucket(C=4,W=65536): tx_data_avail=32768
+POOL post-open bucket(C=4,W=65536): tx_data_avail=32768
+dpdk_maxtp POOL bucket(C=4, W=65536) pre-measure: tx_data_avail=32178 tx_hdr_avail=1999 conn_states=[Established,Established,Established,Established]
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=4 rx_mempool_avail=265635 (capacity=266240) tx_data_mempool_avail=32320 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=114 tx_rto=19482 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+bench-vs-mtcp: maxtp sanity invariant check skipped for bucket W=65536B,C=4 (tx_payload_bytes counter is 0 — build with `--features obs-byte-counters` to enable)
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=4) returned InvalidConnHandle(4); will retry in drain loop
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=1 rx_mempool_avail=265697 (capacity=266240) tx_data_mempool_avail=32768 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=114 tx_rto=19482 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_maxtp: close_persistent_connections: timed out; force-aborted 1/4 conns after 15s
+POOL post-close bucket(C=4,W=65536): tx_data_avail=32768
+bench-vs-mtcp: running dpdk_net maxtp bucket W=65536B,C=16
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (65536 B)
+POOL pre-open bucket(C=16,W=65536): tx_data_avail=32768
+POOL post-open bucket(C=16,W=65536): tx_data_avail=32768
+dpdk_maxtp POOL bucket(C=16, W=65536) pre-measure: tx_data_avail=30674 tx_hdr_avail=2027 conn_states=[Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established]
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=13 rx_mempool_avail=265380 (capacity=266240) tx_data_mempool_avail=30672 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=115 tx_rto=19787 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=15 rx_mempool_avail=265500 (capacity=266240) tx_data_mempool_avail=30848 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=116 tx_rto=19791 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=8 rx_mempool_avail=265484 (capacity=266240) tx_data_mempool_avail=31030 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=117 tx_rto=19793 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=16 rx_mempool_avail=265484 (capacity=266240) tx_data_mempool_avail=31214 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=118 tx_rto=19796 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=9 rx_mempool_avail=265548 (capacity=266240) tx_data_mempool_avail=31258 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=119 tx_rto=19797 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=6 rx_mempool_avail=265564 (capacity=266240) tx_data_mempool_avail=31443 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=120 tx_rto=19798 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=5 rx_mempool_avail=265564 (capacity=266240) tx_data_mempool_avail=31573 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=121 tx_rto=19800 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=2 rx_mempool_avail=265596 (capacity=266240) tx_data_mempool_avail=31776 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=122 tx_rto=19801 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=14 rx_mempool_avail=265644 (capacity=266240) tx_data_mempool_avail=31949 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=123 tx_rto=19802 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=7 rx_mempool_avail=265612 (capacity=266240) tx_data_mempool_avail=32120 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=124 tx_rto=19806 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+bench-vs-mtcp: maxtp sanity invariant check skipped for bucket W=65536B,C=16 (tx_payload_bytes counter is 0 — build with `--features obs-byte-counters` to enable)
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=2) returned InvalidConnHandle(2); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=5) returned InvalidConnHandle(5); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=6) returned InvalidConnHandle(6); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=7) returned InvalidConnHandle(7); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=8) returned InvalidConnHandle(8); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=9) returned InvalidConnHandle(9); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=13) returned InvalidConnHandle(13); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=14) returned InvalidConnHandle(14); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=15) returned InvalidConnHandle(15); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=16) returned InvalidConnHandle(16); will retry in drain loop
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=1 rx_mempool_avail=265675 (capacity=266240) tx_data_mempool_avail=32451 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=125 tx_rto=19813 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=4 rx_mempool_avail=265622 (capacity=266240) tx_data_mempool_avail=32588 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=126 tx_rto=19815 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=3 rx_mempool_avail=265772 (capacity=266240) tx_data_mempool_avail=32768 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=126 tx_rto=19815 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=10 rx_mempool_avail=265772 (capacity=266240) tx_data_mempool_avail=32768 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=126 tx_rto=19815 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=12 rx_mempool_avail=265772 (capacity=266240) tx_data_mempool_avail=32768 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=126 tx_rto=19815 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_maxtp: close_persistent_connections: timed out; force-aborted 3/16 conns after 15s
+POOL post-close bucket(C=16,W=65536): tx_data_avail=32768
+bench-vs-mtcp: running dpdk_net maxtp bucket W=65536B,C=64
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (65536 B)
+POOL pre-open bucket(C=64,W=65536): tx_data_avail=32768
+POOL post-open bucket(C=64,W=65536): tx_data_avail=32768
+dpdk_maxtp POOL bucket(C=64, W=65536) pre-measure: tx_data_avail=24179 tx_hdr_avail=2030 conn_states=[Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established]
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=31 rx_mempool_avail=264911 (capacity=266240) tx_data_mempool_avail=24874 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=127 tx_rto=21139 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=62 rx_mempool_avail=265057 (capacity=266240) tx_data_mempool_avail=25043 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=128 tx_rto=21144 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=15 rx_mempool_avail=265003 (capacity=266240) tx_data_mempool_avail=25169 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=129 tx_rto=21162 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=36 rx_mempool_avail=265036 (capacity=266240) tx_data_mempool_avail=25354 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=130 tx_rto=21164 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=14 rx_mempool_avail=265004 (capacity=266240) tx_data_mempool_avail=25511 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=131 tx_rto=21165 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=53 rx_mempool_avail=265004 (capacity=266240) tx_data_mempool_avail=25648 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=132 tx_rto=21166 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=34 rx_mempool_avail=265004 (capacity=266240) tx_data_mempool_avail=25836 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=133 tx_rto=21170 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=21 rx_mempool_avail=265038 (capacity=266240) tx_data_mempool_avail=26017 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=134 tx_rto=21171 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=41 rx_mempool_avail=265029 (capacity=266240) tx_data_mempool_avail=26209 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=135 tx_rto=21176 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=3 rx_mempool_avail=265008 (capacity=266240) tx_data_mempool_avail=26274 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=136 tx_rto=21187 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=29 rx_mempool_avail=264976 (capacity=266240) tx_data_mempool_avail=26424 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=137 tx_rto=21188 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=48 rx_mempool_avail=264979 (capacity=266240) tx_data_mempool_avail=25999 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=138 tx_rto=21189 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=7 rx_mempool_avail=264815 (capacity=266240) tx_data_mempool_avail=26228 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=139 tx_rto=21194 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=35 rx_mempool_avail=264855 (capacity=266240) tx_data_mempool_avail=26366 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=140 tx_rto=21195 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=26 rx_mempool_avail=264962 (capacity=266240) tx_data_mempool_avail=26294 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=141 tx_rto=21219 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=28 rx_mempool_avail=264458 (capacity=266240) tx_data_mempool_avail=27092 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=142 tx_rto=21243 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=49 rx_mempool_avail=264145 (capacity=266240) tx_data_mempool_avail=26994 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=143 tx_rto=21263 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=61 rx_mempool_avail=264020 (capacity=266240) tx_data_mempool_avail=27319 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=144 tx_rto=21278 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=27 rx_mempool_avail=264105 (capacity=266240) tx_data_mempool_avail=27575 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=145 tx_rto=21287 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=60 rx_mempool_avail=264293 (capacity=266240) tx_data_mempool_avail=27851 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=146 tx_rto=21306 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=55 rx_mempool_avail=264115 (capacity=266240) tx_data_mempool_avail=27982 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=147 tx_rto=21323 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=20 rx_mempool_avail=263851 (capacity=266240) tx_data_mempool_avail=28092 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=148 tx_rto=21348 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+bench-vs-mtcp: maxtp sanity invariant check skipped for bucket W=65536B,C=64 (tx_payload_bytes counter is 0 — build with `--features obs-byte-counters` to enable)
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=3) returned InvalidConnHandle(3); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=7) returned InvalidConnHandle(7); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=14) returned InvalidConnHandle(14); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=15) returned InvalidConnHandle(15); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=20) returned InvalidConnHandle(20); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=21) returned InvalidConnHandle(21); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=26) returned InvalidConnHandle(26); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=27) returned InvalidConnHandle(27); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=28) returned InvalidConnHandle(28); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=29) returned InvalidConnHandle(29); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=31) returned InvalidConnHandle(31); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=34) returned InvalidConnHandle(34); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=35) returned InvalidConnHandle(35); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=36) returned InvalidConnHandle(36); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=41) returned InvalidConnHandle(41); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=48) returned InvalidConnHandle(48); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=49) returned InvalidConnHandle(49); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=53) returned InvalidConnHandle(53); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=55) returned InvalidConnHandle(55); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=60) returned InvalidConnHandle(60); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=61) returned InvalidConnHandle(61); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=62) returned InvalidConnHandle(62); will retry in drain loop
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=22 rx_mempool_avail=263901 (capacity=266240) tx_data_mempool_avail=28828 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=149 tx_rto=21594 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=37 rx_mempool_avail=263853 (capacity=266240) tx_data_mempool_avail=28831 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=150 tx_rto=21599 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=12 rx_mempool_avail=263890 (capacity=266240) tx_data_mempool_avail=28834 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=151 tx_rto=21600 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=24 rx_mempool_avail=263886 (capacity=266240) tx_data_mempool_avail=28978 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=152 tx_rto=21606 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=32 rx_mempool_avail=263846 (capacity=266240) tx_data_mempool_avail=29157 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=153 tx_rto=21708 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=52 rx_mempool_avail=263964 (capacity=266240) tx_data_mempool_avail=29337 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=154 tx_rto=21715 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=54 rx_mempool_avail=264074 (capacity=266240) tx_data_mempool_avail=29517 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=155 tx_rto=21716 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=17 rx_mempool_avail=264046 (capacity=266240) tx_data_mempool_avail=29697 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=156 tx_rto=21717 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=25 rx_mempool_avail=264105 (capacity=266240) tx_data_mempool_avail=29877 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=157 tx_rto=21721 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=18 rx_mempool_avail=264183 (capacity=266240) tx_data_mempool_avail=30004 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=158 tx_rto=21728 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=38 rx_mempool_avail=264345 (capacity=266240) tx_data_mempool_avail=30184 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=159 tx_rto=21729 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=30 rx_mempool_avail=264390 (capacity=266240) tx_data_mempool_avail=30364 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=160 tx_rto=21730 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=19 rx_mempool_avail=264512 (capacity=266240) tx_data_mempool_avail=30544 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=161 tx_rto=21731 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=11 rx_mempool_avail=264575 (capacity=266240) tx_data_mempool_avail=30724 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=162 tx_rto=21732 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=51 rx_mempool_avail=264675 (capacity=266240) tx_data_mempool_avail=30845 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=163 tx_rto=21733 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=2 rx_mempool_avail=264632 (capacity=266240) tx_data_mempool_avail=31025 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=164 tx_rto=21734 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=58 rx_mempool_avail=264747 (capacity=266240) tx_data_mempool_avail=31205 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=165 tx_rto=21735 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=59 rx_mempool_avail=264736 (capacity=266240) tx_data_mempool_avail=31385 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=166 tx_rto=21736 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=13 rx_mempool_avail=264885 (capacity=266240) tx_data_mempool_avail=31565 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=167 tx_rto=21740 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=16 rx_mempool_avail=264872 (capacity=266240) tx_data_mempool_avail=31745 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=168 tx_rto=21775 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=50 rx_mempool_avail=264876 (capacity=266240) tx_data_mempool_avail=31748 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=169 tx_rto=21776 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=10 rx_mempool_avail=264958 (capacity=266240) tx_data_mempool_avail=31751 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=170 tx_rto=21781 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=39 rx_mempool_avail=264930 (capacity=266240) tx_data_mempool_avail=31931 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=171 tx_rto=21783 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=1 rx_mempool_avail=265029 (capacity=266240) tx_data_mempool_avail=32055 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=172 tx_rto=21785 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=46 rx_mempool_avail=265179 (capacity=266240) tx_data_mempool_avail=32084 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=173 tx_rto=21794 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=5 rx_mempool_avail=265127 (capacity=266240) tx_data_mempool_avail=32228 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=173 tx_rto=21796 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=6 rx_mempool_avail=265150 (capacity=266240) tx_data_mempool_avail=32228 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=173 tx_rto=21796 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=8 rx_mempool_avail=265153 (capacity=266240) tx_data_mempool_avail=32228 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=173 tx_rto=21796 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=9 rx_mempool_avail=265153 (capacity=266240) tx_data_mempool_avail=32228 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=173 tx_rto=21796 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=23 rx_mempool_avail=265153 (capacity=266240) tx_data_mempool_avail=32228 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=173 tx_rto=21796 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=33 rx_mempool_avail=265153 (capacity=266240) tx_data_mempool_avail=32228 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=173 tx_rto=21796 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=40 rx_mempool_avail=265277 (capacity=266240) tx_data_mempool_avail=32228 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=173 tx_rto=21796 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=42 rx_mempool_avail=265277 (capacity=266240) tx_data_mempool_avail=32228 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=173 tx_rto=21796 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=43 rx_mempool_avail=265403 (capacity=266240) tx_data_mempool_avail=32228 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=173 tx_rto=21796 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=44 rx_mempool_avail=265527 (capacity=266240) tx_data_mempool_avail=32228 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=173 tx_rto=21796 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=45 rx_mempool_avail=265527 (capacity=266240) tx_data_mempool_avail=32228 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=173 tx_rto=21796 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=47 rx_mempool_avail=265527 (capacity=266240) tx_data_mempool_avail=32228 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=173 tx_rto=21796 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=56 rx_mempool_avail=265647 (capacity=266240) tx_data_mempool_avail=32408 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=173 tx_rto=21796 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=57 rx_mempool_avail=265647 (capacity=266240) tx_data_mempool_avail=32408 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=173 tx_rto=21796 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=64 rx_mempool_avail=265738 (capacity=266240) tx_data_mempool_avail=32588 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=173 tx_rto=21796 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_maxtp: close_persistent_connections: timed out; force-aborted 15/64 conns after 15s
+POOL post-close bucket(C=64,W=65536): tx_data_avail=32768
+bench-vs-mtcp: running dpdk_net maxtp bucket W=262144B,C=1
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (262144 B)
+POOL pre-open bucket(C=1,W=262144): tx_data_avail=32768
+POOL post-open bucket(C=1,W=262144): tx_data_avail=32768
+dpdk_maxtp POOL bucket(C=1, W=262144) pre-measure: tx_data_avail=32588 tx_hdr_avail=2021 conn_states=[Established]
+bench-vs-mtcp: maxtp sanity invariant check skipped for bucket W=262144B,C=1 (tx_payload_bytes counter is 0 — build with `--features obs-byte-counters` to enable)
+POOL post-close bucket(C=1,W=262144): tx_data_avail=32768
+bench-vs-mtcp: running dpdk_net maxtp bucket W=262144B,C=4
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (262144 B)
+POOL pre-open bucket(C=4,W=262144): tx_data_avail=32768
+POOL post-open bucket(C=4,W=262144): tx_data_avail=32768
+dpdk_maxtp POOL bucket(C=4, W=262144) pre-measure: tx_data_avail=32190 tx_hdr_avail=2021 conn_states=[Established,Established,Established,Established]
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=4 rx_mempool_avail=265622 (capacity=266240) tx_data_mempool_avail=32071 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=174 tx_rto=21859 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=3 rx_mempool_avail=265682 (capacity=266240) tx_data_mempool_avail=32228 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=175 tx_rto=21867 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+bench-vs-mtcp: maxtp sanity invariant check skipped for bucket W=262144B,C=4 (tx_payload_bytes counter is 0 — build with `--features obs-byte-counters` to enable)
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=3) returned InvalidConnHandle(3); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=4) returned InvalidConnHandle(4); will retry in drain loop
+POOL post-close bucket(C=4,W=262144): tx_data_avail=32768
+bench-vs-mtcp: running dpdk_net maxtp bucket W=262144B,C=16
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (262144 B)
+POOL pre-open bucket(C=16,W=262144): tx_data_avail=32768
+POOL post-open bucket(C=16,W=262144): tx_data_avail=32768
+dpdk_maxtp POOL bucket(C=16, W=262144) pre-measure: tx_data_avail=30592 tx_hdr_avail=2048 conn_states=[Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established]
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=12 rx_mempool_avail=265006 (capacity=266240) tx_data_mempool_avail=30484 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=176 tx_rto=22227 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=6 rx_mempool_avail=264993 (capacity=266240) tx_data_mempool_avail=30490 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=177 tx_rto=22233 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=11 rx_mempool_avail=264960 (capacity=266240) tx_data_mempool_avail=30680 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=178 tx_rto=22250 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=13 rx_mempool_avail=265129 (capacity=266240) tx_data_mempool_avail=30915 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=179 tx_rto=22254 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=9 rx_mempool_avail=265234 (capacity=266240) tx_data_mempool_avail=31022 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=180 tx_rto=22256 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=16 rx_mempool_avail=265240 (capacity=266240) tx_data_mempool_avail=31123 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=181 tx_rto=22280 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=10 rx_mempool_avail=265497 (capacity=266240) tx_data_mempool_avail=31303 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=182 tx_rto=22288 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+bench-vs-mtcp: maxtp sanity invariant check skipped for bucket W=262144B,C=16 (tx_payload_bytes counter is 0 — build with `--features obs-byte-counters` to enable)
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=6) returned InvalidConnHandle(6); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=9) returned InvalidConnHandle(9); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=10) returned InvalidConnHandle(10); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=11) returned InvalidConnHandle(11); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=12) returned InvalidConnHandle(12); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=13) returned InvalidConnHandle(13); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=16) returned InvalidConnHandle(16); will retry in drain loop
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=7 rx_mempool_avail=265478 (capacity=266240) tx_data_mempool_avail=31483 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=183 tx_rto=22300 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=5 rx_mempool_avail=265487 (capacity=266240) tx_data_mempool_avail=31591 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=184 tx_rto=22325 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=8 rx_mempool_avail=265490 (capacity=266240) tx_data_mempool_avail=31771 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=185 tx_rto=22332 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=4 rx_mempool_avail=265611 (capacity=266240) tx_data_mempool_avail=31951 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=186 tx_rto=22335 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=1 rx_mempool_avail=265554 (capacity=266240) tx_data_mempool_avail=32132 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=187 tx_rto=22336 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=3 rx_mempool_avail=265579 (capacity=266240) tx_data_mempool_avail=32287 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=188 tx_rto=22338 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=2 rx_mempool_avail=265625 (capacity=266240) tx_data_mempool_avail=32467 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=189 tx_rto=22342 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=15 rx_mempool_avail=265790 (capacity=266240) tx_data_mempool_avail=32641 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=190 tx_rto=22344 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=14 rx_mempool_avail=265759 (capacity=266240) tx_data_mempool_avail=32768 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=190 tx_rto=22344 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_maxtp: close_persistent_connections: timed out; force-aborted 1/16 conns after 15s
+POOL post-close bucket(C=16,W=262144): tx_data_avail=32768
+bench-vs-mtcp: running dpdk_net maxtp bucket W=262144B,C=64
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (262144 B)
+POOL pre-open bucket(C=64,W=262144): tx_data_avail=32768
+POOL post-open bucket(C=64,W=262144): tx_data_avail=32768
+dpdk_maxtp POOL bucket(C=64, W=262144) pre-measure: tx_data_avail=25489 tx_hdr_avail=2048 conn_states=[Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established,Established]
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=18 rx_mempool_avail=264996 (capacity=266240) tx_data_mempool_avail=25849 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=191 tx_rto=23744 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=21 rx_mempool_avail=265087 (capacity=266240) tx_data_mempool_avail=26041 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=192 tx_rto=23750 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=36 rx_mempool_avail=265145 (capacity=266240) tx_data_mempool_avail=26217 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=193 tx_rto=23755 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=52 rx_mempool_avail=265117 (capacity=266240) tx_data_mempool_avail=26481 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=194 tx_rto=23761 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=23 rx_mempool_avail=265149 (capacity=266240) tx_data_mempool_avail=26622 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=195 tx_rto=23764 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=33 rx_mempool_avail=265144 (capacity=266240) tx_data_mempool_avail=26799 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=196 tx_rto=23767 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=24 rx_mempool_avail=265155 (capacity=266240) tx_data_mempool_avail=26990 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=197 tx_rto=23772 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=49 rx_mempool_avail=265245 (capacity=266240) tx_data_mempool_avail=27158 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=198 tx_rto=23774 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=22 rx_mempool_avail=265354 (capacity=266240) tx_data_mempool_avail=27361 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=199 tx_rto=23788 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=30 rx_mempool_avail=265333 (capacity=266240) tx_data_mempool_avail=27581 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=200 tx_rto=23791 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=64 rx_mempool_avail=265364 (capacity=266240) tx_data_mempool_avail=27769 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=201 tx_rto=23799 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=9 rx_mempool_avail=265395 (capacity=266240) tx_data_mempool_avail=27826 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=202 tx_rto=23804 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=45 rx_mempool_avail=265415 (capacity=266240) tx_data_mempool_avail=27922 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=203 tx_rto=23815 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=44 rx_mempool_avail=265294 (capacity=266240) tx_data_mempool_avail=28061 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=204 tx_rto=23821 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=57 rx_mempool_avail=264641 (capacity=266240) tx_data_mempool_avail=28341 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=205 tx_rto=23867 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=25 rx_mempool_avail=263659 (capacity=266240) tx_data_mempool_avail=28670 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=206 tx_rto=23922 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+bench-vs-mtcp: maxtp sanity invariant check skipped for bucket W=262144B,C=64 (tx_payload_bytes counter is 0 — build with `--features obs-byte-counters` to enable)
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=9) returned InvalidConnHandle(9); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=18) returned InvalidConnHandle(18); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=21) returned InvalidConnHandle(21); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=22) returned InvalidConnHandle(22); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=23) returned InvalidConnHandle(23); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=24) returned InvalidConnHandle(24); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=25) returned InvalidConnHandle(25); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=30) returned InvalidConnHandle(30); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=33) returned InvalidConnHandle(33); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=36) returned InvalidConnHandle(36); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=44) returned InvalidConnHandle(44); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=45) returned InvalidConnHandle(45); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=49) returned InvalidConnHandle(49); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=52) returned InvalidConnHandle(52); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=57) returned InvalidConnHandle(57); will retry in drain loop
+dpdk_maxtp: close_persistent_connections: close_conn_with_flags(handle=64) returned InvalidConnHandle(64); will retry in drain loop
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=32 rx_mempool_avail=263673 (capacity=266240) tx_data_mempool_avail=29407 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=207 tx_rto=24081 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=8 rx_mempool_avail=263646 (capacity=266240) tx_data_mempool_avail=29522 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=208 tx_rto=24086 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=42 rx_mempool_avail=263638 (capacity=266240) tx_data_mempool_avail=29702 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=209 tx_rto=24102 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=60 rx_mempool_avail=263657 (capacity=266240) tx_data_mempool_avail=29705 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=210 tx_rto=24105 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=56 rx_mempool_avail=263642 (capacity=266240) tx_data_mempool_avail=29708 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=211 tx_rto=24108 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=59 rx_mempool_avail=263644 (capacity=266240) tx_data_mempool_avail=29888 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=212 tx_rto=24109 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=63 rx_mempool_avail=263649 (capacity=266240) tx_data_mempool_avail=29891 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=213 tx_rto=24110 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=34 rx_mempool_avail=263642 (capacity=266240) tx_data_mempool_avail=29894 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=214 tx_rto=24115 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=6 rx_mempool_avail=263825 (capacity=266240) tx_data_mempool_avail=30215 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=215 tx_rto=24194 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=15 rx_mempool_avail=263937 (capacity=266240) tx_data_mempool_avail=30395 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=216 tx_rto=24204 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=10 rx_mempool_avail=264057 (capacity=266240) tx_data_mempool_avail=30489 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=217 tx_rto=24205 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=48 rx_mempool_avail=264059 (capacity=266240) tx_data_mempool_avail=30492 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=218 tx_rto=24206 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=16 rx_mempool_avail=264166 (capacity=266240) tx_data_mempool_avail=30672 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=219 tx_rto=24207 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=3 rx_mempool_avail=264364 (capacity=266240) tx_data_mempool_avail=30852 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=220 tx_rto=24208 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=54 rx_mempool_avail=264453 (capacity=266240) tx_data_mempool_avail=31032 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=221 tx_rto=24209 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=20 rx_mempool_avail=264573 (capacity=266240) tx_data_mempool_avail=31212 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=222 tx_rto=24211 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=1 rx_mempool_avail=264662 (capacity=266240) tx_data_mempool_avail=31392 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=223 tx_rto=24213 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=28 rx_mempool_avail=264749 (capacity=266240) tx_data_mempool_avail=31572 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=224 tx_rto=24215 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=7 rx_mempool_avail=264774 (capacity=266240) tx_data_mempool_avail=31670 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=225 tx_rto=24216 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=17 rx_mempool_avail=264899 (capacity=266240) tx_data_mempool_avail=31850 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=226 tx_rto=24217 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=13 rx_mempool_avail=265003 (capacity=266240) tx_data_mempool_avail=32030 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=227 tx_rto=24225 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=61 rx_mempool_avail=264992 (capacity=266240) tx_data_mempool_avail=32210 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=228 tx_rto=24241 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=46 rx_mempool_avail=265106 (capacity=266240) tx_data_mempool_avail=32213 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=229 tx_rto=24243 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=2 rx_mempool_avail=265193 (capacity=266240) tx_data_mempool_avail=32230 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=229 tx_rto=24249 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=4 rx_mempool_avail=265311 (capacity=266240) tx_data_mempool_avail=32410 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=229 tx_rto=24249 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=11 rx_mempool_avail=265311 (capacity=266240) tx_data_mempool_avail=32410 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=229 tx_rto=24249 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=14 rx_mempool_avail=265443 (capacity=266240) tx_data_mempool_avail=32590 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=229 tx_rto=24249 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=19 rx_mempool_avail=265575 (capacity=266240) tx_data_mempool_avail=32590 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=229 tx_rto=24249 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=26 rx_mempool_avail=265575 (capacity=266240) tx_data_mempool_avail=32590 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=229 tx_rto=24249 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=27 rx_mempool_avail=265575 (capacity=266240) tx_data_mempool_avail=32590 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=229 tx_rto=24249 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=29 rx_mempool_avail=265575 (capacity=266240) tx_data_mempool_avail=32590 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=229 tx_rto=24249 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=31 rx_mempool_avail=265575 (capacity=266240) tx_data_mempool_avail=32590 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=229 tx_rto=24249 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=35 rx_mempool_avail=265575 (capacity=266240) tx_data_mempool_avail=32590 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=229 tx_rto=24249 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=37 rx_mempool_avail=265692 (capacity=266240) tx_data_mempool_avail=32590 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=229 tx_rto=24249 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=38 rx_mempool_avail=265692 (capacity=266240) tx_data_mempool_avail=32590 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=229 tx_rto=24249 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=39 rx_mempool_avail=265692 (capacity=266240) tx_data_mempool_avail=32590 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=229 tx_rto=24249 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=40 rx_mempool_avail=265692 (capacity=266240) tx_data_mempool_avail=32590 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=229 tx_rto=24249 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=41 rx_mempool_avail=265696 (capacity=266240) tx_data_mempool_avail=32590 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=229 tx_rto=24249 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=43 rx_mempool_avail=265696 (capacity=266240) tx_data_mempool_avail=32590 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=229 tx_rto=24249 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=47 rx_mempool_avail=265696 (capacity=266240) tx_data_mempool_avail=32590 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=229 tx_rto=24249 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=50 rx_mempool_avail=265696 (capacity=266240) tx_data_mempool_avail=32590 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=229 tx_rto=24249 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=51 rx_mempool_avail=265703 (capacity=266240) tx_data_mempool_avail=32768 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=229 tx_rto=24249 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=53 rx_mempool_avail=265703 (capacity=266240) tx_data_mempool_avail=32768 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=229 tx_rto=24249 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=55 rx_mempool_avail=265774 (capacity=266240) tx_data_mempool_avail=32768 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=229 tx_rto=24249 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_net: force_close_etimedout DIAGNOSTIC handle=62 rx_mempool_avail=265774 (capacity=266240) tx_data_mempool_avail=32768 (capacity=32768) mbuf_refcnt_drop_unexpected=0 conn_timeout_retrans=229 tx_rto=24249 tx_drop_nomem=15748467 recv_buf_drops=0 rx_partial_read_splits=0
+dpdk_maxtp: close_persistent_connections: timed out; force-aborted 22/64 conns after 15s
+POOL post-close bucket(C=64,W=262144): tx_data_avail=32768
+bench-vs-mtcp: running linux maxtp bucket W=64B,C=1
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (64 B)
+bench-vs-mtcp: running linux maxtp bucket W=64B,C=4
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (64 B)
+bench-vs-mtcp: running linux maxtp bucket W=64B,C=16
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (64 B)
+bench-vs-mtcp: running linux maxtp bucket W=64B,C=64
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (64 B)
+bench-vs-mtcp: running linux maxtp bucket W=256B,C=1
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (256 B)
+bench-vs-mtcp: running linux maxtp bucket W=256B,C=4
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (256 B)
+bench-vs-mtcp: running linux maxtp bucket W=256B,C=16
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (256 B)
+bench-vs-mtcp: running linux maxtp bucket W=256B,C=64
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (256 B)
+bench-vs-mtcp: running linux maxtp bucket W=1024B,C=1
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (1024 B)
+bench-vs-mtcp: running linux maxtp bucket W=1024B,C=4
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (1024 B)
+bench-vs-mtcp: running linux maxtp bucket W=1024B,C=16
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (1024 B)
+bench-vs-mtcp: running linux maxtp bucket W=1024B,C=64
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (1024 B)
+bench-vs-mtcp: running linux maxtp bucket W=4096B,C=1
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (4096 B)
+bench-vs-mtcp: running linux maxtp bucket W=4096B,C=4
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (4096 B)
+bench-vs-mtcp: running linux maxtp bucket W=4096B,C=16
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (4096 B)
+bench-vs-mtcp: running linux maxtp bucket W=4096B,C=64
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (4096 B)
+bench-vs-mtcp: running linux maxtp bucket W=16384B,C=1
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (16384 B)
+bench-vs-mtcp: running linux maxtp bucket W=16384B,C=4
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (16384 B)
+bench-vs-mtcp: running linux maxtp bucket W=16384B,C=16
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (16384 B)
+bench-vs-mtcp: running linux maxtp bucket W=16384B,C=64
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (16384 B)
+bench-vs-mtcp: running linux maxtp bucket W=65536B,C=1
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (65536 B)
+bench-vs-mtcp: running linux maxtp bucket W=65536B,C=4
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (65536 B)
+bench-vs-mtcp: running linux maxtp bucket W=65536B,C=16
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (65536 B)
+bench-vs-mtcp: running linux maxtp bucket W=65536B,C=64
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (65536 B)
+bench-vs-mtcp: running linux maxtp bucket W=262144B,C=1
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (262144 B)
+bench-vs-mtcp: running linux maxtp bucket W=262144B,C=4
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (262144 B)
+bench-vs-mtcp: running linux maxtp bucket W=262144B,C=16
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (262144 B)
+bench-vs-mtcp: running linux maxtp bucket W=262144B,C=64
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (262144 B)
+ena_rx_queue_release(): Rx queue 0:0 released
+ena_tx_queue_release(): Tx queue 0:0 released

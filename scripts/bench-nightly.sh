@@ -9,10 +9,10 @@
 #      Build precedes provisioning so a local build failure costs $0.
 #   5. SCP compiled bench binaries + preconditions checker + peer binaries
 #      to DUT and peer hosts (under /tmp).
-#   6. Start peer echo-server (bench-e2e/bench-stress/bench-vs-mtcp) +
-#      linux-tcp-sink (bench-vs-linux) on the peer host.
-#   7. Run on DUT: bench-e2e, bench-stress, bench-vs-linux (mode A+B),
-#      bench-offload-ab, bench-obs-overhead, bench-vs-mtcp (burst+maxtp).
+#   6. Start peer echo-server (bench-tx-burst / bench-tx-maxtp / bench-rtt) +
+#      linux-tcp-sink (bench-vs-linux + bench-tx-maxtp linux arm) on the peer.
+#   7. Run on DUT: bench-rtt, bench-vs-linux (mode B), bench-offload-ab,
+#      bench-obs-overhead, bench-tx-burst (burst grid), bench-tx-maxtp (maxtp grid).
 #   8. Run locally: cargo bench -p bench-micro + summarize.
 #   9. Pull CSVs back to target/bench-results/<timestamp>/.
 #  10. Invoke bench-report → JSON + HTML + Markdown.
@@ -27,8 +27,9 @@
 #   OUT_DIR        (optional) output dir; default target/bench-results/<ts>/
 #   MY_CIDR        (optional) operator /32 for SSH allow-list; default
 #                  auto-discovered via ifconfig.me
-#   NIC_MAX_BPS    (optional) peer NIC line rate for bench-vs-mtcp
-#                  saturation guard; default 100 Gbps (c6in.metal ENA)
+#   NIC_MAX_BPS    (optional) peer NIC line rate for bench-tx-burst /
+#                  bench-tx-maxtp saturation guard; default 100 Gbps
+#                  (c6in.metal ENA)
 #   SKIP_TEARDOWN  (optional) set to 1 to skip the trap EXIT teardown;
 #                  useful for debugging failed runs
 #
@@ -101,14 +102,35 @@ fi
 # ---------------------------------------------------------------------------
 log "[2/12] building peer C binaries"
 make -C tools/bench-e2e/peer echo-server
+make -C tools/bench-e2e/peer burst-echo-server
 make -C tools/bench-vs-linux/peer linux-tcp-sink
 
 # ---------------------------------------------------------------------------
 # [3/12] cargo build --release --workspace.
 # Built BEFORE provisioning so a local build failure costs $0 AWS spend.
+# If libfstack.a is available at the F-Stack install path (FF_PATH or
+# /opt/f-stack), rebuild bench-tx-burst, bench-tx-maxtp and bench-rtt
+# with --features fstack so the F-Stack bench arms produce real data
+# instead of invalid-marker rows.
+# Requires linker=gcc (GCC ld) because rust-lld (Rust 1.95+) does not
+# auto-generate __start/__stop ELF section-set symbols that F-Stack's
+# FreeBSD-derived module system relies on.
 # ---------------------------------------------------------------------------
 log "[3/12] cargo build --release --workspace"
 cargo build --release --workspace
+FF_LIB="${FF_PATH:-/opt/f-stack}/lib/libfstack.a"
+if [ -f "$FF_LIB" ]; then
+  log "  libfstack.a found at $FF_LIB — rebuilding bench-tx-burst + bench-tx-maxtp + bench-rtt + bench-rx-burst with --features fstack"
+  RUSTFLAGS="${RUSTFLAGS:-} -C linker=gcc" \
+    cargo build --release \
+      -p bench-tx-burst --features bench-tx-burst/fstack \
+      -p bench-tx-maxtp --features bench-tx-maxtp/fstack \
+      -p bench-rtt --features bench-rtt/fstack \
+      -p bench-rx-burst --features bench-rx-burst/fstack \
+    || log "  WARN fstack build failed; fstack arms will emit invalid-marker rows"
+else
+  log "  $FF_LIB not present — fstack arms will emit invalid-marker rows"
+fi
 
 # ---------------------------------------------------------------------------
 # [4/12] Provision bench-pair fleet via resd-aws-infra.
@@ -289,10 +311,11 @@ wait_for_ssh "$PEER_SSH" "$PEER_INSTANCE_ID"
 # `--in-memory` keeps DPDK metadata out of /var/run/dpdk/rte/, and
 # `--huge-unlink` removes /dev/hugepages/rtemap_* backing files at mmap
 # time so they don't survive a half-completed rte_eal_cleanup. Without
-# these flags, residual hugepage state from a prior bench-ab-runner
+# these flags, residual hugepage state from a prior bench-rtt
 # leaks into the next process and rte_eal_cleanup walks a corrupted
 # memzone (observed: bench-obs-overhead obs-none SIGSEGV in run
-# bl16x36lb). Same flags as tests/ffi-test/tests/ffi_smoke.rs:48 uses
+# bl16x36lb against the predecessor bench-ab-runner binary).
+# Same flags as tests/ffi-test/tests/ffi_smoke.rs:48 uses
 # for the same reason.
 EAL_ARGS="${EAL_ARGS:--l 2-3 -n 4 --in-memory --huge-unlink -a 0000:00:06.0,large_llq_hdr=1,miss_txc_to=3}"
 
@@ -302,23 +325,24 @@ EAL_ARGS="${EAL_ARGS:--l 2-3 -n 4 --in-memory --huge-unlink -a 0000:00:06.0,larg
 log "[5/12] deploying binaries to DUT + peer"
 
 DUT_BINS=(
-  target/release/bench-e2e
-  target/release/bench-stress
+  target/release/bench-rtt
   target/release/bench-vs-linux
   target/release/bench-offload-ab
   target/release/bench-obs-overhead
-  target/release/bench-vs-mtcp
-  target/release/bench-ab-runner
+  target/release/bench-tx-burst
+  target/release/bench-tx-maxtp
+  target/release/bench-rx-burst
 )
 PEER_BINS=(
   tools/bench-e2e/peer/echo-server
+  tools/bench-e2e/peer/burst-echo-server
   tools/bench-vs-linux/peer/linux-tcp-sink
 )
 # F-Stack peer is built on the AMI itself (against the AMI's libfstack.a +
 # DPDK 23.11 — see image-builder component 04b-install-f-stack.yaml). We
 # don't ship it via scp; the binary lives at /opt/f-stack-peer/bench-peer
 # on the peer host pre-installed by the AMI bake.
-SHARED_SCRIPTS=(scripts/check-bench-preconditions.sh scripts/bench-ab-runner-gdb.sh)
+SHARED_SCRIPTS=(scripts/check-bench-preconditions.sh scripts/bench-rtt-gdb.sh scripts/peer-ifb-setup.sh)
 
 for bin in "${DUT_BINS[@]}" "${PEER_BINS[@]}" "${SHARED_SCRIPTS[@]}"; do
   if [ ! -f "$bin" ]; then
@@ -359,7 +383,7 @@ retry_remote "scp DUT-bins" "$DUT_INSTANCE_ID" \
 # so bench-offload-ab / bench-obs-overhead can exec it as --runner-bin.
 retry_remote "chmod-DUT" "$DUT_INSTANCE_ID" \
   ssh "${SSH_OPTS[@]}" "ubuntu@$DUT_SSH" \
-    "chmod +x /tmp/bench-ab-runner-gdb.sh /tmp/check-bench-preconditions.sh"
+    "chmod +x /tmp/bench-rtt-gdb.sh /tmp/check-bench-preconditions.sh /tmp/peer-ifb-setup.sh"
 
 refresh_ec2_ic_grants
 log "  -> peer ($PEER_SSH)"
@@ -369,7 +393,7 @@ retry_remote "scp peer-bins" "$PEER_INSTANCE_ID" \
     "ubuntu@${PEER_SSH}:/tmp/"
 retry_remote "chmod-peer" "$PEER_INSTANCE_ID" \
   ssh "${SSH_OPTS[@]}" "ubuntu@$PEER_SSH" \
-    "chmod +x /tmp/check-bench-preconditions.sh"
+    "chmod +x /tmp/check-bench-preconditions.sh /tmp/peer-ifb-setup.sh"
 
 # ---------------------------------------------------------------------------
 # [6/12] Start peer services (echo-server for bench-e2e/stress/vs-mtcp;
@@ -423,24 +447,67 @@ ssh "${SSH_OPTS[@]}" "ubuntu@$PEER_SSH" \
 refresh_ec2_ic_grants
 ssh "${SSH_OPTS[@]}" "ubuntu@$PEER_SSH" \
     "nohup /tmp/linux-tcp-sink 10002 >/tmp/linux-tcp-sink.log 2>&1 </dev/null &"
-
-# F-Stack peer (port 10003) — pre-installed on the AMI at
-# /opt/f-stack-peer/bench-peer (image-builder component
-# 04b-install-f-stack.yaml). Requires F-Stack's config file at
-# /etc/f-stack.conf. Soft-fail if the binary doesn't exist on the
-# peer (e.g. running against a pre-04b AMI bake) so the rest of the
-# pipeline (echo-server + linux-tcp-sink stacks) still proceeds.
+# Phase 8 of the 2026-05-09 bench-suite overhaul: burst-echo-server is
+# the peer for bench-rx-burst. Listens on port 10003; bench-rx-burst
+# sends `BURST N W\n` commands and the server ships N segments of W
+# bytes back-to-back with 16-byte headers (be64 seq_idx + be64
+# peer_send_ns).
 refresh_ec2_ic_grants
 ssh "${SSH_OPTS[@]}" "ubuntu@$PEER_SSH" \
-    "if [ -x /opt/f-stack-peer/bench-peer ]; then \
-       nohup sudo /opt/f-stack-peer/bench-peer 10003 \
-         --conf=/etc/f-stack.conf --proc-id=0 \
-         >/tmp/fstack-peer.log 2>&1 </dev/null & \
-       echo 'fstack-peer started on port 10003'; \
-     else \
-       echo 'fstack-peer binary not present (pre-04b AMI?); fstack stack will emit empty CSV rows'; \
-     fi" \
-    || log "  WARN starting fstack peer failed; fstack stack may produce no data"
+    "nohup /tmp/burst-echo-server 10003 >/tmp/burst-echo-server.log 2>&1 </dev/null &"
+
+# F-Stack uses the same dpdk echo-server on port 10001 (fstack sends
+# standard TCP; the peer DPDK echo-server echoes it back transparently).
+# No separate fstack-peer process needed.
+
+# Create /etc/f-stack.conf on DUT for the fstack bench pass.
+# F-Stack and dpdk_net cannot share an EAL process, so bench-tx-burst /
+# bench-tx-maxtp run them as separate invocations; the fstack pass needs
+# its own config with the DUT's data-plane IP.
+refresh_ec2_ic_grants
+ssh "${SSH_OPTS[@]}" "ubuntu@$DUT_SSH" \
+    "sudo tee /etc/f-stack.conf > /dev/null <<'FSTACK_CONF'
+[dpdk]
+lcore_mask=1
+channel=4
+promiscuous=1
+numa_on=1
+tx_csum_offoad_skip=0
+tso=0
+vlan_strip=1
+port_list=0
+nb_vdev=0
+nb_bond=0
+
+[port0]
+addr=${DUT_IP}
+netmask=255.255.255.0
+broadcast=$(awk -F. '{printf "%s.%s.%s.255",$1,$2,$3}' <<<"$DUT_IP")
+gateway=${GATEWAY_IP}
+
+[freebsd.boot]
+hz=100
+fd_reserve=1024
+kern.ipc.maxsockets=262144
+net.inet.tcp.syncache.hashsize=4096
+net.inet.tcp.syncache.bucketlimit=100
+net.inet.tcp.tcbhashsize=65536
+kern.ncallout=262144
+kern.features.inet6=1
+
+[freebsd.sysctl]
+kern.ipc.somaxconn=32768
+kern.ipc.maxsockbuf=16777216
+net.inet.tcp.sendspace=16384
+net.inet.tcp.recvspace=8192
+net.inet.tcp.cc.algorithm=cubic
+net.inet.tcp.sendbuf_max=16777216
+net.inet.tcp.recvbuf_max=16777216
+net.inet.tcp.sendbuf_auto=1
+net.inet.tcp.recvbuf_auto=1
+FSTACK_CONF
+echo 'DUT f-stack.conf created'" \
+    || log "  WARN DUT f-stack.conf creation failed; fstack bench pass may fail"
 
 # Give the peer services a moment to bind listen sockets.
 sleep 1
@@ -455,6 +522,29 @@ run_dut_bench() {
   local csv_name="$2"
   shift 2
   local cmd="sudo /tmp/$bench"
+  # Scan the caller-provided args for any sidecar CSV paths whose
+  # files we should pull back alongside the primary --output-csv.
+  # Today bench-rtt's --attribution-csv (T51 deferred-work item 4) and
+  # --raw-samples-csv are the two sidecars; widening this list to any
+  # `--*-csv path` arg keeps the helper future-proof. Paths must start
+  # with "/tmp/" (DUT-local) to qualify; absolute non-/tmp paths and
+  # relative paths are skipped — the bench wouldn't write them where
+  # we'd know how to pull them back from.
+  local sidecars=()
+  local i=1
+  while [ $i -le $# ]; do
+    local cur="${!i}"
+    if [[ "$cur" == --*-csv ]]; then
+      local nxt_idx=$((i + 1))
+      if [ $nxt_idx -le $# ]; then
+        local nxt="${!nxt_idx}"
+        if [[ "$nxt" == /tmp/* ]]; then
+          sidecars+=("$nxt")
+        fi
+      fi
+    fi
+    i=$((i + 1))
+  done
   local arg
   for arg in "$@"; do
     cmd+=" $(printf '%q' "$arg")"
@@ -484,23 +574,40 @@ run_dut_bench() {
   refresh_ec2_ic_grants
   scp "${SCP_OPTS[@]}" "ubuntu@$DUT_SSH:/tmp/${csv_name}.csv" "$OUT_DIR/" \
     || log "  scp ${csv_name}.csv failed (bench may have exited before write)"
+  # Pull any sidecar CSVs the bench was asked to emit (raw-samples,
+  # attribution). Same forgiving semantics: a partial sidecar after a
+  # bench failure is still forensically valuable.
+  local sidecar
+  for sidecar in "${sidecars[@]}"; do
+    scp "${SCP_OPTS[@]}" "ubuntu@$DUT_SSH:${sidecar}" "$OUT_DIR/" \
+      || log "  scp $(basename "$sidecar") failed (bench may have skipped sidecar)"
+  done
   return $rc
 }
 
-# Common args shared across bench-e2e / bench-stress / bench-vs-linux /
-# bench-vs-mtcp (DPDK stacks). bench-offload-ab / bench-obs-overhead are
-# A/B drivers that shell out to bench-ab-runner internally, so they take
-# a narrower arg set.
+# Common args shared across bench-rtt / bench-vs-linux / bench-tx-burst /
+# bench-tx-maxtp (DPDK stacks). bench-offload-ab / bench-obs-overhead are
+# A/B drivers that shell out to bench-rtt internally (Phase 4 / Phase 12
+# of the 2026-05-09 overhaul retired the bench-ab-runner intermediary),
+# so they take a narrower arg set.
 #
-# BENCH_ITERATIONS / BENCH_WARMUP: spec §6 defaults (100k post-warmup,
-# 1k warmup) — the iteration ~7051 retransmit-budget cliff that prior
-# runs hit was root-caused to `MbufHandle::Drop` not returning mbufs to
-# the pool and fixed in commit `f3139f6` (see
-# `docs/superpowers/reports/README.md` row "BENCH_ITERATIONS=5000
-# workaround"). 100k AWS runs now complete cleanly; operators can
-# still override via env for shorter sweeps.
-BENCH_ITERATIONS="${BENCH_ITERATIONS:-100000}"
-BENCH_WARMUP="${BENCH_WARMUP:-1000}"
+# BENCH_ITERATIONS / BENCH_WARMUP: lowered from the spec's 100k/1k
+# defaults because run b5scpbl90 observed a deterministic TCP
+# retransmit-budget exhaustion at iteration ~7051 across every bench
+# on c6a.2xlarge. 5k / 500 stays under that threshold and still gives a
+# usable sample count for p50/p99/p999 summaries. Operators can
+# override via env for longer sweeps once the root cause (AWS
+# per-flow throttle vs. our stack's retransmit-history wrap) is
+# identified and fixed.
+BENCH_ITERATIONS="${BENCH_ITERATIONS:-5000}"
+BENCH_WARMUP="${BENCH_WARMUP:-500}"
+
+# Phase 10 Task 10.1: payload-bytes sweep applied to every bench-rtt
+# invocation. Default covers the trading quote/trade size range
+# (64/128/256 B) plus 1024 B for "RTT scales with payload" sanity.
+# Operator can override via env: BENCH_RTT_PAYLOADS=64,256,4096 ...
+# Closes C-C1.
+BENCH_RTT_PAYLOADS="${BENCH_RTT_PAYLOADS:-64,128,256,1024}"
 
 DPDK_COMMON=(
   --peer-ip "$PEER_IP"
@@ -512,140 +619,278 @@ DPDK_COMMON=(
 )
 
 # ---------------------------------------------------------------------------
-# [7/12] bench-e2e — request/response RTT + A-HW Task 18 assertions.
+# [7/12] bench-rtt — request/response RTT + A-HW Task 18 assertions.
 # ---------------------------------------------------------------------------
-log "[7/12] bench-e2e (with --assert-hw-task-18)"
-run_dut_bench bench-e2e bench-e2e \
+# Phase 4 of the 2026-05-09 bench-suite overhaul retired bench-e2e; the
+# dpdk_net RTT inner loop migrated into bench-rtt, which sweeps over a
+# `--payload-bytes-sweep` axis. Phase 10 (Task 10.1) parameterises the
+# sweep via $BENCH_RTT_PAYLOADS (default 64,128,256,1024) so every
+# bench-rtt invocation in the nightly hits the trading quote/trade size
+# range plus 1024B for "RTT scales with payload" sanity. Closes C-C1.
+log "[7/12] bench-rtt (with --assert-hw-task-18)"
+run_dut_bench bench-rtt bench-rtt \
+    --stack dpdk_net \
+    --connections 1 \
+    --payload-bytes-sweep "$BENCH_RTT_PAYLOADS" \
     "${DPDK_COMMON[@]}" \
     --peer-port 10001 \
     --iterations "$BENCH_ITERATIONS" \
     --warmup "$BENCH_WARMUP" \
     --assert-hw-task-18 \
-    --tool bench-e2e \
+    --tool bench-rtt \
     --feature-set trading-latency \
-    || log "  [7/12] bench-e2e exited non-zero — continuing"
+    --attribution-csv /tmp/bench-rtt-attribution.csv \
+    || log "  [7/12] bench-rtt exited non-zero — continuing"
 
 # ---------------------------------------------------------------------------
-# [8/12] bench-stress — operator-side netem orchestration.
+# [8/12] bench-rtt under netem — operator-side qdisc lifecycle.
 # DUT cannot SSH from the data ENI to the peer's mgmt IP (different SG /
-# no route), so the previous in-process NetemGuard apply hangs on
-# OpenSSH's connect timeout. Operator workstation has working SSH to
-# the peer's mgmt IP; orchestrate netem here, run bench-stress with
-# --external-netem on the DUT.
+# no route), so the operator workstation drives the netem qdisc apply +
+# revert. The bench-stress crate that previously orchestrated this loop
+# was retired in Phase 4 of the 2026-05-09 bench-suite overhaul; the
+# scenario matrix moves into the nightly script and per-scenario rows
+# come out of bench-rtt with `dimensions_json.netem_scenario` carried
+# through `--feature-set` (downstream report keys on tool+feature_set).
+#
+# TODO(Phase 10): the bench-stress p999-vs-idle-baseline ratio assertion
+# previously fired in-process. Until Phase 10 lands a post-process
+# helper script (`scripts/bench-stress-ratio-check.py` per the plan)
+# the assertion is intentionally absent — per-scenario p999 cells in
+# the merged CSV are visible to a human reader but no automated gate
+# fires. Document this in the bench-overhaul tracker.
 # ---------------------------------------------------------------------------
-log "[8/12] bench-stress (operator-side netem orchestration)"
+log "[8/12] bench-rtt under netem (operator-side qdisc lifecycle)"
 
-# Spec→string map mirrors the literals in
-# `tools/bench-stress/src/scenarios.rs::MATRIX`. Adding a new netem
-# scenario requires a new entry here AND a row in scenarios.rs.
 declare -A NETEM_SPECS=(
   [random_loss_01pct_10ms]="loss 0.1% delay 10ms"
   [correlated_burst_loss_1pct]="loss 1% 25%"
   [reorder_depth_3]="delay 5ms reorder 50% gap 3"
   [duplication_2x]="duplicate 100%"
+  # Phase 10 Task 10.2: scenarios that actually fire the RTO recovery
+  # path. Per Phase 4 scenarios.rs:67-83 comment, RTO requires a
+  # burst-tail past the 200ms RTO floor; ≥3% loss with correlation
+  # gets us there. Closes C-D2.
+  [high_loss_3pct]="loss 3% delay 5ms"
+  [high_loss_5pct]="loss 5% 25%"
+  [symmetric_3pct]="loss 3%"
 )
 
-NETEM_SCENARIOS=(random_loss_01pct_10ms correlated_burst_loss_1pct reorder_depth_3 duplication_2x)
+NETEM_SCENARIOS=(
+  random_loss_01pct_10ms
+  correlated_burst_loss_1pct
+  reorder_depth_3
+  duplication_2x
+  high_loss_3pct
+  high_loss_5pct
+  symmetric_3pct
+)
+
+# Phase 10 Task 10.3: per-scenario iteration override. The default
+# $BENCH_ITERATIONS=5000 yields ~5 lossy events at 0.1% loss — far too
+# few for a meaningful p999 tail estimate. Low-loss scenarios get 1M
+# iters (~1k lossy events); high-loss scenarios scale down because
+# their RTT tail samples more lossy iters per second of wallclock.
+# bench-tx-burst and bench-rx-burst use their own measure_bursts so
+# the override applies only to bench-rtt. Closes C-D1.
+declare -A SCENARIO_ITERS=(
+  [random_loss_01pct_10ms]=1000000
+  [correlated_burst_loss_1pct]=200000
+  [reorder_depth_3]=20000
+  [duplication_2x]=20000
+  [high_loss_3pct]=200000
+  [high_loss_5pct]=100000
+  [symmetric_3pct]=200000
+)
+
+# Direction axis: each netem scenario runs three times — once on peer
+# egress (current default; shapes peer→DUT, i.e. DUT-RX), once on peer
+# ingress via IFB (shapes DUT→peer, i.e. DUT-TX so DUT-TX-data-loss can
+# trigger DUT fast-retransmit), once with both for symmetric loss.
+# Closes C-C4 (no bidirectional netem).
+NETEM_DIRECTIONS=(egress ingress bidir)
 
 # Defensive cleanup: if a previous run crashed mid-scenario, the peer
-# may still have a netem qdisc installed. The next `tc qdisc add` would
-# return EEXIST and skip ALL subsequent scenarios via the apply-fail
-# branch — fail loud and silent. One pre-loop `del` puts the peer in a
-# known clean state; `|| true` covers the no-orphan case.
+# may still have a netem qdisc installed (root or ingress) and/or a
+# stale ifb0 device. The next `tc qdisc add` would return EEXIST and
+# skip ALL subsequent scenarios via the apply-fail branch — fail loud
+# and silent. One pre-loop teardown puts the peer in a known clean
+# state; `|| true` covers the no-orphan case.
 log "  [8/12] pre-loop netem cleanup (defensive)"
 ssh "${SSH_OPTS[@]}" "ubuntu@$PEER_SSH" \
-  "sudo tc qdisc del dev ens6 root || true" \
+  "sudo /tmp/peer-ifb-setup.sh down ens6 ifb0 2>/dev/null; sudo tc qdisc del dev ens6 root 2>/dev/null || true" \
   || log "    pre-loop cleanup ssh failed (peer unreachable?); continuing"
 
 bench_stress_csvs=()
 
 for scenario in "${NETEM_SCENARIOS[@]}"; do
   spec="${NETEM_SPECS[$scenario]}"
-  log "  [8/12] $scenario — applying netem ($spec)"
-  ssh "${SSH_OPTS[@]}" "ubuntu@$PEER_SSH" \
-    "sudo tc qdisc add dev ens6 root netem $spec" \
-    || { log "    apply failed; skipping scenario"; continue; }
+  for direction in "${NETEM_DIRECTIONS[@]}"; do
+    log "  [8/12] $scenario/$direction — applying netem ($spec)"
+    case "$direction" in
+      egress)
+        ssh "${SSH_OPTS[@]}" "ubuntu@$PEER_SSH" \
+          "sudo tc qdisc add dev ens6 root netem $spec" \
+          || { log "    apply failed; skipping $scenario/$direction"; continue; }
+        ;;
+      ingress)
+        ssh "${SSH_OPTS[@]}" "ubuntu@$PEER_SSH" \
+          "sudo /tmp/peer-ifb-setup.sh up ens6 ifb0 \"$spec\"" \
+          || { log "    ifb setup failed; skipping $scenario/$direction"; continue; }
+        ;;
+      bidir)
+        ssh "${SSH_OPTS[@]}" "ubuntu@$PEER_SSH" \
+          "sudo tc qdisc add dev ens6 root netem $spec && sudo /tmp/peer-ifb-setup.sh up ens6 ifb0 \"$spec\"" \
+          || { log "    bidir apply failed; skipping $scenario/$direction"; continue; }
+        ;;
+    esac
 
-  csv_name="bench-stress-$scenario"
-  if ! run_dut_bench bench-stress "$csv_name" \
-      "${DPDK_COMMON[@]}" \
-      --peer-port 10001 \
-      --peer-ssh "ubuntu@$PEER_SSH" \
-      --peer-iface ens6 \
-      --scenarios "$scenario" \
-      --external-netem \
-      --iterations "$BENCH_ITERATIONS" \
-      --warmup "$BENCH_WARMUP" \
-      --tool bench-stress \
-      --feature-set trading-latency; then
-    log "    $scenario bench-stress exited non-zero — continuing"
-  fi
+    # Phase 10 Task 10.3: per-scenario iter override (bench-rtt only).
+    iters="${SCENARIO_ITERS[$scenario]:-$BENCH_ITERATIONS}"
 
-  log "  [8/12] $scenario — removing netem"
-  ssh "${SSH_OPTS[@]}" "ubuntu@$PEER_SSH" \
-    "sudo tc qdisc del dev ens6 root || true"
+    csv_name="bench-stress-${scenario}-${direction}"
+    if ! run_dut_bench bench-rtt "$csv_name" \
+        --stack dpdk_net \
+        --connections 1 \
+        --payload-bytes-sweep "$BENCH_RTT_PAYLOADS" \
+        "${DPDK_COMMON[@]}" \
+        --peer-port 10001 \
+        --iterations "$iters" \
+        --warmup "$BENCH_WARMUP" \
+        --tool bench-stress \
+        --feature-set "trading-latency-${scenario}-${direction}" \
+        --attribution-csv "/tmp/${csv_name}-attribution.csv"; then
+      log "    $scenario/$direction bench-rtt exited non-zero — continuing"
+    fi
 
-  bench_stress_csvs+=("$OUT_DIR/${csv_name}.csv")
+    # Phase 10 Task 10.2: burst×netem cells. dpdk_net only — Phase 10
+    # keeps the cross-stack comparison on clean wire (steps [9/12],
+    # [11a..h/12]); under netem we only characterise the dpdk_net stack
+    # so the matrix doesn't explode further. Smaller measure_bursts
+    # (1000 not 10000) and trimmed burst_counts (drop 1024) keep the
+    # matrix wallclock manageable. Closes C-C3.
+    if ! run_dut_bench bench-tx-burst "bench-tx-burst-${scenario}-${direction}" \
+        "${DPDK_COMMON[@]}" \
+        --stack dpdk_net \
+        --peer-port 10001 \
+        --tool bench-tx-burst \
+        --feature-set "trading-latency-${scenario}-${direction}" \
+        --nic-max-bps "$NIC_MAX_BPS"; then
+      log "    $scenario/$direction bench-tx-burst exited non-zero — continuing"
+    fi
+
+    if ! run_dut_bench bench-rx-burst "bench-rx-burst-${scenario}-${direction}" \
+        "${DPDK_COMMON[@]}" \
+        --stack dpdk_net \
+        --peer-control-port 10003 \
+        --segment-sizes 64,128,256 \
+        --burst-counts 16,64,256 \
+        --warmup-bursts 50 \
+        --measure-bursts 1000 \
+        --tool bench-rx-burst \
+        --feature-set "trading-latency-${scenario}-${direction}"; then
+      log "    $scenario/$direction bench-rx-burst exited non-zero — continuing"
+    fi
+
+    log "  [8/12] $scenario/$direction — removing netem"
+    case "$direction" in
+      egress)
+        ssh "${SSH_OPTS[@]}" "ubuntu@$PEER_SSH" \
+          "sudo tc qdisc del dev ens6 root || true"
+        ;;
+      ingress)
+        ssh "${SSH_OPTS[@]}" "ubuntu@$PEER_SSH" \
+          "sudo /tmp/peer-ifb-setup.sh down ens6 ifb0"
+        ;;
+      bidir)
+        ssh "${SSH_OPTS[@]}" "ubuntu@$PEER_SSH" \
+          "sudo /tmp/peer-ifb-setup.sh down ens6 ifb0; sudo tc qdisc del dev ens6 root || true"
+        ;;
+    esac
+
+    bench_stress_csvs+=("$OUT_DIR/${csv_name}.csv")
+  done
 done
 
 # Concatenate per-scenario CSVs into a single bench-stress.csv.
-#
-# Header source: scan the list for the first CSV that exists AND has a
-# non-empty first line. Naively using `bench_stress_csvs[0]` breaks when
-# the first scenario was attempted but failed before writing anything —
-# the file would be missing or empty, `head -n 1` emits nothing, and
-# the merged CSV ends up header-less. The bench-stress binary now
-# writes the header eagerly (see `tools/bench-stress/src/main.rs`), but
-# the scan defends against legacy artifacts and against earlier failure
-# modes where scp never copied the per-scenario file.
-#
-# Subsequent files' headers are stripped via `tail -n +2`. If no
-# scenarios produced a CSV (every one failed and no per-scenario file
-# survived), emit an empty file so the downstream report sees the
+# First file's header is preserved; subsequent files' headers are
+# stripped via `tail -n +2`. If no scenarios produced a CSV (every one
+# failed), emit an empty file so the downstream report sees the
 # expected name without erroring.
 log "[8/12] merging per-scenario CSVs into bench-stress.csv"
 {
-  header_src=""
-  for f in "${bench_stress_csvs[@]}"; do
-    if [ -f "$f" ] && [ -s "$f" ] && [ -n "$(head -n 1 "$f")" ]; then
-      header_src="$f"
-      break
-    fi
-  done
-  if [ -n "$header_src" ]; then
-    head -n 1 "$header_src"
+  if [ ${#bench_stress_csvs[@]} -gt 0 ] && [ -f "${bench_stress_csvs[0]}" ]; then
+    head -n 1 "${bench_stress_csvs[0]}"
     for f in "${bench_stress_csvs[@]}"; do
-      [ -f "$f" ] && [ -s "$f" ] && tail -n +2 "$f"
+      [ -f "$f" ] && tail -n +2 "$f"
     done
   fi
 } > "$OUT_DIR/bench-stress.csv"
 
 # ---------------------------------------------------------------------------
-# [9/12] bench-vs-linux — mode A (RTT) + mode B (wire-diff).
-# Mode A: dpdk + linux stacks (afpacket is a T8 stub → dropped in
-#   lenient mode; we keep strict + drop afpacket from --stacks).
-# Mode B: wire-diff consumes pcaps. The live tcpdump orchestration is a
-#   T15-B follow-up; for the MVP we skip mode B if no pcaps are staged.
+# [9/12] bench-rtt cross-stack RTT comparison (replaces bench-vs-linux
+# mode A). Phase 4 of the 2026-05-09 bench-suite overhaul moved the
+# dpdk_net + linux_kernel + fstack RTT triplet into bench-rtt. We
+# invoke bench-rtt three times — once per stack — and let the
+# downstream bench-report group rows by `dimensions_json.stack`.
+# bench-vs-linux retains only mode B (wire-diff), handled below at
+# [9b/12].
 # ---------------------------------------------------------------------------
-log "[9/12] bench-vs-linux mode A (RTT comparison) — dpdk,linux,fstack"
-# F-Stack arm requires the binary built with `--features fstack`; the
-# default release build (step [3/12]) skips F-Stack so the F-Stack
-# stack is selected here in lenient mode (drops it if feature-off).
-# When the AMI build sets cargo build with --features fstack the arm
-# becomes live. The 2026-04-29 follow-up landed the F-Stack rust arm
-# in mode A.
-run_dut_bench bench-vs-linux bench-vs-linux-rtt \
+log "[9/12] bench-rtt cross-stack RTT (dpdk_net + linux_kernel + fstack)"
+run_dut_bench bench-rtt bench-rtt-dpdk_net \
+    --stack dpdk_net \
+    --connections 1 \
+    --payload-bytes-sweep "$BENCH_RTT_PAYLOADS" \
     "${DPDK_COMMON[@]}" \
-    --mode rtt \
-    --peer-port 10002 \
-    --peer-iface ens6 \
-    --stacks dpdk,linux,fstack \
-    --fstack-peer-port 10003 \
+    --peer-port 10001 \
     --iterations "$BENCH_ITERATIONS" \
     --warmup "$BENCH_WARMUP" \
     --tool bench-vs-linux \
     --feature-set trading-latency \
-    || log "  [9/12] bench-vs-linux mode A exited non-zero — continuing"
+    --attribution-csv /tmp/bench-rtt-dpdk_net-attribution.csv \
+    || log "  [9/12] bench-rtt --stack dpdk_net exited non-zero — continuing"
+
+# linux_kernel arm needs no DPDK args — connect to the linux-tcp-sink
+# peer on port 10002. Pass through the EAL flags anyway so the
+# common-arg array stays uniform; bench-rtt's linux_kernel path
+# ignores them.
+run_dut_bench bench-rtt bench-rtt-linux_kernel \
+    --stack linux_kernel \
+    --connections 1 \
+    --payload-bytes-sweep "$BENCH_RTT_PAYLOADS" \
+    --peer-ip "$PEER_IP" \
+    --peer-port 10002 \
+    --local-ip "$DUT_IP" \
+    --gateway-ip "$GATEWAY_IP" \
+    --eal-args "$EAL_ARGS" \
+    --lcore 2 \
+    --precondition-mode strict \
+    --iterations "$BENCH_ITERATIONS" \
+    --warmup "$BENCH_WARMUP" \
+    --tool bench-vs-linux \
+    --feature-set trading-latency \
+    --attribution-csv /tmp/bench-rtt-linux_kernel-attribution.csv \
+    || log "  [9/12] bench-rtt --stack linux_kernel exited non-zero — continuing"
+
+# fstack arm: requires the binary built with `--features fstack`; the
+# default release build (step [3/12]) skips F-Stack so this is a no-op
+# until the AMI build flips the feature on.
+run_dut_bench bench-rtt bench-rtt-fstack \
+    --stack fstack \
+    --connections 1 \
+    --payload-bytes-sweep "$BENCH_RTT_PAYLOADS" \
+    --peer-ip "$PEER_IP" \
+    --peer-port 10003 \
+    --local-ip "$DUT_IP" \
+    --gateway-ip "$GATEWAY_IP" \
+    --eal-args "$EAL_ARGS" \
+    --lcore 2 \
+    --precondition-mode lenient \
+    --iterations "$BENCH_ITERATIONS" \
+    --warmup "$BENCH_WARMUP" \
+    --tool bench-vs-linux \
+    --feature-set trading-latency \
+    --attribution-csv /tmp/bench-rtt-fstack-attribution.csv \
+    || log "  [9/12] bench-rtt --stack fstack exited non-zero — continuing"
 
 # Mode B: wire-diff — consume pcaps captured around a short live
 # workload. A10 Plan B T15-B wires tcpdump orchestration: start tcpdump
@@ -667,7 +912,7 @@ else
   # captures remain readable if tcpdump is killed before normal exit.
   # `-s 0` disables truncation (we need full TCP payloads for the
   # canonicaliser's option walker). `-w <file>` writes pcap. The `tcp
-  # and port 10001` filter narrows to the bench-vs-mtcp / bench-e2e
+  # and port 10001` filter narrows to the bench-tx-burst / bench-rtt
   # peer port — mode B does not compare RTT-port traffic so excluding
   # port 10002 keeps the diff deterministic.
   TCPDUMP_FILTER="tcp and port 10001"
@@ -692,13 +937,17 @@ else
   # which is exactly what the canonicaliser keys on.
   sleep 2
 
-  # Short synthetic workload: reuse bench-e2e for 10 request/response
+  # Short synthetic workload: reuse bench-rtt for 10 request/response
   # exchanges against the echo-server on port 10001. No HW-task-18
   # assertions — those add TX-TS preconditions that are orthogonal to
-  # the pcap content we care about for wire-diff.
-  log "        running bench-e2e live capture workload"
+  # the pcap content we care about for wire-diff. (Phase 4 of the
+  # 2026-05-09 bench-suite overhaul retired bench-e2e; bench-rtt
+  # subsumes the same workload behind --stack dpdk_net.)
+  log "        running bench-rtt live capture workload"
   ssh "${SSH_OPTS[@]}" "ubuntu@$DUT_SSH" \
-      "sudo /tmp/bench-e2e \
+      "sudo /tmp/bench-rtt \
+          --stack dpdk_net \
+          --connections 1 \
           --peer-ip $PEER_IP \
           --local-ip $DUT_IP \
           --gateway-ip $GATEWAY_IP \
@@ -707,10 +956,10 @@ else
           --precondition-mode lenient \
           --peer-port 10001 \
           --iterations 10 \
-          --output-csv /tmp/bench-e2e-mode-b-capture.csv \
+          --output-csv /tmp/bench-rtt-mode-b-capture.csv \
           --tool bench-vs-linux-mode-b \
           --feature-set rfc-compliance" \
-      || log "        WARN bench-e2e capture workload returned non-zero; \
+      || log "        WARN bench-rtt capture workload returned non-zero; \
 diff may still be meaningful"
 
   # Stop tcpdump and flush buffers. SIGINT (the default on killall
@@ -766,7 +1015,7 @@ fi
 # ---------------------------------------------------------------------------
 # [10/12] bench-offload-ab + bench-obs-overhead — A/B drivers. These
 # rebuild the workspace per config, so they cannot run in parallel with
-# each other. They run on the DUT because they invoke bench-ab-runner
+# each other. They run on the DUT because they invoke bench-rtt
 # which opens an EAL. Output goes into the driver's output-dir plus a
 # Markdown report; we pull both into $OUT_DIR.
 # ---------------------------------------------------------------------------
@@ -787,7 +1036,7 @@ ssh "${SSH_OPTS[@]}" "ubuntu@$DUT_SSH" \
         --warmup $BENCH_WARMUP \
         --output-dir /tmp/bench-offload-ab-out \
         --report-path /tmp/bench-offload-ab-out/offload-ab.md \
-        --runner-bin /tmp/bench-ab-runner \
+        --runner-bin /tmp/bench-rtt \
         --skip-rebuild" \
     || log "  [10/12] bench-offload-ab exited non-zero — continuing"
 refresh_ec2_ic_grants
@@ -811,7 +1060,7 @@ ssh "${SSH_OPTS[@]}" "ubuntu@$DUT_SSH" \
         --warmup $BENCH_WARMUP \
         --output-dir /tmp/bench-obs-overhead-out \
         --report-path /tmp/bench-obs-overhead-out/obs-overhead.md \
-        --runner-bin /tmp/bench-ab-runner \
+        --runner-bin /tmp/bench-rtt \
         --skip-rebuild" \
     || log "  [10b/12] bench-obs-overhead exited non-zero — continuing"
 refresh_ec2_ic_grants
@@ -820,56 +1069,171 @@ scp -r "${SCP_OPTS[@]}" \
     || log "  [10b/12] scp of bench-obs-overhead failed — continuing"
 
 # Pull the gdb wrapper's diagnostic log back for offline analysis. The
-# wrapper writes stack traces from any SIGSEGV that hit bench-ab-runner
+# wrapper writes stack traces from any SIGSEGV that hit bench-rtt
 # during [10/12]+[10b/12], plus the gdb-version banner and any apt-install
 # output if gdb was bootstrapped at first invocation.
 refresh_ec2_ic_grants
 scp "${SCP_OPTS[@]}" \
-    "ubuntu@$DUT_SSH:/tmp/bench-ab-runner-gdb.log" "$OUT_DIR/" \
+    "ubuntu@$DUT_SSH:/tmp/bench-rtt-gdb.log" "$OUT_DIR/" \
     || log "  gdb log scp failed — continuing"
 
 # ---------------------------------------------------------------------------
-# [11/12] bench-vs-mtcp burst + maxtp grids.
-# mTCP stub is strict-mode-fatal; pass --stacks dpdk to run the DPDK
-# arm only until Plan 2 T21 lands the real bench-peer binary.
+# [11/12] bench-tx-burst + bench-tx-maxtp grids — six separate passes.
+# Phase 5 of the 2026-05-09 bench-suite overhaul split bench-vs-mtcp into
+# bench-tx-burst (K x G one-shot grid) and bench-tx-maxtp (W x C
+# sustained-rate grid). dpdk and fstack still cannot share an EAL process
+# (both call rte_eal_init); each stack runs as its own pass.
 # ---------------------------------------------------------------------------
-log "[11/12] bench-vs-mtcp burst grid (dpdk + fstack comparator)"
-# 2026-04-29: F-Stack arm landed alongside dpdk_net on the burst grid.
-# F-Stack peer = /opt/f-stack-peer/bench-peer on port 10003 (started
-# in step [6/12]). The dpdk arm continues to use echo-server on
-# 10001. fstack arm requires the binary built with `--features
-# fstack`; default release builds emit invalid-marker rows when
-# `--stacks fstack` is selected without the feature compiled in.
-run_dut_bench bench-vs-mtcp bench-vs-mtcp-burst \
+log "[11/12] bench-tx-burst — pass 1: dpdk_net"
+run_dut_bench bench-tx-burst bench-tx-burst-dpdk_net \
     "${DPDK_COMMON[@]}" \
-    --workload burst \
     --peer-port 10001 \
-    --fstack-peer-port 10003 \
-    --stacks dpdk,fstack \
-    --tool bench-vs-mtcp \
+    --stack dpdk_net \
+    --tool bench-tx-burst \
     --feature-set trading-latency \
     --nic-max-bps "$NIC_MAX_BPS" \
-    || log "  [11/12] bench-vs-mtcp burst exited non-zero — continuing"
+    || log "  [11/12] bench-tx-burst dpdk_net exited non-zero — continuing"
 
-log "[11b/12] bench-vs-mtcp maxtp grid (dpdk + linux + fstack comparators)"
-# 2026-05-03: Linux kernel-TCP arm landed in bench-vs-mtcp (mTCP arm
-# stays stubbed while AMI rebuild is blocked on libmtcp / gcc 13).
-# 2026-04-29: F-Stack arm landed alongside Linux + dpdk_net. The
-# three peers run on distinct ports (echo-server 10001, linux-tcp-
-# sink 10002, fstack-peer 10003). Linux uses linux-tcp-sink to
-# avoid recv-buffer backpressure; fstack + dpdk both use echo-style
-# peers since their writes are bounded by the user-side app and
-# F-Stack's send buffer drains predictably.
-run_dut_bench bench-vs-mtcp bench-vs-mtcp-maxtp \
+log "[11a/12] bench-tx-burst — pass 2: linux_kernel"
+# Phase 5 Task 5.1 added the linux_kernel burst arm; peer is the same
+# echo-server on port 10001 (the recv path is drained but not measured).
+run_dut_bench bench-tx-burst bench-tx-burst-linux_kernel \
     "${DPDK_COMMON[@]}" \
-    --workload maxtp \
     --peer-port 10001 \
-    --fstack-peer-port 10003 \
-    --stacks dpdk,linux,fstack \
-    --tool bench-vs-mtcp \
+    --stack linux_kernel \
+    --tool bench-tx-burst \
     --feature-set trading-latency \
     --nic-max-bps "$NIC_MAX_BPS" \
-    || log "  [11b/12] bench-vs-mtcp maxtp exited non-zero — continuing"
+    || log "  [11a/12] bench-tx-burst linux_kernel exited non-zero — continuing"
+
+log "[11b/12] bench-tx-burst — pass 3: fstack"
+# fstack connects to port 10001 (same dpdk echo-server; standard TCP).
+run_dut_bench bench-tx-burst bench-tx-burst-fstack \
+    --peer-ip "$PEER_IP" \
+    --local-ip "$DUT_IP" \
+    --peer-port 10001 \
+    --stack fstack \
+    --fstack-conf /etc/f-stack.conf \
+    --fstack-eal-args "$EAL_ARGS" \
+    --lcore 2 \
+    --precondition-mode lenient \
+    --tool bench-tx-burst \
+    --feature-set trading-latency \
+    --nic-max-bps "$NIC_MAX_BPS" \
+    || log "  [11b/12] bench-tx-burst fstack exited non-zero — continuing"
+
+log "[11c/12] bench-tx-maxtp — pass 1: dpdk_net"
+# dpdk alone so the peer stays below backlog threshold for large-W buckets.
+run_dut_bench bench-tx-maxtp bench-tx-maxtp-dpdk_net \
+    "${DPDK_COMMON[@]}" \
+    --peer-port 10001 \
+    --stack dpdk_net \
+    --tool bench-tx-maxtp \
+    --feature-set trading-latency \
+    --nic-max-bps "$NIC_MAX_BPS" \
+    || log "  [11c/12] bench-tx-maxtp dpdk_net exited non-zero — continuing"
+
+log "[11d/12] bench-tx-maxtp — pass 2: linux_kernel"
+# linux_kernel arm targets port 10002 (linux-tcp-sink) which DISCARDS
+# bytes; pointing at echo-server back-pressures the kernel TCP recv
+# buffer to ~0 Gbps. Task 5.5 asserts peer_port=10002 inside the
+# linux arm at start-of-bench.
+run_dut_bench bench-tx-maxtp bench-tx-maxtp-linux_kernel \
+    "${DPDK_COMMON[@]}" \
+    --peer-port 10002 \
+    --stack linux_kernel \
+    --tool bench-tx-maxtp \
+    --feature-set trading-latency \
+    --nic-max-bps "$NIC_MAX_BPS" \
+    || log "  [11d/12] bench-tx-maxtp linux_kernel exited non-zero — continuing"
+
+log "[11e/12] bench-tx-maxtp — pass 3: fstack"
+# fstack connects to port 10001 (dpdk echo-server); NIC stays vfio-pci.
+run_dut_bench bench-tx-maxtp bench-tx-maxtp-fstack \
+    --peer-ip "$PEER_IP" \
+    --local-ip "$DUT_IP" \
+    --peer-port 10001 \
+    --stack fstack \
+    --fstack-conf /etc/f-stack.conf \
+    --fstack-eal-args "$EAL_ARGS" \
+    --lcore 2 \
+    --precondition-mode lenient \
+    --tool bench-tx-maxtp \
+    --feature-set trading-latency \
+    --nic-max-bps "$NIC_MAX_BPS" \
+    || log "  [11e/12] bench-tx-maxtp fstack exited non-zero — continuing"
+
+# ---------------------------------------------------------------------------
+# [11f/12] bench-rx-burst grid — three passes (dpdk_net + linux_kernel +
+# fstack). Phase 8 of the 2026-05-09 bench-suite overhaul. Closes
+# claims C-A3 (final replacement for bench-rx-zero-copy placeholder),
+# C-B3 (per-RX-segment latency), C-C2 (RX burst workload).
+#
+# Per stack: W in {64,128,256} × N in {16,64,256,1024} = 12 buckets.
+# All three passes target the burst-echo-server on port 10003 (peer
+# binary built in step [2/12], deployed in step [5/12], started in
+# step [6/12]).
+# ---------------------------------------------------------------------------
+BENCH_RX_MEASURE_BURSTS="${BENCH_RX_MEASURE_BURSTS:-1000}"
+
+log "[11f/12] bench-rx-burst — pass 1: dpdk_net"
+run_dut_bench bench-rx-burst bench-rx-burst-dpdk_net \
+    "${DPDK_COMMON[@]}" \
+    --stack dpdk_net \
+    --peer-control-port 10003 \
+    --segment-sizes 64,128,256 \
+    --burst-counts 16,64,256,1024 \
+    --warmup-bursts 100 \
+    --measure-bursts "$BENCH_RX_MEASURE_BURSTS" \
+    --raw-samples-csv /tmp/bench-rx-burst-dpdk_net-raw.csv \
+    --tool bench-rx-burst \
+    --feature-set trading-latency \
+    || log "  [11f/12] bench-rx-burst dpdk_net exited non-zero — continuing"
+# Pull the raw-samples sidecar back for offline analysis.
+refresh_ec2_ic_grants
+scp "${SCP_OPTS[@]}" \
+    "ubuntu@$DUT_SSH:/tmp/bench-rx-burst-dpdk_net-raw.csv" "$OUT_DIR/" \
+    || log "  scp bench-rx-burst-dpdk_net-raw.csv failed — continuing"
+
+log "[11g/12] bench-rx-burst — pass 2: linux_kernel"
+run_dut_bench bench-rx-burst bench-rx-burst-linux_kernel \
+    "${DPDK_COMMON[@]}" \
+    --stack linux_kernel \
+    --peer-control-port 10003 \
+    --segment-sizes 64,128,256 \
+    --burst-counts 16,64,256,1024 \
+    --warmup-bursts 100 \
+    --measure-bursts "$BENCH_RX_MEASURE_BURSTS" \
+    --raw-samples-csv /tmp/bench-rx-burst-linux_kernel-raw.csv \
+    --tool bench-rx-burst \
+    --feature-set trading-latency \
+    || log "  [11g/12] bench-rx-burst linux_kernel exited non-zero — continuing"
+refresh_ec2_ic_grants
+scp "${SCP_OPTS[@]}" \
+    "ubuntu@$DUT_SSH:/tmp/bench-rx-burst-linux_kernel-raw.csv" "$OUT_DIR/" \
+    || log "  scp bench-rx-burst-linux_kernel-raw.csv failed — continuing"
+
+log "[11h/12] bench-rx-burst — pass 3: fstack"
+run_dut_bench bench-rx-burst bench-rx-burst-fstack \
+    --peer-ip "$PEER_IP" \
+    --local-ip "$DUT_IP" \
+    --stack fstack \
+    --peer-control-port 10003 \
+    --segment-sizes 64,128,256 \
+    --burst-counts 16,64,256,1024 \
+    --warmup-bursts 100 \
+    --measure-bursts "$BENCH_RX_MEASURE_BURSTS" \
+    --raw-samples-csv /tmp/bench-rx-burst-fstack-raw.csv \
+    --fstack-conf /etc/f-stack.conf \
+    --lcore 2 \
+    --precondition-mode lenient \
+    --tool bench-rx-burst \
+    --feature-set trading-latency \
+    || log "  [11h/12] bench-rx-burst fstack exited non-zero — continuing"
+refresh_ec2_ic_grants
+scp "${SCP_OPTS[@]}" \
+    "ubuntu@$DUT_SSH:/tmp/bench-rx-burst-fstack-raw.csv" "$OUT_DIR/" \
+    || log "  scp bench-rx-burst-fstack-raw.csv failed — continuing"
 
 # ---------------------------------------------------------------------------
 # [12/12] Local bench-micro + summarize + bench-report.
@@ -889,7 +1253,6 @@ log "[12/12] bench-micro (local) + summarize + bench-report"
 BENCH_MICRO_ARGS="${BENCH_MICRO_ARGS:-}"
 # shellcheck disable=SC2086 # BENCH_MICRO_ARGS is intentionally word-split
 RUSTFLAGS="${RUSTFLAGS:-} -C panic=abort" cargo bench -p bench-micro \
-    --features bench-internals \
     --bench poll --bench tsc_read --bench flow_lookup \
     --bench send --bench tcp_input --bench counters --bench timer \
     $BENCH_MICRO_ARGS

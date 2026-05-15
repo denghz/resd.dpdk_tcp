@@ -106,47 +106,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
-name = "bench-ab-runner"
+name = "bench-build-helpers"
 version = "0.1.0"
-dependencies = [
- "anyhow",
- "bench-common",
- "chrono",
- "clap 4.6.1",
- "csv",
- "dpdk-net-core",
- "dpdk-net-sys",
- "hostname",
- "serde_json",
- "uuid",
-]
 
 [[package]]
 name = "bench-common"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "csv",
  "serde",
  "serde_json",
+ "tempfile",
  "uuid",
 ]
 
 [[package]]
-name = "bench-e2e"
+name = "bench-fstack-ffi"
 version = "0.1.0"
-dependencies = [
- "anyhow",
- "bench-common",
- "chrono",
- "clap 4.6.1",
- "csv",
- "dpdk-net",
- "dpdk-net-core",
- "dpdk-net-sys",
- "hostname",
- "serde_json",
- "uuid",
-]
 
 [[package]]
 name = "bench-micro"
@@ -163,6 +140,7 @@ dependencies = [
  "hostname",
  "serde",
  "serde_json",
+ "smallvec",
  "uuid",
  "walkdir",
 ]
@@ -211,30 +189,87 @@ dependencies = [
 ]
 
 [[package]]
-name = "bench-rx-zero-copy"
-version = "0.1.0"
-dependencies = [
- "criterion",
- "dpdk-net-core",
- "dpdk-net-sys",
-]
-
-[[package]]
-name = "bench-stress"
+name = "bench-rtt"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bench-build-helpers",
  "bench-common",
- "bench-e2e",
+ "bench-fstack-ffi",
+ "chrono",
+ "clap 4.6.1",
+ "csv",
+ "dpdk-net",
+ "dpdk-net-core",
+ "dpdk-net-sys",
+ "hostname",
+ "libc",
+ "serde_json",
+ "tempfile",
+ "uuid",
+]
+
+[[package]]
+name = "bench-rx-burst"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bench-build-helpers",
+ "bench-common",
+ "bench-fstack-ffi",
+ "bench-rtt",
+ "chrono",
+ "clap 4.6.1",
+ "csv",
+ "dpdk-net",
+ "dpdk-net-core",
+ "dpdk-net-sys",
+ "hostname",
+ "libc",
+ "serde_json",
+ "tempfile",
+ "uuid",
+]
+
+[[package]]
+name = "bench-tx-burst"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bench-build-helpers",
+ "bench-common",
+ "bench-fstack-ffi",
+ "bench-rtt",
  "chrono",
  "clap 4.6.1",
  "csv",
  "dpdk-net-core",
  "dpdk-net-sys",
  "hostname",
- "serde",
+ "serde_json",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
+name = "bench-tx-maxtp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bench-build-helpers",
+ "bench-common",
+ "bench-fstack-ffi",
+ "bench-rtt",
+ "chrono",
+ "clap 4.6.1",
+ "csv",
+ "dpdk-net-core",
+ "dpdk-net-sys",
+ "hostname",
+ "libc",
  "serde_json",
  "tempfile",
+ "thiserror",
  "uuid",
 ]
 
@@ -244,8 +279,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bench-common",
- "bench-e2e",
- "bench-vs-mtcp",
  "chrono",
  "clap 4.6.1",
  "csv",
@@ -255,24 +288,6 @@ dependencies = [
  "hostname",
  "libc",
  "pcap-file",
- "serde_json",
- "thiserror",
- "uuid",
-]
-
-[[package]]
-name = "bench-vs-mtcp"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bench-common",
- "bench-e2e",
- "chrono",
- "clap 4.6.1",
- "csv",
- "dpdk-net-core",
- "dpdk-net-sys",
- "hostname",
  "serde_json",
  "thiserror",
  "uuid",
@@ -631,7 +646,6 @@ dependencies = [
  "dpdk-net-core",
  "dpdk-net-sys",
  "libc",
- "smallvec",
 ]
 
 [[package]]
@@ -931,8 +945,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bench-common",
- "bench-e2e",
- "bench-stress",
+ "bench-rtt",
  "chrono",
  "clap 4.6.1",
  "dpdk-net-core",

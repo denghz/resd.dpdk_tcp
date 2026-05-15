@@ -60,32 +60,87 @@ fn ffi_eal_init_and_engine_lifecycle() {
     let rc = unsafe { dpdk_net_eal_init(argv.len() as i32, argv.as_ptr()) };
     assert_eq!(rc, 0, "dpdk_net_eal_init failed: {rc}");
 
-    // A5 cross-phase fix: use the real Rust type instead of a hand-rolled
-    // byte-shim. Manual mirroring drifted silently when `rx_mempool_size`
-    // was appended in A6.6-7 Task 10 — `dpdk_net_engine_create` was reading
-    // uninitialized memory past the end of the shorter shim. Zero-init the
-    // whole struct, then override only the fields the test exercises.
-    let mut cfg = unsafe {
-        std::mem::zeroed::<dpdk_net::api::dpdk_net_engine_config_t>()
+    // Byte-shim of dpdk_net_engine_config_t. Must match the cbindgen layout.
+    // Read include/dpdk_net.h to confirm field order before relying on this.
+    #[repr(C)]
+    struct Cfg {
+        port_id: u16,
+        rx_queue_id: u16,
+        tx_queue_id: u16,
+        _pad1: u16,
+        max_connections: u32,
+        recv_buffer_bytes: u32,
+        send_buffer_bytes: u32,
+        tcp_mss: u32,
+        tcp_timestamps: bool,
+        tcp_sack: bool,
+        tcp_ecn: bool,
+        tcp_nagle: bool,
+        tcp_delayed_ack: bool,
+        cc_mode: u8,
+        _pad2: [u8; 2],
+        tcp_min_rto_ms: u32,
+        // A5 Task 21: replace tcp_initial_rto_ms with µs floor/initial/max
+        // tuple + retrans budget.
+        tcp_min_rto_us: u32,
+        tcp_initial_rto_us: u32,
+        tcp_max_rto_us: u32,
+        tcp_max_retrans_count: u32,
+        tcp_msl_ms: u32,
+        tcp_per_packet_events: bool,
+        preset: u8,
+        _pad3: [u8; 2],
+        // Phase A2 additions
+        local_ip: u32,
+        gateway_ip: u32,
+        gateway_mac: [u8; 6],
+        _pad4: [u8; 2],
+        garp_interval_sec: u32,
+        event_queue_soft_cap: u32,
+        // A6 Task 20: caller-supplied RTT histogram bucket edges. All-zero
+        // triggers the stack's trading-tuned default (spec §3.8.2).
+        rtt_histogram_bucket_edges_us: [u32; 15],
+        // A-HW+ T7: ENA devarg intent knobs. 0 = use PMD default.
+        ena_large_llq_hdr: u8,
+        ena_miss_txc_to_sec: u8,
+    }
+    let cfg = Cfg {
+        port_id: 0,
+        rx_queue_id: 0,
+        tx_queue_id: 0,
+        _pad1: 0,
+        max_connections: 16,
+        recv_buffer_bytes: 256 * 1024,
+        send_buffer_bytes: 256 * 1024,
+        tcp_mss: 0,
+        tcp_timestamps: true,
+        tcp_sack: true,
+        tcp_ecn: false,
+        tcp_nagle: false,
+        tcp_delayed_ack: false,
+        cc_mode: 0,
+        _pad2: [0; 2],
+        tcp_min_rto_ms: 20,
+        tcp_min_rto_us: 5_000,
+        tcp_initial_rto_us: 5_000,
+        tcp_max_rto_us: 1_000_000,
+        tcp_max_retrans_count: 15,
+        tcp_msl_ms: 30000,
+        tcp_per_packet_events: false,
+        preset: 0,
+        _pad3: [0; 2],
+        local_ip: 0,
+        gateway_ip: 0,
+        gateway_mac: [0u8; 6],
+        _pad4: [0; 2],
+        garp_interval_sec: 0,
+        event_queue_soft_cap: 4096,
+        rtt_histogram_bucket_edges_us: [0u32; 15],
+        ena_large_llq_hdr: 0,
+        ena_miss_txc_to_sec: 0,
     };
-    cfg.max_connections = 16;
-    cfg.recv_buffer_bytes = 256 * 1024;
-    cfg.send_buffer_bytes = 256 * 1024;
-    cfg.tcp_timestamps = true;
-    cfg.tcp_sack = true;
-    cfg.tcp_min_rto_us = 5_000;
-    cfg.tcp_initial_rto_us = 5_000;
-    cfg.tcp_max_rto_us = 1_000_000;
-    cfg.tcp_max_retrans_count = 15;
-    cfg.tcp_msl_ms = 30000;
-    cfg.event_queue_soft_cap = 4096;
 
-    let eng = unsafe {
-        dpdk_net_engine_create(
-            0,
-            &cfg as *const dpdk_net::api::dpdk_net_engine_config_t as *const core::ffi::c_void,
-        )
-    };
+    let eng = unsafe { dpdk_net_engine_create(0, &cfg as *const Cfg as *const core::ffi::c_void) };
     assert!(!eng.is_null(), "dpdk_net_engine_create returned null");
 
     for _ in 0..10 {

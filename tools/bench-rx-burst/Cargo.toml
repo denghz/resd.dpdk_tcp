@@ -1,0 +1,67 @@
+[package]
+name = "bench-rx-burst"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# bench-rx-burst — peer-driven RX-burst per-segment latency tool.
+#
+# Phase 8 of the 2026-05-09 bench-suite overhaul. Closes claims:
+#   * C-A3 — final replacement for bench-rx-zero-copy placeholder purpose.
+#   * C-B3 — per-RX-segment latency (no other bench tool measures this).
+#   * C-C2 — RX burst workload (no other bench tool drives this shape).
+#
+# # Workload
+#
+# Per (W, N) bucket: connect to the peer's burst-echo-server control
+# port, send `BURST <N> <W>\n`, drive the engine until N segments of W
+# bytes have been received. Each segment carries a 16-byte header
+# `[be64 seq_idx | be64 peer_send_ns]`. The DUT computes
+# `latency_ns = clock::now_ns() - peer_send_ns` per segment (skewed by
+# NTP offset; see burst-echo-server.c header) and emits a per-bucket
+# percentile summary plus optional raw-sample CSV.
+#
+# # Comparator triplet
+#
+# `dpdk_net` (this stack) + `linux_kernel` (kernel TCP via std::net) +
+# `fstack` (F-Stack on DPDK, feature-gated). Same shape as bench-rtt /
+# bench-tx-burst — one stack per invocation; dpdk_net and fstack cannot
+# share an EAL process.
+
+[lib]
+name = "bench_rx_burst"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bench-rx-burst"
+path = "src/main.rs"
+
+[features]
+default = []
+# Enables the F-Stack arm (fstack.rs). Mirrors bench-tx-burst's recipe.
+fstack = ["bench-fstack-ffi/fstack", "dep:libc"]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+csv = "1.3"
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+hostname = "0.4"
+uuid = { version = "1", features = ["v4"] }
+libc = { workspace = true, optional = true }
+bench-common = { path = "../bench-common" }
+bench-fstack-ffi = { path = "../bench-fstack-ffi" }
+bench-rtt = { path = "../bench-rtt" }
+dpdk-net-core = { path = "../../crates/dpdk-net-core" }
+dpdk-net-sys = { path = "../../crates/dpdk-net-sys" }
+dpdk-net = { path = "../../crates/dpdk-net" }
+
+[build-dependencies]
+# T51 deferred-work item 2: shared libfstack.a + DPDK link-arg emit.
+# build.rs delegates to bench_build_helpers::emit_fstack_link_args_if_enabled().
+bench-build-helpers = { path = "../bench-build-helpers" }
+
+[dev-dependencies]
+tempfile = "3"

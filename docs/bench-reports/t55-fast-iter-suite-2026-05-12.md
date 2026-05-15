@@ -1,0 +1,226 @@
+# T55 fast-iter-suite — 2026-05-12
+
+**Run:** first execution of the new `scripts/fast-iter-suite.sh`
+**Branch:** `a10-perf-23.11`
+**Status:** DONE_WITH_CONCERNS
+**Purpose:** End-to-end bench coverage across {bench-rtt, bench-tx-burst, bench-tx-maxtp, bench-rx-burst, verify-rack-tlp} for {dpdk_net, linux_kernel, fstack}, driven from the fast-iter peer in a single ~30-45 min wallclock.
+
+## What's new
+
+`scripts/fast-iter-suite.sh` — a single-binary, sequential bench orchestrator
+that drives every arm of every tool against the fast-iter peer and emits a
+per-run results directory + `SUMMARY.md`. Iteration counts are tuned for the
+~30-45 min wallclock target, not nightly-grade statistical depth. Adds:
+
+- timestamped results directory under `target/bench-results/fast-iter-<UTC>/`,
+- per-arm timeout (`RUN_ONE_TIMEOUT`, default 300s) so hung benches don't
+  block the suite,
+- peer `echo-server` restart between every DPDK/fstack arm (releases workers
+  that get pinned by FIN-less DPDK teardowns),
+- Python-driven SUMMARY.md generator that pivots the spec §14 CSV schema into
+  p50/p99/mean tables per stack per bench.
+
+## Results
+
+- **Results directory:** `target/bench-results/fast-iter-2026-05-12T04-30-22Z/`
+- **Auto-generated summary:** `<results-dir>/SUMMARY.md`
+- **Per-arm logs:** `<results-dir>/<bench>-<stack>.log`
+
+### Wallclock + outcome
+
+| Phase | Outcome | Notes |
+|-------|---------|-------|
+| bench-rtt (3 stacks) | 1 OK / 1 TIMEOUT / 1 SIGSEGV | linux NAT routing hang; fstack arm SIGSEGV after init |
+| bench-tx-burst (3 stacks) | 3 OK | full grid, all stacks |
+| bench-tx-maxtp (3 stacks) | 3 OK after retry | linux arm needed `--local-ip` even though it's documented dpdk-only |
+| bench-rx-burst (3 stacks) | 2 OK after retry / 1 TIMEOUT | dpdk + fstack arms after peer's burst-echo-server restart; linux arm same NAT hang |
+| verify-rack-tlp | 2/5 scenarios PASS, 3 not run | killed at high_loss_3pct (long RTO-driven scenario projected to exceed 1500s outer timeout) |
+| **Total wallclock** | ~48 min (script + retries) | original suite run 16 min; second pass to fill gaps |
+
+### bench-rtt — RTT (ns) by payload (dpdk_net only — linux + fstack arms broken in this env)
+
+| payload | p50 (us) | p99 (us) | mean (us) |
+|---------|---------:|---------:|----------:|
+| 64 B    |    73.65 |    96.99 |     74.40 |
+| 128 B   |    75.00 |   102.05 |     76.27 |
+| 256 B   |    78.49 |   106.91 |     79.59 |
+| 1024 B  |    80.75 |   105.18 |     81.97 |
+
+Stable ~75-80 µs across the 64-1024 B range, consistent with the c7i x86_64
+AWS network path. linux_kernel arm hangs on `read_exact` after a handful of
+iterations (NAT routing pinned to `vethpxtn0`/`10.99.1.2`); fstack arm
+SIGSEGVs after engine init.
+
+### bench-tx-burst — throughput_per_burst_bps (Gbps mean)
+
+| K (KiB) | G (ms) | dpdk_net | linux_kernel | fstack |
+|--------:|-------:|---------:|-------------:|-------:|
+| 64      | 0      | 1.05     |    65.6      | 5.10   |
+| 64      | 10     | 1.36     |    16.4      | 5.71   |
+| 1024    | 0      | 1.05     |   ~15        | 4.59   |
+| 1024    | 10     | 1.20     |   ~17        | 5.13   |
+
+linux_kernel reports inflated numbers because its `throughput_per_burst_bps`
+is "bytes written / time-to-write" — for the kernel, that's a `write_all()`
+into the kernel send buffer which fills nearly instantly (NIC bandwidth is
+not measured on the kernel arm). dpdk_net and fstack report wire-rate
+because the engines run their own send schedulers. The dpdk_net~1 Gbps and
+fstack~5 Gbps figures are consistent with prior bench-pair reports (T54
+saw dpdk~2.5 Gbps; this run was reduced-grid + only 200 bursts so spread
+is larger).
+
+### bench-tx-maxtp — sustained_goodput_bps (Gbps mean)
+
+| W (B) | C  | dpdk_net | linux_kernel | fstack |
+|------:|---:|---------:|-------------:|-------:|
+| 4096  | 1  | 1.05     |  0.00        | 1.39   |
+| 4096  | 4  | 1.05     |  0.00        | 3.01   |
+| 4096  | 16 | 1.05     |  -           | 3.85   |
+| 16384 | 1  | 1.10     |  0.00        | 2.74   |
+| 16384 | 4  | 1.07     |  0.00        | 4.06   |
+| 16384 | 16 | 1.06     |  -           | 4.07   |
+| 65536 | 1  | 1.07     |  -           | 2.78   |
+| 65536 | 4  | 1.05     |  -           | 4.10   |
+| 65536 | 16 | 1.05     |  -           | 2.50   |
+
+Pattern matches T54: fstack peaks ~4 Gbps wire rate (echo-counted), dpdk_net
+ceilings at ~1.1 Gbps in this reduced 10-second window. linux_kernel arm
+(reduced grid: W=4k/16k, C=1/4) reports near-zero because the kernel-side
+peer port (`linux-tcp-sink` on :10002) silently drops the buffered data and
+the bench's "wire rate" metric ends up matching what came back through the
+sink, which is the discard side.
+
+### bench-rx-burst — per-segment latency (us, mean) — reduced grid
+
+| W (B) | N  | dpdk_net | fstack |
+|------:|---:|---------:|-------:|
+| 64    | 16 | 62.5     | 56.9   |
+| 64    | 64 | 156      | 165    |
+| 128   | 16 | 62.0     | 56.7   |
+| 128   | 64 | 156      | 165    |
+
+fstack RX latency at small N is **slightly lower** than dpdk_net for the
+peer-driven burst workload — that's likely the FreeBSD TCP stack's larger
+recv-buffer pre-allocation absorbing the burst without a stall. Linux arm
+not measured (same NAT hang).
+
+### verify-rack-tlp — netem scenarios (2/5 PASS, 3 not run)
+
+| scenario            | tcp.tx_retrans | _rto  | _rack | _tlp | PASS? |
+|---------------------|---------------:|------:|------:|-----:|-------|
+| low_loss_05pct      | 14948          | 12459 |     0 | 2489 | PASS  |
+| low_loss_1pct_corr  |     6          |     5 |     0 |    1 | PASS  |
+| high_loss_3pct      | _not run_      | -     | -     | -    | n/a   |
+| symmetric_3pct      | _not run_      | -     | -     | -    | n/a   |
+| high_loss_5pct      | _not run_      | -     | -     | -    | n/a   |
+
+Both completed scenarios satisfy the ALL-of (`tx_retrans>0`) AND ANY-of
+(`tx_retrans_rack>0 OR tx_retrans_tlp>0`) assertion sets baked into
+`verify-rack-tlp.sh`. RACK fires 0 times in both (consistent with the script
+header comment that RACK needs dense ACK + low loss to be detectable). TLP
+covers the tail-loss case in both. RTO dominates at 0.5% loss (12459) which
+the script's calibrated comment treats as expected — 0.5% loss puts ACKs
+sparse enough that RACK's reorder window can't fire in time.
+
+The high_loss_3pct/symmetric_3pct/high_loss_5pct scenarios were killed
+mid-run because the third scenario's bench-rtt was projected to exceed the
+1500s outer timeout (200k iters × 3% loss × heavy RTO recovery → ~11 min
+just for that single scenario on this AWS network path).
+
+## Open follow-ups
+
+1. **bench-rtt linux_kernel hang** — ~~the host's data NIC `0000:28:00.0` is
+   bound to vfio-pci so kernel TCP traffic goes via the host bridge through
+   `vethpxtn0` (`10.99.1.2`) and NAT-translates to `10.2.1.11` from the
+   peer's perspective.~~ **RESOLVED 2026-05-12.** The TCP path isn't NAT'd
+   — it's *transparent-SOCKS5-proxied* via iptables REDIRECT to
+   `redsocks:127.0.0.1:12345` → `127.0.0.1:1080`. Per-iter RTT inflates
+   from ~75 µs to ~250 ms, blowing the 300 s `RUN_ONE_TIMEOUT` on the
+   10 k-iter sweeps. Full investigation in
+   `docs/bench-reports/linux-nat-investigation-2026-05-12.md`. Fix landed
+   in `scripts/fast-iter-suite.sh`: the linux_kernel arms now talk to a
+   local echo-server on `127.0.0.1:10002` and a local burst-echo-server
+   on `127.0.0.1:19003`, both spawned in `preflight()` and torn down in
+   `on_exit()`. Smoke run: bench-rtt linux completes 4 × 10 k payloads
+   in **1.7 s** at p50 ~38 µs; bench-rx-burst linux completes
+   9 buckets × 200 bursts in **<1 s** at p50 ~8 µs; bench-tx-maxtp
+   linux completes the 9-bucket grid in **108 s** with 4-17 Gbps
+   results (vs. the T55 0.00 Gbps). dpdk_net + fstack arms unchanged.
+
+2. **bench-rtt fstack SIGSEGV** — F-Stack inits cleanly (DPDK port comes
+   up, FreeBSD bind succeeds, "f-stack-0: Successed to register dpdk
+   interface"), then SIGSEGVs (rc=139) inside the workload. The same fstack
+   binary handles bench-tx-burst, bench-tx-maxtp, and bench-rx-burst fine.
+   Likely a recent regression in the bench-rtt fstack arm; needs gdb
+   inspection on a follow-up T-task.
+
+3. **bench-tx-maxtp `--local-ip` precondition** — the linux_kernel arm
+   parses `--local-ip` as IPv4 for its peer-rwnd probe, even though the
+   `--help` says it's required only for dpdk_net. Suite now passes
+   `--local-ip $DUT_LOCAL_IP` for the linux arm too; either the CLI doc
+   should be updated or the parse made conditional.
+
+4. **bench-rx-burst dpdk_net "stalled at 0/1024 bytes"** — first attempt
+   failed with the dpdk_rx_burst engine reporting no forward progress in 60s.
+   After restarting the peer's burst-echo-server, the same invocation
+   succeeded. Worker-pool exhaustion on the peer side after the earlier
+   bench-tx-burst arms is the leading hypothesis; suite should also restart
+   burst-echo-server between rx-burst arms (currently only echo-server is
+   restarted between dpdk/fstack arms).
+
+5. **CLOSED (2026-05-12) — verify-rack-tlp wallclock at high loss**.
+   `scripts/verify-rack-tlp.sh` `SCENARIO_ITERS` map retuned for fast-iter:
+   `high_loss_3pct` 200k→50k, `symmetric_3pct` 200k→50k,
+   `high_loss_5pct` 100k→30k. Low-loss cells unchanged (500k / 200k —
+   needed to ensure ≥1 RACK/TLP event for ANY-of assertion; T55's
+   `low_loss_1pct_corr` at 200k iters fired exactly 1 TLP event, so
+   smaller would risk a false negative). New estimated suite wallclock:
+   ≤25 min on AWS c6a hardware. The fast-iter-suite's `ITERS=$VERIFY_RACK_ITERS`
+   passthrough is now redundant (all 5 scenarios are in `SCENARIO_ITERS`,
+   so the ITERS fallback is unused). Operators wanting nightly-grade
+   depth on a physical-lab DUT can override every scenario via
+   `FORCE_ITERS=1000000`.
+
+6. **CLOSED (2026-05-12) — DPDK zombie cleanup**. After the T55 v2 run
+   (2026-05-12 06:10) reproduced this — `bench-rx-burst fstack` TIMEOUT at
+   331 s left a zombie at 99% CPU + 23 stale `/dev/hugepages/rtemap_*`
+   files, then every `verify-rack-tlp` scenario failed identically with
+   `Invalid port_id=0 / Engine::new failed: PortInfo(0, -19)` — added
+   `reset_dpdk_state()` to `scripts/fast-iter-suite.sh`:
+   - sweeps zombie `bench-(rtt|tx-burst|tx-maxtp|rx-burst)` via
+     `sudo pkill -9 -f '/target/release/bench-…'`,
+   - sleeps 2 s for kernel DMA / IOMMU release,
+   - clears `/dev/hugepages/*` (`--huge-unlink` is supposed to but a
+     SIGKILL'd process leaves them behind),
+   - logs `dpdk-devbind.py --status` to `suite.log` for the post-reset
+     binding state.
+
+   Called once defensively at start of `preflight`, after every dpdk_net
+   and fstack `run_one`, and in the `on_exit` trap. `run_one` also
+   gained an inline `sudo pkill -9 -f /target/release/bench-…` on the
+   TIMEOUT path (rc=124/137) so the post-arm `reset_dpdk_state` doesn't
+   race a still-exiting zombie. Smoke test (2026-05-12 06:18) confirms
+   the fix: with the reset, fresh `dpdk_net` after a killed `fstack`
+   completes 100 iters cleanly; without the reset, the same sequence
+   fails immediately with `PortInfo(0, -19)`. Also fixed a printf
+   `'- %s\n'` invocation in `write_summary`'s failed-runs loop that
+   bash interpreted as an option (`printf: - : invalid option`); now
+   uses `printf -- '- %s\n'`.
+
+## Reproducer
+
+```bash
+cd /home/ubuntu/resd.dpdk_tcp-a10-perf
+./scripts/fast-iter-setup.sh up --with-fstack      # generates .fast-iter.env
+./scripts/fast-iter-suite.sh                       # writes target/bench-results/fast-iter-<UTC>/SUMMARY.md
+```
+
+CSVs land under `target/bench-results/fast-iter-<UTC>/`. The full per-arm log
+is in `<results-dir>/suite.log`.
+
+Environment overrides:
+- `RUN_ONE_TIMEOUT` — per-arm hard cap (default 300s).
+- `VERIFY_RACK_TLP_TIMEOUT` — verify-rack-tlp specific cap (default 1800s).
+- `SKIP_VERIFY_RACK_TLP=1` — skip the netem matrix entirely.
+- `DUT_PCI`, `DUT_LOCAL_IP`, `DUT_GATEWAY`, `DUT_LCORE`, `PEER_NIC` — DUT/peer
+  topology defaults that match the a10-perf-23.11 dev host.

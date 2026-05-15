@@ -333,6 +333,13 @@ pub struct TcpConn {
     /// at close time. `reap_time_wait` short-circuits the 2×MSL wait
     /// when this is set.
     pub force_tw_skip: bool,
+    /// RFC 9293 §3.8.6.1 persist timer handle. `Some` iff a zero-window
+    /// probe timer is armed. Cleared when snd_wnd opens or on close.
+    pub persist_timer_id: Option<crate::tcp_timer_wheel::TimerId>,
+    /// Exponential backoff shift for persist probes (0→1→2…capped at 6
+    /// so the inter-probe interval stays within ~64× RTO).
+    pub persist_backoff_shift: u8,
+
     /// A6 (spec §3.8): per-connection RTT histogram — 16 × u32
     /// buckets on one cacheline. Updated after each `rtt_est.sample()`
     /// in `tcp_input.rs` (Task 15). Slow-path update (~5–10 ns).
@@ -354,6 +361,18 @@ pub struct TcpConn {
     /// `dpdk_net_iovec_t` has identical `#[repr(C)]` layout (layout-
     /// asserted in `crates/dpdk-net/src/api.rs`).
     pub readable_scratch_iovecs: Vec<crate::iovec::DpdkNetIovec>,
+
+    /// Phase 6 (bench instrumentation): per-segment send→ACK latency
+    /// ringbuffer. Defaults to `disabled()` so the hot-path branch in
+    /// `record_send` is a single early-return; bench tools call
+    /// `Engine::enable_send_ack_logging(cap)` to opt in. Drained by
+    /// the bench tool via `Engine::drain_send_ack_samples`.
+    pub send_ack_log: crate::tcp_send_ack_log::SendAckLog,
+    /// Phase 6 (bench instrumentation): pending samples produced by
+    /// `send_ack_log.observe_cumulative_ack` after an ACK advances
+    /// `snd_una`. Drained by `Engine::drain_send_ack_samples`. Always
+    /// empty when `send_ack_log` is disabled.
+    pub send_ack_samples_pending: Vec<crate::tcp_send_ack_log::SendAckSample>,
 }
 
 impl TcpConn {
@@ -468,12 +487,18 @@ impl TcpConn {
             syn_tx_ts_ns: 0,
             send_refused_pending: false,
             force_tw_skip: false,
+            persist_timer_id: None,
+            persist_backoff_shift: 0,
             rtt_histogram: crate::rtt_histogram::RttHistogram::default(),
             // A6.6 Task 7: per-conn scratch for READABLE iovec
             // materialization + segment-ref holding. Both cleared at
             // top of each `poll_once`; capacity retained across polls.
             delivered_segments: smallvec::SmallVec::new(),
             readable_scratch_iovecs: Vec::new(),
+            // Phase 6 (bench instrumentation): disabled by default —
+            // bench tooling opts in via `Engine::enable_send_ack_logging`.
+            send_ack_log: crate::tcp_send_ack_log::SendAckLog::disabled(),
+            send_ack_samples_pending: Vec::new(),
         }
     }
 
@@ -786,7 +811,12 @@ mod tests {
 
     #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
-    fn rcv_wnd_clamped_to_u16_max_without_wscale() {
+    fn rcv_wnd_capped_at_u16_max_pre_wscale() {
+        // T21 (HEAD-side fix, commit 51cb1bb): new_client caps rcv_wnd
+        // at u16::MAX (65535) because before window-scale negotiation
+        // the wire encoding has no shift. The cap is lifted to
+        // recv.cap inside handle_syn_sent once WS is negotiated — see
+        // tcp_input::tests::syn_ack_sets_rcv_wnd_to_recv_cap_after_wscale_negotiation.
         let c = TcpConn::new_client(tuple(), 0, 1460, 1_000_000, 1024, 5000, 5000, 1_000_000);
         assert_eq!(c.rcv_wnd, u16::MAX as u32);
     }

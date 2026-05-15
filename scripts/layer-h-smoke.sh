@@ -87,28 +87,11 @@ log "[2/8] building peer C binaries"
 make -C tools/bench-e2e/peer echo-server
 
 # ---------------------------------------------------------------------------
-# [3/8] cargo build --release.
+# [3/8] cargo build --release --workspace.
 # Build BEFORE provisioning so a local build failure costs $0 AWS spend.
-#
-# IMPORTANT: --features test-server is REQUIRED. The layer-h-correctness
-# binary declares `required-features = ["test-server"]` in its Cargo.toml
-# (workspace unification fix, commit 9988dd8) — without the flag, cargo
-# silently SKIPS the bin and target/release/layer-h-correctness is never
-# produced. The bin needs Engine::state_of (test-server-only) to drive
-# the netem matrix's per-state liveness assertions.
 # ---------------------------------------------------------------------------
-log "[3/8] cargo build --release -p layer-h-correctness --features test-server"
-timeout 600s cargo build --release -p layer-h-correctness --features test-server
-
-# Post-build sanity check: required-features means cargo silently skips
-# the bin if the feature isn't in the resolved set, so verify the artefact
-# actually exists before we burn AWS spend on provisioning.
-if [ ! -x target/release/layer-h-correctness ]; then
-  log "post-build check: target/release/layer-h-correctness MISSING"
-  log "  this almost certainly means --features test-server was not"
-  log "  honoured (see Cargo.toml: required-features = [\"test-server\"])."
-  exit 4
-fi
+log "[3/8] cargo build --release --workspace"
+timeout 600s cargo build --release --workspace
 
 # ---------------------------------------------------------------------------
 # [4/8] Provision bench-pair fleet via resd-aws-infra.

@@ -1,0 +1,71 @@
+dpdk_net: port 0 driver=net_ena rx_offload_capa=0x000000000000200e tx_offload_capa=0x000000000001800e dev_flags=0x00000042
+dpdk_net: port 0 WC verification skipped: cannot read /sys/kernel/debug/x86/pat_memtype_list: No such file or directory (os error 2)
+dpdk_net: port 0 on net_ena with ena_large_llq_hdr=0; worst-case header 94 B is within 6 B of the 96 B LLQ limit. Consider setting EngineConfig.ena_large_llq_hdr=1 + splicing dpdk_net_recommended_ena_devargs(...) into EAL args. See docs/references/ena-dpdk-readme.md §5.1.
+dpdk_net: PMD on port 0 does not advertise RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE (0x0000000000004000); degrading to software path for this offload
+dpdk_net: PMD on port 0 does not advertise RTE_ETH_RX_OFFLOAD_RSS_HASH (0x0000000000080000); degrading to software path for this offload
+dpdk_net: port 0 configured rx_offloads=0x000000000000000e tx_offloads=0x000000000000800e
+dpdk_net: RX timestamp dynfield/dynflag unavailable on port 0 (ENA steady state — see spec §10.5)
+bench-vs-mtcp: WARN --nic-max-bps unset and NIC_MAX_BPS env var unset; skipping post-run NIC-saturation check (spec §11.1 check 3). Pass `--nic-max-bps <bps>` or export `NIC_MAX_BPS=<bps>` to enable.
+bench-vs-mtcp: opening persistent connection to 10.4.1.29:10001
+bench-vs-mtcp: running dpdk_net bucket K=65536B,G=0ms
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (65536 B)
+bench-vs-mtcp: sanity invariant check skipped for bucket K=65536B,G=0ms (tx_payload_bytes counter is 0 — build with `--features obs-byte-counters` to enable)
+bench-vs-mtcp: running dpdk_net bucket K=65536B,G=1ms
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (65536 B)
+bench-vs-mtcp: sanity invariant check skipped for bucket K=65536B,G=1ms (tx_payload_bytes counter is 0 — build with `--features obs-byte-counters` to enable)
+bench-vs-mtcp: running dpdk_net bucket K=65536B,G=10ms
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (65536 B)
+bench-vs-mtcp: sanity invariant check skipped for bucket K=65536B,G=10ms (tx_payload_bytes counter is 0 — build with `--features obs-byte-counters` to enable)
+bench-vs-mtcp: running dpdk_net bucket K=65536B,G=100ms
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (65536 B)
+bench-vs-mtcp: sanity invariant check skipped for bucket K=65536B,G=100ms (tx_payload_bytes counter is 0 — build with `--features obs-byte-counters` to enable)
+bench-vs-mtcp: running dpdk_net bucket K=262144B,G=0ms
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (262144 B)
+bench-vs-mtcp: sanity invariant check skipped for bucket K=262144B,G=0ms (tx_payload_bytes counter is 0 — build with `--features obs-byte-counters` to enable)
+bench-vs-mtcp: running dpdk_net bucket K=262144B,G=1ms
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (262144 B)
+bench-vs-mtcp: sanity invariant check skipped for bucket K=262144B,G=1ms (tx_payload_bytes counter is 0 — build with `--features obs-byte-counters` to enable)
+bench-vs-mtcp: running dpdk_net bucket K=262144B,G=10ms
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (262144 B)
+bench-vs-mtcp: sanity invariant check skipped for bucket K=262144B,G=10ms (tx_payload_bytes counter is 0 — build with `--features obs-byte-counters` to enable)
+bench-vs-mtcp: running dpdk_net bucket K=262144B,G=100ms
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (262144 B)
+bench-vs-mtcp: sanity invariant check skipped for bucket K=262144B,G=100ms (tx_payload_bytes counter is 0 — build with `--features obs-byte-counters` to enable)
+bench-vs-mtcp: running dpdk_net bucket K=1048576B,G=0ms
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (1048576 B)
+bench-vs-mtcp: sanity invariant check skipped for bucket K=1048576B,G=0ms (tx_payload_bytes counter is 0 — build with `--features obs-byte-counters` to enable)
+bench-vs-mtcp: running dpdk_net bucket K=1048576B,G=1ms
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (1048576 B)
+bench-vs-mtcp: sanity invariant check skipped for bucket K=1048576B,G=1ms (tx_payload_bytes counter is 0 — build with `--features obs-byte-counters` to enable)
+bench-vs-mtcp: running dpdk_net bucket K=1048576B,G=10ms
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (1048576 B)
+bench-vs-mtcp: sanity invariant check skipped for bucket K=1048576B,G=10ms (tx_payload_bytes counter is 0 — build with `--features obs-byte-counters` to enable)
+bench-vs-mtcp: running dpdk_net bucket K=1048576B,G=100ms
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (1048576 B)
+bench-vs-mtcp: sanity invariant check skipped for bucket K=1048576B,G=100ms (tx_payload_bytes counter is 0 — build with `--features obs-byte-counters` to enable)
+bench-vs-mtcp: running dpdk_net bucket K=4194304B,G=0ms
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (4194304 B)
+bench-vs-mtcp: sanity invariant check skipped for bucket K=4194304B,G=0ms (tx_payload_bytes counter is 0 — build with `--features obs-byte-counters` to enable)
+bench-vs-mtcp: running dpdk_net bucket K=4194304B,G=1ms
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (4194304 B)
+bench-vs-mtcp: sanity invariant check skipped for bucket K=4194304B,G=1ms (tx_payload_bytes counter is 0 — build with `--features obs-byte-counters` to enable)
+bench-vs-mtcp: running dpdk_net bucket K=4194304B,G=10ms
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (4194304 B)
+bench-vs-mtcp: sanity invariant check skipped for bucket K=4194304B,G=10ms (tx_payload_bytes counter is 0 — build with `--features obs-byte-counters` to enable)
+bench-vs-mtcp: running dpdk_net bucket K=4194304B,G=100ms
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (4194304 B)
+bench-vs-mtcp: sanity invariant check skipped for bucket K=4194304B,G=100ms (tx_payload_bytes counter is 0 — build with `--features obs-byte-counters` to enable)
+bench-vs-mtcp: running dpdk_net bucket K=16777216B,G=0ms
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (16777216 B)
+bench-vs-mtcp: sanity invariant check skipped for bucket K=16777216B,G=0ms (tx_payload_bytes counter is 0 — build with `--features obs-byte-counters` to enable)
+bench-vs-mtcp: running dpdk_net bucket K=16777216B,G=1ms
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (16777216 B)
+bench-vs-mtcp: sanity invariant check skipped for bucket K=16777216B,G=1ms (tx_payload_bytes counter is 0 — build with `--features obs-byte-counters` to enable)
+bench-vs-mtcp: running dpdk_net bucket K=16777216B,G=10ms
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (16777216 B)
+bench-vs-mtcp: sanity invariant check skipped for bucket K=16777216B,G=10ms (tx_payload_bytes counter is 0 — build with `--features obs-byte-counters` to enable)
+bench-vs-mtcp: running dpdk_net bucket K=16777216B,G=100ms
+bench-vs-mtcp: WARN --peer-ssh unset; peer_rwnd pre-run check degraded to placebo (16777216 B)
+bench-vs-mtcp: sanity invariant check skipped for bucket K=16777216B,G=100ms (tx_payload_bytes counter is 0 — build with `--features obs-byte-counters` to enable)
+ena_rx_queue_release(): Rx queue 0:0 released
+ena_tx_queue_release(): Tx queue 0:0 released

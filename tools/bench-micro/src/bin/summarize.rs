@@ -194,7 +194,8 @@ fn main() -> anyhow::Result<()> {
     // We walk the whole tree looking for `*/new/sample.json` (primary)
     // and fall back to `*/new/estimates.json` (best-effort) per-target.
     // The `<benchmark_id>` is the criterion target name (e.g.
-    // `bench_poll_empty`), which becomes the CSV's `test_case` column.
+    // `bench_poll_scheduler_tick_empty`), which becomes the CSV's
+    // `test_case` column.
     if std::path::Path::new(&input_root).exists() {
         // Dedupe per-target so we emit at most one CSV cluster per
         // criterion benchmark — walkdir surfaces both sample.json and
@@ -273,6 +274,8 @@ fn main() -> anyhow::Result<()> {
                     dpdk_version_pkgconfig: host_meta.dpdk_version_pkgconfig.clone(),
                     worktree_branch: host_meta.worktree_branch.clone(),
                     uprof_session_id: host_meta.uprof_session_id.clone(),
+                    raw_samples_path: None,
+                    failed_iter_count: 0,
                 };
                 wtr.serialize(&row)?;
                 count += 1;
