@@ -1,9 +1,15 @@
 #!/usr/bin/env bash
 # bench-quick.sh — fast local bench pair for iterative dev testing.
 #
-# THIS machine acts as the DPDK DUT (data NIC 0000:00:06.0, IP 10.4.1.141).
-# A fresh peer EC2 instance runs echo-server in the same subnet.
+# THIS machine acts as the DPDK DUT (data NIC bound to vfio-pci).
+# Default DUT_PCI is 0000:28:00.0 (a10-perf c7i-flex.2xlarge); override
+# via env for other hosts (e.g. the AMI-bake c6a.2xlarge uses 0000:00:06.0).
 # Iteration time: ~3-5 min (vs 60+ min for full bench-nightly).
+#
+# Peer source: if `$WORKDIR/.fast-iter.env` is present (provisioned via
+# `scripts/fast-iter-setup.sh up`), it is reused as the peer — no AWS
+# credentials needed and `setup` just binds the local NIC + hugepages.
+# Otherwise `setup` launches a fresh c6a.xlarge peer via the AWS CLI.
 #
 # Usage:
 #   ./scripts/bench-quick.sh setup
@@ -17,7 +23,13 @@
 #   rx-burst  bench-rx-burst    RX-side W × N segment-absorb   (burst-echo-server :10003)
 #
 # Env overrides:
-#   AWS_PROFILE                AWS credential profile (default: resd-infra-operator)
+#   DUT_IP                     DUT data-NIC IPv4              (default: 10.4.1.141)
+#   DUT_GATEWAY                DUT data-NIC gateway IPv4      (default: 10.4.1.1)
+#   DUT_PCI                    DUT data-NIC PCI BDF           (default: 0000:28:00.0)
+#   DUT_LCORE                  Worker lcore                   (default: 2)
+#   DUT_NIC_MAX_BPS            NIC saturation guard (bps)     (default: 10 Gbps)
+#   AWS_PROFILE                AWS credential profile (default: resd-infra-operator,
+#                              only used when bench-quick launches its own peer)
 #   BENCH_BURSTS_PER_BUCKET    burst:    bursts per bucket post-warmup (default: 200)
 #   BENCH_BURST_WARMUP         burst:    discarded warm-up bursts      (default: 20)
 #   BENCH_MAXTP_WARMUP_SECS    maxtp:    warmup duration s             (default: 3)
@@ -34,21 +46,24 @@
 set -euo pipefail
 
 # ── DUT ───────────────────────────────────────────────────────────────────────
-DUT_IP="10.4.1.141"
-DUT_GATEWAY="10.4.1.1"
-DUT_PCI="0000:00:06.0"
-DUT_INSTANCE_ID="i-0a6e844d6af751c1f"
+# All DUT params env-overridable (matches fast-iter-suite.sh conventions).
+# Defaults are the a10-perf c7i-flex.2xlarge host; override on other DUTs.
+DUT_IP="${DUT_IP:-10.4.1.141}"
+DUT_GATEWAY="${DUT_GATEWAY:-10.4.1.1}"
+DUT_PCI="${DUT_PCI:-0000:28:00.0}"
+DUT_LCORE="${DUT_LCORE:-2}"
 DUT_EAL_ARGS="-l 2-3 -n 4 --in-memory --huge-unlink -a ${DUT_PCI},large_llq_hdr=1,miss_txc_to=3"
-DUT_LCORE=2
-DUT_NIC_MAX_BPS=10000000000   # c6a.2xlarge baseline: 10 Gbps
+DUT_NIC_MAX_BPS="${DUT_NIC_MAX_BPS:-10000000000}"   # 10 Gbps baseline
 
 # ── Peer ──────────────────────────────────────────────────────────────────────
 PEER_AMI="ami-0e483926d07d19647"
 PEER_SUBNET="subnet-05d4a1cf65e5df23c"
 PEER_SG="sg-093d563579a51ca88"
 PEER_INSTANCE_TYPE="c6a.xlarge"
-PEER_ECHO_PORT=10001
-PEER_BURST_PORT=10003
+# Ports default to bench-pair convention but are env-overridable so an
+# already-sourced .fast-iter.env (which exports the same names) wins.
+PEER_ECHO_PORT="${PEER_ECHO_PORT:-10001}"
+PEER_BURST_PORT="${PEER_BURST_PORT:-10003}"
 
 # ── AWS / SSH ─────────────────────────────────────────────────────────────────
 AWS_PROFILE="${AWS_PROFILE:-resd-infra-operator}"
@@ -56,6 +71,8 @@ AWS_REGION="${AWS_REGION:-ap-south-1}"
 SSH_KEY="${HOME}/.ssh/id_ed25519"
 SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30 -o ProxyCommand=none -i "$SSH_KEY")
 STATE_FILE="/tmp/bench-quick-state.json"
+WORKDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+FAST_ITER_ENV="$WORKDIR/.fast-iter.env"
 
 # ── Bench params ──────────────────────────────────────────────────────────────
 # burst workload
@@ -82,7 +99,6 @@ BENCH_RX_BURST_COUNTS="${BENCH_RX_BURST_COUNTS:-16,64,256,4096,10240}"
 # Drop to lenient if the dev host has known/permanent precondition gaps.
 BENCH_PRECONDITION_MODE="${BENCH_PRECONDITION_MODE:-strict}"
 
-WORKDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export AWS_PROFILE AWS_REGION
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -99,9 +115,26 @@ push_ic_pubkey() {
 }
 
 load_state() {
-    [ -f "$STATE_FILE" ] || die "No state file — run setup first"
+    # Prefer an existing fast-iter peer when `$WORKDIR/.fast-iter.env` is
+    # present (provisioned via `scripts/fast-iter-setup.sh up`). This lets
+    # bench-quick.sh skip the AWS launch entirely on hosts where a peer
+    # has already been brought up for fast-iter — no AWS creds required.
+    # Falls back to the bench-quick-private state file from `cmd_setup`.
+    if [ -f "$FAST_ITER_ENV" ]; then
+        # shellcheck disable=SC1090
+        source "$FAST_ITER_ENV"
+        : "${PEER_IP:?PEER_IP missing in $FAST_ITER_ENV}"
+        : "${PEER_INSTANCE_ID:?PEER_INSTANCE_ID missing in $FAST_ITER_ENV}"
+        : "${PEER_ECHO_PORT:?PEER_ECHO_PORT missing in $FAST_ITER_ENV}"
+        : "${PEER_BURST_PORT:?PEER_BURST_PORT missing in $FAST_ITER_ENV}"
+        PEER_SOURCE="fast-iter"
+        return 0
+    fi
+    [ -f "$STATE_FILE" ] \
+        || die "No peer state — run \`./scripts/bench-quick.sh setup\` or provision a fast-iter peer via \`./scripts/fast-iter-setup.sh up\`"
     PEER_IP=$(python3 -c "import json; print(json.load(open('$STATE_FILE'))['peer_ip'])")
     PEER_INSTANCE_ID=$(python3 -c "import json; print(json.load(open('$STATE_FILE'))['instance_id'])")
+    PEER_SOURCE="bench-quick"
 }
 
 # Sweep zombie bench processes + clear stale hugepages left by a prior
@@ -121,9 +154,25 @@ cmd_setup() {
     log "=== bench-quick setup ==="
     cd "$WORKDIR"
 
-    # [1] peer C binaries
-    log "[1/5] Building peer binaries (echo-server + burst-echo-server)..."
-    make -C tools/bench-e2e/peer echo-server burst-echo-server
+    # If a fast-iter peer is already provisioned, reuse it: skip the AWS
+    # launch path entirely and just do the local DUT prep. Saves ~2 min
+    # per setup and avoids needing AWS credentials when a peer is already
+    # running. The fast-iter peer must already have echo-server + burst-
+    # echo-server listening (fast-iter-setup.sh up does that).
+    local reuse_fast_iter=0
+    if [ -f "$FAST_ITER_ENV" ]; then
+        reuse_fast_iter=1
+        log "  Detected $FAST_ITER_ENV — reusing existing fast-iter peer (skipping AWS launch)"
+    fi
+
+    # [1] peer C binaries (skipped when reusing fast-iter peer: fast-iter-
+    # setup.sh already built + deployed them onto the live peer).
+    if [ "$reuse_fast_iter" -eq 0 ]; then
+        log "[1/5] Building peer binaries (echo-server + burst-echo-server)..."
+        make -C tools/bench-e2e/peer echo-server burst-echo-server
+    else
+        log "[1/5] Skipping peer-binary build (fast-iter peer already provisioned)"
+    fi
 
     # [2] hugepages
     log "[2/5] Checking hugepages..."
@@ -146,6 +195,18 @@ cmd_setup() {
         log "  Was $current_drv — binding to vfio-pci"
         sudo /usr/local/bin/dpdk-devbind.py --bind vfio-pci "$DUT_PCI"
         log "  Bound"
+    fi
+
+    if [ "$reuse_fast_iter" -eq 1 ]; then
+        # shellcheck disable=SC1090
+        source "$FAST_ITER_ENV"
+        log "=== Setup complete (fast-iter peer reused) ==="
+        log "    DUT:  $DUT_IP  ($DUT_PCI, vfio-pci)"
+        log "    Peer: $PEER_IP (echo-server :${PEER_ECHO_PORT}, burst-echo-server :${PEER_BURST_PORT})"
+        log "    Note: \`bench-quick.sh teardown\` will NOT terminate the fast-iter peer."
+        log "          Use \`./scripts/fast-iter-setup.sh down\` to terminate it."
+        log "    Run:  ./scripts/bench-quick.sh run [burst|maxtp|rtt|rx-burst]"
+        return 0
     fi
 
     # [4] launch peer
@@ -327,6 +388,10 @@ cmd_run() {
 cmd_teardown() {
     log "=== bench-quick teardown ==="
 
+    # Only terminate a peer that bench-quick.sh itself launched (i.e. the
+    # private state file is present). Fast-iter peers are owned by
+    # fast-iter-setup.sh and must be torn down through it — terminating one
+    # here would invalidate someone else's iteration loop.
     if [ -f "$STATE_FILE" ]; then
         local instance_id
         instance_id=$(python3 -c "import json; print(json.load(open('$STATE_FILE'))['instance_id'])")
@@ -334,6 +399,9 @@ cmd_teardown() {
         aws ec2 terminate-instances --instance-ids "$instance_id" --output text >/dev/null
         rm -f "$STATE_FILE"
         log "Peer terminated, state cleared"
+    elif [ -f "$FAST_ITER_ENV" ]; then
+        log "Fast-iter peer detected ($FAST_ITER_ENV) — leaving it running"
+        log "  Use \`./scripts/fast-iter-setup.sh down\` to terminate the fast-iter peer"
     else
         log "No state file — nothing to terminate"
     fi
@@ -361,7 +429,10 @@ case "${1:-help}" in
 Usage: bench-quick.sh <command> [args]
 
 Commands:
-  setup               spin up peer EC2 + bind DUT data NIC to vfio-pci
+  setup               bind DUT data NIC to vfio-pci + ensure peer is ready.
+                      If `.fast-iter.env` is present, that peer is reused
+                      (no AWS launch needed); otherwise a fresh c6a.xlarge
+                      peer is launched via the AWS CLI.
   run [workload] ...  incremental build + run the selected workload (default: burst).
                       Workloads (all --stack dpdk_net):
                         burst     bench-tx-burst    K × G one-shot burst grid
@@ -369,10 +440,17 @@ Commands:
                         rtt       bench-rtt         req/resp p50/p99 payload sweep
                         rx-burst  bench-rx-burst    RX-side W × N segment-absorb
                       Remaining args forwarded to the selected binary.
-  teardown            terminate peer instance + rebind DUT NIC to ena
+  teardown            terminate the bench-quick-launched peer + rebind DUT
+                      NIC to ena. Leaves fast-iter peers alone (use
+                      `./scripts/fast-iter-setup.sh down` for those).
 
 Env overrides (export before calling):
-  AWS_PROFILE=resd-infra-operator
+  DUT_IP=10.4.1.141                DUT data-NIC IPv4
+  DUT_GATEWAY=10.4.1.1             DUT data-NIC gateway IPv4
+  DUT_PCI=0000:28:00.0             DUT data-NIC PCI BDF (a10-perf default)
+  DUT_LCORE=2                      Worker lcore
+  DUT_NIC_MAX_BPS=10000000000      NIC saturation guard, bps (10 Gbps default)
+  AWS_PROFILE=resd-infra-operator  Only used when bench-quick launches its own peer
   BENCH_BURSTS_PER_BUCKET=200      burst:    bursts per bucket post-warmup
   BENCH_BURST_WARMUP=20            burst:    discarded warm-up bursts
   BENCH_MAXTP_WARMUP_SECS=3        maxtp:    warmup duration in seconds
