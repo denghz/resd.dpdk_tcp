@@ -1561,15 +1561,24 @@ pub fn eal_init(args: &[&str]) -> Result<(), Error> {
     // and dispatches into `rte_vlog`, which only THEN checks the runtime
     // level and bails. Profiling (`docs/bench-reports/po-investigate-uprof-2026-05-14.md`)
     // shows ~4-5% of bench-tx-burst CPU in this dead-log path. Pinning
-    // the `lib.eal.ena.com` logtype to WARNING short-circuits the
-    // dispatch at the level check inside `rte_log` itself (one branch
-    // mispredict at worst) — saves ~80-150 ns per `rte_eth_tx_burst`
-    // and per-doorbell-write call. Pattern is `lib.eal.ena.com`
-    // matching the DPDK ENA driver registration string. Ignore the
-    // return: any miss (pattern doesn't match a registered logtype on
-    // non-ENA NICs, e.g. virtio in CI) is a no-op and not an error.
-    let pat = CString::new("lib.eal.ena.com").unwrap();
-    let _ = unsafe { sys::rte_log_set_level_pattern(pat.as_ptr(), sys::RTE_LOG_WARNING) };
+    // the ENA `*.com` logtype to WARNING short-circuits the dispatch at
+    // the level check inside `rte_log` itself (one branch mispredict at
+    // worst) — saves ~80-150 ns per `rte_eth_tx_burst` and per-
+    // doorbell-write call.
+    //
+    // PO11-fix: the ENA driver actually registers its logtype as
+    // `pmd.net.ena.com` (DPDK 23.11 naming convention), not
+    // `lib.eal.ena.com` as the original patch assumed. We set both
+    // patterns as defense-in-depth: the primary `pmd.net.ena.com` match
+    // covers the current driver; the legacy `lib.eal.ena.com` is left in
+    // place so we remain robust to any future DPDK rename or convention
+    // shift. Both return-codes are intentionally ignored — DPDK returns
+    // 0 even for an unmatched pattern (no-op on non-ENA NICs like virtio
+    // in CI is expected and not an error).
+    let pat_pmd = CString::new("pmd.net.ena.com").unwrap();
+    let _ = unsafe { sys::rte_log_set_level_pattern(pat_pmd.as_ptr(), sys::RTE_LOG_WARNING) };
+    let pat_lib = CString::new("lib.eal.ena.com").unwrap();
+    let _ = unsafe { sys::rte_log_set_level_pattern(pat_lib.as_ptr(), sys::RTE_LOG_WARNING) };
 
     *guard = true;
     Ok(())
